@@ -4,6 +4,11 @@ use crate::util::{self, Cmd, Result, cargo, tool};
 
 const WASM_TARGET: &str = "wasm32-unknown-unknown";
 
+/// A target that has no standard library at all. Kernel crates are `no_std`;
+/// checking them here proves it, because anything that reaches for `std`,
+/// in the crate or in one of its dependencies, fails to compile.
+const NO_STD_TARGET: &str = "wasm32v1-none";
+
 /// Crates that make up the engine kernel, by directory name under `crates/`.
 const KERNEL_CRATES: [&str; 1] = ["core"];
 
@@ -39,6 +44,13 @@ pub fn check() -> Result {
         clippy = clippy.args(["--package", package]);
     }
     clippy.args(["--", "-D", "warnings"]).run()?;
+
+    util::step("kernel without a standard library");
+    let mut check = cargo().args(["check", "--locked", "--target", NO_STD_TARGET]);
+    for name in KERNEL_CRATES {
+        check = check.args(["--package", &format!("reticula-{name}")]);
+    }
+    check.run()?;
 
     util::step("kernel lint block");
     check_kernel_lint_block()
