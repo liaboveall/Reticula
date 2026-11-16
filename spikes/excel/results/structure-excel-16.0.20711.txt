@@ -1,0 +1,69 @@
+Excel version 16.0, build 20711
+
+== a range reference, =SUM(A5:A9), under inserts and deletes ==
+insert at row 7 (inside the range)                         =SUM(A5:A10)             = 35
+insert at row 10 (just below the last row)                 =SUM(A5:A9)              = 35
+insert at row 5 (at the first row)                         =SUM(A6:A10)             = 35
+delete row 9 (the last row)                                =SUM(A5:A8)              = 26
+  then insert at row 9                                     =SUM(A5:A8)              = 26
+delete row 5 (the first row)                               =SUM(A5:A8)              = 30
+  then insert at row 5                                     =SUM(A6:A9)              = 30
+delete row 9, then insert at row 8                         =SUM(A5:A9)              = 26
+delete rows 5:9 (the whole range)                          =SUM(#REF!)              = #REF!
+
+== a single-cell reference, =A5 ==
+insert at row 3 (above the referenced cell)                =A6                      = 5
+delete row 5 (the referenced row)                          =#REF!                   = #REF!
+
+== whole-column and position-dependent formulas, insert at row 3 ==
+before: SUM over a whole column                            =SUM(A:A)                = 78
+after:  SUM over a whole column (new row holds 100)        =SUM(A:A)                = 178
+after:  =ROW(), was in D5                                  =ROW()                   = 6
+after:  =ROW(A5), was in E5                                =ROW(A6)                 = 6
+after:  =MATCH(9,A1:A12,0)                                 =MATCH(9,A1:A13,0)       = 10
+after:  =INDEX(A1:A12,5)                                   =INDEX(A1:A13,5)         = 4
+after:  =ROWS(A1:A12)                                      =ROWS(A1:A13)            = 13
+after:  =INDIRECT("A5")                                    =INDIRECT("A5")          = 4
+after:  =OFFSET(A1,4,0)                                    =OFFSET(A1,4,0)          = 4
+
+== the sheet is full: row 1048576 ==
+insert a row while the last row is empty                   ok
+insert a row while the last row holds a value              refused: Microsoft Excel 无法插入新的单元格，因为这会将非空单元格推送到工作表的末尾。这些非空单元格可能显示为空，但具有空值、某些格式或公式。删除足够多的行或列，为您要插入的内容腾出空间，然后再试一次。
+row count                                                  =ROWS(A:A)               = 1048576
+
+== copy and fill adjust relative references ==
+copy D1 to E3 (one column right, two rows down)            =B3+$A$2+B$3+$A6         = 8
+fill D1 down: D3                                           =A3+$A$2+A$3+$A6         = 14
+
+== cut a cell onto a cell that is referenced elsewhere ==
+reference to the moved cell, was =A9                       =A20                     = 9
+reference to the overwritten cell, was =A20                =#REF!                   = #REF!
+range containing the overwritten cell, was =SUM(A18:A22)   =SUM(A18:A22)            = 9
+range ending at the overwritten cell, was =SUM(A19:A20)    =SUM(A19:A20)            = 9
+the other range, was =SUM(A5:A9)                           =SUM(A5:A20)             = 68
+
+== cut with an explicit destination: a corner of a range moves ==
+cut A9 to A20 (last cell moved away)                       =SUM(A5:A20)             = 68
+cut A5 to A2 (first cell moved up)                         =SUM(A2:A9)              = 42
+cut A7 to A20 (an interior cell)                           =SUM(A5:A9)              = 28
+cut A9 to A3 (last cell to above the first)                =SUM(A5:A9)              = 26
+cut row 9 onto row 20 (whole row, overwrite)               =SUM(A5:A20)             = 68
+
+== sort A1:D5 by column A (values 5,3,1,4,2) ==
+column A after sorting:           1, 2, 3, 4, 5
+B, was =A<row>*10:                =A1*10  =A2*10  =A3*10  =A4*10  =A5*10
+C, was one row down / 4 rows up:  =A2  =#REF!  =A4  =A5  =A6
+D, was =H<row> (outside the sort): =H1  =H2  =H3  =H4  =H5
+E, absolute references:               =H$1    =$H$1
+outside the range: =A2                                     =A2                      = 2
+outside the range: =$A$2                                   =$A$2                    = 2
+outside the range: =SUM(A1:A3)                             =SUM(A1:A3)              = 6
+
+== arrays and implicit intersection ==
+dynamic-array formula =A1:A3*2 in E1: spills=True, E1:E3 = 2, 4, 6
+legacy formula =A1:A12 in G5: value=5, stored as =@A1:A12
+
+== sheets ==
+before deleting the sheet                                  =Data!A1                 = 5
+after deleting the referenced sheet                        =#REF!A1                 = #REF!
+rename a second sheet to an existing name                  refused: 此名称已被使用。请尝试其他名称。

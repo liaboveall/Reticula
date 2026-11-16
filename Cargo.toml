@@ -1,6 +1,12 @@
 [workspace]
 resolver = "3"
-members = ["crates/core", "crates/wasm", "crates/xtask", "spikes/*"]
+members = [
+    "crates/core",
+    "crates/wasm",
+    "crates/xtask",
+    "spikes/determinism",
+    "spikes/nostd-deps",
+]
 
 [workspace.package]
 version = "0.0.0"
