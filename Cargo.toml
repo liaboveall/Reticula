@@ -1,0 +1,39 @@
+[workspace]
+resolver = "3"
+members = ["crates/core"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.100"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/liaboveall/Reticula"
+publish = false
+
+[workspace.dependencies]
+# Pinned exactly: results of the math functions are part of the engine's
+# observable behaviour, so an upgrade is a deliberate, reviewed change.
+libm = "=0.2.16"
+
+wasm-bindgen-test = "0.3.80"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+unused_must_use = "deny"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+dbg_macro = "warn"
+explicit_iter_loop = "warn"
+manual_let_else = "warn"
+needless_pass_by_value = "warn"
+redundant_closure_for_method_calls = "warn"
+semicolon_if_nothing_returned = "warn"
+todo = "warn"
+uninlined_format_args = "warn"
+
+[profile.release]
+codegen-units = 1
+lto = "fat"
+opt-level = 3

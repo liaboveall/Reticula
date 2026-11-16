@@ -1,2 +1,15 @@
 # Local-only working notes
 /docs/
+
+# Build output
+/target/
+dist/
+/packages/protocol/pkg/
+
+# Dependencies and locally installed tools
+node_modules/
+/.tools/
+
+# Test output
+/test-results/
+/playwright-report/
