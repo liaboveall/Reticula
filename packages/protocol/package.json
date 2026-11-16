@@ -1,0 +1,9 @@
+{
+  "name": "@reticula/protocol",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./wasm": "./pkg/reticula_wasm_bg.wasm"
+  }
+}

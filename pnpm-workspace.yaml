@@ -1,0 +1,8 @@
+packages:
+  - apps/*
+  - packages/*
+
+# Dependencies do not run install scripts unless listed here as true. lefthook's
+# script would install the git hooks; `cargo xtask setup` does that explicitly.
+allowBuilds:
+  lefthook: false
