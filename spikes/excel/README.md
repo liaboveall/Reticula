@@ -46,7 +46,8 @@ What the recorded run (Excel 16.0, build 20711) shows:
 | `ROUNDUP` | The same decision; the result is `ROUNDDOWN` plus one unit added in floating point, so it can be one unit in the last place off the nearest double |
 | `INT` | Below 10^15 as above; from 10^15 on, the exact floor |
 | `MOD` | The exact remainder with the sign of the divisor. No 15-digit rounding. `#NUM!` once the quotient reaches about 10^13 |
-| `a - b` | Exact, except as the last operation of a formula, where a result about 2^50 times smaller than the operands becomes 0 |
+| `a + b`, `a - b` | Exact, except as the outermost operation of a formula, where a result about 2^50 times smaller than the operands becomes 0. Wrapping the expression in parentheses, or in any function, keeps the exact result |
+| `SUM`, `AVERAGE`, `SUBTOTAL`, `AGGREGATE` | Return 0 for such a cancelled sum wherever they appear. `SUMPRODUCT` and `SUMIF` return the exact residue |
 
 Excel also stores 0 in place of subnormal numbers and of negative zero.
 

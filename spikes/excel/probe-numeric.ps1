@@ -94,6 +94,8 @@ try {
   if ($rows.Count -gt 0) {
     $lines.Add('# lit: id, kind, formula, value')
     $ws = $wb.Worksheets.Add()
+    # Operands for the formulas that refer to cells.
+    $ws.Range('X1').Value2 = 0.1; $ws.Range('X2').Value2 = 0.2; $ws.Range('X3').Value2 = -0.3; $ws.Range('X4').Value2 = 0.3
     for ($i = 0; $i -lt $rows.Count; $i++) {
       $cell = $ws.Cells.Item($i + 1, 1)
       $cell.Formula = $rows[$i].note
