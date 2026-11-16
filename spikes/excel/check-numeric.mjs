@@ -90,6 +90,12 @@ check("a = b: relative difference within 1e-15 (for contrast)", "cmp", false, (c
 check("a = b: rounding to 16 digits instead (for contrast)", "cmp", false, (c) => truth(c.results[0]) === (Number(c.a.toPrecision(16)) === Number(c.b.toPrecision(16)) || c.a === c.b));
 check("(a-b), not the last operation: exact IEEE subtraction", "cmp", true, (c) => c.results[7] === toHex(c.a - c.b));
 check("a-b as the last operation: exact IEEE subtraction (it is not: small results become 0)", "cmp", false, (c) => c.results[6] === toHex(c.a - c.b));
+check("a-b as the last operation: 0 when |a-b| < 2^(exponent of a - 49), unless the result is subnormal", "cmp", true, (c) => {
+  const difference = c.a - c.b;
+  const size = Math.abs(difference);
+  const cancelled = c.a !== 0 && size < 2 ** (Math.floor(Math.log2(Math.abs(c.a))) - 49) && size >= 2.2250738585072014e-308;
+  return c.results[6] === toHex(cancelled ? 0 : difference);
+});
 check("DELTA(a,b): equal only when bit-identical", "cmp", true, (c) => (c.results[9] === one) === (c.aBits === c.bBits));
 
 // --- conditions and lookups

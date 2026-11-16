@@ -46,8 +46,8 @@ What the recorded run (Excel 16.0, build 20711) shows:
 | `ROUNDUP` | The same decision; the result is `ROUNDDOWN` plus one unit added in floating point, so it can be one unit in the last place off the nearest double |
 | `INT` | Below 10^15 as above; from 10^15 on, the exact floor |
 | `MOD` | The exact remainder with the sign of the divisor. No 15-digit rounding. `#NUM!` once the quotient reaches about 10^13 |
-| `a + b`, `a - b` | Exact, except as the outermost operation of a formula, where a result about 2^50 times smaller than the operands becomes 0. Wrapping the expression in parentheses, or in any function, keeps the exact result |
-| `SUM`, `AVERAGE`, `SUBTOTAL`, `AGGREGATE` | Return 0 for such a cancelled sum wherever they appear. `SUMPRODUCT` and `SUMIF` return the exact residue |
+| `a - b` | Exact, except as the outermost operation of a formula: there the result is 0 when it is smaller than 2^(exponent of `a` − 49) and not subnormal. Wrapping the expression in parentheses, or in any function, keeps the exact result |
+| `SUM`, `AVERAGE`, `SUBTOTAL`, `AGGREGATE` | Apply the same test to their last addition only, wherever they appear: `SUM(0.1, 0.2, -0.3)` is 0, `SUM(0.1, 0.2, -0.3, 0)` is 5.55e-17. `SUMPRODUCT` and `SUMIF` return the exact residue |
 
 Subnormal numbers and negative zero written into a cell read back as 0.
 

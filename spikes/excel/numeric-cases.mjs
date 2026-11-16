@@ -111,6 +111,9 @@ const formulas = [
   "=AVERAGE(X1:X3)", "=SUBTOTAL(9,X1:X3)", "=AGGREGATE(9,0,X1:X3)", "=SUMPRODUCT(X1:X3)", "=SUMIF(X1:X3,\"<>\")",
   "=IF(TRUE,X1+X2-X4)", "=N(X1+X2-X4)", "=ABS(X1+X2-X4)", "=MAX(X1+X2-X4,-1)", "=IF(X1+X2-X4=0,\"zero\",\"not zero\")",
   "=X1+X2-X4=0", "=SUM(X1:X3)=0", "=ROUND(X1+X2-X4,20)", "=1+X1+X2-X4-1", "=X1*3-X4", "=X1+X1+X1-X4",
+  // Does SUM zero a cancelled partial sum at every step, only at the end, or relative to its largest term?
+  "=SUM(X1:X3,1E-20)", "=SUM(X1:X3,0)", "=SUM(1E-20,X1:X3)", "=SUM(X1,X2,X3,1E-20)", "=SUM(X3,X1,X2)", "=SUM(X3,X2,X1)",
+  "=SUM(X1:X3,X1:X3)", "=SUM(X1:X3)+1E-20", "=X1+X2+X3+1E-20", "=AVERAGE(X1:X3,1E-20)",
 ];
 for (const formula of formulas) rows.push(["lit", "", "", formula]);
 
