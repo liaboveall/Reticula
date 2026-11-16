@@ -1,0 +1,11 @@
+# Git hooks. Installed by `cargo xtask setup`.
+
+pre-commit:
+  commands:
+    check:
+      run: cargo xtask check
+
+pre-push:
+  commands:
+    ci:
+      run: cargo xtask ci
