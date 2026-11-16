@@ -49,7 +49,7 @@ What the recorded run (Excel 16.0, build 20711) shows:
 | `a + b`, `a - b` | Exact, except as the outermost operation of a formula, where a result about 2^50 times smaller than the operands becomes 0. Wrapping the expression in parentheses, or in any function, keeps the exact result |
 | `SUM`, `AVERAGE`, `SUBTOTAL`, `AGGREGATE` | Return 0 for such a cancelled sum wherever they appear. `SUMPRODUCT` and `SUMIF` return the exact residue |
 
-Excel also stores 0 in place of subnormal numbers and of negative zero.
+Subnormal numbers and negative zero written into a cell read back as 0.
 
 Against the same data, plain IEEE comparison reproduces 72% of the equality
 cases, and rounding the binary value directly reproduces 76% of the `ROUND`
