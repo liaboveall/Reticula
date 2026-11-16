@@ -6,6 +6,7 @@
 
 mod rust;
 mod setup;
+mod spike;
 mod util;
 mod wasm;
 mod web;
@@ -33,6 +34,7 @@ Commands:
   e2e [--browser <name>] [--skip-build]
                           End-to-end tests in chromium, firefox and webkit.
   ci                      Everything CI runs on a push. Run it before pushing.
+  spike <name>            Run one of the experiments under spikes/ and print its report.
 ";
 
 fn main() -> ExitCode {
@@ -79,6 +81,10 @@ fn run(args: &[String]) -> Result {
             Flags::parse(rest, &[], &[])?;
             ci()
         }
+        "spike" => match rest {
+            [name] => spike::run(name),
+            _ => Err("usage: cargo xtask spike <name>".to_owned()),
+        },
         "help" | "--help" | "-h" => {
             print!("{HELP}");
             Ok(())
