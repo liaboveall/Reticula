@@ -44,8 +44,8 @@ Commands:
                           options on: see spikes/grid/measure.mjs. `s4` tries local
                           storage and locks between tabs: see spikes/opfs/run.mjs.
                           `s9` measures a first visit of the production build: see
-                          spikes/startup/measure.mjs; `s9-builds` compares the
-                          engine at several optimisation levels. `s10` serves the
+                          spikes/startup/measure.mjs; `s9-builds [--affinity <mask>]`
+                          compares the engine at several optimisation levels. `s10` serves the
                           page for checking input methods: see spikes/grid/ime.mjs.
 ";
 

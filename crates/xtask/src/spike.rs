@@ -1,6 +1,6 @@
 //! Running the experiments under `spikes/`.
 
-use crate::util::{self, Cmd, Result, cargo, node, pnpm, tool};
+use crate::util::{self, Cmd, Flags, Result, cargo, node, pnpm, tool};
 use crate::wasm::{self, Profile};
 use crate::web;
 
@@ -16,6 +16,9 @@ pub fn run(name: &str, options: &[String]) -> Result {
     if name == "s9" {
         return first_visit(options);
     }
+    if name == "s9-builds" {
+        return engine_builds(Flags::parse(options, &[], &["affinity"])?.get("affinity"));
+    }
     if name == "s10" {
         return input_methods(options);
     }
@@ -26,7 +29,6 @@ pub fn run(name: &str, options: &[String]) -> Result {
         "axis" => axis(),
         "axis-cost" => axis_cost(),
         "determinism" => determinism(),
-        "s9-builds" => engine_builds(),
         other => Err(format!(
             "unknown spike `{other}`; available: axis, axis-cost, determinism, s1, s2, s4, s9, \
              s9-builds, s10"
@@ -69,8 +71,9 @@ fn first_visit(options: &[String]) -> Result {
 /// Builds the engine at several optimisation levels, apart from the build the
 /// app uses, and reports for each how large the module is and how fast it
 /// runs in a browser: generating the sample, and the workloads of the
-/// identity-addressing prototype, which stand for calculation.
-fn engine_builds() -> Result {
+/// identity-addressing prototype, which stand for calculation. With
+/// `affinity`, a hexadecimal mask, the browsers are pinned to those processors.
+fn engine_builds(affinity: Option<&str>) -> Result {
     const LEVELS: [(&str, &str); 4] = [("3", "-O3"), ("2", "-O2"), ("s", "-Os"), ("z", "-Oz")];
     const DIRECTORY: &str = "target/spikes/startup/builds";
 
@@ -97,15 +100,22 @@ fn engine_builds() -> Result {
     }
 
     util::step("size, and generating the sample (in Chrome)");
-    node()
+    let mut engine = node()
         .arg("spikes/startup/engine.mjs")
-        .args(["--out", "target/spikes/startup/engine-builds.json"])
-        .args(&builds)
-        .run()?;
+        .args(["--out", "target/spikes/startup/engine-builds.json"]);
+    if let Some(mask) = affinity {
+        engine = engine.args(["--affinity", mask]);
+    }
+    engine.args(&builds).run()?;
 
     for (level, _) in LEVELS {
         util::step(&format!("calculation at opt-level {level} (in Chrome)"));
-        node()
+        // That script has no option for pinning; it is run through one that pins.
+        let timing = match affinity {
+            Some(mask) => node().args(["spikes/pin.mjs", mask]),
+            None => node(),
+        };
+        timing
             .arg("spikes/axis/time-chromium.mjs")
             .arg(format!(
                 "{DIRECTORY}/{level}/{WASM_TARGET}/release/spike_axis.wasm"
