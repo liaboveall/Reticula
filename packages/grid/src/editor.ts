@@ -81,6 +81,7 @@ export class CellEditor {
       parent: this.#box,
       state: EditorState.create({
         extensions: [
+          EditorView.contentAttributes.of({ "aria-label": "Cell editor" }),
           // A cell's text is one line; whatever would add another is refused.
           EditorState.transactionFilter.of((transaction) =>
             transaction.newDoc.lines > 1 ? [] : transaction,
@@ -237,7 +238,9 @@ export class CellEditor {
   ): "input method" | "moved" | "committed" | "cancelled" | "swallowed" | "passed" {
     // A key the input method is using is not a key press of ours: Enter
     // accepts a candidate, Escape discards the composition, the arrows walk
-    // the candidates. Browsers mark such events in one of these ways.
+    // the candidates. Browsers mark such events in one of these ways. The key
+    // code is what marks the key that starts a composition, and the Enter
+    // that Safari reports only after the composition it accepted has ended.
     if (event.isComposing || event.keyCode === 229 || view.composing || view.compositionStarted) {
       return "input method";
     }
