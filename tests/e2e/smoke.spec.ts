@@ -60,6 +60,22 @@ test("the engine generates the sample in a worker and the grid draws it", async 
   expect(await textAt(page, 1, 1)).toBe("2023-01-01");
 });
 
+test("the page marks the moments of starting up, in order", async ({ page }) => {
+  await open(page);
+  const marks = await page.evaluate(() =>
+    Object.fromEntries(
+      performance.getEntriesByType("mark").map((mark) => [mark.name, mark.startTime]),
+    ),
+  );
+  const shell = marks["reticula:shell"] ?? Number.NaN;
+  const ready = marks["reticula:engine-ready"] ?? Number.NaN;
+  const firstScreen = marks["reticula:first-screen"] ?? Number.NaN;
+  expect(shell).toBeGreaterThan(0);
+  // The grid is on screen before the engine has anything to show.
+  expect(ready).toBeGreaterThan(shell);
+  expect(firstScreen).toBeGreaterThan(ready);
+});
+
 test("the engine passes the determinism self-check in this browser", async ({ page }) => {
   await open(page);
   const digest = await page.evaluate(() => window.__reticula?.selfCheck());

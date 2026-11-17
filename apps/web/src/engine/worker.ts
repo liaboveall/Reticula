@@ -62,8 +62,10 @@ async function main(): Promise<void> {
   try {
     // Passing the URL lets the browser compile the module while it downloads.
     await init({ module_or_path: wasmUrl });
+    performance.mark("reticula:wasm-ready");
     engine = new Engine();
     run(engine, SAMPLE);
+    performance.mark("reticula:sample-ready");
     for (const command of waiting.splice(0)) {
       run(engine, command);
     }

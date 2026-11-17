@@ -12,6 +12,21 @@ type EngineState =
 /** How often the status bar looks at what the grid is doing. */
 const STATUS_INTERVAL_MS = 500;
 
+/**
+ * Moments of starting up, marked on the page's timeline where the browser's
+ * own tools and the start-up measurements read them. The engine's worker
+ * marks its own two, `reticula:wasm-ready` and `reticula:sample-ready`, on
+ * its timeline.
+ */
+const MARKS = {
+  /** The grid has drawn its first frame and takes input. */
+  shell: "reticula:shell",
+  /** The engine has said that the document is open. */
+  engineReady: "reticula:engine-ready",
+  /** A frame has been drawn in which every cell in view had its text. */
+  firstScreen: "reticula:first-screen",
+} as const;
+
 const integer = new Intl.NumberFormat("en-US");
 const milliseconds = new Intl.NumberFormat("en-US", {
   minimumFractionDigits: 1,
@@ -35,6 +50,7 @@ export function App() {
       onMessage(message) {
         switch (message.kind) {
           case "ready":
+            performance.mark(MARKS.engineReady);
             grid.setSheet(message.sheet);
             setEngine({ status: "ready", info: message.info, sheet: message.sheet });
             break;
@@ -56,6 +72,18 @@ export function App() {
       subscribe: (subscription) => client.send({ kind: "subscribe", ...subscription }),
     });
 
+    let shellMarked = false;
+    const stopMarking = grid.watchFrames((frame) => {
+      if (!shellMarked) {
+        shellMarked = true;
+        performance.mark(MARKS.shell);
+      }
+      if (frame.cells > 0 && frame.missing === 0) {
+        performance.mark(MARKS.firstScreen);
+        stopMarking();
+      }
+    });
+
     const removeHooks = hooksRequested()
       ? installHooks(grid, () => {
           client.send({ kind: "selfCheck" });
@@ -66,6 +94,7 @@ export function App() {
 
     return () => {
       window.clearInterval(timer);
+      stopMarking();
       removeHooks?.();
       grid.destroy();
       client.stop();
