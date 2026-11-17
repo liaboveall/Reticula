@@ -163,6 +163,19 @@ const verdict = (passed) => (passed ? "within the target" : "MISSES THE TARGET")
 const results = {};
 const quick = options.quick;
 
+/**
+ * A browser stops drawing a window that is covered or minimised: frames then
+ * come about once a second. Numbers taken that way mean nothing, and nothing
+ * else in the output would say so.
+ */
+function checkShown(label, interval) {
+  if (interval.max > 250) {
+    const message = `${label}: a frame took ${interval.max.toFixed(0)} ms to come. The window was probably covered or minimised for part of this run, and its numbers are not valid.`;
+    console.log(`  !! ${message}`);
+    problems.push(message);
+  }
+}
+
 const wanted = (part) => !options.only || options.only === part;
 
 if (bench === "s1" && wanted("roundTrip")) {
@@ -192,6 +205,7 @@ if (bench === "s1" && wanted("scroll")) {
   for (const marginRows of [0, 0.25, 0.5, 1, 2]) {
     const scroll = await call("s1", "scroll", { marginRows, marginCols: 1, screensPerSecond: 5, seconds: quick ? 3 : 30, warmupSeconds: 2 });
     results.scroll.push(scroll);
+    checkShown(`scrolling, margin ${marginRows}`, scroll.interval);
     console.log(
       `  margin ${String(marginRows).padEnd(4)} ${scroll.frames} frames, ${scroll.framesWithPlaceholders} with placeholders (most ${scroll.mostPlaceholders} cells); ` +
         `${scroll.pagesReceived} pages, ${(scroll.bytesReceived / 1024).toFixed(0)} KB; held at most ${scroll.mostPagesHeld}; ` +
@@ -222,6 +236,7 @@ if (bench === "s2") {
   for (const [label, parameters] of cases) {
     const result = await call("s2", "draw", { ...parameters, frames, warmup: 60 });
     results.draw.push({ label, ...result });
+    checkShown(label, result.interval);
     row(label, result.draw);
     console.log(`    ${result.cells.p50} cells a frame, ${result.clipped.p50} of them clipped; frames every ${result.interval.p50.toFixed(2)} ms`);
   }
@@ -251,7 +266,10 @@ if (bench === "s2") {
   console.log(`\nscrolling at 5 screens a second for ${pace.seconds} s: ${pace.frames} frames (ms)`);
   row("time between frames", pace.interval);
   row("draw calls of a frame", pace.draw);
-  console.log(`  ${pace.lateFrames} frames came late by more than half an interval; ${pace.framesOver60Hz} took longer than 16.7 ms`);
+  checkShown("pacing", pace.interval);
+  // At 60 Hz every frame takes 16.7 ms, so that count says nothing there.
+  const slow = pace.interval.p50 < 12 ? `; ${pace.framesOver60Hz} took longer than 16.7 ms` : "";
+  console.log(`  ${pace.lateFrames} of ${pace.frames} frames came late by more than half an interval${slow}`);
   if (!options.headed) {
     console.log("  (headless: there is no display, so these intervals say little; run with --headed)");
   }
