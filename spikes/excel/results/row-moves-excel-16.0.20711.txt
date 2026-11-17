@@ -1,0 +1,53 @@
+Excel version 16.0, build 20711
+
+== the range is =SUM(A5:A9); single cells are =A5, =A7, =A9 ==
+
+-- an interior row leaves or moves within the range
+row 7 to above row 2 (interior row moves out, up)    =SUM(A6:A9)    = 28  rows now: 1 7 2 3 4 5 6 8 9 10 11 12
+                                                     single cells: =A6 (5)  =A2 (7)  =A9 (9)
+row 7 to above row 12 (interior row moves out, down) =SUM(A5:A8)    = 28  rows now: 1 2 3 4 5 6 8 9 10 11 7 12
+                                                     single cells: =A5 (5)  =A11 (7)  =A8 (9)
+row 6 to above row 9 (interior row, stays inside)    =SUM(A5:A9)    = 35  rows now: 1 2 3 4 5 7 8 6 9 10 11 12
+                                                     single cells: =A5 (5)  =A6 (7)  =A9 (9)
+
+-- the last row of the range moves
+row 9 to above row 12 (last row moves down, out)     =SUM(A5:A11)   = 56  rows now: 1 2 3 4 5 6 7 8 10 11 9 12
+                                                     single cells: =A5 (5)  =A7 (7)  =A11 (9)
+row 9 to above row 7 (last row moves inside)         =SUM(A5:A9)    = 35  rows now: 1 2 3 4 5 6 9 7 8 10 11 12
+                                                     single cells: =A5 (5)  =A8 (7)  =A7 (9)
+row 9 to above row 5 (last row to above the first)   =SUM(A6:A9)    = 26  rows now: 1 2 3 4 9 5 6 7 8 10 11 12
+                                                     single cells: =A6 (5)  =A8 (7)  =A5 (9)
+row 9 to above row 2 (last row far above the first)  =SUM(A6:A9)    = 26  rows now: 1 9 2 3 4 5 6 7 8 10 11 12
+                                                     single cells: =A6 (5)  =A8 (7)  =A2 (9)
+
+-- the first row of the range moves
+row 5 to above row 2 (first row moves up, out)       =SUM(A2:A9)    = 44  rows now: 1 5 2 3 4 6 7 8 9 10 11 12
+                                                     single cells: =A2 (5)  =A7 (7)  =A9 (9)
+row 5 to above row 8 (first row moves inside)        =SUM(A5:A9)    = 35  rows now: 1 2 3 4 6 7 5 8 9 10 11 12
+                                                     single cells: =A7 (5)  =A6 (7)  =A9 (9)
+row 5 to above row 10 (first row to below the last)  =SUM(A5:A8)    = 30  rows now: 1 2 3 4 6 7 8 9 5 10 11 12
+                                                     single cells: =A9 (5)  =A6 (7)  =A8 (9)
+row 5 to above row 12 (first row far below the last) =SUM(A5:A8)    = 30  rows now: 1 2 3 4 6 7 8 9 10 11 5 12
+                                                     single cells: =A11 (5)  =A6 (7)  =A8 (9)
+
+-- a row from outside moves in
+row 11 to above row 7 (into the interior)            =SUM(A5:A10)   = 46  rows now: 1 2 3 4 5 6 11 7 8 9 10 12
+                                                     single cells: =A5 (5)  =A8 (7)  =A10 (9)
+row 11 to above row 5 (to the first row position)    =SUM(A6:A10)   = 35  rows now: 1 2 3 4 11 5 6 7 8 9 10 12
+                                                     single cells: =A6 (5)  =A8 (7)  =A10 (9)
+row 11 to above row 10 (just below the last row)     =SUM(A5:A9)    = 35  rows now: 1 2 3 4 5 6 7 8 9 11 10 12
+                                                     single cells: =A5 (5)  =A7 (7)  =A9 (9)
+row 2 to above row 7 (from above, into the interior) =SUM(A4:A9)    = 37  rows now: 1 3 4 5 6 2 7 8 9 10 11 12
+                                                     single cells: =A4 (5)  =A7 (7)  =A9 (9)
+row 2 to above row 10 (from above, to just below)    =SUM(A4:A8)    = 35  rows now: 1 3 4 5 6 7 8 9 2 10 11 12
+                                                     single cells: =A4 (5)  =A6 (7)  =A8 (9)
+
+-- several rows at once
+rows 5:6 to above row 12 (first two rows move out)   =SUM(A5:A7)    = 24  rows now: 1 2 3 4 7 8 9 10 11 5 6 12
+                                                     single cells: =A10 (5)  =A5 (7)  =A7 (9)
+rows 8:9 to above row 2 (last two rows move out)     =SUM(A7:A9)    = 18  rows now: 1 8 9 2 3 4 5 6 7 10 11 12
+                                                     single cells: =A7 (5)  =A9 (7)  =A3 (9)
+rows 5:9 to above row 2 (the whole range moves)      =SUM(A2:A6)    = 35  rows now: 1 5 6 7 8 9 2 3 4 10 11 12
+                                                     single cells: =A2 (5)  =A4 (7)  =A6 (9)
+rows 4:10 to above row 2 (the range and its neighbours) =SUM(A3:A7)    = 35  rows now: 1 4 5 6 7 8 9 10 2 3 11 12
+                                                     single cells: =A3 (5)  =A5 (7)  =A7 (9)

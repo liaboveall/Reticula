@@ -20,6 +20,31 @@ Prints how formulas change when rows are inserted, deleted, cut, sorted and
 filled, and when sheets are deleted. The recorded output is in
 [results/](results/).
 
+## Moving rows
+
+```
+powershell -File spikes/excel/probe-clipboard.ps1
+```
+
+Moves whole rows with cut and "Insert Cut Cells" and prints what happens to a
+range and to single-cell references. This is the one probe that uses the
+clipboard: Excel offers the operation no other way. The clipboard's text is
+saved and restored; anything else on it is lost.
+
+What the recorded run shows, for a range such as `SUM(A5:A9)`:
+
+- A single-cell reference always follows its row.
+- When the first or last row of the range moves *outward* (the last row further
+  down, the first row further up), the range stretches to its new position and
+  takes in the rows in between.
+- When it moves anywhere else (to another place inside the range, or past the
+  other end), the range does not follow it. It keeps the rows it still spans,
+  as if the row had been deleted and then inserted at its destination.
+- When the whole range moves, the reference moves with it.
+
+So a range is not simply "the rows between two marked rows": dragging the last
+row of a summed range up by two positions leaves the sum unchanged.
+
 ## Comparison, rounding and MOD
 
 ```
