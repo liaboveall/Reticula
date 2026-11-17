@@ -27,10 +27,11 @@
 //   --serve             only serve the page, on port 5276, to open by hand
 //   --out <file>        the data file (default: target/spikes/opfs/<browser>.json)
 
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { mkdirSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import { dirname, join, resolve } from "node:path";
+import { pin } from "../pin.mjs";
 import { run } from "./scenarios.mjs";
 import { root, serve } from "./serve.mjs";
 
@@ -60,21 +61,9 @@ function fail(message) {
   process.exit(2);
 }
 
-// A process cannot change which processors it may run on from the inside, so
-// the script starts itself again under a command that can. The browser's
-// processes inherit the setting.
-if (options.affinity && !process.env.RETICULA_PINNED) {
-  const environment = { ...process.env, RETICULA_PINNED: options.affinity };
-  const command = [process.execPath, ...process.argv.slice(1)];
-  const child =
-    process.platform === "win32"
-      ? spawnSync("cmd.exe", ["/d", "/s", "/c", `"start "" /B /WAIT /AFFINITY ${options.affinity} ${command.map((part) => `"${part}"`).join(" ")}"`], {
-          stdio: "inherit",
-          env: environment,
-          windowsVerbatimArguments: true,
-        })
-      : spawnSync("taskset", [options.affinity, ...command], { stdio: "inherit", env: environment });
-  process.exit(child.status ?? 1);
+// The browser is started by this process and inherits the setting.
+if (options.affinity) {
+  pin(options.affinity);
 }
 
 function git(...args) {
