@@ -4,6 +4,8 @@
   "type": "module",
   "exports": {
     ".": "./src/index.ts",
+    "./viewport": "./src/generated/viewport-layout.ts",
+    "./viewport-fixture": "./src/generated/viewport-fixture.ts",
     "./wasm": "./pkg/reticula_wasm_bg.wasm"
   }
 }

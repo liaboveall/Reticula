@@ -4,6 +4,7 @@
 //! same commands work on Windows, Linux and macOS without shell scripts, and CI
 //! runs exactly what a developer runs.
 
+mod codegen;
 mod rust;
 mod setup;
 mod spike;
@@ -25,9 +26,13 @@ Commands:
                           Playwright browsers.
   check [--rust] [--web] [--skip-wasm]
                           Formatting, lints and type checks. With no option, both halves.
-  test [--rust] [--wasm]  Tests: native, and the kernel tests again under WebAssembly.
+  test [--rust] [--wasm] [--web]
+                          Tests: native, the kernel tests again under WebAssembly, and
+                          the front-end unit tests. With no option, all three.
   deny                    Dependency licences, advisories and sources.
   wasm [--dev]            Build the WebAssembly module and its bindings.
+  codegen [--check]       Write the TypeScript files generated from the Rust sources;
+                          --check only reports whether they are up to date.
   digest [--update]       Print the determinism digest; --update records it as expected.
   dev                     Build a debug module and start the development server.
   build [--skip-wasm]     Production build with precompressed assets and a size report.
@@ -56,7 +61,7 @@ fn run(args: &[String]) -> Result {
     match command.as_str() {
         "setup" => setup::run(&Flags::parse(rest, &["browsers"], &[])?),
         "check" => check(&Flags::parse(rest, &["rust", "web", "skip-wasm"], &[])?),
-        "test" => test(&Flags::parse(rest, &["rust", "wasm"], &[])?),
+        "test" => test(&Flags::parse(rest, &["rust", "wasm", "web"], &[])?),
         "deny" => {
             Flags::parse(rest, &[], &[])?;
             rust::deny()
@@ -69,6 +74,7 @@ fn run(args: &[String]) -> Result {
                 Profile::Release
             })
         }
+        "codegen" => codegen::run(Flags::parse(rest, &["check"], &[])?.has("check")),
         "digest" => digest(&Flags::parse(rest, &["update"], &[])?),
         "dev" => {
             Flags::parse(rest, &[], &[])?;
@@ -100,6 +106,7 @@ fn check(flags: &Flags) -> Result {
         setup::check_workflow_pins()?;
     }
     if everything || flags.has("web") {
+        codegen::run(true)?;
         // The TypeScript types of the engine are generated with the module.
         if !flags.has("skip-wasm") {
             wasm::build(Profile::Dev)?;
@@ -110,12 +117,15 @@ fn check(flags: &Flags) -> Result {
 }
 
 fn test(flags: &Flags) -> Result {
-    let everything = !flags.has("rust") && !flags.has("wasm");
+    let everything = !flags.has("rust") && !flags.has("wasm") && !flags.has("web");
     if everything || flags.has("rust") {
         rust::test()?;
     }
     if everything || flags.has("wasm") {
         rust::test_wasm()?;
+    }
+    if everything || flags.has("web") {
+        web::test()?;
     }
     Ok(())
 }
@@ -167,7 +177,9 @@ fn ci() -> Result {
     rust::test_wasm()?;
     rust::deny()?;
     wasm::build(Profile::Release)?;
+    codegen::run(true)?;
     web::check()?;
+    web::test()?;
     web::build()?;
     web::e2e(None)
 }

@@ -1,0 +1,12 @@
+{
+  "name": "@reticula/grid",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./grid.css": "./src/grid.css"
+  },
+  "dependencies": {
+    "@reticula/protocol": "workspace:*"
+  }
+}

@@ -9,7 +9,12 @@ const APP: &str = "@reticula/web";
 const DIST: &str = "apps/web/dist";
 
 /// TypeScript projects, each with its own `tsconfig.json`.
-const TS_PROJECTS: [&str; 3] = ["packages/protocol", "apps/web", "tests/e2e"];
+const TS_PROJECTS: [&str; 4] = [
+    "packages/protocol",
+    "packages/grid",
+    "apps/web",
+    "tests/e2e",
+];
 
 pub fn check() -> Result {
     util::step("biome");
@@ -22,6 +27,12 @@ pub fn check() -> Result {
             .run()?;
     }
     Ok(())
+}
+
+/// The front-end unit tests. They need neither a browser nor the engine.
+pub fn test() -> Result {
+    util::step("vitest");
+    pnpm().args(["exec", "vitest", "run"]).run()
 }
 
 pub fn dev() -> Result {

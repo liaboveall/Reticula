@@ -1,0 +1,95 @@
+/*
+ * The grid's own styles. The canvas takes its colours and its font from the
+ * custom properties and the `font` declared here, so this file is the one
+ * place that decides how the grid looks; a host page restyles it by setting
+ * the same properties on `.reticula-grid`.
+ *
+ * The colours are switched with a media query rather than `light-dark()`: the
+ * canvas reads them as text and needs plain colours.
+ */
+.reticula-grid {
+  --grid-background: #ffffff;
+  --grid-text: #1f2328;
+  --grid-line: #e3e5e8;
+  --grid-placeholder: #f1f2f4;
+  --grid-header-background: #f6f7f8;
+  --grid-header-text: #59636e;
+  --grid-header-line: #d1d5da;
+  --grid-header-selected: #dbe7ff;
+  --grid-selection: #1a5fd0;
+  --grid-scrollbar-track: #f6f7f8;
+  --grid-scrollbar-thumb: #b4bac1;
+  --grid-scrollbar-thumb-active: #7d8590;
+
+  position: relative;
+  overflow: hidden;
+  background: var(--grid-background);
+  font:
+    13px "Segoe UI",
+    system-ui,
+    -apple-system,
+    "PingFang SC",
+    "Microsoft YaHei",
+    sans-serif;
+  outline: none;
+  user-select: none;
+  /* Scrolling and zooming gestures are the grid's to interpret. */
+  touch-action: none;
+}
+
+@media (prefers-color-scheme: dark) {
+  .reticula-grid {
+    --grid-background: #16181c;
+    --grid-text: #e3e6ea;
+    --grid-line: #2a2e35;
+    --grid-placeholder: #1d2026;
+    --grid-header-background: #1e2127;
+    --grid-header-text: #9aa3ad;
+    --grid-header-line: #363b44;
+    --grid-header-selected: #1d3157;
+    --grid-selection: #6ea1ff;
+    --grid-scrollbar-track: #1e2127;
+    --grid-scrollbar-thumb: #4a515c;
+    --grid-scrollbar-thumb-active: #7a8492;
+  }
+}
+
+.reticula-grid > canvas {
+  position: absolute;
+  inset: 0;
+  display: block;
+}
+
+.reticula-scrollbar {
+  position: absolute;
+  background: var(--grid-scrollbar-track);
+}
+
+.reticula-scrollbar[data-orientation="vertical"] {
+  border-left: 1px solid var(--grid-header-line);
+}
+
+.reticula-scrollbar[data-orientation="horizontal"] {
+  border-top: 1px solid var(--grid-header-line);
+}
+
+.reticula-scrollbar-thumb {
+  position: absolute;
+  inset: 2px;
+  border-radius: 999px;
+  background: var(--grid-scrollbar-thumb);
+}
+
+.reticula-scrollbar-thumb:hover,
+.reticula-scrollbar-thumb[data-dragging] {
+  background: var(--grid-scrollbar-thumb-active);
+}
+
+.reticula-scrollbar-corner {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  border-top: 1px solid var(--grid-header-line);
+  border-left: 1px solid var(--grid-header-line);
+  background: var(--grid-scrollbar-track);
+}
