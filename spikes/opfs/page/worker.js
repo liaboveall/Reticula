@@ -88,6 +88,12 @@ async function remove(path) {
 }
 
 /**
+ * The errors that opening a file fails with while another context has it
+ * open: the first in Chromium and Firefox, the second in Safari.
+ */
+const IN_USE = new Set(["NoModificationAllowedError", "InvalidStateError"]);
+
+/**
  * Opens a file for reading and writing. Only one context can have a file open
  * this way; while another has it, opening fails, and this tries again until
  * `patience` milliseconds have passed.
@@ -99,7 +105,7 @@ async function access(path, patience = 0) {
     try {
       return { file: await handle.createSyncAccessHandle(), attempts, waited: now() - started };
     } catch (error) {
-      if (error.name !== "NoModificationAllowedError" || now() - started >= patience) {
+      if (!IN_USE.has(error.name) || now() - started >= patience) {
         throw error;
       }
       await sleep(20);
@@ -248,7 +254,7 @@ async function finishOpening(timeline, started, patience) {
     doc.state = "open";
     doc.note = "";
   } catch (error) {
-    if (error.name !== "NoModificationAllowedError") {
+    if (!IN_USE.has(error.name)) {
       throw error;
     }
     timeline.gaveUp = now() - started;
