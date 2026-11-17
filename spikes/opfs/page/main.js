@@ -132,19 +132,20 @@ const pageCommands = {
 
   otherWorker: ({ command, args }) => askAnotherWorker(command, args),
 
-  /** Keeps the worker, the page or both from answering for a while. */
-  makeBusy({ worker: workerMs = 0, main: mainMs = 0 }) {
-    if (workerMs > 0) {
-      ask("spin", { ms: workerMs }).catch(() => {});
-    }
-    if (mainMs > 0) {
-      // Late enough for this command's answer to leave first.
-      setTimeout(() => {
-        for (const end = performance.now() + mainMs; performance.now() < end; ) {
-          // busy
-        }
-      }, 50);
-    }
+  /**
+   * Keeps the worker, the page or both from answering for a while, starting
+   * `after` milliseconds from now: late enough for this command's answer to
+   * leave first, and for whoever asked to arrange what happens meanwhile.
+   */
+  makeBusy({ worker: workerMs = 0, main: mainMs = 0, after = 50 }) {
+    setTimeout(() => {
+      if (workerMs > 0) {
+        ask("spin", { ms: workerMs }).catch(() => {});
+      }
+      for (const end = performance.now() + mainMs; performance.now() < end; ) {
+        // busy
+      }
+    }, after);
     return true;
   },
 

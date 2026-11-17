@@ -187,12 +187,36 @@ export async function run(backend, { quick = false, only = "", say = console.log
     const second = await open();
     const measured = {};
 
-    // The holder's worker is stuck; its page is not.
+    // The holder stops answering a second after it is told to, and the other
+    // tab starts taking the document over two and a half seconds after that,
+    // by itself. Nothing is asked of either tab in between: in some browsers
+    // the tabs of a site share one thread, and a page that is stuck keeps the
+    // other from answering too. Timers of a tab in the background can also
+    // be a second late.
+    const BUSY_AFTER = 1000;
+    const ASK_AFTER = 3500;
+    const takeFrom = async (holder, asker, busy, how) => {
+      const found = await asker.call("openDocument", { id });
+      expect(found.state === "blocked", `the asking tab found the document ${found.state}, not blocked`);
+      await holder.call("makeBusy", { ...busy, after: BUSY_AFTER });
+      await asker.call("takeOverLater", { delay: ASK_AFTER, ...how });
+      for (const deadline = performance.now() + 60000; performance.now() < deadline; ) {
+        const outcome = await asker.call("takenOver");
+        if (outcome?.error) {
+          throw Object.assign(new Error(outcome.error.message), { name: outcome.error.name });
+        }
+        if (outcome) {
+          return outcome.result;
+        }
+        await sleep(100);
+      }
+      throw new Error("taking over did not come to an end within a minute");
+    };
+
+    // The holder's worker is stuck; its page is not, and stops the worker.
     await first.call("openDocument", { id });
     await first.call("appendDocument", { count: 2 });
-    await first.call("makeBusy", { worker: 8000 });
-    await second.call("openDocument", { id });
-    let taken = await second.call("takeOver", { patience: 4000 });
+    let taken = await takeFrom(first, second, { worker: 12000 }, { patience: 6000 });
     expect(taken.state === "open" && taken.records === 2, `worker stuck: ended ${taken.state} with ${taken.records} records`);
     expect(taken.timeline.how === "handed over", `worker stuck: the lock was ${taken.timeline.how}`);
     let left = await first.call("document");
@@ -200,26 +224,32 @@ export async function run(backend, { quick = false, only = "", say = console.log
     measured.workerStuck = taken.timeline;
     say(`   worker stuck, page alive: ${taken.timeline.how} after ${round(taken.timeline.lock)} ms, open after ${round(taken.timeline.open)} ms (the page stops its worker)`);
 
-    // The holder's page is stuck; its worker is not.
-    await second.call("makeBusy", { main: 3000 });
-    await first.call("openDocument", { id });
-    taken = await first.call("takeOver", { patience: 4000 });
+    // The holder's page is stuck for eight seconds; its worker is not.
+    // Whether the worker can then hand the document over by itself differs
+    // between browsers, so that is recorded, not required.
+    taken = await takeFrom(second, first, { main: 8000 }, { patience: 12000 });
     expect(taken.state === "open" && taken.timeline.how === "handed over", `page stuck: ended ${taken.state}, ${taken.timeline.how}`);
-    expect(taken.timeline.open < 2000, `page stuck: it took ${round(taken.timeline.open)} ms, as if the worker had waited for the page`);
-    measured.pageStuck = taken.timeline;
-    say(`   page stuck, worker alive: ${taken.timeline.how} after ${round(taken.timeline.lock)} ms, open after ${round(taken.timeline.open)} ms`);
-    await sleep(3200);
+    const whileStuck = taken.timeline.open < 3000;
+    measured.pageStuck = { ...taken.timeline, workerAnsweredWhileItsPageWasStuck: whileStuck };
+    say(
+      `   page stuck, worker alive: ${taken.timeline.how} after ${round(taken.timeline.lock)} ms, open after ${round(taken.timeline.open)} ms: ` +
+        (whileStuck ? "the worker handed over while its page was stuck" : "the worker handed over only once its page answered again"),
+    );
+    // Answered once the page is itself again.
+    await second.call("page");
 
     // Both are stuck: only force is left, and force gets the lock, not the file.
-    await first.call("makeBusy", { main: 5000, worker: 5000 });
-    await second.call("openDocument", { id });
-    taken = await second.call("takeOver", { patience: 1500, filePatience: 12000 });
+    taken = await takeFrom(first, second, { main: 8000, worker: 8000 }, { patience: 1500, filePatience: 15000 });
     expect(taken.timeline.how === "taken by force", `both stuck: the lock was ${taken.timeline.how}`);
     expect(taken.state === "open", `both stuck: ended ${taken.state}`);
-    expect(taken.timeline.fileAttempts > 1 && taken.timeline.open > 3000, `both stuck: the file opened after ${round(taken.timeline.open ?? 0)} ms and ${taken.timeline.fileAttempts} attempts, while the old worker still had it`);
+    expect(
+      taken.timeline.fileAttempts > 1 && taken.timeline.open - taken.timeline.lock > 500,
+      `both stuck: the file opened ${round((taken.timeline.open ?? 0) - taken.timeline.lock)} ms after the lock was taken, at attempt ${taken.timeline.fileAttempts}, as if the old worker had not had it`,
+    );
     measured.bothStuck = taken.timeline;
-    say(`   both stuck for 5 s: ${taken.timeline.how} after ${round(taken.timeline.lock)} ms, but the file opened only after ${round(taken.timeline.open ?? 0)} ms (${taken.timeline.fileAttempts} attempts)`);
-    await sleep(600);
+    say(`   both stuck: ${taken.timeline.how} after ${round(taken.timeline.lock)} ms, but the file opened only after ${round(taken.timeline.open ?? 0)} ms (${taken.timeline.fileAttempts} attempts)`);
+    await first.call("page");
+    await sleep(300);
     left = await first.call("document");
     expect(left.state === "evicted" || left.state === "yielded", `both stuck: the old tab is left ${left.state}`);
     measured.oldTabAfterForce = left.state;

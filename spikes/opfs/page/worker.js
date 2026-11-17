@@ -216,6 +216,8 @@ function release(name) {
 //      for a while, and reports being stuck if it cannot.
 
 let doc = null;
+/** The outcome of a take-over started by `takeOverLater`. */
+let later = null;
 const nameOf = (id) => `reticula-s4:document:${id}`;
 const logOf = (id) => `documents/${id}/log`;
 
@@ -338,6 +340,30 @@ const documents = {
     timeline.lock = now() - started;
     return finishOpening(timeline, started, filePatience);
   },
+
+  /**
+   * Starts taking the document over after `delay` milliseconds and returns
+   * at once; `takenOver` tells how it went. This lets an experiment have the
+   * taking over begin at a moment when nothing can be asked of the pages,
+   * because their thread is the one that is stuck.
+   */
+  takeOverLater({ delay, ...how }) {
+    later = null;
+    setTimeout(() => {
+      documents.takeOver(how).then(
+        (result) => {
+          later = { result };
+        },
+        (error) => {
+          later = { error: describeError(error) };
+        },
+      );
+    }, delay);
+    return true;
+  },
+
+  /** How the take-over that `takeOverLater` started went, or nothing while it is under way. */
+  takenOver: () => later,
 
   /** After being stuck: the lock is held, try the file again. */
   async retryOpen({ patience = 5000 }) {
