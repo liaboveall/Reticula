@@ -8,5 +8,8 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+[lib]
+crate-type = ["cdylib", "rlib"]
+
 [lints]
 workspace = true

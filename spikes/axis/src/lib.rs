@@ -7,7 +7,9 @@
 //! - [`model`]: does that give the behaviour a spreadsheet user expects when
 //!   rows are inserted, deleted, moved and sorted, alone and concurrently? The
 //!   tests compare it with what Excel was recorded to do.
-//! - the cost of the extra indirection (added separately).
+//! - [`cost`]: what does the extra indirection cost, next to a sheet addressed
+//!   by position?
 
+pub mod cost;
 pub mod model;
 pub mod sync;

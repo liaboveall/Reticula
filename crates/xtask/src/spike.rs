@@ -7,9 +7,10 @@ const WASM_TARGET: &str = "wasm32-unknown-unknown";
 pub fn run(name: &str) -> Result {
     match name {
         "axis" => axis(),
+        "axis-cost" => axis_cost(),
         "determinism" => determinism(),
         other => Err(format!(
-            "unknown spike `{other}`; available: axis, determinism"
+            "unknown spike `{other}`; available: axis, axis-cost, determinism"
         )),
     }
 }
@@ -41,6 +42,44 @@ fn axis() -> Result {
             "--",
         ])
         .args(["--nocapture", "--test-threads=1"])
+        .run()
+}
+
+/// Times what identity addressing costs next to addressing by position:
+/// natively, then as WebAssembly inside Chromium.
+fn axis_cost() -> Result {
+    const PACKAGE: &str = "spike-axis";
+
+    util::step("cost (native, release)");
+    cargo()
+        .args([
+            "test",
+            "--locked",
+            "--release",
+            "--package",
+            PACKAGE,
+            "--test",
+            "cost",
+            "--",
+        ])
+        .args(["--ignored", "--nocapture", "print_costs"])
+        .run()?;
+
+    util::step("cost (wasm32, release, in Chromium)");
+    cargo()
+        .args([
+            "build",
+            "--locked",
+            "--release",
+            "--package",
+            PACKAGE,
+            "--target",
+            WASM_TARGET,
+        ])
+        .run()?;
+    node()
+        .arg("spikes/axis/time-chromium.mjs")
+        .arg(format!("target/{WASM_TARGET}/release/spike_axis.wasm"))
         .run()
 }
 
