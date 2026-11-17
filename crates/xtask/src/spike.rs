@@ -10,6 +10,9 @@ pub fn run(name: &str, options: &[String]) -> Result {
     if matches!(name, "s1" | "s2") {
         return grid(name, options);
     }
+    if name == "s4" {
+        return storage(options);
+    }
     if name == "s10" {
         return input_methods(options);
     }
@@ -21,7 +24,7 @@ pub fn run(name: &str, options: &[String]) -> Result {
         "axis-cost" => axis_cost(),
         "determinism" => determinism(),
         other => Err(format!(
-            "unknown spike `{other}`; available: axis, axis-cost, determinism, s1, s2, s10"
+            "unknown spike `{other}`; available: axis, axis-cost, determinism, s1, s2, s4, s10"
         )),
     }
 }
@@ -38,6 +41,14 @@ fn grid(name: &str, options: &[String]) -> Result {
         .arg(name)
         .args(options)
         .run()
+}
+
+/// Runs the experiments on local storage and tabs in a browser: files in the
+/// origin private file system, and locks shared between tabs. Their page needs
+/// no build; the script that drives it takes the options.
+fn storage(options: &[String]) -> Result {
+    util::step("s4");
+    node().arg("spikes/opfs/run.mjs").args(options).run()
 }
 
 /// Serves the page on which input methods are checked by hand, and opens it

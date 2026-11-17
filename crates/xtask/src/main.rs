@@ -41,8 +41,10 @@ Commands:
   ci                      Everything CI runs on a push. Run it before pushing.
   spike <name> [options]  Run one of the experiments under spikes/ and print its report.
                           `s1` and `s2` measure the grid in a browser and pass their
-                          options on: see spikes/grid/measure.mjs. `s10` serves the
-                          page for checking input methods: see spikes/grid/ime.mjs.
+                          options on: see spikes/grid/measure.mjs. `s4` tries local
+                          storage and locks between tabs: see spikes/opfs/run.mjs.
+                          `s10` serves the page for checking input methods: see
+                          spikes/grid/ime.mjs.
 ";
 
 fn main() -> ExitCode {
