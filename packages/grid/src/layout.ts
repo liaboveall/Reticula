@@ -135,6 +135,50 @@ export function cellAt(
   return row < sheet.rows && col < sheet.cols ? { row, col } : null;
 }
 
+/** A rectangle in CSS pixels, measured from the top left corner of the grid's area. */
+export interface Box {
+  readonly left: number;
+  readonly top: number;
+  readonly width: number;
+  readonly height: number;
+}
+
+/** Where a cell is. A cell that is scrolled out of view has a box outside the cell area. */
+export function cellBox(metrics: Metrics, scroll: Scroll, row: number, col: number): Box {
+  return {
+    left: metrics.headerWidth + col * metrics.colWidth - scroll.left,
+    top: metrics.headerHeight + row * metrics.rowHeight - scroll.top,
+    width: metrics.colWidth,
+    height: metrics.rowHeight,
+  };
+}
+
+/**
+ * The scroll position nearest to `scroll` at which a cell is fully in view:
+ * unchanged if it already is, otherwise moved just far enough.
+ */
+export function scrollToReveal(
+  metrics: Metrics,
+  size: Size,
+  scroll: Scroll,
+  row: number,
+  col: number,
+): Scroll {
+  const area = cellArea(metrics, size);
+  const along = (position: number, extent: number, at: number, room: number) => {
+    const start = at * extent;
+    if (start < position) {
+      return start;
+    }
+    // A cell larger than the area is aligned at its start.
+    return Math.max(position, Math.min(start, start + extent - room));
+  };
+  return {
+    top: along(scroll.top, metrics.rowHeight, row, area.height),
+    left: along(scroll.left, metrics.colWidth, col, area.width),
+  };
+}
+
 /**
  * The pages to hold for a range of visible cells: the pages those cells are
  * in, and around them a margin measured in multiples of the visible range.

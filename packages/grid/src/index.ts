@@ -9,4 +9,4 @@ export {
   type Selection,
   type Subscription,
 } from "./grid.ts";
-export type { Metrics, Scroll, SheetSize, Span } from "./layout.ts";
+export type { Box, Metrics, Scroll, SheetSize, Span } from "./layout.ts";

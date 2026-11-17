@@ -4,10 +4,13 @@
   "type": "module",
   "exports": {
     ".": "./src/index.ts",
+    "./editor": "./src/editor.ts",
     "./internals": "./src/internals.ts",
     "./grid.css": "./src/grid.css"
   },
   "dependencies": {
+    "@codemirror/state": "6.7.6",
+    "@codemirror/view": "6.43.15",
     "@reticula/protocol": "workspace:*"
   }
 }

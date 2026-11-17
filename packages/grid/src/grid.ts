@@ -1,7 +1,9 @@
 import { PageCache } from "./cache.ts";
 import {
+  type Box,
   cellArea,
   cellAt,
+  cellBox,
   cellsOfPages,
   clampScroll,
   columnName,
@@ -16,6 +18,7 @@ import {
   type Span,
   sameSpan,
   scrollLimits,
+  scrollToReveal,
   visibleCells,
 } from "./layout.ts";
 import { decodePage } from "./page.ts";
@@ -143,7 +146,7 @@ export class Grid {
   #subscribe: (subscription: Subscription) => void;
   #metrics: Metrics;
   #margin: { readonly rows: number; readonly cols: number };
-  #onFrame: ((frame: FrameReport) => void) | undefined;
+  #frameListeners = new Set<(frame: FrameReport) => void>();
 
   #theme: Theme;
   #sheet: SheetSize = { rows: 0, cols: 0 };
@@ -180,7 +183,9 @@ export class Grid {
     this.#subscribe = options.subscribe;
     this.#metrics = options.metrics ?? DEFAULT_METRICS;
     this.#margin = options.margin ?? DEFAULT_MARGIN;
-    this.#onFrame = options.onFrame;
+    if (options.onFrame) {
+      this.#frameListeners.add(options.onFrame);
+    }
 
     host.classList.add("reticula-grid");
     host.tabIndex = 0;
@@ -247,6 +252,51 @@ export class Grid {
     this.#invalidate();
   }
 
+  /** The selected cell. */
+  get selection(): { readonly row: number; readonly col: number } | null {
+    return this.#selected;
+  }
+
+  /**
+   * Moves the selection by a number of rows and columns, stopping at the
+   * edges of the sheet, and scrolls it into view. Without a selection it does
+   * nothing.
+   */
+  moveSelection(rows: number, cols: number): void {
+    const from = this.#selected;
+    if (!from || this.#sheet.rows <= 0 || this.#sheet.cols <= 0) {
+      return;
+    }
+    const row = Math.min(this.#sheet.rows - 1, Math.max(0, from.row + rows));
+    const col = Math.min(this.#sheet.cols - 1, Math.max(0, from.col + cols));
+    this.#selected = { row, col };
+    this.reveal(row, col);
+    this.#invalidate();
+  }
+
+  /** Scrolls just far enough for a cell to be fully in view. */
+  reveal(row: number, col: number): void {
+    this.scrollTo(scrollToReveal(this.#metrics, this.#size, this.#scroll, row, col));
+  }
+
+  /**
+   * Where a cell is drawn, in CSS pixels from the top left corner of the
+   * grid's element. A cell that is scrolled out of view has a box outside it.
+   */
+  boxOf(row: number, col: number): Box {
+    return cellBox(this.#metrics, this.#drawnScroll(), row, col);
+  }
+
+  /**
+   * Calls `listener` at the end of every frame from now on, after the canvas
+   * was drawn and before the browser shows it: whatever the listener moves
+   * stays in step with the cells. Returns a function that stops the calls.
+   */
+  watchFrames(listener: (frame: FrameReport) => void): () => void {
+    this.#frameListeners.add(listener);
+    return () => this.#frameListeners.delete(listener);
+  }
+
   /** The text of a cell, if the page that holds it has arrived. */
   textAt(row: number, col: number): string | null {
     const page = this.#cache.pageOf(row, col);
@@ -293,6 +343,7 @@ export class Grid {
     // and send none of them to the next grid.
     this.#hold(EMPTY_SPAN);
     this.#destroyed = true;
+    this.#frameListeners.clear();
     cancelAnimationFrame(this.#frameRequest);
     this.#observer.disconnect();
     this.#scheme.removeEventListener("change", this.#restyle);
@@ -344,18 +395,12 @@ export class Grid {
     this.#visible = visible;
     this.#hold(pagesToHold(visible, this.#sheet, this.#margin));
 
-    // Drawing from a position on the device's pixel grid keeps text and lines
-    // sharp while the scroll position itself moves smoothly.
-    const scale = this.#scale;
     const counts = this.#renderer.draw({
       size: this.#size,
-      scale,
+      scale: this.#scale,
       metrics,
       theme: this.#theme,
-      scroll: {
-        top: Math.round(this.#scroll.top * scale) / scale,
-        left: Math.round(this.#scroll.left * scale) / scale,
-      },
+      scroll: this.#drawnScroll(),
       visible,
       cache: this.#cache,
       selection: this.#selected,
@@ -377,14 +422,32 @@ export class Grid {
     this.#pendingWork = 0;
     this.#work[this.#workCount % FRAME_SAMPLES] = this.#lastWork;
     this.#workCount++;
-    this.#onFrame?.({
-      time: finished,
-      work: this.#lastWork,
-      visible,
-      cells: counts.cells,
-      missing: counts.missing,
-    });
+    if (this.#frameListeners.size > 0) {
+      const report: FrameReport = {
+        time: finished,
+        work: this.#lastWork,
+        visible,
+        cells: counts.cells,
+        missing: counts.missing,
+      };
+      for (const listener of this.#frameListeners) {
+        listener(report);
+      }
+    }
   };
+
+  /**
+   * The scroll position that is drawn: the nearest one on the device's pixel
+   * grid, which keeps text and lines sharp while the scroll position itself
+   * moves smoothly.
+   */
+  #drawnScroll(): Scroll {
+    const scale = this.#scale;
+    return {
+      top: Math.round(this.#scroll.top * scale) / scale,
+      left: Math.round(this.#scroll.left * scale) / scale,
+    };
+  }
 
   /** Subscribes to a new span of pages when the one to hold has changed. */
   #hold(pages: Span): void {

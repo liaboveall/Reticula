@@ -93,3 +93,52 @@
   border-left: 1px solid var(--grid-header-line);
   background: var(--grid-scrollbar-track);
 }
+
+/*
+ * The cell editor. It is always present and focused, and invisible until an
+ * edit starts: hidden by opacity, because an element that is not rendered
+ * cannot hold the focus.
+ */
+.reticula-editor {
+  position: absolute;
+  top: 0;
+  left: 0;
+  box-sizing: border-box;
+  max-width: 100%;
+  opacity: 0;
+  pointer-events: none;
+  background: var(--grid-background);
+  color: var(--grid-text);
+  /* Drawn where the selection's outline is, so the cell does not seem to move. */
+  box-shadow: 0 0 0 2px var(--grid-selection);
+  user-select: text;
+}
+
+.reticula-editor[data-editing] {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.reticula-editor .cm-editor {
+  height: 100%;
+}
+
+.reticula-editor .cm-editor.cm-focused {
+  outline: none;
+}
+
+.reticula-editor .cm-scroller {
+  /* The grid's font, and a line as tall as the row, so that the text being
+     typed sits exactly where the cell's text is drawn. */
+  font: inherit;
+  line-height: inherit;
+  overflow: hidden;
+}
+
+.reticula-editor .cm-content {
+  padding: 0 6px;
+}
+
+.reticula-editor .cm-line {
+  padding: 0;
+}

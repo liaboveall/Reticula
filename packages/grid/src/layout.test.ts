@@ -2,6 +2,7 @@ import { describe, expect, test } from "vitest";
 import {
   cellArea,
   cellAt,
+  cellBox,
   cellsOfPages,
   clampScroll,
   columnName,
@@ -10,6 +11,7 @@ import {
   pagesToHold,
   scrollAtThumb,
   scrollLimits,
+  scrollToReveal,
   thumb,
   visibleCells,
 } from "./layout.ts";
@@ -240,5 +242,69 @@ describe("column names", () => {
       "AAA",
       "XFD",
     ]);
+  });
+});
+
+describe("where a cell is", () => {
+  test("the first cell sits right after the headers", () => {
+    expect(cellBox(metrics, { top: 0, left: 0 }, 0, 0)).toEqual({
+      left: 50,
+      top: 30,
+      width: 100,
+      height: 20,
+    });
+  });
+
+  test("scrolling moves it, out of the area if far enough", () => {
+    expect(cellBox(metrics, { top: 30, left: 150 }, 2, 3)).toEqual({
+      left: 50 + 300 - 150,
+      top: 30 + 40 - 30,
+      width: 100,
+      height: 20,
+    });
+    expect(cellBox(metrics, { top: 500, left: 0 }, 0, 0).top).toBe(30 - 500);
+  });
+
+  test("it is the cell a point inside it is over", () => {
+    const scroll = { top: 130, left: 250 };
+    const box = cellBox(metrics, scroll, 9, 4);
+    expect(cellAt(metrics, sheet, scroll, size, box.left + 1, box.top + 1)).toEqual({
+      row: 9,
+      col: 4,
+    });
+  });
+});
+
+describe("bringing a cell into view", () => {
+  // The cell area is 400 by 200: columns 0 to 3 and rows 0 to 9 at the origin.
+  const reveal = (scroll: { top: number; left: number }, row: number, col: number) =>
+    scrollToReveal(metrics, size, scroll, row, col);
+
+  test("does nothing when the cell is fully visible", () => {
+    expect(reveal({ top: 0, left: 0 }, 9, 3)).toEqual({ top: 0, left: 0 });
+    expect(reveal({ top: 35, left: 120 }, 5, 3)).toEqual({ top: 35, left: 120 });
+  });
+
+  test("scrolls down or right just far enough to show the whole cell", () => {
+    expect(reveal({ top: 0, left: 0 }, 10, 0)).toEqual({ top: 20, left: 0 });
+    expect(reveal({ top: 0, left: 0 }, 0, 4)).toEqual({ top: 0, left: 100 });
+    expect(reveal({ top: 0, left: 0 }, 500, 19)).toEqual({ top: 501 * 20 - 200, left: 1600 });
+  });
+
+  test("scrolls up or left to the start of the cell", () => {
+    expect(reveal({ top: 1000, left: 800 }, 49, 7)).toEqual({ top: 980, left: 700 });
+    expect(reveal({ top: 1000, left: 800 }, 0, 0)).toEqual({ top: 0, left: 0 });
+  });
+
+  test("completes a cell that is cut off at an edge", () => {
+    // Row 1 starts at 20; scrolled to 30 it is half hidden at the top.
+    expect(reveal({ top: 30, left: 0 }, 1, 0)).toEqual({ top: 20, left: 0 });
+    // Row 11 ends at 240; the area ends at 230.
+    expect(reveal({ top: 30, left: 0 }, 11, 0)).toEqual({ top: 40, left: 0 });
+  });
+
+  test("a cell larger than the area is aligned at its start", () => {
+    const tall = { ...metrics, rowHeight: 500 };
+    expect(scrollToReveal(tall, size, { top: 0, left: 0 }, 3, 0)).toEqual({ top: 1500, left: 0 });
   });
 });
