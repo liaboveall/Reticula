@@ -4,7 +4,7 @@ A local-first, real-time collaborative spreadsheet for the browser. The calculat
 
 ## Status
 
-Early development. There is nothing to try yet: this repository currently holds only the project scaffolding.
+Early development. Nothing is deployed yet. What exists so far is the path from the engine to the screen: the engine runs in a worker, generates a million-row sample from a seed, and sends the cells in view to a canvas grid that scrolls through them. `cargo xtask dev` runs it locally.
 
 ## Development
 

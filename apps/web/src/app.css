@@ -1,36 +1,110 @@
 :root {
+  --shell-background: #f6f7f8;
+  --shell-text: #1f2328;
+  --shell-muted: #59636e;
+  --shell-line: #d1d5da;
+  --shell-danger: #b42318;
+
+  /* Lets the browser match its own surfaces to the scheme in use. */
   color-scheme: light dark;
-  font-family: system-ui, sans-serif;
-  line-height: 1.5;
+  font-family: "Segoe UI", system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+  font-size: 13px;
+  line-height: 1.4;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --shell-background: #1e2127;
+    --shell-text: #e3e6ea;
+    --shell-muted: #9aa3ad;
+    --shell-line: #363b44;
+    --shell-danger: #ff8a7a;
+  }
+}
+
+html,
+body,
+#root {
+  height: 100%;
 }
 
 body {
   margin: 0;
+  /* The page never scrolls: the grid does its own scrolling. */
+  overflow: hidden;
+  background: var(--shell-background);
+  color: var(--shell-text);
 }
 
-main {
-  max-width: 40rem;
-  margin: 0 auto;
-  padding: 3rem 1.5rem;
-}
-
-h1 {
-  margin: 0 0 1.5rem;
-  font-size: 1.5rem;
-}
-
-dl {
+.app {
   display: grid;
-  grid-template-columns: max-content 1fr;
-  gap: 0.25rem 1.5rem;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  height: 100%;
+}
+
+.titlebar {
+  display: flex;
+  align-items: baseline;
+  gap: 16px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--shell-line);
+}
+
+.titlebar h1 {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.titlebar .document {
+  color: var(--shell-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.sheet {
+  position: relative;
+  min-height: 0;
+}
+
+.grid {
+  position: absolute;
+  inset: 0;
+}
+
+.failure {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-content: center;
+  gap: 4px;
+  padding: 24px;
+  background: color-mix(in srgb, var(--shell-background) 92%, transparent);
+  text-align: center;
+}
+
+.failure p {
   margin: 0;
 }
 
-dt {
-  opacity: 0.7;
+.failure .detail {
+  color: var(--shell-danger);
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
 }
 
-dd {
-  margin: 0;
-  font-family: ui-monospace, monospace;
+.statusbar {
+  display: flex;
+  gap: 16px;
+  padding: 4px 12px;
+  border-top: 1px solid var(--shell-line);
+  color: var(--shell-muted);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.statusbar .spacer {
+  flex: 1;
 }
