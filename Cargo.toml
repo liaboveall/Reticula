@@ -4,6 +4,7 @@ members = [
     "crates/core",
     "crates/wasm",
     "crates/xtask",
+    "spikes/axis",
     "spikes/determinism",
     "spikes/nostd-deps",
 ]

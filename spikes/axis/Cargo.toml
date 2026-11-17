@@ -1,0 +1,12 @@
+[package]
+name = "spike-axis"
+description = "M0 prototype of identity addressing: the semantics of structural edits, and their cost."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true

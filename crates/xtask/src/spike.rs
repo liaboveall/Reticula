@@ -6,9 +6,42 @@ const WASM_TARGET: &str = "wasm32-unknown-unknown";
 
 pub fn run(name: &str) -> Result {
     match name {
+        "axis" => axis(),
         "determinism" => determinism(),
-        other => Err(format!("unknown spike `{other}`; available: determinism")),
+        other => Err(format!(
+            "unknown spike `{other}`; available: axis, determinism"
+        )),
     }
+}
+
+/// Runs the identity-addressing prototype: the row moves recorded from Excel,
+/// then the concurrent edits, printed as a transcript of what users end up with.
+fn axis() -> Result {
+    util::step("row moves, against Excel");
+    cargo()
+        .args([
+            "test",
+            "--locked",
+            "--package",
+            "spike-axis",
+            "--test",
+            "excel_row_moves",
+        ])
+        .run()?;
+
+    util::step("concurrent edits");
+    cargo()
+        .args([
+            "test",
+            "--locked",
+            "--package",
+            "spike-axis",
+            "--test",
+            "concurrency",
+            "--",
+        ])
+        .args(["--nocapture", "--test-threads=1"])
+        .run()
 }
 
 /// Prints everything `spikes/determinism` measures, for this machine's native
