@@ -1,7 +1,7 @@
 name: Spikes
 
 # Experiments that need machines a developer does not have: other
-# architectures, and a target without a standard library. Run by hand.
+# architectures, a target without a standard library, and Safari. Run by hand.
 on:
   workflow_dispatch:
 
@@ -27,6 +27,43 @@ jobs:
         with:
           tool: wasm-bindgen@0.2.130
       - run: cargo xtask spike determinism
+
+  # Local storage and locks between tabs, in the browsers and on the systems a
+  # Windows machine does not have. Safari is driven through safaridriver;
+  # the others are the builds Playwright downloads.
+  s4:
+    name: s4 (${{ matrix.browser }}, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-24.04, browser: chromium }
+          - { os: ubuntu-24.04, browser: firefox }
+          - { os: macos-26, browser: webkit }
+          - { os: macos-26, browser: safari }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 26
+      - name: Install pnpm
+        if: matrix.browser != 'safari'
+        run: npm install --global "$(node --print "require('./package.json').packageManager")"
+      - if: matrix.browser != 'safari'
+        run: pnpm install --frozen-lockfile
+      - if: matrix.browser != 'safari'
+        run: pnpm exec playwright install --with-deps ${{ matrix.browser }}
+      - name: Allow Safari to be automated
+        if: matrix.browser == 'safari'
+        run: sudo safaridriver --enable
+      - run: cargo xtask spike s4 --browser ${{ matrix.browser }}
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: s4-${{ matrix.browser }}-${{ matrix.os }}
+          path: target/spikes/opfs/*.json
 
   no-std:
     runs-on: ubuntu-24.04
