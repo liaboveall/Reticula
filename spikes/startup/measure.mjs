@@ -14,10 +14,11 @@
 //                      chromium or firefox (the builds Playwright downloads)
 //   --runs <n>         how many visits (default 20)
 //   --network <name>   reference (the default: 20 Mbit/s down, a round trip
-//                      of 50 ms) or none
+//                      of 50 ms, two round trips to set up the connection)
+//                      or none
 //   --connect <n>      round trips that setting up the connection costs the
-//                      visit's first request (default 0; 2 stands for TCP and
-//                      TLS 1.3)
+//                      visit's first request, instead of the reference's two,
+//                      which stand for TCP and TLS 1.3; 0 leaves it out
 //   --shaping <where>  server (the default: the server holds its responses
 //                      back) or protocol (the browser's own throttling, which
 //                      is Chromium's alone and does not reach the request for
@@ -41,14 +42,18 @@ import { chromium, firefox } from "@playwright/test";
 import { pin } from "../pin.mjs";
 import { root, serve } from "./serve.mjs";
 
-/** The network a first visit is measured on. */
-const REFERENCE = { roundTripMs: 50, downBitsPerSecond: 20_000_000, upBitsPerSecond: 5_000_000 };
+/**
+ * The network a first visit is measured on. The upstream rate is only used
+ * when the browser does the holding back; a visit's requests are a few
+ * hundred bytes.
+ */
+const REFERENCE = { roundTripMs: 50, downBitsPerSecond: 20_000_000, upBitsPerSecond: 5_000_000, connectRoundTrips: 2 };
 /** What the start-up may take, in milliseconds, at the median. */
 const TARGETS = { shell: 1500, firstScreen: 2000 };
 
 // --- options ---------------------------------------------------------------
 
-const options = { browser: "chrome", runs: 20, network: "reference", connect: 0, shaping: "server", encoding: "br", slowdown: 1, affinity: "", headed: false, quick: false, out: "" };
+const options = { browser: "chrome", runs: 20, network: "reference", connect: REFERENCE.connectRoundTrips, shaping: "server", encoding: "br", slowdown: 1, affinity: "", headed: false, quick: false, out: "" };
 const given = process.argv.slice(2);
 for (let index = 0; index < given.length; index++) {
   const name = given[index].replace(/^--/, "");
@@ -248,7 +253,9 @@ function summary(values) {
 
 const network = !shaped
   ? "no network held back"
-  : `${REFERENCE.downBitsPerSecond / 1e6} Mbit/s down, round trip ${REFERENCE.roundTripMs} ms, ${options.connect} round trips to connect, held back by the ${options.shaping === "server" ? "server" : "browser"}`;
+  : options.shaping === "server"
+    ? `${REFERENCE.downBitsPerSecond / 1e6} Mbit/s down, round trip ${REFERENCE.roundTripMs} ms, ${options.connect} round trips to connect, held back by the server`
+    : `${REFERENCE.downBitsPerSecond / 1e6} Mbit/s down, round trip ${REFERENCE.roundTripMs} ms, nothing for connecting, held back by the browser`;
 const visits = [];
 for (let number = 1; number <= options.runs; number++) {
   const result = await visit(number);
@@ -314,7 +321,7 @@ if (problems.length > 0) {
 const name = [
   "s9",
   options.browser,
-  shaped ? `${options.shaping}${options.connect ? `-connect${options.connect}` : ""}` : "unshaped",
+  shaped ? `${options.shaping}${options.shaping === "server" ? `-connect${options.connect}` : ""}` : "unshaped",
   options.encoding,
   ...(options.slowdown > 1 ? [`slow${options.slowdown}`] : []),
   ...(options.headed ? ["headed"] : []),
@@ -338,7 +345,7 @@ writeFileSync(
       },
       browser: { name: options.browser, version, headless: !options.headed, userAgent: visits[0]?.userAgent },
       options,
-      network: shaped ? { ...REFERENCE, connectRoundTrips: options.connect, heldBackBy: options.shaping } : null,
+      network: shaped ? { ...REFERENCE, connectRoundTrips: options.shaping === "server" ? options.connect : 0, heldBackBy: options.shaping } : null,
       targets: TARGETS,
       sizes: sizes(),
       requests,
