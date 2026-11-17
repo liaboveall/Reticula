@@ -4,6 +4,7 @@
   "type": "module",
   "exports": {
     ".": "./src/index.ts",
+    "./internals": "./src/internals.ts",
     "./grid.css": "./src/grid.css"
   },
   "dependencies": {

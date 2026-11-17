@@ -46,6 +46,22 @@ export interface GridOptions {
    */
   readonly margin?: { readonly rows: number; readonly cols: number };
   readonly metrics?: Metrics;
+  /** Called at the end of every frame, for measurements. */
+  readonly onFrame?: (frame: FrameReport) => void;
+}
+
+/** What one frame did. */
+export interface FrameReport {
+  /** When the frame's draw calls had all been issued, on the clock of `performance.now()`. */
+  readonly time: number;
+  /** Main-thread work of the frame in milliseconds, as in {@link GridStats.frameWork}. */
+  readonly work: number;
+  /** The cells that were at least partly in view. */
+  readonly visible: Span;
+  /** Cells whose text was drawn. */
+  readonly cells: number;
+  /** Cells in view that were still placeholders. */
+  readonly missing: number;
 }
 
 /** The cell the user picked. */
@@ -127,6 +143,7 @@ export class Grid {
   #subscribe: (subscription: Subscription) => void;
   #metrics: Metrics;
   #margin: { readonly rows: number; readonly cols: number };
+  #onFrame: ((frame: FrameReport) => void) | undefined;
 
   #theme: Theme;
   #sheet: SheetSize = { rows: 0, cols: 0 };
@@ -163,6 +180,7 @@ export class Grid {
     this.#subscribe = options.subscribe;
     this.#metrics = options.metrics ?? DEFAULT_METRICS;
     this.#margin = options.margin ?? DEFAULT_MARGIN;
+    this.#onFrame = options.onFrame;
 
     host.classList.add("reticula-grid");
     host.tabIndex = 0;
@@ -269,8 +287,11 @@ export class Grid {
     };
   }
 
-  /** Removes everything the grid added to its host. */
+  /** Removes everything the grid added to its host and gives up its subscription. */
   destroy(): void {
+    // The engine would otherwise go on counting this grid's pages as held,
+    // and send none of them to the next grid.
+    this.#hold(EMPTY_SPAN);
     this.#destroyed = true;
     cancelAnimationFrame(this.#frameRequest);
     this.#observer.disconnect();
@@ -351,10 +372,18 @@ export class Grid {
     if (counts.missing > 0) {
       this.#framesWithMissing++;
     }
-    this.#lastWork = performance.now() - started + this.#pendingWork;
+    const finished = performance.now();
+    this.#lastWork = finished - started + this.#pendingWork;
     this.#pendingWork = 0;
     this.#work[this.#workCount % FRAME_SAMPLES] = this.#lastWork;
     this.#workCount++;
+    this.#onFrame?.({
+      time: finished,
+      work: this.#lastWork,
+      visible,
+      cells: counts.cells,
+      missing: counts.missing,
+    });
   };
 
   /** Subscribes to a new span of pages when the one to hold has changed. */

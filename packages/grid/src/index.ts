@@ -2,6 +2,7 @@
 // It knows nothing about the engine or about any UI framework; its host wires
 // it to both. Its styles are in `@reticula/grid/grid.css`.
 export {
+  type FrameReport,
   Grid,
   type GridOptions,
   type GridStats,

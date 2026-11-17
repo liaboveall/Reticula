@@ -23,9 +23,33 @@ export interface Frame {
 export interface FrameCounts {
   /** Cells in view whose text was drawn. */
   cells: number;
+  /** Of those, the cells whose text was drawn through a clip. */
+  clipped: number;
   /** Cells in view whose page has not arrived; they are shown as placeholders. */
   missing: number;
 }
+
+/**
+ * The renderer's shortcuts. All of them are on, unless a measurement turns
+ * one off to find out what it is worth.
+ */
+export interface Shortcuts {
+  /** Remember the measured width of each string. */
+  readonly cacheWidths: boolean;
+  /** Skip measuring a number whose length alone shows that it fits. */
+  readonly boundNumbers: boolean;
+  /** Clip only text that is wider than its cell, not every text. */
+  readonly clipOnlyOverwide: boolean;
+  /** Set the drawing state when it changes, not for every cell. */
+  readonly batchState: boolean;
+}
+
+export const ALL_SHORTCUTS: Shortcuts = {
+  cacheWidths: true,
+  boundNumbers: true,
+  clipOnlyOverwide: true,
+  batchState: true,
+};
 
 /** Space between a cell's edge and its text. */
 const PADDING = 6;
@@ -43,9 +67,14 @@ const NUMBER_ALPHABET = "0123456789.,-+%eE";
  * that most numbers already pass.
  */
 class TextWidths {
+  #shortcuts: Shortcuts;
   #font = "";
   #widths = new Map<string, number>();
   #numberAdvance = 0;
+
+  constructor(shortcuts: Shortcuts) {
+    this.#shortcuts = shortcuts;
+  }
 
   /** Call with the context's current font before asking for widths. */
   use(context: CanvasRenderingContext2D, font: string): void {
@@ -62,8 +91,11 @@ class TextWidths {
   }
 
   fits(context: CanvasRenderingContext2D, text: string, number: boolean, room: number): boolean {
-    if (number && text.length * this.#numberAdvance <= room) {
+    if (this.#shortcuts.boundNumbers && number && text.length * this.#numberAdvance <= room) {
       return true;
+    }
+    if (!this.#shortcuts.cacheWidths) {
+      return context.measureText(text).width <= room;
     }
     let width = this.#widths.get(text);
     if (width === undefined) {
@@ -77,24 +109,61 @@ class TextWidths {
   }
 }
 
+/** The part of one page that is in view. */
+interface Part {
+  readonly pageRow: number;
+  readonly pageCol: number;
+  readonly firstRow: number;
+  readonly endRow: number;
+  readonly firstCol: number;
+  readonly endCol: number;
+}
+
+/** The pages the visible cells are in, each cut down to what is visible of it. */
+function partsOf(visible: Span): Part[] {
+  const parts: Part[] = [];
+  const lastPageRow = Math.floor((visible.endRow - 1) / PAGE_ROWS);
+  const lastPageCol = Math.floor((visible.endCol - 1) / PAGE_COLS);
+  for (let pageRow = Math.floor(visible.firstRow / PAGE_ROWS); pageRow <= lastPageRow; pageRow++) {
+    for (
+      let pageCol = Math.floor(visible.firstCol / PAGE_COLS);
+      pageCol <= lastPageCol;
+      pageCol++
+    ) {
+      parts.push({
+        pageRow,
+        pageCol,
+        firstRow: Math.max(visible.firstRow, pageRow * PAGE_ROWS),
+        endRow: Math.min(visible.endRow, (pageRow + 1) * PAGE_ROWS),
+        firstCol: Math.max(visible.firstCol, pageCol * PAGE_COLS),
+        endCol: Math.min(visible.endCol, (pageCol + 1) * PAGE_COLS),
+      });
+    }
+  }
+  return parts;
+}
+
 /** Draws frames onto one canvas. */
 export class Renderer {
   #context: CanvasRenderingContext2D;
-  #widths = new TextWidths();
+  #shortcuts: Shortcuts;
+  #widths: TextWidths;
 
-  constructor(canvas: HTMLCanvasElement) {
+  constructor(canvas: HTMLCanvasElement, shortcuts: Shortcuts = ALL_SHORTCUTS) {
     // The grid is opaque; saying so lets the browser skip blending the canvas.
     const context = canvas.getContext("2d", { alpha: false });
     if (!context) {
       throw new Error("this browser cannot draw on a 2D canvas");
     }
     this.#context = context;
+    this.#shortcuts = shortcuts;
+    this.#widths = new TextWidths(shortcuts);
   }
 
   draw(frame: Frame): FrameCounts {
     const context = this.#context;
     const { size, scale, metrics, theme, scroll, visible } = frame;
-    const counts: FrameCounts = { cells: 0, missing: 0 };
+    const counts: FrameCounts = { cells: 0, clipped: 0, missing: 0 };
 
     context.setTransform(scale, 0, 0, scale, 0, 0);
     context.fillStyle = theme.background;
@@ -107,85 +176,103 @@ export class Renderer {
     const bottom = size.height - metrics.scrollbarSize;
 
     if (!isEmpty(visible)) {
-      this.#cells(frame, originX, originY, counts);
+      // Fills, then lines, then text: text that is wider than its cell will
+      // one day run across the lines of the empty cells beside it.
+      const parts = partsOf(visible);
+      this.#placeholders(frame, parts, originX, originY, counts);
       this.#lines(frame, originX, originY, right, bottom);
+      this.#text(frame, parts, originX, originY, counts);
       this.#selection(frame, originX, originY);
     }
     this.#headers(frame, originX, originY, right, bottom);
     return counts;
   }
 
-  /** Cell text, page by page; a placeholder where a page has not arrived. */
-  #cells(frame: Frame, originX: number, originY: number, counts: FrameCounts): void {
+  /** A plain fill where a page has not arrived. */
+  #placeholders(
+    frame: Frame,
+    parts: readonly Part[],
+    originX: number,
+    originY: number,
+    counts: FrameCounts,
+  ): void {
     const context = this.#context;
-    const { metrics, theme, visible, cache } = frame;
+    const { rowHeight, colWidth } = frame.metrics;
+    context.fillStyle = frame.theme.placeholder;
+    for (const part of parts) {
+      if (frame.cache.get(part.pageRow, part.pageCol)) {
+        continue;
+      }
+      context.fillRect(
+        originX + part.firstCol * colWidth,
+        originY + part.firstRow * rowHeight,
+        (part.endCol - part.firstCol) * colWidth,
+        (part.endRow - part.firstRow) * rowHeight,
+      );
+      counts.missing += (part.endRow - part.firstRow) * (part.endCol - part.firstCol);
+    }
+  }
+
+  /** The text of the cells, page by page. */
+  #text(
+    frame: Frame,
+    parts: readonly Part[],
+    originX: number,
+    originY: number,
+    counts: FrameCounts,
+  ): void {
+    const context = this.#context;
+    const { metrics, theme, cache } = frame;
     const { rowHeight, colWidth } = metrics;
+    const { clipOnlyOverwide, batchState } = this.#shortcuts;
     const room = colWidth - 2 * PADDING;
 
     context.font = theme.font;
     context.textBaseline = "middle";
+    context.fillStyle = theme.text;
     this.#widths.use(context, theme.font);
+    let aligned: CanvasTextAlign | null = null;
 
-    const lastPageRow = Math.floor((visible.endRow - 1) / PAGE_ROWS);
-    const lastPageCol = Math.floor((visible.endCol - 1) / PAGE_COLS);
-    for (
-      let pageRow = Math.floor(visible.firstRow / PAGE_ROWS);
-      pageRow <= lastPageRow;
-      pageRow++
-    ) {
-      for (
-        let pageCol = Math.floor(visible.firstCol / PAGE_COLS);
-        pageCol <= lastPageCol;
-        pageCol++
-      ) {
-        const firstRow = Math.max(visible.firstRow, pageRow * PAGE_ROWS);
-        const endRow = Math.min(visible.endRow, (pageRow + 1) * PAGE_ROWS);
-        const firstCol = Math.max(visible.firstCol, pageCol * PAGE_COLS);
-        const endCol = Math.min(visible.endCol, (pageCol + 1) * PAGE_COLS);
-
-        const page = cache.get(pageRow, pageCol);
-        if (!page) {
-          context.fillStyle = theme.placeholder;
-          context.fillRect(
-            originX + firstCol * colWidth,
-            originY + firstRow * rowHeight,
-            (endCol - firstCol) * colWidth,
-            (endRow - firstRow) * rowHeight,
-          );
-          counts.missing += (endRow - firstRow) * (endCol - firstCol);
-          continue;
-        }
-
-        context.fillStyle = theme.text;
-        // Column by column: a column mostly holds one kind of value, so the
-        // alignment rarely changes from one cell to the next.
-        for (let col = firstCol; col < endCol; col++) {
-          const x = originX + col * colWidth;
-          for (let row = firstRow; row < endRow; row++) {
-            const cell = (row - page.firstRow) * page.colCount + (col - page.firstCol);
-            const text = page.texts[cell];
-            if (!text) {
-              continue;
-            }
-            const number = isNumber(page.flags[cell] ?? 0);
-            const y = originY + row * rowHeight;
-            const align = number ? "right" : "left";
-            if (context.textAlign !== align) {
-              context.textAlign = align;
-            }
-            const textX = number ? x + colWidth - PADDING : x + PADDING;
-            if (this.#widths.fits(context, text, number, room)) {
-              context.fillText(text, textX, y + rowHeight / 2);
-            } else {
-              context.save();
-              context.beginPath();
-              context.rect(x + PADDING, y, room, rowHeight);
-              context.clip();
-              context.fillText(text, textX, y + rowHeight / 2);
-              context.restore();
-            }
-            counts.cells++;
+    for (const part of parts) {
+      const page = cache.get(part.pageRow, part.pageCol);
+      if (!page) {
+        continue;
+      }
+      // Column by column: a column mostly holds one kind of value, so the
+      // alignment rarely changes from one cell to the next.
+      for (let col = part.firstCol; col < part.endCol; col++) {
+        const x = originX + col * colWidth;
+        for (let row = part.firstRow; row < part.endRow; row++) {
+          const cell = (row - page.firstRow) * page.colCount + (col - page.firstCol);
+          const text = page.texts[cell];
+          if (!text) {
+            continue;
           }
+          const number = isNumber(page.flags[cell] ?? 0);
+          const y = originY + row * rowHeight;
+          const align = number ? "right" : "left";
+          if (!batchState) {
+            context.font = theme.font;
+            context.textBaseline = "middle";
+            context.fillStyle = theme.text;
+            context.textAlign = align;
+          } else if (aligned !== align) {
+            context.textAlign = align;
+            aligned = align;
+          }
+          const textX = number ? x + colWidth - PADDING : x + PADDING;
+          if (clipOnlyOverwide && this.#widths.fits(context, text, number, room)) {
+            context.fillText(text, textX, y + rowHeight / 2);
+          } else {
+            context.save();
+            context.beginPath();
+            context.rect(x + PADDING, y, room, rowHeight);
+            context.clip();
+            context.fillText(text, textX, y + rowHeight / 2);
+            context.restore();
+            counts.clipped++;
+          }
+          counts.cells++;
         }
       }
     }
