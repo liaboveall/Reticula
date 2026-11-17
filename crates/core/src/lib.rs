@@ -29,13 +29,21 @@
 )]
 // --- end kernel lint block ---
 
+extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
 pub mod determinism;
 pub mod digest;
+pub mod format;
 pub mod num;
 pub mod rng;
+pub mod sample;
+pub mod sheet;
+pub mod store;
+pub mod strings;
+pub mod value;
+pub mod viewport;
 
 /// Version of the kernel, recorded alongside cached results so that they can
 /// be discarded when the code that produced them changes.

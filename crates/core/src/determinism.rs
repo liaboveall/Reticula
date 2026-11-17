@@ -9,9 +9,14 @@
 //! The workload grows with the kernel. Changing it changes the expected value,
 //! which is updated in the same commit.
 
+use alloc::string::String;
+
 use crate::digest::Digest64;
+use crate::format::{NumberFormat, write_number};
 use crate::num;
 use crate::rng::Rng;
+use crate::sample;
+use crate::viewport::{self, Page};
 
 const SEED: u64 = 0x5EED_0000_0000_0001;
 
@@ -23,6 +28,8 @@ pub fn digest() -> u64 {
     math_functions(&mut digest);
     accumulation(&mut digest);
     conversions(&mut digest);
+    formatting(&mut digest);
+    sample_sheet(&mut digest);
     digest.finish()
 }
 
@@ -144,6 +151,60 @@ fn conversions(digest: &mut Digest64) {
         digest.write_u64(saturating_i64(scaled).cast_unsigned());
         digest.write_u64(u64::from(saturating_u32(scaled)));
         digest.write_f64(f64::from_bits(bits));
+    }
+}
+
+/// Numbers as text, over magnitudes from a millionth to beyond what is printed
+/// digit by digit.
+fn formatting(digest: &mut Digest64) {
+    let mut rng = Rng::from_seed(SEED ^ 0x0004_0000);
+    let mut text = String::new();
+    for _ in 0..4096 {
+        let unit = rng.next_f64();
+        let magnitude = num::pow(10.0, num::floor(rng.next_f64() * 24.0) - 6.0);
+        let value = (unit - 0.5) * magnitude;
+        for (number, format) in [
+            (value, NumberFormat::General),
+            (num::round(value), NumberFormat::General),
+            (value, NumberFormat::Fixed2),
+            (unit, NumberFormat::Percent),
+            (unit * 80_000.0, NumberFormat::Date),
+        ] {
+            text.clear();
+            write_number(number, format, &mut text);
+            digest.write_bytes(text.as_bytes());
+        }
+    }
+}
+
+/// The seeded sample: every stored value, every string, and two viewport pages.
+fn sample_sheet(digest: &mut Digest64) {
+    const ROWS: u32 = 3000;
+    let sheet = sample::generate(SEED ^ 0x0005_0000, ROWS);
+    for col in 0..sheet.cols() {
+        for row in 0..sheet.rows() {
+            digest.write_u64(sheet.value(row, col).pack());
+        }
+    }
+    let strings = sheet.strings();
+    for id in 0..u32::try_from(strings.len()).unwrap_or(u32::MAX) {
+        digest.write_bytes(strings.get(id).as_bytes());
+    }
+    let mut text = String::new();
+    // The first page, and the last one, which is cut short on both sides.
+    let last = Page {
+        row: ROWS
+            .saturating_sub(1)
+            .checked_div(viewport::PAGE_ROWS)
+            .unwrap_or(0),
+        col: sheet
+            .cols()
+            .saturating_sub(1)
+            .checked_div(viewport::PAGE_COLS)
+            .unwrap_or(0),
+    };
+    for page in [Page { row: 0, col: 0 }, last] {
+        digest.write_bytes(&viewport::encode_page(&sheet, page, 1, &mut text));
     }
 }
 
