@@ -1,18 +1,40 @@
 //! Running the experiments under `spikes/`.
 
 use crate::util::{self, Result, cargo, node, tool};
+use crate::wasm::{self, Profile};
+use crate::web;
 
 const WASM_TARGET: &str = "wasm32-unknown-unknown";
 
-pub fn run(name: &str) -> Result {
+pub fn run(name: &str, options: &[String]) -> Result {
+    if matches!(name, "s1" | "s2") {
+        return grid(name, options);
+    }
+    if let Some(option) = options.first() {
+        return Err(format!("spike `{name}` takes no options, got `{option}`"));
+    }
     match name {
         "axis" => axis(),
         "axis-cost" => axis_cost(),
         "determinism" => determinism(),
         other => Err(format!(
-            "unknown spike `{other}`; available: axis, axis-cost, determinism"
+            "unknown spike `{other}`; available: axis, axis-cost, determinism, s1, s2"
         )),
     }
+}
+
+/// Measures the grid in a browser: viewport pages (`s1`) or drawing text
+/// (`s2`). The page that is measured is built like the app, from the same
+/// engine and grid, and is driven by a script that takes the options.
+fn grid(name: &str, options: &[String]) -> Result {
+    wasm::build(Profile::Release)?;
+    web::build_bench()?;
+    util::step(name);
+    node()
+        .arg("spikes/grid/measure.mjs")
+        .arg(name)
+        .args(options)
+        .run()
 }
 
 /// Runs the identity-addressing prototype: the row moves recorded from Excel,

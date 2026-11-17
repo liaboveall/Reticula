@@ -39,7 +39,9 @@ Commands:
   e2e [--browser <name>] [--skip-build]
                           End-to-end tests in chromium, firefox and webkit.
   ci                      Everything CI runs on a push. Run it before pushing.
-  spike <name>            Run one of the experiments under spikes/ and print its report.
+  spike <name> [options]  Run one of the experiments under spikes/ and print its report.
+                          `s1` and `s2` measure the grid in a browser and pass their
+                          options on: see spikes/grid/measure.mjs.
 ";
 
 fn main() -> ExitCode {
@@ -87,9 +89,9 @@ fn run(args: &[String]) -> Result {
             Flags::parse(rest, &[], &[])?;
             ci()
         }
-        "spike" => match rest {
-            [name] => spike::run(name),
-            _ => Err("usage: cargo xtask spike <name>".to_owned()),
+        "spike" => match rest.split_first() {
+            Some((name, options)) => spike::run(name, options),
+            None => Err("usage: cargo xtask spike <name> [options]".to_owned()),
         },
         "help" | "--help" | "-h" => {
             print!("{HELP}");

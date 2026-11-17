@@ -70,6 +70,14 @@ for (const file of walk(process.argv[1])) {
     report_sizes(&files)
 }
 
+/// Builds the measurement page: the app's build settings, another entry.
+pub fn build_bench() -> Result {
+    util::step("vite build (measurement page)");
+    pnpm()
+        .args(["--filter", APP, "exec", "vite", "build", "--mode", "bench"])
+        .run()
+}
+
 pub fn e2e(browser: Option<&str>) -> Result {
     util::step("playwright");
     let mut test = pnpm().args(["exec", "playwright", "test"]);
