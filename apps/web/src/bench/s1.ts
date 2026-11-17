@@ -404,6 +404,11 @@ export interface JumpResult {
   readonly firstFrame: Summary;
   /** Frames drawn at the new position before it was complete. */
   readonly framesWithPlaceholders: Summary;
+  /**
+   * Main-thread work, in milliseconds, of the frame that completed each jump:
+   * a whole screen of cells that were not on screen the frame before.
+   */
+  readonly work: Summary;
   /** Every sample of `filled`, in the order taken. */
   readonly samples: readonly number[];
 }
@@ -425,6 +430,7 @@ export async function jump(options: {
   const filled: number[] = [];
   const firstFrame: number[] = [];
   const placeholderFrames: number[] = [];
+  const work: number[] = [];
   for (let index = 0; index < options.jumps; index++) {
     // Away from where the grid is now, so that nothing needed is held yet.
     const top = Math.floor(random.unit() * limit);
@@ -448,6 +454,7 @@ export async function jump(options: {
     filled.push(report.time - started);
     firstFrame.push((first ?? report.time) - started);
     placeholderFrames.push(incomplete);
+    work.push(report.work);
     await nextFrame();
     await nextFrame();
   }
@@ -458,6 +465,7 @@ export async function jump(options: {
     filled: summarize(filled),
     firstFrame: summarize(firstFrame),
     framesWithPlaceholders: summarize(placeholderFrames),
+    work: summarize(work),
     samples: filled,
   };
 }

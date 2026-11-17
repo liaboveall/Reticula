@@ -23,8 +23,11 @@
 //                      performance and efficiency cores, name the former
 //   --trace            s2 only, Chromium only: record a trace of the pacing
 //                      run that the browser's Performance panel can load
+//   --only <part>      s1 only: just one of its parts, which are roundTrip,
+//                      codec, scroll and jump
 //   --quick            a short run, to see that everything works
-//   --out <file>       the data file (default: target/spikes/grid/<name>.json)
+//   --out <file>       the data file (default: target/spikes/grid/<name>.json,
+//                      the name made of the measurement and its options)
 
 import { execFileSync, spawnSync } from "node:child_process";
 import { mkdirSync, writeFileSync } from "node:fs";
@@ -36,7 +39,7 @@ import { root, serve } from "./serve.mjs";
 // --- options ---------------------------------------------------------------
 
 const [bench, ...rest] = process.argv.slice(2);
-const options = { browser: "chrome", headed: false, dpr: 1, slowdown: 1, affinity: "", trace: false, quick: false, out: "" };
+const options = { browser: "chrome", headed: false, dpr: 1, slowdown: 1, affinity: "", trace: false, only: "", quick: false, out: "" };
 for (let index = 0; index < rest.length; index++) {
   const name = rest[index].replace(/^--/, "");
   if (!(name in options) || !rest[index].startsWith("--")) {
@@ -57,6 +60,9 @@ if (bench !== "s1" && bench !== "s2") {
 }
 if (!["chrome", "chromium", "firefox"].includes(options.browser)) {
   fail(`unknown browser ${options.browser}`);
+}
+if (options.only && (bench !== "s1" || !["roundTrip", "codec", "scroll", "jump"].includes(options.only))) {
+  fail("--only takes one of roundTrip, codec, scroll, jump, and only with s1");
 }
 
 function fail(message) {
@@ -157,7 +163,9 @@ const verdict = (passed) => (passed ? "within the target" : "MISSES THE TARGET")
 const results = {};
 const quick = options.quick;
 
-if (bench === "s1") {
+const wanted = (part) => !options.only || options.only === part;
+
+if (bench === "s1" && wanted("roundTrip")) {
   const roundTrip = (results.roundTrip = await call("s1", "roundTrip", { samples: quick ? 200 : 2000, warmup: 200, seed: 1 }));
   console.log(`\nround trip of one page, ${roundTrip.cellsPerPage} cells, ${roundTrip.total.count} samples (ms)`);
   row("request to decoded", roundTrip.total);
@@ -165,7 +173,8 @@ if (bench === "s1") {
   row("  decoding", roundTrip.decode);
   row("packet size (bytes)", roundTrip.bytes, (value) => value.toFixed(0));
   console.log(`  target p95 <= 2 ms: ${verdict(roundTrip.total.p95 <= 2)}`);
-
+}
+if (bench === "s1" && wanted("codec")) {
   const codec = (results.codec = await call("s1", "codec", { pages: 200, rounds: quick ? 5 : 30, seed: 2 }));
   const micros = (value) => value.toFixed(1);
   console.log(`\none page on its own, ${codec.pages} pages x ${codec.rounds} rounds (microseconds for a page)`);
@@ -176,7 +185,8 @@ if (bench === "s1") {
   console.log(
     `  text of a page: ${codec.textBytesUtf8.mean.toFixed(0)} bytes as UTF-8, ${codec.textBytesUtf16.mean.toFixed(0)} as UTF-16; whole packet ${codec.packetBytes.mean.toFixed(0)} bytes`,
   );
-
+}
+if (bench === "s1" && wanted("scroll")) {
   results.scroll = [];
   console.log(`\nscrolling at 5 screens a second${quick ? "" : " for 30 s"}, by margin (in multiples of the visible rows)`);
   for (const marginRows of [0, 0.25, 0.5, 1, 2]) {
@@ -190,14 +200,17 @@ if (bench === "s1") {
   }
   const smallest = results.scroll.find((scroll) => scroll.framesWithPlaceholders === 0);
   console.log(`  target no placeholders: ${smallest ? `met from a margin of ${smallest.margin.rows}` : "NOT MET at any margin tried"}`);
-
+}
+if (bench === "s1" && wanted("jump")) {
   const jump = (results.jump = await call("s1", "jump", { jumps: quick ? 20 : 200, seed: 3, marginRows: 2, marginCols: 1 }));
   console.log(`\njumping to ${jump.jumps} random positions (ms)`);
   row("jump to every cell drawn", jump.filled);
   row("  jump to the first frame there", jump.firstFrame);
   row("frames with placeholders", jump.framesWithPlaceholders, (value) => value.toFixed(0));
+  row("work of the frame that completed it", jump.work);
   console.log(`  target p95 <= 100 ms: ${verdict(jump.filled.p95 <= 100)}`);
-} else {
+}
+if (bench === "s2") {
   const frames = quick ? 120 : 600;
   const cases = [
     ["new text every frame", { content: "unique", rowsPerFrame: 50 }],
@@ -250,7 +263,7 @@ if (problems.length > 0) {
 
 // --- the data file ---------------------------------------------------------
 
-const out = options.out ? resolve(options.out) : join(root, `target/spikes/grid/${bench}-${options.browser}${options.headed ? "-headed" : ""}-dpr${options.dpr}${options.slowdown > 1 ? `-slow${options.slowdown}` : ""}.json`);
+const out = options.out ? resolve(options.out) : join(root, `target/spikes/grid/${bench}-${options.browser}${options.headed ? "-headed" : ""}-dpr${options.dpr}${options.slowdown > 1 ? `-slow${options.slowdown}` : ""}${options.only ? `-${options.only}` : ""}${quick ? "-quick" : ""}.json`);
 mkdirSync(dirname(out), { recursive: true });
 writeFileSync(
   out,
