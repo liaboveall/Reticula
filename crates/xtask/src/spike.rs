@@ -10,6 +10,9 @@ pub fn run(name: &str, options: &[String]) -> Result {
     if matches!(name, "s1" | "s2") {
         return grid(name, options);
     }
+    if name == "s10" {
+        return input_methods(options);
+    }
     if let Some(option) = options.first() {
         return Err(format!("spike `{name}` takes no options, got `{option}`"));
     }
@@ -18,7 +21,7 @@ pub fn run(name: &str, options: &[String]) -> Result {
         "axis-cost" => axis_cost(),
         "determinism" => determinism(),
         other => Err(format!(
-            "unknown spike `{other}`; available: axis, axis-cost, determinism, s1, s2"
+            "unknown spike `{other}`; available: axis, axis-cost, determinism, s1, s2, s10"
         )),
     }
 }
@@ -28,13 +31,22 @@ pub fn run(name: &str, options: &[String]) -> Result {
 /// engine and grid, and is driven by a script that takes the options.
 fn grid(name: &str, options: &[String]) -> Result {
     wasm::build(Profile::Release)?;
-    web::build_bench()?;
+    web::build_spikes()?;
     util::step(name);
     node()
         .arg("spikes/grid/measure.mjs")
         .arg(name)
         .args(options)
         .run()
+}
+
+/// Serves the page on which input methods are checked by hand, and opens it
+/// in a browser if the options name one. It runs until it is stopped.
+fn input_methods(options: &[String]) -> Result {
+    wasm::build(Profile::Release)?;
+    web::build_spikes()?;
+    util::step("s10");
+    node().arg("spikes/grid/ime.mjs").args(options).run()
 }
 
 /// Runs the identity-addressing prototype: the row moves recorded from Excel,

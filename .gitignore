@@ -4,7 +4,7 @@
 # Build output
 /target/
 dist/
-dist-bench/
+dist-spikes/
 /packages/protocol/pkg/
 
 # Generated inputs of the Excel probes (see spikes/excel/README.md)

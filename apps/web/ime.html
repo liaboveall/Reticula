@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <title>Reticula: input method check</title>
+  </head>
+  <body>
+    <!--
+      A page for checking by hand that text can be typed into a cell with an
+      input method. Such input cannot be automated faithfully, so this page
+      lists what to try, shows what the editor saw, and collects the verdicts.
+      Its wording is Chinese because the input methods it is for are.
+    -->
+    <div class="page">
+      <div id="grid" class="grid"></div>
+      <aside class="panel">
+        <h1>输入法手测</h1>
+        <p class="hint">
+          点一下表格再开始。编辑的内容不会写进表格（引擎还不接受编辑），提交了什么显示在下面的“状态”里。
+        </p>
+
+        <section>
+          <h2>状态</h2>
+          <dl class="state">
+            <dt>模式</dt>
+            <dd id="mode" data-testid="mode">导航</dd>
+            <dt>当前格</dt>
+            <dd id="cell" data-testid="cell">—</dd>
+            <dt>编辑器里</dt>
+            <dd id="text" data-testid="text"></dd>
+            <dt>上次提交</dt>
+            <dd id="committed" data-testid="committed">—</dd>
+          </dl>
+        </section>
+
+        <section>
+          <h2>清单</h2>
+          <ol id="checklist" class="checklist"></ol>
+        </section>
+
+        <section>
+          <h2>结果</h2>
+          <label class="field">
+            输入法
+            <input id="method" type="text" placeholder="例如：微软拼音" autocomplete="off" />
+          </label>
+          <button id="copy" type="button">复制结果</button>
+          <textarea id="report" readonly rows="6" aria-label="结果"></textarea>
+        </section>
+
+        <section>
+          <h2>
+            事件
+            <button id="clear" type="button">清空</button>
+          </h2>
+          <ol id="log" class="log"></ol>
+        </section>
+      </aside>
+    </div>
+    <script type="module" src="/src/ime/main.ts"></script>
+  </body>
+</html>

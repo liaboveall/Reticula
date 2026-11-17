@@ -5,8 +5,8 @@
 //   s1  viewport pages between the engine's worker and the main thread
 //   s2  drawing text on a 2D canvas
 //
-// It serves the measurement page built by `vite build --mode bench`
-// (apps/web/dist-bench), drives it, prints a summary and writes everything it
+// It serves the measurement page built by `vite build --mode spikes`
+// (apps/web/dist-spikes), drives it, prints a summary and writes everything it
 // measured, with a description of the machine and the browser, to a data file.
 // `cargo xtask spike s1` builds the page first and then runs this.
 //
@@ -28,14 +28,10 @@
 
 import { execFileSync, spawnSync } from "node:child_process";
 import { mkdirSync, writeFileSync } from "node:fs";
-import { readFile } from "node:fs/promises";
-import { createServer } from "node:http";
 import os from "node:os";
-import { dirname, extname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { dirname, join, resolve } from "node:path";
 import { chromium, firefox } from "@playwright/test";
-
-const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
+import { root, serve } from "./serve.mjs";
 
 // --- options ---------------------------------------------------------------
 
@@ -115,31 +111,7 @@ function git(...args) {
 
 // --- the page --------------------------------------------------------------
 
-const site = join(root, "apps/web/dist-bench");
-const types = { ".html": "text/html", ".js": "text/javascript", ".css": "text/css", ".wasm": "application/wasm" };
-const server = createServer(async (request, response) => {
-  const path = new URL(request.url, "http://localhost").pathname;
-  if (path === "/favicon.ico") {
-    response.writeHead(204).end();
-    return;
-  }
-  let body;
-  try {
-    body = await readFile(join(site, path === "/" ? "bench.html" : path));
-  } catch {
-    response.writeHead(404).end();
-    return;
-  }
-  response.writeHead(200, {
-    "content-type": types[extname(path)] ?? "application/octet-stream",
-    "cache-control": "no-store",
-    // Cross-origin isolation: browsers give an isolated page a finer clock.
-    "cross-origin-opener-policy": "same-origin",
-    "cross-origin-embedder-policy": "require-corp",
-  });
-  response.end(body);
-});
-await new Promise((ready) => server.listen(0, "127.0.0.1", ready));
+const server = await serve();
 
 const browser = await (options.browser === "firefox" ? firefox : chromium).launch({
   headless: !options.headed,
@@ -155,7 +127,7 @@ page.on("console", (message) => {
     problems.push(message.text());
   }
 });
-await page.goto(`http://localhost:${server.address().port}/bench.html`);
+await page.goto(`${server.address}/bench.html`);
 await page.waitForFunction(() => window.__bench !== undefined);
 if (options.slowdown > 1) {
   if (options.browser === "firefox") {

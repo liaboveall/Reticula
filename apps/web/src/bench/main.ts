@@ -1,7 +1,7 @@
 // The measurement page. It shows nothing by itself: a script drives it through
 // `window.__bench` and records what the functions return.
 //
-// It is built with `vite build --mode bench`, with the same settings as the
+// It is built with `vite build --mode spikes`, with the same settings as the
 // app, and measures the same grid package and engine worker the app runs.
 
 import "@reticula/grid/grid.css";

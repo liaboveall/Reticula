@@ -8,7 +8,7 @@
       "packages/**",
       "tests/**",
       "!**/dist",
-      "!**/dist-bench",
+      "!**/dist-spikes",
       "!**/pkg",
       "!**/generated"
     ]

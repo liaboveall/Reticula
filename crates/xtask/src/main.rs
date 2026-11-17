@@ -41,7 +41,8 @@ Commands:
   ci                      Everything CI runs on a push. Run it before pushing.
   spike <name> [options]  Run one of the experiments under spikes/ and print its report.
                           `s1` and `s2` measure the grid in a browser and pass their
-                          options on: see spikes/grid/measure.mjs.
+                          options on: see spikes/grid/measure.mjs. `s10` serves the
+                          page for checking input methods: see spikes/grid/ime.mjs.
 ";
 
 fn main() -> ExitCode {
@@ -161,13 +162,15 @@ fn build(flags: &Flags) -> Result {
     if !flags.has("skip-wasm") {
         wasm::build(Profile::Release)?;
     }
-    web::build()
+    web::build()?;
+    web::build_spikes()
 }
 
 fn e2e(flags: &Flags) -> Result {
     if !flags.has("skip-build") {
         wasm::build(Profile::Release)?;
         web::build()?;
+        web::build_spikes()?;
     }
     web::e2e(flags.get("browser"))
 }
@@ -183,5 +186,6 @@ fn ci() -> Result {
     web::check()?;
     web::test()?;
     web::build()?;
+    web::build_spikes()?;
     web::e2e(None)
 }

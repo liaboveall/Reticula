@@ -70,11 +70,14 @@ for (const file of walk(process.argv[1])) {
     report_sizes(&files)
 }
 
-/// Builds the measurement page: the app's build settings, another entry.
-pub fn build_bench() -> Result {
-    util::step("vite build (measurement page)");
+/// Builds the pages that experiments are run on, with the app's build
+/// settings but apart from the app: the page that is measured, and the page
+/// for checking input methods, which the end-to-end tests of the cell editor
+/// also use.
+pub fn build_spikes() -> Result {
+    util::step("vite build (pages for experiments)");
     pnpm()
-        .args(["--filter", APP, "exec", "vite", "build", "--mode", "bench"])
+        .args(["--filter", APP, "exec", "vite", "build", "--mode", "spikes"])
         .run()
 }
 
