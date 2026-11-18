@@ -1,0 +1,207 @@
+{
+  "affinity": "FFFF",
+  "commit": "9cbf93f",
+  "date": "2026-11-18",
+  "native": {
+    "b2_sum_1m": {
+      "max_ms": 1.735,
+      "mean_ms": 1.623,
+      "p50_ms": 1.648,
+      "p95_ms": 1.735,
+      "p99_ms": 1.735,
+      "samples": 15,
+      "warmup": 3
+    },
+    "b3_full_recalc_1m": {
+      "max_ms": 595.105,
+      "mean_ms": 556.35,
+      "p50_ms": 548.155,
+      "p95_ms": 595.105,
+      "p99_ms": 595.105,
+      "samples": 7,
+      "warmup": 2
+    },
+    "b4_incremental_100k": {
+      "max_ms": 29.607,
+      "mean_ms": 25.238,
+      "p50_ms": 24.713,
+      "p95_ms": 29.607,
+      "p99_ms": 29.607,
+      "samples": 15,
+      "warmup": 3
+    },
+    "b5_chain_1m": {
+      "max_ms": 665.665,
+      "mean_ms": 632.754,
+      "p50_ms": 623.324,
+      "p95_ms": 665.665,
+      "p99_ms": 665.665,
+      "samples": 7,
+      "warmup": 2
+    },
+    "b7a_insert_cross_range": {
+      "max_ms": 1.822,
+      "mean_ms": 1.591,
+      "p50_ms": 1.56,
+      "p95_ms": 1.822,
+      "p99_ms": 1.822,
+      "samples": 15,
+      "warmup": 3
+    },
+    "b7a_insert_structural_row_fn": {
+      "max_ms": 41.483,
+      "mean_ms": 36.848,
+      "p50_ms": 36.272,
+      "p95_ms": 41.483,
+      "p99_ms": 41.483,
+      "samples": 15,
+      "warmup": 3
+    },
+    "b7a_insert_top_row_local": {
+      "max_ms": 0.012,
+      "mean_ms": 0.002,
+      "p50_ms": 0.001,
+      "p95_ms": 0.012,
+      "p99_ms": 0.012,
+      "samples": 15,
+      "warmup": 3
+    },
+    "b7b_edit_after_insert_cross_range": {
+      "max_ms": 1.714,
+      "mean_ms": 1.615,
+      "p50_ms": 1.634,
+      "p95_ms": 1.714,
+      "p99_ms": 1.714,
+      "samples": 15,
+      "warmup": 3
+    },
+    "b7b_edit_after_insert_row_local": {
+      "max_ms": 0.263,
+      "mean_ms": 0.17,
+      "p50_ms": 0.148,
+      "p95_ms": 0.263,
+      "p99_ms": 0.263,
+      "samples": 15,
+      "warmup": 3
+    },
+    "b7b_edit_after_insert_structural": {
+      "max_ms": 0.267,
+      "mean_ms": 0.182,
+      "p50_ms": 0.171,
+      "p95_ms": 0.267,
+      "p99_ms": 0.267,
+      "samples": 15,
+      "warmup": 3
+    }
+  },
+  "suite": "m1a-engine",
+  "uncommittedChanges": false,
+  "wasmChrome": {
+    "affinity": "FFFF",
+    "b2_sum_1m": {
+      "max_ms": 2.255,
+      "mean_ms": 2.027,
+      "p50_ms": 2.04,
+      "p95_ms": 2.255,
+      "p99_ms": 2.255,
+      "samples": 20,
+      "warmup": 3
+    },
+    "b3_full_recalc_1m": {
+      "max_ms": 475.63,
+      "mean_ms": 446.545,
+      "p50_ms": 456.27,
+      "p95_ms": 475.63,
+      "p99_ms": 475.63,
+      "samples": 10,
+      "warmup": 2
+    },
+    "b4_incremental_100k": {
+      "max_ms": 31.96,
+      "mean_ms": 25.574,
+      "p50_ms": 24.18,
+      "p95_ms": 31.96,
+      "p99_ms": 31.96,
+      "samples": 20,
+      "warmup": 3
+    },
+    "b5_chain_1m": {
+      "max_ms": 623.26,
+      "mean_ms": 600.446,
+      "p50_ms": 608.955,
+      "p95_ms": 623.26,
+      "p99_ms": 623.26,
+      "samples": 10,
+      "warmup": 2
+    },
+    "b7a_insert_cross_range": {
+      "max_ms": 2.28,
+      "mean_ms": 2.106,
+      "p50_ms": 2.125,
+      "p95_ms": 2.28,
+      "p99_ms": 2.28,
+      "samples": 20,
+      "warmup": 3
+    },
+    "b7a_insert_structural_row_fn": {
+      "max_ms": 30.77,
+      "mean_ms": 28.861,
+      "p50_ms": 29.355,
+      "p95_ms": 30.77,
+      "p99_ms": 30.77,
+      "samples": 15,
+      "warmup": 3
+    },
+    "b7a_insert_top_row_local": {
+      "batch100_mean_ms": 0.0017,
+      "batch_note": "mean of 100 consecutive top-row insertions (single op approaches 5 us timer quantum)",
+      "max_ms": 0.01,
+      "mean_ms": 0.004,
+      "p50_ms": 0.005,
+      "p95_ms": 0.01,
+      "p99_ms": 0.01,
+      "samples": 30,
+      "warmup": 5
+    },
+    "b7b_edit_after_insert_cross_range": {
+      "max_ms": 2.18,
+      "mean_ms": 1.914,
+      "p50_ms": 1.905,
+      "p95_ms": 2.18,
+      "p99_ms": 2.18,
+      "samples": 20,
+      "warmup": 3
+    },
+    "b7b_edit_after_insert_row_local": {
+      "max_ms": 0.31,
+      "mean_ms": 0.192,
+      "p50_ms": 0.18,
+      "p95_ms": 0.28,
+      "p99_ms": 0.31,
+      "samples": 30,
+      "warmup": 5
+    },
+    "b7b_edit_after_insert_structural": {
+      "max_ms": 0.29,
+      "mean_ms": 0.22,
+      "p50_ms": 0.215,
+      "p95_ms": 0.29,
+      "p99_ms": 0.29,
+      "samples": 15,
+      "warmup": 3
+    },
+    "browser": {
+      "name": "chrome",
+      "version": "158.0.8127.36"
+    },
+    "clockResolutionUs": 5,
+    "crossOriginIsolated": true,
+    "machine": {
+      "cpus": "13th Gen Intel(R) Core(TM) i9-13980HX",
+      "logicalProcessors": 32,
+      "platform": "win32 10.0.26300",
+      "totalMemGiB": 31.7
+    },
+    "memoryBytes": 2773483520
+  }
+}
