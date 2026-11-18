@@ -4,6 +4,7 @@ members = [
     "crates/core",
     "crates/formula",
     "crates/kernel-bench",
+    "crates/server",
     "crates/wasm",
     "crates/xtask",
     "spikes/determinism",

@@ -262,6 +262,17 @@ impl WasmBench {
             .edit_cell_raw(SheetId(0), RowId(50), ColId(1), &format!("{v}"));
         self.engine.recalc_all()
     }
+
+    /// Decodes an `RTCLSNAP` v0 snapshot buffer into a live `FormulaEngine` and
+    /// returns the primary sheet's live row count (used for real-dataset load
+    /// benchmarks in `13-m1a.md` 8.3).
+    pub fn decode_snapshot_rows(bytes: &[u8]) -> Result<u32, JsError> {
+        let _ = reticula_core::memory::try_reserve_heap(bytes.len().saturating_mul(16));
+        let (eng, _) = FormulaEngine::decode_snapshot(bytes)
+            .map_err(|e| JsError::new(&format!("decode_snapshot failed: {e:?}")))?;
+        let rows = eng.workbook().sheet(SheetId(0)).map_or(0, Sheet::rows);
+        Ok(rows)
+    }
 }
 
 fn build_1m_row_local() -> FormulaEngine {

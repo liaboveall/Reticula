@@ -1,0 +1,88 @@
+name: Container Image
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  CARGO_TERM_COLOR: always
+  IMAGE_NAME: ghcr.io/liaboveall/reticula
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  arm64:
+    name: linux/arm64 image
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
+        with:
+          tool: wasm-bindgen@0.2.130
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 26
+      - name: Install pnpm
+        run: npm install --global "$(node --print "require('./package.json').packageManager")"
+      - run: pnpm install --frozen-lockfile
+      - name: Build production web bundle and server binary
+        run: |
+          cargo xtask build --check-budget
+          cargo build --locked --release --package reticula-server
+      - name: Package runtime image
+        run: |
+          STAGE="$(mktemp -d)"
+          cp target/release/reticula-server "${STAGE}/reticula-server"
+          cp -R apps/web/dist "${STAGE}/dist"
+          cat > "${STAGE}/Dockerfile" <<'EOF'
+          FROM debian:bookworm-slim
+          RUN apt-get update \
+              && apt-get install -y --no-install-recommends ca-certificates \
+              && rm -rf /var/lib/apt/lists/* \
+              && useradd --uid 10001 --user-group --no-create-home --shell /usr/sbin/nologin reticula
+          WORKDIR /srv/reticula
+          COPY reticula-server /usr/local/bin/reticula-server
+          COPY dist ./dist
+          USER 10001:10001
+          ENV BIND_ADDR=0.0.0.0:3200
+          ENV RETICULA_STATIC_DIR=/srv/reticula/dist
+          EXPOSE 3200
+          ENTRYPOINT ["/usr/local/bin/reticula-server"]
+          EOF
+          SHORT_SHA="${GITHUB_SHA::7}"
+          docker build --tag "${IMAGE_NAME}:${SHORT_SHA}" --tag "${IMAGE_NAME}:latest" "${STAGE}"
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            TAG_NAME="${GITHUB_REF#refs/tags/}"
+            docker tag "${IMAGE_NAME}:${SHORT_SHA}" "${IMAGE_NAME}:${TAG_NAME}"
+          fi
+      - name: Smoke-test container health and precompressed assets
+        run: |
+          SHORT_SHA="${GITHUB_SHA::7}"
+          CID="$(docker run -d -p 127.0.0.1:3200:3200 "${IMAGE_NAME}:${SHORT_SHA}")"
+          trap 'docker rm -f "${CID}" >/dev/null 2>&1 || true' EXIT
+          for _ in {1..20}; do
+            if curl -fsS http://127.0.0.1:3200/healthz >/dev/null; then
+              break
+            fi
+            sleep 0.25
+          done
+          curl -fsS http://127.0.0.1:3200/healthz | grep -qx "ok"
+          curl -fsSI -H "Accept-Encoding: br" http://127.0.0.1:3200/app | grep -qi "^content-encoding: br"
+      - name: Push to GitHub Container Registry
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          SHORT_SHA="${GITHUB_SHA::7}"
+          docker push "${IMAGE_NAME}:${SHORT_SHA}"
+          docker push "${IMAGE_NAME}:latest"
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            TAG_NAME="${GITHUB_REF#refs/tags/}"
+            docker push "${IMAGE_NAME}:${TAG_NAME}"
+          fi
