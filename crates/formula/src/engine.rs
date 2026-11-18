@@ -227,11 +227,11 @@ impl FormulaEngine {
     #[must_use]
     pub fn open_sample(seed: u64, rows: u32) -> Self {
         let formula_rows = rows.saturating_sub(1).min(SAMPLE_FORMULA_ROWS);
-        let extra_formula_heap = (formula_rows as usize).saturating_mul(512);
+        let extra_formula_heap = (formula_rows as usize).saturating_mul(1_152);
         let total_reserve = (rows as usize)
-            .saturating_mul(20_usize.saturating_mul(size_of::<u64>()))
+            .saturating_mul(200)
             .saturating_add(extra_formula_heap)
-            .saturating_add(8 * 1024 * 1024);
+            .saturating_add(16 * 1024 * 1024);
         let _ = try_reserve_heap(total_reserve);
 
         let mut sheet = sample::generate(seed, rows);
@@ -316,10 +316,10 @@ impl FormulaEngine {
             let cached = wb
                 .sheet(sheet_id)
                 .map_or(Value::Number(0.0), |s| s.value_by_id(row_id, ColId(12)));
-            wb.insert_seeded_formula(sheet_id, row_id, ColId(12), formula.clone(), cached);
             let fid = u32::try_from(slots.len()).unwrap_or(0);
             let key = (sheet_id, row_id, ColId(12));
             let reg = dep_graph.register(fid, sheet_id, &formula);
+            wb.insert_seeded_formula(sheet_id, row_id, ColId(12), formula, cached);
             slots.push(Some(FormulaSlot { key, reg }));
             cell_to_fid.insert(key, fid);
         }
@@ -343,16 +343,16 @@ impl FormulaEngine {
                     })],
                 },
             };
+            let fid = u32::try_from(slots.len()).unwrap_or(0);
+            let key = (sheet_id, RowId(1), ColId(21));
+            let reg = dep_graph.register(fid, sheet_id, &sum_formula);
             wb.insert_seeded_formula(
                 sheet_id,
                 RowId(1),
                 ColId(21),
-                sum_formula.clone(),
+                sum_formula,
                 Value::number(v2_initial),
             );
-            let fid = u32::try_from(slots.len()).unwrap_or(0);
-            let key = (sheet_id, RowId(1), ColId(21));
-            let reg = dep_graph.register(fid, sheet_id, &sum_formula);
             slots.push(Some(FormulaSlot { key, reg }));
             cell_to_fid.insert(key, fid);
         }

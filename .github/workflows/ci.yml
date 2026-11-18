@@ -91,7 +91,7 @@ jobs:
           path: packages/protocol/pkg
       - run: cargo xtask check --web --skip-wasm
       - run: cargo xtask test --web
-      - run: cargo xtask build --skip-wasm
+      - run: cargo xtask build --skip-wasm --check-budget
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: web-dist

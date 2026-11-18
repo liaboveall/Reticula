@@ -42,7 +42,8 @@ Commands:
   bench [--affinity <mask>] [--browser <name>] [--quick] [--out <file>]
                           Run native and Chrome WASM engine benchmarks (B2-B5, B7a, B7b).
   dev                     Build a debug module and start the development server.
-  build [--skip-wasm]     Production build with precompressed assets and a size report.
+  build [--skip-wasm] [--check-budget]
+                          Production build with preloads, precompressed assets and size budget check.
   e2e [--browser <name>] [--skip-build]
                           End-to-end tests in chromium, firefox and webkit.
   ci                      Everything CI runs on a push. Run it before pushing.
@@ -106,7 +107,7 @@ fn run(args: &[String]) -> Result {
             wasm::build(Profile::Dev)?;
             web::dev()
         }
-        "build" => build(&Flags::parse(rest, &["skip-wasm"], &[])?),
+        "build" => build(&Flags::parse(rest, &["skip-wasm", "check-budget"], &[])?),
         "e2e" => e2e(&Flags::parse(rest, &["skip-build"], &["browser"])?),
         "ci" => {
             Flags::parse(rest, &[], &[])?;
