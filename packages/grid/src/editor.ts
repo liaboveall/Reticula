@@ -10,7 +10,10 @@ export interface CellPosition {
 
 /** Something the editor did or saw: for a log, or for a test to wait on. */
 export type EditorEvent =
-  | { readonly kind: "started"; readonly cause: "typing" | "composition" | "F2" }
+  | {
+      readonly kind: "started";
+      readonly cause: "typing" | "composition" | "F2" | "doubleClick" | "formulaBar";
+    }
   | { readonly kind: "committed"; readonly cell: CellPosition; readonly text: string }
   | { readonly kind: "cancelled"; readonly cell: CellPosition }
   | {
@@ -33,10 +36,14 @@ export type EditorEvent =
   | { readonly kind: "clipboard"; readonly type: "copy" | "cut" | "paste" };
 
 export interface CellEditorOptions {
-  /** The text to start from when a cell is opened for editing with F2. */
+  /** The text to start from when a cell is opened for editing (`F2` or double-click). */
   readonly textOf: (cell: CellPosition) => string;
   /** Called with what was typed when an edit is accepted. */
   readonly onCommit: (cell: CellPosition, text: string) => void;
+  /** Called when the user presses `Delete` or `Backspace` while navigating. */
+  readonly onClear?: () => void;
+  /** Called whenever the live editor text or active editing cell changes (for formula bar sync). */
+  readonly onTextChange?: (text: string, editing: CellPosition | null) => void;
   readonly onEvent?: (event: EditorEvent) => void;
 }
 
@@ -49,15 +56,14 @@ const STEPS: Readonly<Record<string, readonly [number, number]>> = {
 };
 
 /**
- * The editor of the selected cell.
+ * The editor of the selected cell (`13-m1a.md` 6.2).
  *
- * A canvas cannot take text input, least of all from an input method, whose
- * window of candidates has to open next to the text being written. So there
- * is a real text editor, and it is always there: it holds the keyboard focus
- * and sits on the selected cell, invisible. Moving around the grid is its key
- * presses, passed on. The moment a character or a composition arrives, it
- * arrives in the right place, and all that is left to do is to show the
- * editor.
+ * Always present and focused on the active cell, invisible until an edit
+ * starts. Distinguishes two entry modes matching Excel:
+ * - `"input"` mode (direct typing or IME composition): pressing an arrow key
+ *   outside IME composition commits the cell and moves the grid selection;
+ * - `"edit"` mode (`F2`, double-click, or formula bar): arrow keys move the
+ *   text caret inside the editor without leaving the cell.
  */
 export class CellEditor {
   #grid: Grid;
@@ -67,6 +73,8 @@ export class CellEditor {
   #view: EditorView;
   /** The cell being edited, while one is. */
   #cell: CellPosition | null = null;
+  #mode: "input" | "edit" = "input";
+  #suppressAutoStart = false;
   #stopWatching: () => void;
 
   constructor(grid: Grid, host: HTMLElement, options: CellEditorOptions) {
@@ -87,9 +95,11 @@ export class CellEditor {
             transaction.newDoc.lines > 1 ? [] : transaction,
           ),
           EditorView.updateListener.of((update) => {
-            // Text has arrived in the hidden editor: that is how an edit starts.
-            if (update.docChanged && !this.#cell && update.state.doc.length > 0) {
-              this.#start("typing");
+            if (update.docChanged) {
+              if (!this.#suppressAutoStart && !this.#cell && update.state.doc.length > 0) {
+                this.#start("typing", "input");
+              }
+              this.#options.onTextChange?.(update.state.doc.toString(), this.#cell);
             }
           }),
           EditorView.domEventHandlers({
@@ -97,9 +107,7 @@ export class CellEditor {
             compositionstart: (event) => {
               this.#note({ kind: "composition", phase: "start", data: event.data });
               if (!this.#cell) {
-                // Shown before the first character is settled, so that the
-                // text being composed is seen where it will go.
-                this.#start("composition");
+                this.#start("composition", "input");
               }
             },
             compositionupdate: (event) => {
@@ -107,6 +115,7 @@ export class CellEditor {
             },
             compositionend: (event) => {
               this.#note({ kind: "composition", phase: "end", data: event.data });
+              this.#options.onTextChange?.(this.text, this.#cell);
             },
             copy: (event) => this.#onClipboard(event, "copy"),
             cut: (event) => this.#onClipboard(event, "cut"),
@@ -116,17 +125,20 @@ export class CellEditor {
       }),
     });
 
-    // Focus that lands on the grid belongs to the editor.
     host.addEventListener("focus", this.#takeFocus);
-    // Before the grid moves the selection to a cell that was clicked.
     host.addEventListener("pointerdown", this.#onPointerDown, { capture: true });
     this.#stopWatching = grid.watchFrames(this.#place);
     this.#place();
   }
 
-  /** The cell being edited, or `null` while the user is moving around. */
+  /** The cell being edited, or `null` while navigating. */
   get editing(): CellPosition | null {
     return this.#cell;
+  }
+
+  /** Current entry mode while editing (`"input"` or `"edit"`). */
+  get editMode(): "input" | "edit" {
+    return this.#mode;
   }
 
   /** The text typed so far. */
@@ -141,6 +153,74 @@ export class CellEditor {
 
   /** Gives the editor the keyboard. */
   focus(): void {
+    this.#view.focus();
+  }
+
+  /** Opens the currently selected cell in `"edit"` mode (double-click or `F2`). */
+  startEdit(
+    cause: "F2" | "doubleClick" | "formulaBar" = "doubleClick",
+    initialText?: string,
+    focusEditor = true,
+  ): void {
+    const cell = this.#grid.selection;
+    if (!cell) {
+      return;
+    }
+    const text = initialText ?? this.#options.textOf(cell);
+    this.#suppressAutoStart = true;
+    this.#view.dispatch({
+      changes: { from: 0, to: this.#view.state.doc.length, insert: text },
+      selection: { anchor: text.length },
+    });
+    this.#suppressAutoStart = false;
+    if (!this.#cell) {
+      this.#start(cause, "edit");
+    } else {
+      this.#mode = "edit";
+    }
+    this.#options.onTextChange?.(this.text, this.#cell);
+    if (focusEditor) {
+      this.#view.focus();
+    }
+  }
+
+  /**
+   * Synchronizes live text typed in the external formula bar without stealing
+   * keyboard focus away from the formula bar `<input>`.
+   */
+  setTextExternal(text: string): void {
+    if (!this.#cell) {
+      this.startEdit("formulaBar", text, false);
+      return;
+    }
+    this.#mode = "edit";
+    if (this.text !== text) {
+      this.#suppressAutoStart = true;
+      this.#view.dispatch({
+        changes: { from: 0, to: this.#view.state.doc.length, insert: text },
+        selection: { anchor: text.length },
+      });
+      this.#suppressAutoStart = false;
+    }
+  }
+
+  /** Commits an active edit initiated or modified from the formula bar and moves down. */
+  commitExternal(moveDown = true): void {
+    const cell = this.#commit();
+    if (cell && moveDown) {
+      this.#grid.select(cell);
+      this.#grid.moveSelection(1, 0);
+    }
+    this.#view.focus();
+  }
+
+  /** Cancels an active edit from the formula bar and returns focus to the grid. */
+  cancelExternal(): void {
+    const cell = this.#cell;
+    if (cell) {
+      this.#finish();
+      this.#note({ kind: "cancelled", cell });
+    }
     this.#view.focus();
   }
 
@@ -163,15 +243,11 @@ export class CellEditor {
   /** Keeps the editor on its cell. Runs at the end of every frame the grid draws. */
   #place = (): void => {
     const cell = this.#cell ?? this.#grid.selection;
-    // With nothing selected it waits in the corner. It is never taken out of
-    // rendering: an element that is not rendered cannot hold the focus.
     const box = cell
       ? this.#grid.boxOf(cell.row, cell.col)
       : { left: 0, top: 0, width: 0, height: 0 };
     let { left, top } = box;
     if (!this.#cell) {
-      // While hidden it stays inside the grid even if its cell is scrolled
-      // away: an input method opens its window wherever the editor is.
       left = Math.min(Math.max(0, left), Math.max(0, this.#host.clientWidth - box.width));
       top = Math.min(Math.max(0, top), Math.max(0, this.#host.clientHeight - box.height));
     }
@@ -179,32 +255,39 @@ export class CellEditor {
     style.transform = `translate(${left}px, ${top}px)`;
     style.minWidth = `${box.width}px`;
     style.height = `${box.height}px`;
-    // One line, as tall as the row: the text sits where the cell's text is drawn.
     style.lineHeight = `${box.height}px`;
   };
 
-  #start(cause: "typing" | "composition" | "F2"): void {
+  #start(
+    cause: "typing" | "composition" | "F2" | "doubleClick" | "formulaBar",
+    mode: "input" | "edit",
+  ): void {
     const cell = this.#grid.selection;
     if (!cell) {
-      // Nothing is selected, so there is nowhere to type into.
       if (!this.composing) {
         this.#clear();
       }
       return;
     }
     this.#cell = { row: cell.row, col: cell.col };
+    this.#mode = mode;
     this.#grid.reveal(cell.row, cell.col);
     this.#box.dataset.editing = "";
     this.#place();
+    this.#options.onTextChange?.(this.text, this.#cell);
     this.#note({ kind: "started", cause });
   }
 
   /** Empties the editor and hides it again. */
   #finish(): void {
     this.#cell = null;
+    this.#mode = "input";
     delete this.#box.dataset.editing;
+    this.#suppressAutoStart = true;
     this.#clear();
+    this.#suppressAutoStart = false;
     this.#place();
+    this.#options.onTextChange?.("", null);
   }
 
   #clear(): void {
@@ -236,11 +319,6 @@ export class CellEditor {
     event: KeyboardEvent,
     view: EditorView,
   ): "input method" | "moved" | "committed" | "cancelled" | "swallowed" | "passed" {
-    // A key the input method is using is not a key press of ours: Enter
-    // accepts a candidate, Escape discards the composition, the arrows walk
-    // the candidates. Browsers mark such events in one of these ways. The key
-    // code is what marks the key that starts a composition, and the Enter
-    // that Safari reports only after the composition it accepted has ended.
     if (event.isComposing || event.keyCode === 229 || view.composing || view.compositionStarted) {
       return "input method";
     }
@@ -261,39 +339,46 @@ export class CellEditor {
         this.#note({ kind: "cancelled", cell });
         return "cancelled";
       }
-      // Everything else is editing: typing, moving the caret, deleting.
+      // In `"input"` mode (direct typing without F2), plain arrow keys commit
+      // the cell and step the grid selection, matching Excel.
+      if (this.#mode === "input" && plain && !event.shiftKey && STEPS[event.key]) {
+        const cell = this.#commit();
+        if (cell) {
+          this.#grid.select(cell);
+          this.#move(event);
+        }
+        return "committed";
+      }
       return "passed";
     }
 
-    if (plain && (STEPS[event.key] || event.key === "Enter" || event.key === "Tab")) {
+    if (plain && STEPS[event.key]) {
+      const [rows, cols] = STEPS[event.key] ?? [0, 0];
+      if (event.shiftKey) {
+        this.#grid.extendSelection(rows, cols);
+      } else {
+        this.#grid.moveSelection(rows, cols);
+      }
+      return "moved";
+    }
+    if (plain && (event.key === "Enter" || event.key === "Tab")) {
       this.#move(event);
       return "moved";
     }
     if (event.key === "F2") {
-      const cell = this.#grid.selection;
-      if (cell) {
-        const text = this.#options.textOf(cell);
-        this.#view.dispatch({
-          changes: { from: 0, to: this.#view.state.doc.length, insert: text },
-          selection: { anchor: text.length },
-        });
-        if (!this.#cell) {
-          // The cell was empty, so no text arrived to start the edit.
-          this.#start("F2");
-        }
-      }
+      this.startEdit("F2");
       return "swallowed";
     }
-    // Keys that would act on the hidden, empty editor and mean nothing yet.
-    if (event.key === "Backspace" || event.key === "Delete" || event.key === "Escape") {
+    if (event.key === "Backspace" || event.key === "Delete") {
+      this.#options.onClear?.();
       return "swallowed";
     }
-    // A character starts an edit by arriving in the editor; a shortcut is
-    // the browser's, or raises a clipboard event handled below.
+    if (event.key === "Escape") {
+      return "swallowed";
+    }
     return "passed";
   }
 
-  /** Moves the selection as a key asks: an arrow, Enter (down) or Tab (right), Shift reversing the last two. */
   #move(event: KeyboardEvent): void {
     const back = event.shiftKey ? -1 : 1;
     const [rows, cols] =
@@ -304,9 +389,6 @@ export class CellEditor {
 
   #onClipboard(event: ClipboardEvent, type: "copy" | "cut" | "paste"): boolean {
     this.#note({ kind: "clipboard", type });
-    // While a cell is being edited the clipboard works on its text, as in any
-    // editor. Otherwise it is about the selected cells, which is the grid's
-    // business once it can copy and paste; the hidden editor must not change.
     if (this.#cell) {
       return false;
     }
@@ -319,10 +401,7 @@ export class CellEditor {
     if (!this.#cell || (event.target instanceof Node && this.#box.contains(event.target))) {
       return;
     }
-    // Hidden at once, so that it is not seen jumping to the clicked cell.
     delete this.#box.dataset.editing;
-    // The click takes the focus away, which makes an input method finish or
-    // drop what it was composing. The text is read after that has happened.
     setTimeout(() => {
       this.#commit();
       this.#view.focus();

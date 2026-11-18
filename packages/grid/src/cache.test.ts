@@ -1,6 +1,7 @@
 import { PAGE_COLS, PAGE_ROWS } from "@reticula/protocol/viewport";
 import { describe, expect, test } from "vitest";
 import { PageCache } from "./cache.ts";
+import { coalesceIdRuns } from "./grid.ts";
 import type { Page } from "./page.ts";
 
 function page(pageRow: number, pageCol: number, epoch = 1): Page {
@@ -104,5 +105,24 @@ describe("the page cache", () => {
     cache.clear();
     expect(cache.size).toBe(0);
     expect(cache.accept(page(0, 0))).toBe(false);
+  });
+
+  test("resolves row and column IDs across held page strips and coalesces contiguous runs", () => {
+    const cache = new PageCache();
+    cache.retain(span(0, 2, 0, 2));
+    const p = page(0, 1);
+    p.rowIds[0] = 4294967297n;
+    p.rowIds[1] = 10n;
+    p.rowIds[2] = 11n;
+    p.colIds[3] = 99n;
+    expect(cache.accept(p)).toBe(true);
+    expect(cache.rowIdAt(0)).toBe(4294967297n);
+    expect(cache.rowIdAt(2)).toBe(11n);
+    expect(cache.colIdAt(PAGE_COLS + 3)).toBe(99n);
+    expect(coalesceIdRuns([4294967297n, 10n, 11n, 12n, 50n])).toEqual([
+      { firstId: "4294967297", len: 1 },
+      { firstId: "10", len: 3 },
+      { firstId: "50", len: 1 },
+    ]);
   });
 });

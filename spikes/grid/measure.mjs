@@ -234,7 +234,7 @@ if (bench === "s2") {
 
   results.shortcuts = [];
   console.log("\nwith one shortcut turned off (ms)");
-  for (const shortcut of ["cacheWidths", "boundNumbers", "clipOnlyOverwide", "batchState"]) {
+  for (const shortcut of ["cacheWidths", "clipOnlyOverwide", "batchState"]) {
     for (const [label, parameters] of [cases[0], cases[2]]) {
       const result = await call("s2", "draw", { ...parameters, frames, warmup: 60, shortcuts: { [shortcut]: false } });
       results.shortcuts.push({ off: shortcut, label, ...result });

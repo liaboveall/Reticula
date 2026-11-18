@@ -10,6 +10,7 @@
 .reticula-grid {
   --grid-background: #ffffff;
   --grid-text: #1f2328;
+  --grid-error-text: #b42318;
   --grid-line: #e3e5e8;
   --grid-placeholder: #f1f2f4;
   --grid-header-background: #f6f7f8;
@@ -17,6 +18,7 @@
   --grid-header-line: #d1d5da;
   --grid-header-selected: #dbe7ff;
   --grid-selection: #1a5fd0;
+  --grid-selection-fill: rgba(26, 95, 208, 0.12);
   --grid-scrollbar-track: #f6f7f8;
   --grid-scrollbar-thumb: #b4bac1;
   --grid-scrollbar-thumb-active: #7d8590;
@@ -41,6 +43,7 @@
   .reticula-grid {
     --grid-background: #16181c;
     --grid-text: #e3e6ea;
+    --grid-error-text: #ff8a7a;
     --grid-line: #2a2e35;
     --grid-placeholder: #1d2026;
     --grid-header-background: #1e2127;
@@ -48,6 +51,7 @@
     --grid-header-line: #363b44;
     --grid-header-selected: #1d3157;
     --grid-selection: #6ea1ff;
+    --grid-selection-fill: rgba(110, 161, 255, 0.18);
     --grid-scrollbar-track: #1e2127;
     --grid-scrollbar-thumb: #4a515c;
     --grid-scrollbar-thumb-active: #7a8492;

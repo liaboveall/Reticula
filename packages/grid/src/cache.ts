@@ -58,6 +58,32 @@ export class PageCache {
     return this.get(Math.floor(row / PAGE_ROWS), Math.floor(col / PAGE_COLS));
   }
 
+  /** Identifier of `row` from any held page covering `row`'s page strip. */
+  rowIdAt(row: number): bigint | undefined {
+    const pageRow = Math.floor(row / PAGE_ROWS);
+    const offset = row - pageRow * PAGE_ROWS;
+    for (let col = this.#span.firstCol; col < this.#span.endCol; col++) {
+      const page = this.get(pageRow, col);
+      if (page && offset >= 0 && offset < page.rowCount) {
+        return page.rowIds[offset];
+      }
+    }
+    return undefined;
+  }
+
+  /** Identifier of `col` from any held page covering `col`'s page strip. */
+  colIdAt(col: number): bigint | undefined {
+    const pageCol = Math.floor(col / PAGE_COLS);
+    const offset = col - pageCol * PAGE_COLS;
+    for (let row = this.#span.firstRow; row < this.#span.endRow; row++) {
+      const page = this.get(row, pageCol);
+      if (page && offset >= 0 && offset < page.colCount) {
+        return page.colIds[offset];
+      }
+    }
+    return undefined;
+  }
+
   clear(): void {
     this.#pages.clear();
     this.#span = EMPTY_SPAN;

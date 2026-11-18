@@ -61,7 +61,8 @@ export async function serve({ port = 0, site = join(root, "apps/web/dist"), enco
   const server = createServer(async (request, response) => {
     const arrived = performance.now();
     const path = new URL(request.url, "http://localhost").pathname;
-    const file = normalize(join(site, path === "/" ? "index.html" : path));
+    const targetPath = extname(path) ? path : "index.html";
+    const file = normalize(join(site, targetPath));
     const accepted = String(request.headers["accept-encoding"] ?? "");
     let body;
     let encoding = "";

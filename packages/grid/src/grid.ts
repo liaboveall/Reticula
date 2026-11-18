@@ -26,6 +26,12 @@ import { Renderer } from "./renderer.ts";
 import { Scrollbar } from "./scrollbar.ts";
 import { readTheme, type Theme } from "./theme.ts";
 
+/** Contiguous run of row or column identifiers (`firstId .. firstId + len`). */
+export interface IdRun {
+  readonly firstId: string;
+  readonly len: number;
+}
+
 /** A range of cells the grid asks the engine for. */
 export interface Subscription {
   /** Chosen by the grid; the engine returns it on every page sent for this range. */
@@ -43,14 +49,18 @@ export interface GridOptions {
    */
   readonly subscribe: (subscription: Subscription) => void;
   /**
-   * How much to hold beyond what is visible, in multiples of the visible
-   * range, on each side. More means fewer placeholders when scrolling fast
-   * and more data in flight.
+   * Fixed prefetch margin in multiples of the visible range. When omitted, the
+   * grid adapts row margin dynamically between `0.5` (idle / slow scroll) and
+   * `2.0` (rapid continuous scroll).
    */
   readonly margin?: { readonly rows: number; readonly cols: number };
   readonly metrics?: Metrics;
   /** Called at the end of every frame, for measurements. */
   readonly onFrame?: (frame: FrameReport) => void;
+  /** Called whenever the active selection or its resolved IDs/text change. */
+  readonly onSelectionChange?: (selection: Selection | null) => void;
+  /** Called when the user double-clicks a cell to open edit mode. */
+  readonly onActivateEdit?: (cell: { readonly row: number; readonly col: number }) => void;
 }
 
 /** What one frame did. */
@@ -67,15 +77,18 @@ export interface FrameReport {
   readonly missing: number;
 }
 
-/** The cell the user picked. */
+/** The active cell and rectangular selection chosen by the user. */
 export interface Selection {
+  /** Active anchor cell row (`0`-based). */
   readonly row: number;
+  /** Active anchor cell column (`0`-based). */
   readonly col: number;
-  /** Its name, such as `B7`. */
+  /** Half-open normalized selection bounds (`firstRow..endRow`, `firstCol..endCol`). */
+  readonly range: Span;
+  /** Canonical A1 label: `"B7"` for one cell, `"B7:D10"` for a multi-cell range. */
   readonly name: string;
   /**
-   * The identifiers of its row and column, which is how a command names a
-   * cell, and its text; `null` until the page that holds the cell arrives.
+   * Identifiers of the active cell's row and column (`null` until its page arrives).
    */
   readonly rowId: string | null;
   readonly colId: string | null;
@@ -107,8 +120,7 @@ export interface GridStats {
   readonly epoch: number;
   /**
    * Time the main thread spent per frame handling input, receiving pages and
-   * issuing draw calls, in milliseconds, over the most recent frames. It does
-   * not include the browser's own rasterisation and compositing.
+   * issuing draw calls, in milliseconds, over the most recent frames.
    */
   readonly frameWork: {
     readonly samples: number;
@@ -121,13 +133,29 @@ export interface GridStats {
   readonly selection: Selection | null;
 }
 
-const DEFAULT_MARGIN = { rows: 2, cols: 1 };
+const IDLE_MARGIN = { rows: 0.5, cols: 1 };
+const FAST_MARGIN = { rows: 2, cols: 1 };
+const FAST_SCROLL_HOLD_MS = 400;
 
 /** How many recent frames the frame-work statistics cover. */
 const FRAME_SAMPLES = 600;
 
 /** Pixels per line and per page for wheels that report those units. */
 const WHEEL_LINE = 40;
+
+/** Coalesces an array of `bigint` IDs into contiguous `{ firstId, len }` runs. */
+export function coalesceIdRuns(ids: readonly bigint[]): IdRun[] {
+  const runs: IdRun[] = [];
+  for (const id of ids) {
+    const prev = runs[runs.length - 1];
+    if (prev && BigInt(prev.firstId) + BigInt(prev.len) === id) {
+      runs[runs.length - 1] = { firstId: prev.firstId, len: prev.len + 1 };
+    } else {
+      runs.push({ firstId: String(id), len: 1 });
+    }
+  }
+  return runs;
+}
 
 /**
  * A spreadsheet grid drawn on a canvas.
@@ -145,17 +173,29 @@ export class Grid {
   #corner: HTMLDivElement;
   #subscribe: (subscription: Subscription) => void;
   #metrics: Metrics;
-  #margin: { readonly rows: number; readonly cols: number };
+  #fixedMargin: { readonly rows: number; readonly cols: number } | null;
   #frameListeners = new Set<(frame: FrameReport) => void>();
+  #onSelectionChange: ((selection: Selection | null) => void) | undefined;
+  #onActivateEdit: ((cell: { readonly row: number; readonly col: number }) => void) | undefined;
 
   #theme: Theme;
   #sheet: SheetSize = { rows: 0, cols: 0 };
   #size: Size = { width: 0, height: 0 };
   #scale = 1;
   #scroll: Scroll = { top: 0, left: 0 };
-  #selected: { row: number; col: number } | null = null;
+  #anchor: { row: number; col: number } | null = null;
+  #focus: { row: number; col: number } | null = null;
   #cache = new PageCache();
   #epoch = 0;
+
+  #lastVelocityTop = 0;
+  #lastVelocityTime = 0;
+  #fastScrollUntil = 0;
+
+  #draggingPointerId: number | null = null;
+  #dragClientX = 0;
+  #dragClientY = 0;
+  #autoScrollTimer = 0;
 
   #frameRequest = 0;
   #resized = true;
@@ -182,7 +222,9 @@ export class Grid {
     this.#host = host;
     this.#subscribe = options.subscribe;
     this.#metrics = options.metrics ?? DEFAULT_METRICS;
-    this.#margin = options.margin ?? DEFAULT_MARGIN;
+    this.#fixedMargin = options.margin ?? null;
+    this.#onSelectionChange = options.onSelectionChange;
+    this.#onActivateEdit = options.onActivateEdit;
     if (options.onFrame) {
       this.#frameListeners.add(options.onFrame);
     }
@@ -205,6 +247,10 @@ export class Grid {
 
     host.addEventListener("wheel", this.#onWheel, { passive: false });
     this.#canvas.addEventListener("pointerdown", this.#onPointerDown);
+    this.#canvas.addEventListener("pointermove", this.#onPointerMove);
+    this.#canvas.addEventListener("pointerup", this.#onPointerUp);
+    this.#canvas.addEventListener("pointercancel", this.#onPointerUp);
+    this.#canvas.addEventListener("dblclick", this.#onDoubleClick);
     this.#observer = new ResizeObserver(() => {
       this.#resized = true;
       this.#invalidate();
@@ -213,12 +259,38 @@ export class Grid {
     this.#invalidate();
   }
 
-  /** Tells the grid how large the sheet is. Call it when a document opens. */
+  /** Tells the grid how large a newly opened sheet is, resetting scroll and selection. */
   setSheet(sheet: SheetSize): void {
     this.#sheet = { rows: sheet.rows, cols: sheet.cols };
     this.#scroll = { top: 0, left: 0 };
-    this.#selected = null;
+    this.#anchor = null;
+    this.#focus = null;
     this.#cache.clear();
+    this.#notifySelection();
+    this.#invalidate();
+  }
+
+  /**
+   * Updates sheet dimensions after a structural operation (`InsertRows` /
+   * `DeleteRows`) while preserving scroll position and clamping selection.
+   */
+  updateSheet(sheet: SheetSize): void {
+    this.#sheet = { rows: sheet.rows, cols: sheet.cols };
+    this.#scroll = clampScroll(this.#scroll, scrollLimits(this.#metrics, this.#sheet, this.#size));
+    if (this.#anchor && (this.#sheet.rows <= 0 || this.#sheet.cols <= 0)) {
+      this.#anchor = null;
+      this.#focus = null;
+    } else if (this.#anchor && this.#focus) {
+      this.#anchor = {
+        row: Math.min(this.#sheet.rows - 1, this.#anchor.row),
+        col: Math.min(this.#sheet.cols - 1, this.#anchor.col),
+      };
+      this.#focus = {
+        row: Math.min(this.#sheet.rows - 1, this.#focus.row),
+        col: Math.min(this.#sheet.cols - 1, this.#focus.col),
+      };
+    }
+    this.#notifySelection();
     this.#invalidate();
   }
 
@@ -229,6 +301,18 @@ export class Grid {
     this.#pagesReceived++;
     this.#bytesReceived += page.byteLength;
     if (this.#cache.accept(page)) {
+      if (this.#anchor) {
+        const range = this.selectionRange;
+        if (
+          range &&
+          page.firstRow < range.endRow &&
+          page.firstRow + page.rowCount > range.firstRow &&
+          page.firstCol < range.endCol &&
+          page.firstCol + page.colCount > range.firstCol
+        ) {
+          this.#notifySelection();
+        }
+      }
       this.#invalidate();
     } else {
       this.#pagesDiscarded++;
@@ -241,36 +325,152 @@ export class Grid {
     const limits = scrollLimits(this.#metrics, this.#sheet, this.#size);
     const next = clampScroll({ ...this.#scroll, ...position }, limits);
     if (next.top !== this.#scroll.top || next.left !== this.#scroll.left) {
+      const now = performance.now();
+      const dt = now - this.#lastVelocityTime;
+      const dTop = Math.abs(next.top - this.#lastVelocityTop);
+      const areaHeight = Math.max(1, cellArea(this.#metrics, this.#size).height);
+      if (dt > 0 && dt < 250 && (dTop / dt) * 1000 > areaHeight * 1.5) {
+        this.#fastScrollUntil = now + FAST_SCROLL_HOLD_MS;
+      } else if (dTop > areaHeight * 1.5) {
+        this.#fastScrollUntil = now + FAST_SCROLL_HOLD_MS;
+      }
+      this.#lastVelocityTop = next.top;
+      this.#lastVelocityTime = now;
       this.#scroll = next;
       this.#invalidate();
     }
   }
 
-  /** Selects a cell, or nothing. */
+  /** Selects a single cell, or clears selection when `null`. */
   select(cell: { row: number; col: number } | null): void {
-    this.#selected = cell ? { row: cell.row, col: cell.col } : null;
+    if (!cell || this.#sheet.rows <= 0 || this.#sheet.cols <= 0) {
+      this.#anchor = null;
+      this.#focus = null;
+    } else {
+      const clamped = {
+        row: Math.min(this.#sheet.rows - 1, Math.max(0, cell.row)),
+        col: Math.min(this.#sheet.cols - 1, Math.max(0, cell.col)),
+      };
+      this.#anchor = clamped;
+      this.#focus = clamped;
+    }
+    this.#notifySelection();
     this.#invalidate();
   }
 
-  /** The selected cell. */
+  /** Selects a rectangular range from `anchor` to `focus`. */
+  selectRange(anchor: { row: number; col: number }, focus: { row: number; col: number }): void {
+    if (this.#sheet.rows <= 0 || this.#sheet.cols <= 0) {
+      return;
+    }
+    this.#anchor = {
+      row: Math.min(this.#sheet.rows - 1, Math.max(0, anchor.row)),
+      col: Math.min(this.#sheet.cols - 1, Math.max(0, anchor.col)),
+    };
+    this.#focus = {
+      row: Math.min(this.#sheet.rows - 1, Math.max(0, focus.row)),
+      col: Math.min(this.#sheet.cols - 1, Math.max(0, focus.col)),
+    };
+    this.#notifySelection();
+    this.#invalidate();
+  }
+
+  /** The active anchor cell (`null` when nothing is selected). */
   get selection(): { readonly row: number; readonly col: number } | null {
-    return this.#selected;
+    return this.#anchor;
+  }
+
+  /** Normalized half-open span covering the rectangular selection. */
+  get selectionRange(): Span | null {
+    if (!this.#anchor || !this.#focus) {
+      return null;
+    }
+    return {
+      firstRow: Math.min(this.#anchor.row, this.#focus.row),
+      endRow: Math.max(this.#anchor.row, this.#focus.row) + 1,
+      firstCol: Math.min(this.#anchor.col, this.#focus.col),
+      endCol: Math.max(this.#anchor.col, this.#focus.col) + 1,
+    };
+  }
+
+  /** Full selection descriptor with resolved IDs and A1 name. */
+  selectionDetails(): Selection | null {
+    return this.#selection();
+  }
+
+  /** Resolves a `0`-based row position's 64-bit ID as decimal string, if cached. */
+  rowIdAt(row: number): string | null {
+    const id = this.#cache.rowIdAt(row);
+    return id === undefined ? null : String(id);
+  }
+
+  /** Resolves contiguous `IdRun`s for all rows in the current selection, or `null` if uncached. */
+  selectedRowRuns(): IdRun[] | null {
+    const range = this.selectionRange;
+    if (!range) {
+      return null;
+    }
+    const ids: bigint[] = [];
+    for (let r = range.firstRow; r < range.endRow; r++) {
+      const id = this.#cache.rowIdAt(r);
+      if (id === undefined) {
+        return null;
+      }
+      ids.push(id);
+    }
+    return coalesceIdRuns(ids);
+  }
+
+  /** Resolves contiguous row and column `IdRun`s for clearing the current selection. */
+  selectedCellRuns(): { readonly rows: IdRun[]; readonly cols: IdRun[] } | null {
+    const range = this.selectionRange;
+    if (!range) {
+      return null;
+    }
+    const rows = this.selectedRowRuns();
+    if (!rows) {
+      return null;
+    }
+    const colIds: bigint[] = [];
+    for (let c = range.firstCol; c < range.endCol; c++) {
+      const id = this.#cache.colIdAt(c);
+      if (id === undefined) {
+        return null;
+      }
+      colIds.push(id);
+    }
+    return { rows, cols: coalesceIdRuns(colIds) };
   }
 
   /**
-   * Moves the selection by a number of rows and columns, stopping at the
-   * edges of the sheet, and scrolls it into view. Without a selection it does
-   * nothing.
+   * Moves the active selection by `(rows, cols)` collapsing any multi-cell
+   * range, clamping to sheet edges, and scrolling into view.
    */
   moveSelection(rows: number, cols: number): void {
-    const from = this.#selected;
+    const from = this.#anchor;
     if (!from || this.#sheet.rows <= 0 || this.#sheet.cols <= 0) {
       return;
     }
     const row = Math.min(this.#sheet.rows - 1, Math.max(0, from.row + rows));
     const col = Math.min(this.#sheet.cols - 1, Math.max(0, from.col + cols));
-    this.#selected = { row, col };
+    this.#anchor = { row, col };
+    this.#focus = { row, col };
     this.reveal(row, col);
+    this.#notifySelection();
+    this.#invalidate();
+  }
+
+  /** Extends the rectangular selection's focus corner by `(rows, cols)` (`Shift+Arrow`). */
+  extendSelection(rows: number, cols: number): void {
+    const from = this.#focus ?? this.#anchor;
+    if (!from || !this.#anchor || this.#sheet.rows <= 0 || this.#sheet.cols <= 0) {
+      return;
+    }
+    const row = Math.min(this.#sheet.rows - 1, Math.max(0, from.row + rows));
+    const col = Math.min(this.#sheet.cols - 1, Math.max(0, from.col + cols));
+    this.#focus = { row, col };
+    this.reveal(row, col);
+    this.#notifySelection();
     this.#invalidate();
   }
 
@@ -289,8 +489,7 @@ export class Grid {
 
   /**
    * Calls `listener` at the end of every frame from now on, after the canvas
-   * was drawn and before the browser shows it: whatever the listener moves
-   * stays in step with the cells. Returns a function that stops the calls.
+   * was drawn and before the browser shows it. Returns an unsubscribe function.
    */
   watchFrames(listener: (frame: FrameReport) => void): () => void {
     this.#frameListeners.add(listener);
@@ -339,8 +538,7 @@ export class Grid {
 
   /** Removes everything the grid added to its host and gives up its subscription. */
   destroy(): void {
-    // The engine would otherwise go on counting this grid's pages as held,
-    // and send none of them to the next grid.
+    this.#stopAutoScroll();
     this.#hold(EMPTY_SPAN);
     this.#destroyed = true;
     this.#frameListeners.clear();
@@ -356,22 +554,39 @@ export class Grid {
     this.#host.classList.remove("reticula-grid");
   }
 
+  #notifySelection(): void {
+    this.#onSelectionChange?.(this.#selection());
+  }
+
   #selection(): Selection | null {
-    const selected = this.#selected;
-    if (!selected) {
+    const anchor = this.#anchor;
+    const range = this.selectionRange;
+    if (!anchor || !range) {
       return null;
     }
-    const page = this.#cache.pageOf(selected.row, selected.col);
-    const rowId = page?.rowIds[selected.row - page.firstRow];
-    const colId = page?.colIds[selected.col - page.firstCol];
+    const rowId = this.#cache.rowIdAt(anchor.row);
+    const colId = this.#cache.colIdAt(anchor.col);
+    const startName = `${columnName(range.firstCol)}${range.firstRow + 1}`;
+    const single = range.endRow - range.firstRow === 1 && range.endCol - range.firstCol === 1;
+    const name = single
+      ? `${columnName(anchor.col)}${anchor.row + 1}`
+      : `${startName}:${columnName(range.endCol - 1)}${range.endRow}`;
     return {
-      row: selected.row,
-      col: selected.col,
-      name: `${columnName(selected.col)}${selected.row + 1}`,
+      row: anchor.row,
+      col: anchor.col,
+      range,
+      name,
       rowId: rowId === undefined ? null : String(rowId),
       colId: colId === undefined ? null : String(colId),
-      text: this.textAt(selected.row, selected.col),
+      text: this.textAt(anchor.row, anchor.col),
     };
+  }
+
+  #effectiveMargin(now: number): { readonly rows: number; readonly cols: number } {
+    if (this.#fixedMargin) {
+      return this.#fixedMargin;
+    }
+    return now < this.#fastScrollUntil ? FAST_MARGIN : IDLE_MARGIN;
   }
 
   #invalidate(): void {
@@ -393,7 +608,18 @@ export class Grid {
     const metrics = this.#metrics;
     const visible = visibleCells(metrics, this.#sheet, this.#scroll, this.#size);
     this.#visible = visible;
-    this.#hold(pagesToHold(visible, this.#sheet, this.#margin));
+    const wantedPages = pagesToHold(visible, this.#sheet, this.#effectiveMargin(started));
+    // While decaying from fast-scroll margin back to idle margin without moving
+    // outside held pages, avoid thrashing subscriptions until visible nears an edge.
+    if (
+      !this.#fixedMargin &&
+      started >= this.#fastScrollUntil &&
+      !isEmptySpanSubset(wantedPages, this.#cache.span)
+    ) {
+      this.#hold(wantedPages);
+    } else if (this.#fixedMargin || started < this.#fastScrollUntil || this.#cache.size === 0) {
+      this.#hold(wantedPages);
+    }
 
     const counts = this.#renderer.draw({
       size: this.#size,
@@ -403,7 +629,8 @@ export class Grid {
       scroll: this.#drawnScroll(),
       visible,
       cache: this.#cache,
-      selection: this.#selected,
+      selection: this.#anchor,
+      selectionRange: this.selectionRange,
     });
 
     const content = contentSize(metrics, this.#sheet);
@@ -436,11 +663,6 @@ export class Grid {
     }
   };
 
-  /**
-   * The scroll position that is drawn: the nearest one on the device's pixel
-   * grid, which keeps text and lines sharp while the scroll position itself
-   * moves smoothly.
-   */
   #drawnScroll(): Scroll {
     const scale = this.#scale;
     return {
@@ -449,15 +671,10 @@ export class Grid {
     };
   }
 
-  /** Subscribes to a new span of pages when the one to hold has changed. */
   #hold(pages: Span): void {
     if (sameSpan(pages, this.#cache.span)) {
       return;
     }
-    // Dropping what fell out of the span and announcing the new one happen
-    // together: that is what keeps the engine's idea of what is held here
-    // true. An empty span is announced like any other, or the engine would go
-    // on counting pages as held that were just dropped.
     this.#cache.retain(pages);
     const cells = cellsOfPages(pages, this.#sheet);
     this.#epoch = (this.#epoch + 1) >>> 0;
@@ -477,7 +694,6 @@ export class Grid {
     const scale = window.devicePixelRatio || 1;
     this.#size = { width, height };
     this.#scale = scale;
-    // Setting the size clears the canvas, so only do it when it changes.
     const pixelWidth = Math.round(width * scale);
     const pixelHeight = Math.round(height * scale);
     if (this.#canvas.width !== pixelWidth || this.#canvas.height !== pixelHeight) {
@@ -486,7 +702,6 @@ export class Grid {
     }
     this.#canvas.style.width = `${width}px`;
     this.#canvas.style.height = `${height}px`;
-    // A larger area can leave the scroll position past its new limit.
     this.#scroll = clampScroll(this.#scroll, scrollLimits(this.#metrics, this.#sheet, this.#size));
   }
 
@@ -512,7 +727,6 @@ export class Grid {
     this.#invalidate();
   };
 
-  /** Redraws when the page is zoomed or moves to a screen of another density. */
   #watchDensity(): void {
     this.#density?.removeEventListener("change", this.#onDensityChange);
     this.#density = matchMedia(`(resolution: ${window.devicePixelRatio}dppx)`);
@@ -527,7 +741,6 @@ export class Grid {
 
   #onWheel = (event: WheelEvent): void => {
     if (event.ctrlKey) {
-      // Zooming the page is the browser's business.
       return;
     }
     const started = performance.now();
@@ -542,12 +755,32 @@ export class Grid {
     let left = event.deltaX * unit(area.width);
     let top = event.deltaY * unit(area.height);
     if (event.shiftKey && left === 0) {
-      // A plain wheel scrolls sideways while Shift is held.
       [left, top] = [top, 0];
     }
     this.scrollTo({ top: this.#scroll.top + top, left: this.#scroll.left + left });
     this.#pendingWork += performance.now() - started;
   };
+
+  #cellAtClamped(localX: number, localY: number): { row: number; col: number } | null {
+    if (this.#sheet.rows <= 0 || this.#sheet.cols <= 0) {
+      return null;
+    }
+    const area = cellArea(this.#metrics, this.#size);
+    if (area.width <= 0 || area.height <= 0) {
+      return null;
+    }
+    const clampedX = Math.min(area.width - 1, Math.max(0, localX - this.#metrics.headerWidth));
+    const clampedY = Math.min(area.height - 1, Math.max(0, localY - this.#metrics.headerHeight));
+    const row = Math.min(
+      this.#sheet.rows - 1,
+      Math.max(0, Math.floor((this.#scroll.top + clampedY) / this.#metrics.rowHeight)),
+    );
+    const col = Math.min(
+      this.#sheet.cols - 1,
+      Math.max(0, Math.floor((this.#scroll.left + clampedX) / this.#metrics.colWidth)),
+    );
+    return { row, col };
+  }
 
   #onPointerDown = (event: PointerEvent): void => {
     if (event.button !== 0) {
@@ -555,6 +788,56 @@ export class Grid {
     }
     const started = performance.now();
     this.#host.focus({ preventScroll: true });
+    const bounds = this.#canvas.getBoundingClientRect();
+    const x = event.clientX - bounds.left;
+    const y = event.clientY - bounds.top;
+    const cell = cellAt(this.#metrics, this.#sheet, this.#scroll, this.#size, x, y);
+    if (cell) {
+      if (event.shiftKey && this.#anchor) {
+        this.#focus = cell;
+        this.#notifySelection();
+        this.#invalidate();
+      } else {
+        this.select(cell);
+      }
+      this.#draggingPointerId = event.pointerId;
+      this.#dragClientX = event.clientX;
+      this.#dragClientY = event.clientY;
+      try {
+        this.#canvas.setPointerCapture(event.pointerId);
+      } catch {
+        // Synthetic pointer events in unit environments may lack capture.
+      }
+    }
+    this.#pendingWork += performance.now() - started;
+  };
+
+  #onPointerMove = (event: PointerEvent): void => {
+    if (this.#draggingPointerId !== event.pointerId || !this.#anchor) {
+      return;
+    }
+    this.#dragClientX = event.clientX;
+    this.#dragClientY = event.clientY;
+    this.#updateDragFocus();
+    this.#syncAutoScroll();
+  };
+
+  #onPointerUp = (event: PointerEvent): void => {
+    if (this.#draggingPointerId !== event.pointerId) {
+      return;
+    }
+    this.#draggingPointerId = null;
+    this.#stopAutoScroll();
+    try {
+      if (this.#canvas.hasPointerCapture(event.pointerId)) {
+        this.#canvas.releasePointerCapture(event.pointerId);
+      }
+    } catch {
+      // Ignore synthetic pointer release errors.
+    }
+  };
+
+  #onDoubleClick = (event: MouseEvent): void => {
     const bounds = this.#canvas.getBoundingClientRect();
     const cell = cellAt(
       this.#metrics,
@@ -566,7 +849,74 @@ export class Grid {
     );
     if (cell) {
       this.select(cell);
+      this.#onActivateEdit?.(cell);
     }
-    this.#pendingWork += performance.now() - started;
   };
+
+  #updateDragFocus(): void {
+    if (!this.#anchor) {
+      return;
+    }
+    const bounds = this.#canvas.getBoundingClientRect();
+    const next = this.#cellAtClamped(
+      this.#dragClientX - bounds.left,
+      this.#dragClientY - bounds.top,
+    );
+    if (next && (!this.#focus || next.row !== this.#focus.row || next.col !== this.#focus.col)) {
+      this.#focus = next;
+      this.#notifySelection();
+      this.#invalidate();
+    }
+  }
+
+  #syncAutoScroll(): void {
+    const bounds = this.#canvas.getBoundingClientRect();
+    const area = cellArea(this.#metrics, this.#size);
+    const localX = this.#dragClientX - bounds.left - this.#metrics.headerWidth;
+    const localY = this.#dragClientY - bounds.top - this.#metrics.headerHeight;
+    const outside = localX < 0 || localX >= area.width || localY < 0 || localY >= area.height;
+    if (!outside) {
+      this.#stopAutoScroll();
+      return;
+    }
+    if (this.#autoScrollTimer !== 0) {
+      return;
+    }
+    this.#autoScrollTimer = window.setInterval(() => {
+      if (this.#draggingPointerId === null) {
+        this.#stopAutoScroll();
+        return;
+      }
+      const b = this.#canvas.getBoundingClientRect();
+      const a = cellArea(this.#metrics, this.#size);
+      const lx = this.#dragClientX - b.left - this.#metrics.headerWidth;
+      const ly = this.#dragClientY - b.top - this.#metrics.headerHeight;
+      const dTop =
+        ly < 0 ? -this.#metrics.rowHeight * 2 : ly >= a.height ? this.#metrics.rowHeight * 2 : 0;
+      const dLeft = lx < 0 ? -this.#metrics.colWidth : lx >= a.width ? this.#metrics.colWidth : 0;
+      if (dTop !== 0 || dLeft !== 0) {
+        this.scrollTo({ top: this.#scroll.top + dTop, left: this.#scroll.left + dLeft });
+        this.#updateDragFocus();
+      }
+    }, 40);
+  }
+
+  #stopAutoScroll(): void {
+    if (this.#autoScrollTimer !== 0) {
+      window.clearInterval(this.#autoScrollTimer);
+      this.#autoScrollTimer = 0;
+    }
+  }
+}
+
+function isEmptySpanSubset(inner: Span, outer: Span): boolean {
+  if (inner.firstRow >= inner.endRow || inner.firstCol >= inner.endCol) {
+    return outer.firstRow >= outer.endRow || outer.firstCol >= outer.endCol;
+  }
+  return (
+    inner.firstRow >= outer.firstRow &&
+    inner.endRow <= outer.endRow &&
+    inner.firstCol >= outer.firstCol &&
+    inner.endCol <= outer.endCol
+  );
 }

@@ -53,7 +53,7 @@ const TARGETS = { shell: 1500, firstScreen: 2000 };
 
 // --- options ---------------------------------------------------------------
 
-const options = { browser: "chrome", runs: 20, network: "reference", connect: REFERENCE.connectRoundTrips, shaping: "server", encoding: "br", slowdown: 1, affinity: "", headed: false, quick: false, out: "" };
+const options = { browser: "chrome", runs: 20, path: "/app", network: "reference", connect: REFERENCE.connectRoundTrips, shaping: "server", encoding: "br", slowdown: 1, affinity: "", headed: false, quick: false, out: "" };
 const given = process.argv.slice(2);
 for (let index = 0; index < given.length; index++) {
   const name = given[index].replace(/^--/, "");
@@ -183,7 +183,7 @@ async function visit(number) {
     }
     server.newVisit();
     const workerStarted = page.waitForEvent("worker");
-    await page.goto(`${server.address}/`, { waitUntil: "commit" });
+    await page.goto(`${server.address}${options.path}`, { waitUntil: "commit" });
     await page.waitForFunction(() => performance.getEntriesByName("reticula:first-screen").length > 0, null, { timeout: 60000 });
     const worker = await workerStarted;
 

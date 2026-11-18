@@ -14,6 +14,8 @@ export interface Hooks {
   scrollTo(position: { top?: number; left?: number }): void;
   /** Selects a cell. */
   select(row: number, col: number): void;
+  /** Selects a rectangular cell range (`anchor` to `focus`). */
+  selectRange(anchor: { row: number; col: number }, focus: { row: number; col: number }): void;
   /** The text of a cell, or `null` while the grid does not hold it. */
   textAt(row: number, col: number): string | null;
   /** Runs the engine's determinism self-check and resolves to its digest. */
@@ -35,6 +37,7 @@ export function installHooks(grid: Grid, selfCheck: () => Promise<string>): () =
     stats: () => grid.stats(),
     scrollTo: (position) => grid.scrollTo(position),
     select: (row, col) => grid.select({ row, col }),
+    selectRange: (anchor, focus) => grid.selectRange(anchor, focus),
     textAt: (row, col) => grid.textAt(row, col),
     selfCheck,
   };

@@ -102,7 +102,7 @@ function showState(): void {
 function describe(event: EditorEvent): string {
   switch (event.kind) {
     case "started":
-      return `进入编辑（${{ typing: "打字", composition: "输入法组合", F2: "F2" }[event.cause]}）`;
+      return `进入编辑（${{ typing: "打字", composition: "输入法组合", F2: "F2", doubleClick: "双击", formulaBar: "公式栏" }[event.cause]}）`;
     case "committed":
       return `提交 ${cellName(event.cell)} ← “${event.text}”`;
     case "cancelled":

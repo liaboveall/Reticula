@@ -9,11 +9,11 @@ const expectedDigest = readFileSync(
 ).trim();
 
 const ROWS = 1_000_000;
-const COLS = 20;
+const COLS = 22;
 
 /** Opens the app with its test hooks and waits until the sample is on screen. */
 async function open(page: Page): Promise<void> {
-  await page.goto("/?hooks");
+  await page.goto("/app?hooks");
   await expect(page.getByTestId("engine-status")).toHaveText("ready");
   await settled(page);
 }
@@ -45,7 +45,7 @@ function textAt(page: Page, row: number, col: number) {
 
 test("the engine generates the sample in a worker and the grid draws it", async ({ page }) => {
   await open(page);
-  await expect(page.getByTestId("document")).toContainText("1,000,000 rows × 20 columns");
+  await expect(page.getByTestId("document")).toContainText("1,000,000 rows × 22 columns");
   await expect(page.getByTestId("kernel-version")).toHaveText(/^kernel \d+\.\d+\.\d+/);
 
   const first = await stats(page);

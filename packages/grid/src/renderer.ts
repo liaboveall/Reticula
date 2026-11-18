@@ -1,7 +1,7 @@
 import { PAGE_COLS, PAGE_ROWS } from "@reticula/protocol/viewport";
 import type { PageCache } from "./cache.ts";
 import { columnName, isEmpty, type Metrics, type Scroll, type Size, type Span } from "./layout.ts";
-import { isNumber } from "./page.ts";
+import { isBool, isError, isNumber } from "./page.ts";
 import type { Theme } from "./theme.ts";
 
 /** Everything one frame is drawn from. */
@@ -18,6 +18,8 @@ export interface Frame {
   readonly visible: Span;
   readonly cache: PageCache;
   readonly selection: { readonly row: number; readonly col: number } | null;
+  /** Optional multi-cell rectangular selection span (`firstRow..endRow`, `firstCol..endCol`). */
+  readonly selectionRange?: Span | null;
 }
 
 export interface FrameCounts {
@@ -36,8 +38,6 @@ export interface FrameCounts {
 export interface Shortcuts {
   /** Remember the measured width of each string. */
   readonly cacheWidths: boolean;
-  /** Skip measuring a number whose length alone shows that it fits. */
-  readonly boundNumbers: boolean;
   /** Clip only text that is wider than its cell, not every text. */
   readonly clipOnlyOverwide: boolean;
   /** Set the drawing state when it changes, not for every cell. */
@@ -46,7 +46,6 @@ export interface Shortcuts {
 
 export const ALL_SHORTCUTS: Shortcuts = {
   cacheWidths: true,
-  boundNumbers: true,
   clipOnlyOverwide: true,
   batchState: true,
 };
@@ -54,46 +53,31 @@ export const ALL_SHORTCUTS: Shortcuts = {
 /** Space between a cell's edge and its text. */
 const PADDING = 6;
 
-/** Every character a formatted number can contain. */
-const NUMBER_ALPHABET = "0123456789.,-+%eE";
-
 /**
- * Widths of strings in one font.
+ * Cached widths of strings in one font.
  *
  * Whether a text fits its cell decides between a plain draw and a clipped
- * one, and clipping is the expensive path. Measuring is not free either, so
- * the common case is answered without it: a number is drawn from a small
- * alphabet, and its length times the widest of those characters is a bound
- * that most numbers already pass.
+ * one, and clipping is the expensive path.
  */
 class TextWidths {
   #shortcuts: Shortcuts;
   #font = "";
   #widths = new Map<string, number>();
-  #numberAdvance = 0;
 
   constructor(shortcuts: Shortcuts) {
     this.#shortcuts = shortcuts;
   }
 
   /** Call with the context's current font before asking for widths. */
-  use(context: CanvasRenderingContext2D, font: string): void {
+  use(font: string): void {
     if (font === this.#font) {
       return;
     }
     this.#font = font;
     this.#widths.clear();
-    let widest = 0;
-    for (const character of NUMBER_ALPHABET) {
-      widest = Math.max(widest, context.measureText(character).width);
-    }
-    this.#numberAdvance = widest;
   }
 
-  fits(context: CanvasRenderingContext2D, text: string, number: boolean, room: number): boolean {
-    if (this.#shortcuts.boundNumbers && number && text.length * this.#numberAdvance <= room) {
-      return true;
-    }
+  fits(context: CanvasRenderingContext2D, text: string, room: number): boolean {
     if (!this.#shortcuts.cacheWidths) {
       return context.measureText(text).width <= room;
     }
@@ -176,13 +160,12 @@ export class Renderer {
     const bottom = size.height - metrics.scrollbarSize;
 
     if (!isEmpty(visible)) {
-      // Fills, then lines, then text: text that is wider than its cell will
-      // one day run across the lines of the empty cells beside it.
       const parts = partsOf(visible);
       this.#placeholders(frame, parts, originX, originY, counts);
+      this.#selectionFill(frame, originX, originY, right, bottom);
       this.#lines(frame, originX, originY, right, bottom);
       this.#text(frame, parts, originX, originY, counts);
-      this.#selection(frame, originX, originY);
+      this.#selection(frame, originX, originY, right, bottom);
     }
     this.#headers(frame, originX, originY, right, bottom);
     return counts;
@@ -213,6 +196,59 @@ export class Renderer {
     }
   }
 
+  /** Semi-transparent tint across a multi-cell selection, leaving the active cell crisp. */
+  #selectionFill(
+    frame: Frame,
+    originX: number,
+    originY: number,
+    right: number,
+    bottom: number,
+  ): void {
+    const range = frame.selectionRange;
+    if (!range) {
+      return;
+    }
+    const multi = range.endRow - range.firstRow > 1 || range.endCol - range.firstCol > 1;
+    if (!multi) {
+      return;
+    }
+    const { metrics, theme, visible, selection } = frame;
+    const firstRow = Math.max(visible.firstRow, range.firstRow);
+    const endRow = Math.min(visible.endRow, range.endRow);
+    const firstCol = Math.max(visible.firstCol, range.firstCol);
+    const endCol = Math.min(visible.endCol, range.endCol);
+    if (firstRow >= endRow || firstCol >= endCol) {
+      return;
+    }
+    const context = this.#context;
+    const x0 = Math.max(metrics.headerWidth, originX + firstCol * metrics.colWidth);
+    const y0 = Math.max(metrics.headerHeight, originY + firstRow * metrics.rowHeight);
+    const x1 = Math.min(right, originX + endCol * metrics.colWidth);
+    const y1 = Math.min(bottom, originY + endRow * metrics.rowHeight);
+    if (x1 <= x0 || y1 <= y0) {
+      return;
+    }
+    context.fillStyle = theme.selectionFill;
+    context.fillRect(x0, y0, x1 - x0, y1 - y0);
+
+    if (
+      selection &&
+      selection.row >= firstRow &&
+      selection.row < endRow &&
+      selection.col >= firstCol &&
+      selection.col < endCol
+    ) {
+      const ax0 = Math.max(metrics.headerWidth, originX + selection.col * metrics.colWidth);
+      const ay0 = Math.max(metrics.headerHeight, originY + selection.row * metrics.rowHeight);
+      const ax1 = Math.min(right, originX + (selection.col + 1) * metrics.colWidth);
+      const ay1 = Math.min(bottom, originY + (selection.row + 1) * metrics.rowHeight);
+      if (ax1 > ax0 && ay1 > ay0) {
+        context.fillStyle = theme.background;
+        context.fillRect(ax0, ay0, ax1 - ax0, ay1 - ay0);
+      }
+    }
+  }
+
   /** The text of the cells, page by page. */
   #text(
     frame: Frame,
@@ -229,8 +265,9 @@ export class Renderer {
 
     context.font = theme.font;
     context.textBaseline = "middle";
-    context.fillStyle = theme.text;
-    this.#widths.use(context, theme.font);
+    let currentFill = theme.text;
+    context.fillStyle = currentFill;
+    this.#widths.use(theme.font);
     let aligned: CanvasTextAlign | null = null;
 
     for (const part of parts) {
@@ -239,7 +276,7 @@ export class Renderer {
         continue;
       }
       // Column by column: a column mostly holds one kind of value, so the
-      // alignment rarely changes from one cell to the next.
+      // alignment and fill colour rarely change from one cell to the next.
       for (let col = part.firstCol; col < part.endCol; col++) {
         const x = originX + col * colWidth;
         for (let row = part.firstRow; row < part.endRow; row++) {
@@ -248,20 +285,30 @@ export class Renderer {
           if (!text) {
             continue;
           }
-          const number = isNumber(page.flags[cell] ?? 0);
+          const flags = page.flags[cell] ?? 0;
+          const number = isNumber(flags);
+          const error = isError(flags);
+          const centered = error || isBool(flags);
           const y = originY + row * rowHeight;
-          const align = number ? "right" : "left";
+          const align: CanvasTextAlign = number ? "right" : centered ? "center" : "left";
+          const fill = error ? theme.errorText : theme.text;
           if (!batchState) {
             context.font = theme.font;
             context.textBaseline = "middle";
-            context.fillStyle = theme.text;
+            context.fillStyle = fill;
             context.textAlign = align;
-          } else if (aligned !== align) {
-            context.textAlign = align;
-            aligned = align;
+          } else {
+            if (aligned !== align) {
+              context.textAlign = align;
+              aligned = align;
+            }
+            if (currentFill !== fill) {
+              context.fillStyle = fill;
+              currentFill = fill;
+            }
           }
-          const textX = number ? x + colWidth - PADDING : x + PADDING;
-          if (clipOnlyOverwide && this.#widths.fits(context, text, number, room)) {
+          const textX = number ? x + colWidth - PADDING : centered ? x + colWidth / 2 : x + PADDING;
+          if (clipOnlyOverwide && this.#widths.fits(context, text, room)) {
             context.fillText(text, textX, y + rowHeight / 2);
           } else {
             context.save();
@@ -282,8 +329,6 @@ export class Renderer {
   #lines(frame: Frame, originX: number, originY: number, right: number, bottom: number): void {
     const context = this.#context;
     const { metrics, theme, visible, scale } = frame;
-    // One device pixel wide at whole-number scales, and placed on device
-    // pixels at any scale, so the lines stay sharp.
     const width = Math.max(1, Math.round(scale)) / scale;
     const snap = (position: number) => Math.round(position * scale) / scale - width / 2;
 
@@ -305,8 +350,41 @@ export class Renderer {
     context.stroke();
   }
 
-  #selection(frame: Frame, originX: number, originY: number): void {
-    const { metrics, theme, visible, selection } = frame;
+  #selection(frame: Frame, originX: number, originY: number, right: number, bottom: number): void {
+    const { metrics, theme, visible, selection, selectionRange } = frame;
+    const context = this.#context;
+
+    if (
+      selectionRange &&
+      (selectionRange.endRow - selectionRange.firstRow > 1 ||
+        selectionRange.endCol - selectionRange.firstCol > 1)
+    ) {
+      const rx0 = originX + selectionRange.firstCol * metrics.colWidth;
+      const ry0 = originY + selectionRange.firstRow * metrics.rowHeight;
+      const rw = (selectionRange.endCol - selectionRange.firstCol) * metrics.colWidth;
+      const rh = (selectionRange.endRow - selectionRange.firstRow) * metrics.rowHeight;
+      if (
+        rx0 < right &&
+        ry0 < bottom &&
+        rx0 + rw > metrics.headerWidth &&
+        ry0 + rh > metrics.headerHeight
+      ) {
+        context.save();
+        context.beginPath();
+        context.rect(
+          metrics.headerWidth,
+          metrics.headerHeight,
+          Math.max(0, right - metrics.headerWidth),
+          Math.max(0, bottom - metrics.headerHeight),
+        );
+        context.clip();
+        context.lineWidth = 1.5;
+        context.strokeStyle = theme.selection;
+        context.strokeRect(rx0 - 0.5, ry0 - 0.5, rw, rh);
+        context.restore();
+      }
+    }
+
     if (
       !selection ||
       selection.row < visible.firstRow ||
@@ -316,10 +394,8 @@ export class Renderer {
     ) {
       return;
     }
-    const context = this.#context;
     context.lineWidth = 2;
     context.strokeStyle = theme.selection;
-    // Over the grid lines that bound the cell, half inside and half outside.
     context.strokeRect(
       originX + selection.col * metrics.colWidth - 1,
       originY + selection.row * metrics.rowHeight - 1,
@@ -331,23 +407,38 @@ export class Renderer {
   /** The strips of column names and row numbers. They cover whatever scrolled under them. */
   #headers(frame: Frame, originX: number, originY: number, right: number, bottom: number): void {
     const context = this.#context;
-    const { size, metrics, theme, visible, selection, scale } = frame;
+    const { size, metrics, theme, visible, selection, selectionRange, scale } = frame;
     const { rowHeight, colWidth, headerHeight, headerWidth } = metrics;
 
     context.fillStyle = theme.headerBackground;
     context.fillRect(0, 0, size.width, headerHeight);
     context.fillRect(0, 0, headerWidth, size.height);
 
-    if (selection && !isEmpty(visible)) {
+    const activeCols: Span | null = selectionRange
+      ? selectionRange
+      : selection
+        ? {
+            firstRow: selection.row,
+            endRow: selection.row + 1,
+            firstCol: selection.col,
+            endCol: selection.col + 1,
+          }
+        : null;
+
+    if (activeCols && !isEmpty(visible)) {
       context.fillStyle = theme.headerSelected;
-      if (selection.col >= visible.firstCol && selection.col < visible.endCol) {
-        const x = Math.max(headerWidth, originX + selection.col * colWidth);
-        const end = Math.min(right, originX + (selection.col + 1) * colWidth);
+      const c0 = Math.max(visible.firstCol, activeCols.firstCol);
+      const c1 = Math.min(visible.endCol, activeCols.endCol);
+      if (c0 < c1) {
+        const x = Math.max(headerWidth, originX + c0 * colWidth);
+        const end = Math.min(right, originX + c1 * colWidth);
         context.fillRect(x, 0, Math.max(0, end - x), headerHeight);
       }
-      if (selection.row >= visible.firstRow && selection.row < visible.endRow) {
-        const y = Math.max(headerHeight, originY + selection.row * rowHeight);
-        const end = Math.min(bottom, originY + (selection.row + 1) * rowHeight);
+      const r0 = Math.max(visible.firstRow, activeCols.firstRow);
+      const r1 = Math.min(visible.endRow, activeCols.endRow);
+      if (r0 < r1) {
+        const y = Math.max(headerHeight, originY + r0 * rowHeight);
+        const end = Math.min(bottom, originY + r1 * rowHeight);
         context.fillRect(0, y, headerWidth, Math.max(0, end - y));
       }
     }
@@ -357,8 +448,6 @@ export class Renderer {
     context.textAlign = "center";
     context.fillStyle = theme.headerText;
 
-    // A name that is partly under the other strip is clipped by it: the
-    // corner is painted last.
     for (let col = visible.firstCol; col < visible.endCol; col++) {
       context.fillText(columnName(col), originX + col * colWidth + colWidth / 2, headerHeight / 2);
     }
