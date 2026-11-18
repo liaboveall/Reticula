@@ -14,7 +14,7 @@ export const BENCHMARKS = {
   b2Sum1mP50Ms: 2.04,
   b3FullRecalc1mP50Ms: 456.3,
   b5Chain1mP50Ms: 609.0,
-  startupShellP50Ms: null as number | null,
-  startupFirstScreenP50Ms: null as number | null,
-  renderScrollWorkP99Ms: null as number | null,
+  startupShellP50Ms: 370.10,
+  startupFirstScreenP50Ms: 765.20,
+  renderScrollWorkP99Ms: 0.93,
 } as const;
