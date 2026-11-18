@@ -3,11 +3,10 @@ resolver = "3"
 members = [
     "crates/core",
     "crates/formula",
+    "crates/kernel-bench",
     "crates/wasm",
     "crates/xtask",
-    "spikes/axis",
     "spikes/determinism",
-    "spikes/nostd-deps",
 ]
 
 [workspace.package]

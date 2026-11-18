@@ -1,0 +1,44 @@
+[package]
+name = "reticula-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+# Standalone workspace so `libfuzzer-sys` (which requires a nightly compiler on
+# Unix) does not enter the default stable workspace build (`09-quality.md`).
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+reticula-kernel-bench = { path = "../crates/kernel-bench" }
+
+[[bin]]
+name = "fuzz_parser"
+path = "fuzz_targets/fuzz_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_snapshot"
+path = "fuzz_targets/fuzz_snapshot.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_ops"
+path = "fuzz_targets/fuzz_ops.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_eval"
+path = "fuzz_targets/fuzz_eval.rs"
+test = false
+doc = false
+bench = false

@@ -20,6 +20,9 @@ use serde::{Deserialize, Serialize};
 use tsify::{Ts, Tsify};
 use wasm_bindgen::prelude::*;
 
+#[cfg(feature = "bench")]
+pub mod bench;
+
 /// A message from the main thread to the engine worker.
 #[derive(Debug, Deserialize, Tsify)]
 #[serde(

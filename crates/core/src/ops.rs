@@ -997,15 +997,48 @@ fn id_in_runs(id: u64, runs: &[IdRun]) -> bool {
 }
 
 fn write_axis_digest(axis: &crate::axis::Axis, d: &mut Digest64) {
+    use crate::id::{id_counter, id_stream};
+
     d.write_u32(axis.live_len());
     d.write_u32(axis.total_len());
-    d.write_u32(u32::try_from(axis.runs().len()).unwrap_or(u32::MAX));
+
+    // Coalesce adjacent contiguous `IdRun`s so internal run-splitting history
+    // (e.g. splitting a base run around a tombstoned prefix and later undoing an
+    // insertion) never alters the logical digest.
+    let mut coalesced: Vec<IdRun> = Vec::new();
+    let mut tombstoned: Vec<(u64, u32)> = Vec::new();
+
     for run in axis.runs() {
-        d.write_u64(run.ids.first_id);
-        d.write_u32(run.ids.len);
-        for offset in 0..run.ids.len {
-            d.write_u32(run.tombstone_at(offset));
+        if let Some(last) = coalesced.last_mut()
+            && id_stream(last.first_id) == id_stream(run.ids.first_id)
+            && id_counter(last.first_id).checked_add(last.len) == Some(id_counter(run.ids.first_id))
+        {
+            last.len = last.len.saturating_add(run.ids.len);
+        } else {
+            coalesced.push(run.ids);
         }
+
+        if let Some(counts) = &run.tombstones {
+            for (idx, &cnt) in counts.iter().enumerate() {
+                if cnt > 0
+                    && let Ok(off) = u32::try_from(idx)
+                    && let Some(id) = run.ids.id_at(off)
+                {
+                    tombstoned.push((id, cnt));
+                }
+            }
+        }
+    }
+
+    d.write_u32(u32::try_from(coalesced.len()).unwrap_or(u32::MAX));
+    for r in coalesced {
+        d.write_u64(r.first_id);
+        d.write_u32(r.len);
+    }
+    d.write_u32(u32::try_from(tombstoned.len()).unwrap_or(u32::MAX));
+    for (id, cnt) in tombstoned {
+        d.write_u64(id);
+        d.write_u32(cnt);
     }
 }
 

@@ -8,8 +8,18 @@ targets = [
     "wasm32-unknown-unknown",
 ]
 
+[advisories]
+ignore = [
+    # Pulled in solely by the external reference formula engines (`ironcalc_base`
+    # and `formualizer-eval`) inside the native-only `reticula-kernel-bench`
+    # differential-testing harness; never compiled into the kernel, WASM module,
+    # or server binary.
+    { id = "RUSTSEC-2026-0543", reason = "unmaintained `chrono` used transitively by `ironcalc_base` and `formualizer-eval` in `reticula-kernel-bench` only" },
+    { id = "RUSTSEC-2026-0555", reason = "unmaintained `chrono-tz` used transitively by `ironcalc_base` in `reticula-kernel-bench` only" },
+]
+
 [licenses]
-allow = ["Apache-2.0", "MIT", "Unicode-3.0"]
+allow = ["Apache-2.0", "CC0-1.0", "MIT", "Unicode-3.0"]
 confidence-threshold = 0.93
 
 [bans]

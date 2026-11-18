@@ -5,6 +5,7 @@
 //! runs exactly what a developer runs.
 
 mod codegen;
+mod qa;
 mod rust;
 mod setup;
 mod spike;
@@ -34,6 +35,12 @@ Commands:
   codegen [--check]       Write the TypeScript files generated from the Rust sources;
                           --check only reports whether they are up to date.
   digest [--update]       Print the determinism digest; --update records it as expected.
+  diff [--count <n>] [--out <file>]
+                          Differential evaluation against ironcalc_base and formualizer-eval.
+  fuzz [--cpu-seconds <s>] [--threads <n>] [--affinity <mask>]
+                          Multi-threaded mutation & structured fuzzing campaign.
+  bench [--affinity <mask>] [--browser <name>] [--quick] [--out <file>]
+                          Run native and Chrome WASM engine benchmarks (B2-B5, B7a, B7b).
   dev                     Build a debug module and start the development server.
   build [--skip-wasm]     Production build with precompressed assets and a size report.
   e2e [--browser <name>] [--skip-build]
@@ -83,6 +90,17 @@ fn run(args: &[String]) -> Result {
         }
         "codegen" => codegen::run(Flags::parse(rest, &["check"], &[])?.has("check")),
         "digest" => digest(&Flags::parse(rest, &["update"], &[])?),
+        "diff" => qa::diff(&Flags::parse(rest, &[], &["count", "out"])?),
+        "fuzz" => qa::fuzz(&Flags::parse(
+            rest,
+            &[],
+            &["cpu-seconds", "threads", "affinity", "out"],
+        )?),
+        "bench" => qa::bench(&Flags::parse(
+            rest,
+            &["quick"],
+            &["affinity", "browser", "date", "out"],
+        )?),
         "dev" => {
             Flags::parse(rest, &[], &[])?;
             wasm::build(Profile::Dev)?;
