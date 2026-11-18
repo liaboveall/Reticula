@@ -2,6 +2,7 @@
 //! the Reticula kernel.
 
 pub mod bench_workloads;
+#[cfg(feature = "diff")]
 pub mod diff;
 pub mod fuzz_harnesses;
 pub mod fuzz_runner;

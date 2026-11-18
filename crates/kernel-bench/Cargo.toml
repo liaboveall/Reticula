@@ -11,20 +11,40 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = ["diff"]
+diff = [
+  "dep:formualizer-common",
+  "dep:formualizer-eval",
+  "dep:formualizer-parse",
+  "dep:ironcalc_base",
+  "dep:serde_json",
+]
+
+[[bin]]
+name = "runner"
+path = "src/bin/runner.rs"
+required-features = ["diff"]
+
+[[test]]
+name = "diff_regression"
+path = "tests/diff_regression.rs"
+required-features = ["diff"]
+
 [[bench]]
 name = "kernel"
 harness = false
 
 [dependencies]
 arbitrary = { version = "1.5.0", features = ["derive"] }
-formualizer-common = "4.2.0"
-formualizer-eval = { version = "0.14.0", features = ["test-support"] }
-formualizer-parse = "4.2.0"
-ironcalc_base = "0.9.1"
+formualizer-common = { version = "4.2.0", optional = true }
+formualizer-eval = { version = "0.14.0", features = ["test-support"], optional = true }
+formualizer-parse = { version = "4.2.0", optional = true }
+ironcalc_base = { version = "0.9.1", optional = true }
 reticula-core = { workspace = true }
 reticula-formula = { workspace = true }
 serde = { workspace = true, features = ["std"] }
-serde_json = "1.0"
+serde_json = { version = "1.0", optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
