@@ -138,7 +138,7 @@ fn test(flags: &Flags) -> Result {
 }
 
 fn digest(flags: &Flags) -> Result {
-    use reticula_core::determinism;
+    use reticula_formula::determinism;
 
     let hex = determinism::to_hex(determinism::digest());
     let hex = String::from_utf8_lossy(&hex);

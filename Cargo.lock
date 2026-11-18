@@ -232,8 +232,11 @@ dependencies = [
 name = "reticula-formula"
 version = "0.0.0"
 dependencies = [
+ "hashbrown",
  "reticula-core",
+ "rustc-hash",
  "serde",
+ "smallvec",
  "wasm-bindgen-test",
 ]
 
@@ -242,6 +245,7 @@ name = "reticula-wasm"
 version = "0.0.0"
 dependencies = [
  "reticula-core",
+ "reticula-formula",
  "serde",
  "tsify",
  "wasm-bindgen",
@@ -594,6 +598,7 @@ name = "xtask"
 version = "0.0.0"
 dependencies = [
  "reticula-core",
+ "reticula-formula",
 ]
 
 [[package]]

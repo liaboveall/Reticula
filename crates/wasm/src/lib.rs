@@ -12,10 +12,10 @@
 
 use std::collections::VecDeque;
 
-use reticula_core::determinism;
 use reticula_core::sample;
 use reticula_core::sheet::Sheet;
 use reticula_core::viewport::{self, Page, PageRange};
+use reticula_formula::determinism;
 use serde::{Deserialize, Serialize};
 use tsify::{Ts, Tsify};
 use wasm_bindgen::prelude::*;

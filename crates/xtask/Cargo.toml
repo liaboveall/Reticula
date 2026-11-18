@@ -13,3 +13,4 @@ workspace = true
 
 [dependencies]
 reticula-core = { workspace = true }
+reticula-formula = { workspace = true }

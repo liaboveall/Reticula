@@ -312,6 +312,7 @@ pub type WorkbookCellKey = (SheetId, RowId, ColId);
 pub struct Workbook<F = RawFormula> {
     sheets: Vec<Sheet>,
     formulas: BTreeMap<WorkbookCellKey, F>,
+    formulas_bytes: usize,
     allocator: IdAllocator,
     next_sheet_id: u32,
     seed_origin: Option<SeedOrigin>,
@@ -331,6 +332,7 @@ impl<F: FormulaPayload> Workbook<F> {
         Self {
             sheets: alloc::vec![sheet],
             formulas: BTreeMap::new(),
+            formulas_bytes: 0,
             allocator: IdAllocator::local(),
             next_sheet_id: 1,
             seed_origin: None,
@@ -345,6 +347,7 @@ impl<F: FormulaPayload> Workbook<F> {
         Self {
             sheets: alloc::vec![sheet],
             formulas: BTreeMap::new(),
+            formulas_bytes: 0,
             allocator: IdAllocator::local(),
             next_sheet_id: next_id,
             seed_origin,
@@ -373,6 +376,7 @@ impl<F: FormulaPayload> Workbook<F> {
                 return Err(OpError::Axis(AxisError::LimitExceeded));
             }
         }
+        let mut formulas_bytes = 0usize;
         for (&(sheet_id, row, col), formula) in &formulas {
             let sheet = sheets
                 .iter()
@@ -382,10 +386,12 @@ impl<F: FormulaPayload> Workbook<F> {
                 return Err(OpError::TargetNotFound);
             }
             formula.validate()?;
+            formulas_bytes = formulas_bytes.saturating_add(formula_entry_bytes(formula));
         }
         let wb = Self {
             sheets,
             formulas,
+            formulas_bytes,
             allocator,
             next_sheet_id,
             seed_origin,
@@ -457,7 +463,7 @@ impl<F: FormulaPayload> Workbook<F> {
         if !target.set_value_by_id(row, col, cached) {
             return false;
         }
-        self.formulas.insert((sheet, row, col), formula);
+        self.put_formula((sheet, row, col), formula);
         true
     }
 
@@ -506,13 +512,7 @@ impl<F: FormulaPayload> Workbook<F> {
             .sheets
             .iter()
             .fold(0usize, |acc, s| acc.saturating_add(s.estimated_bytes()));
-        let formulas_mem = self.formulas.values().fold(0usize, |acc, f| {
-            acc.saturating_add(
-                f.estimated_bytes()
-                    .saturating_add(size_of::<WorkbookCellKey>().saturating_mul(2)),
-            )
-        });
-        sheets_mem.saturating_add(formulas_mem)
+        sheets_mem.saturating_add(self.formulas_bytes)
     }
 
     /// Reads the complete logical [`CellSnapshot`] of `(sheet, row, col)`.
@@ -861,6 +861,24 @@ impl<F: FormulaPayload> Workbook<F> {
         Ok(())
     }
 
+    fn put_formula(&mut self, key: WorkbookCellKey, formula: F) {
+        let added = formula_entry_bytes(&formula);
+        if let Some(old) = self.formulas.insert(key, formula) {
+            self.formulas_bytes = self
+                .formulas_bytes
+                .saturating_sub(formula_entry_bytes(&old));
+        }
+        self.formulas_bytes = self.formulas_bytes.saturating_add(added);
+    }
+
+    fn take_formula(&mut self, key: WorkbookCellKey) {
+        if let Some(old) = self.formulas.remove(&key) {
+            self.formulas_bytes = self
+                .formulas_bytes
+                .saturating_sub(formula_entry_bytes(&old));
+        }
+    }
+
     fn write_validated_cell(
         &mut self,
         sheet_id: SheetId,
@@ -871,13 +889,13 @@ impl<F: FormulaPayload> Workbook<F> {
     ) -> Result<(), OpError> {
         match input {
             CellInput::Empty => {
-                self.formulas.remove(&(sheet_id, row, col));
+                self.take_formula((sheet_id, row, col));
                 let sheet = self.sheet_mut(sheet_id).ok_or(OpError::SheetNotFound)?;
                 sheet.set_value_by_id(row, col, Value::Empty);
                 apply_format_patch(sheet, row, col, format);
             }
             CellInput::Scalar(scalar) => {
-                self.formulas.remove(&(sheet_id, row, col));
+                self.take_formula((sheet_id, row, col));
                 let sheet = self.sheet_mut(sheet_id).ok_or(OpError::SheetNotFound)?;
                 let value = intern_scalar(sheet, scalar)?;
                 sheet.set_value_by_id(row, col, value);
@@ -891,11 +909,17 @@ impl<F: FormulaPayload> Workbook<F> {
                 };
                 sheet.set_value_by_id(row, col, cached_val);
                 apply_format_patch(sheet, row, col, format);
-                self.formulas.insert((sheet_id, row, col), formula);
+                self.put_formula((sheet_id, row, col), formula);
             }
         }
         Ok(())
     }
+}
+
+fn formula_entry_bytes<F: FormulaPayload>(formula: &F) -> usize {
+    formula
+        .estimated_bytes()
+        .saturating_add(size_of::<WorkbookCellKey>().saturating_mul(2))
 }
 
 fn validate_scalar(scalar: &ScalarValue) -> Result<usize, OpError> {
