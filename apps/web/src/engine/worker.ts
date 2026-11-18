@@ -18,8 +18,23 @@ const SAMPLE: EngineCommand = { kind: "openSample", seed: 20261117, rows: 1_000_
 
 let engine: Engine | null = null;
 let stopped = false;
+let recalcTimer = 0;
 /** Commands that arrived while the engine was still starting. */
 const waiting: EngineCommand[] = [];
+
+function scheduleContinue(): void {
+  if (stopped || recalcTimer !== 0 || !engine?.hasPendingRecalc()) {
+    return;
+  }
+  // Yield to the worker macrotask queue between ~4 ms slices so incoming
+  // `subscribe` (scroll) or newer `editCell` commands execute immediately.
+  recalcTimer = setTimeout(() => {
+    recalcTimer = 0;
+    if (engine?.hasPendingRecalc()) {
+      run(engine, { kind: "continueRecalc" });
+    }
+  }, 0) as unknown as number;
+}
 
 function run(engine: Engine, command: EngineCommand): void {
   if (stopped) {
@@ -36,6 +51,7 @@ function run(engine: Engine, command: EngineCommand): void {
       const buffer = page.buffer as ArrayBuffer;
       scope.postMessage(buffer, [buffer]);
     }
+    scheduleContinue();
   } catch (error) {
     fail(error);
   }
@@ -44,6 +60,10 @@ function run(engine: Engine, command: EngineCommand): void {
 /** After a failure the engine's state cannot be trusted, so nothing more is run. */
 function fail(error: unknown): void {
   stopped = true;
+  if (recalcTimer !== 0) {
+    clearTimeout(recalcTimer);
+    recalcTimer = 0;
+  }
   scope.postMessage({
     kind: "failed",
     message: error instanceof Error ? error.message : String(error),

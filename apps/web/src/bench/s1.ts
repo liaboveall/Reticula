@@ -34,6 +34,7 @@ function fetchPage(
     const started = performance.now();
     engine.client.send({
       kind: "subscribe",
+      sheet: 0,
       epoch,
       firstRow: pageRow * PAGE_ROWS,
       rowCount: PAGE_ROWS,
@@ -195,6 +196,7 @@ export async function codec(options: {
         for (let index = 0; index < options.pages; index++) {
           local.handle({
             kind: "subscribe",
+            sheet: 0,
             epoch: index,
             firstRow: localRows.next().value * PAGE_ROWS,
             rowCount: PAGE_ROWS,
@@ -261,7 +263,8 @@ async function openGrid(margin: { rows: number; cols: number }): Promise<{
   let waiting: { accept: (report: FrameReport) => boolean; resolve: (r: FrameReport) => void }[] =
     [];
   const grid = new Grid(stage(), {
-    subscribe: (subscription) => engine.client.send({ kind: "subscribe", ...subscription }),
+    subscribe: (subscription) =>
+      engine.client.send({ kind: "subscribe", sheet: 0, ...subscription }),
     margin,
     metrics: METRICS,
     onFrame(report) {

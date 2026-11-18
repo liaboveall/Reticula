@@ -7,10 +7,15 @@ import {
   EPOCH_AT,
   FIRST_COL_AT,
   FIRST_ROW_AT,
+  FLAG_BOOL,
+  FLAG_ERROR,
+  FLAG_FORMULA,
   FLAG_NUMBER,
+  FLAG_TRUNCATED,
   HEADER_LEN,
   ID_LEN,
   ROW_COUNT_AT,
+  SHEET_AT,
   TEXT_LEN_AT,
   VERSION,
   VERSION_AT,
@@ -21,6 +26,8 @@ import {
  * one shows and the identifiers of its rows and columns.
  */
 export interface Page {
+  /** Identifier of the sheet (`SheetId`). */
+  readonly sheet: number;
   /** The subscription the engine sent this page for. */
   readonly epoch: number;
   /** Position of the first row. */
@@ -46,6 +53,26 @@ export function isNumber(flags: number): boolean {
   return (flags & FLAG_NUMBER) !== 0;
 }
 
+/** Whether a cell with these flags holds a boolean (`TRUE` / `FALSE`). */
+export function isBool(flags: number): boolean {
+  return (flags & FLAG_BOOL) !== 0;
+}
+
+/** Whether a cell with these flags holds an error (`#DIV/0!`, `#REF!`, ...). */
+export function isError(flags: number): boolean {
+  return (flags & FLAG_ERROR) !== 0;
+}
+
+/** Whether a cell with these flags is backed by a bound formula. */
+export function isFormula(flags: number): boolean {
+  return (flags & FLAG_FORMULA) !== 0;
+}
+
+/** Whether a cell's display text was truncated at the viewport cap. */
+export function isTruncated(flags: number): boolean {
+  return (flags & FLAG_TRUNCATED) !== 0;
+}
+
 const utf8 = new TextDecoder("utf-8");
 
 /**
@@ -64,6 +91,7 @@ export function decodePage(buffer: ArrayBuffer): Page {
   if (version !== VERSION) {
     throw new Error(`viewport page: layout version ${version}, expected ${VERSION}`);
   }
+  const sheet = view.getUint32(SHEET_AT, true);
   const rowCount = view.getUint16(ROW_COUNT_AT, true);
   const colCount = view.getUint16(COL_COUNT_AT, true);
   const textLength = view.getUint32(TEXT_LEN_AT, true);
@@ -108,6 +136,7 @@ export function decodePage(buffer: ArrayBuffer): Page {
   }
 
   return {
+    sheet,
     epoch: view.getUint32(EPOCH_AT, true),
     firstRow: view.getUint32(FIRST_ROW_AT, true),
     firstCol: view.getUint32(FIRST_COL_AT, true),

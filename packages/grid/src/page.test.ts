@@ -1,7 +1,7 @@
 import { HEADER_LEN, TEXT_LEN_AT, VERSION_AT } from "@reticula/protocol/viewport";
 import { fixture } from "@reticula/protocol/viewport-fixture";
 import { describe, expect, test } from "vitest";
-import { decodePage, isNumber } from "./page.ts";
+import { decodePage, isBool, isError, isFormula, isNumber, isTruncated } from "./page.ts";
 
 /** The fixture's packet, as a buffer of its own. */
 function packet(): ArrayBuffer {
@@ -16,6 +16,7 @@ describe("a page encoded by the engine", () => {
   const page = decodePage(packet());
 
   test("says where it belongs", () => {
+    expect(page.sheet).toBe(fixture.sheet);
     expect(page.epoch).toBe(fixture.epoch);
     expect(page.firstRow).toBe(fixture.firstRow);
     expect(page.firstCol).toBe(fixture.firstCol);
@@ -29,11 +30,19 @@ describe("a page encoded by the engine", () => {
     expect([...page.colIds]).toEqual(fixture.colIds);
   });
 
-  test("gives every cell the text and the kind the engine gave it", () => {
+  test("gives every cell the text and the v1 flags the engine gave it", () => {
     const cells = fixture.cells.map((row, rowIndex) =>
       row.map((_, colIndex) => {
         const cell = rowIndex * page.colCount + colIndex;
-        return { text: page.texts[cell], number: isNumber(page.flags[cell] ?? 0) };
+        const flags = page.flags[cell] ?? 0;
+        return {
+          text: page.texts[cell],
+          number: isNumber(flags),
+          bool: isBool(flags),
+          error: isError(flags),
+          formula: isFormula(flags),
+          truncated: isTruncated(flags),
+        };
       }),
     );
     expect(cells).toEqual(fixture.cells);

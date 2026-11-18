@@ -4,18 +4,20 @@
 // must give exactly the rest.
 
 export const fixture = {
-  hex: "00000000000000004000000010000000060002005c0000000700000000000000400000000000000041000000000000004200000000000000430000000000000044000000000000004500000000000000100000000000000011000000000000000000000005000000050000000a0000010f00000005000001140000000000000014000000080000011c0000000a0000012600000000000000260000000b000000310000000b0000003c0000000a00000146000000050000014b00000000000000e59381e5908d20f09f9880323032342d30322d323931322e35302d313233342e3031313930302d30322d3239e6b7b7e59088206d6978656420e69687e69cacf09d92b32d72617920636166c3a9323032362d31312d313631452b3231",
+  hex: "01000000000000004000000010000000070002006702000007000000000000004000000000000000410000000000000042000000000000004300000000000000440000000000000045000000000000004600000000000000100000000000000011000000000000000000000005000000050000000a0000010f00000005000009140000000000000014000000080000011c0000000a0000012600000000000000260000000b000000310000000b0000003c0000000a00000146000000050000014b000000040000024f0000000700000c5600000000020010e59381e5908d20f09f9880323032342d30322d323931322e35302d313233342e3031313930302d30322d3239e6b7b7e59088206d6978656420e69687e69cacf09d92b32d72617920636166c3a9323032362d31312d313631452b323154525545234449562f30217a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a",
+  sheet: 0,
   epoch: 7,
   firstRow: 64,
   firstCol: 16,
-  rowIds: [64n, 65n, 66n, 67n, 68n, 69n],
+  rowIds: [64n, 65n, 66n, 67n, 68n, 69n, 70n],
   colIds: [16n, 17n],
   cells: [
-    [{ text: "品名 😀", number: false }, { text: "2024-02-29", number: true }],
-    [{ text: "12.50", number: true }, { text: "", number: false }],
-    [{ text: "-1234.01", number: true }, { text: "1900-02-29", number: true }],
-    [{ text: "", number: false }, { text: "混合 mixed 文本", number: false }],
-    [{ text: "𝒳-ray café", number: false }, { text: "2026-11-16", number: true }],
-    [{ text: "1E+21", number: true }, { text: "", number: false }],
+    [{ text: "品名 😀", number: false, bool: false, error: false, formula: false, truncated: false }, { text: "2024-02-29", number: true, bool: false, error: false, formula: false, truncated: false }],
+    [{ text: "12.50", number: true, bool: false, error: false, formula: true, truncated: false }, { text: "", number: false, bool: false, error: false, formula: false, truncated: false }],
+    [{ text: "-1234.01", number: true, bool: false, error: false, formula: false, truncated: false }, { text: "1900-02-29", number: true, bool: false, error: false, formula: false, truncated: false }],
+    [{ text: "", number: false, bool: false, error: false, formula: false, truncated: false }, { text: "混合 mixed 文本", number: false, bool: false, error: false, formula: false, truncated: false }],
+    [{ text: "𝒳-ray café", number: false, bool: false, error: false, formula: false, truncated: false }, { text: "2026-11-16", number: true, bool: false, error: false, formula: false, truncated: false }],
+    [{ text: "1E+21", number: true, bool: false, error: false, formula: false, truncated: false }, { text: "TRUE", number: false, bool: true, error: false, formula: false, truncated: false }],
+    [{ text: "#DIV/0!", number: false, bool: false, error: true, formula: true, truncated: false }, { text: "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz", number: false, bool: false, error: false, formula: false, truncated: true }],
   ],
 } as const;

@@ -14,8 +14,9 @@
 use std::fmt::Write as _;
 
 use reticula_core::format::NumberFormat;
+use reticula_core::id::{ColId, RowId};
 use reticula_core::sheet::Sheet;
-use reticula_core::value::Value;
+use reticula_core::value::{CalcError, Value};
 use reticula_core::viewport::{self, Page};
 
 use crate::util::{self, Result};
@@ -79,6 +80,11 @@ fn layout() -> String {
         CELL_STYLE_AT,
         CELL_FLAGS_AT,
         FLAG_NUMBER,
+        FLAG_BOOL,
+        FLAG_ERROR,
+        FLAG_FORMULA,
+        FLAG_TRUNCATED,
+        MAX_CELL_DISPLAY_UTF16,
         MAX_SUBSCRIBED_PAGE_ROWS,
         MAX_SUBSCRIBED_PAGE_COLS,
     ];
@@ -107,15 +113,18 @@ fn fixture() -> String {
     for _ in 0..ROWS_ABOVE {
         sheet.push_row(&[]);
     }
+    let long_text = "z".repeat(600);
     // Text of one, two and three bytes per character, and of four, which takes
-    // two UTF-16 code units; numbers in two formats; empty cells and empty text.
-    let rows: [[Cell; 2]; 6] = [
+    // two UTF-16 code units; numbers in two formats; booleans, errors, formulas,
+    // truncated strings, empty cells and empty text.
+    let rows: [[Cell<'_>; 2]; 7] = [
         [Cell::Text("品名 😀"), Cell::Number(45_351.0)],
         [Cell::Number(12.5), Cell::Text("")],
         [Cell::Number(-1234.005), Cell::Number(60.0)],
         [Cell::Empty, Cell::Text("混合 mixed 文本")],
         [Cell::Text("𝒳-ray café"), Cell::Number(46_342.75)],
-        [Cell::Number(1.0e21), Cell::Empty],
+        [Cell::Number(1.0e21), Cell::Bool(true)],
+        [Cell::Error(CalcError::Div0), Cell::Text(&long_text)],
     ];
     for row in rows {
         let mut values = vec![Value::Empty; COLS_LEFT];
@@ -123,16 +132,24 @@ fn fixture() -> String {
             values.push(match cell {
                 Cell::Empty => Value::Empty,
                 Cell::Number(number) => Value::Number(number),
+                Cell::Bool(b) => Value::Bool(b),
+                Cell::Error(e) => Value::Error(e),
                 Cell::Text(text) => sheet.add_string(text).map_or(Value::Empty, Value::Text),
             });
         }
         sheet.push_row(&values);
     }
 
+    let first_row = viewport::PAGE_ROWS;
+    let first_col = viewport::PAGE_COLS;
+    let is_formula = |r: RowId, c: ColId| {
+        (r == RowId(u64::from(first_row + 1)) && c == ColId(u64::from(first_col)))
+            || (r == RowId(u64::from(first_row + 6)) && c == ColId(u64::from(first_col)))
+    };
+
     let page = Page { row: 1, col: 1 };
-    let bytes = viewport::encode_page(&sheet, page, EPOCH, &mut String::new());
-    let first_row = page.row * viewport::PAGE_ROWS;
-    let first_col = page.col * viewport::PAGE_COLS;
+    let bytes =
+        viewport::encode_page_with_formulas(&sheet, page, EPOCH, &mut String::new(), is_formula);
 
     let mut out = String::from(BANNER);
     out.push_str(
@@ -144,6 +161,7 @@ fn fixture() -> String {
         let _ = write!(out, "{byte:02x}");
     }
     out.push_str("\",\n");
+    let _ = writeln!(out, "  sheet: {},", sheet.id().0);
     let _ = writeln!(out, "  epoch: {EPOCH},");
     let _ = writeln!(out, "  firstRow: {first_row},");
     let _ = writeln!(out, "  firstCol: {first_col},");
@@ -171,11 +189,27 @@ fn fixture() -> String {
         for col in first_col..sheet.cols() {
             let mut text = String::new();
             let value = sheet.write_text(row, col, &mut text);
+            let mut truncated = false;
+            if text.encode_utf16().count() > usize::from(viewport::MAX_CELL_DISPLAY_UTF16) {
+                truncated = true;
+                let units: Vec<u16> = text
+                    .encode_utf16()
+                    .take(usize::from(viewport::MAX_CELL_DISPLAY_UTF16))
+                    .collect();
+                text = String::from_utf16_lossy(&units);
+            }
             let number = matches!(value, Value::Number(_));
+            let boolean = matches!(value, Value::Bool(_));
+            let error = matches!(value, Value::Error(_));
+            let formula = is_formula(RowId(sheet.row_id(row)), ColId(sheet.col_id(col)));
             if col > first_col {
                 out.push_str(", ");
             }
-            let _ = write!(out, "{{ text: {}, number: {number} }}", quoted(&text));
+            let _ = write!(
+                out,
+                "{{ text: {}, number: {number}, bool: {boolean}, error: {error}, formula: {formula}, truncated: {truncated} }}",
+                quoted(&text)
+            );
         }
         out.push_str("],\n");
     }
@@ -183,10 +217,12 @@ fn fixture() -> String {
     out
 }
 
-enum Cell {
+enum Cell<'a> {
     Empty,
     Number(f64),
-    Text(&'static str),
+    Bool(bool),
+    Error(CalcError),
+    Text(&'a str),
 }
 
 /// A string as a double-quoted TypeScript literal.

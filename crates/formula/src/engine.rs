@@ -392,6 +392,13 @@ impl FormulaEngine {
         self.dirty_cursor < self.dirty_queue.len() || !self.call_stack.is_empty()
     }
 
+    /// O(1) check whether `(sheet_id, row, col)` holds a bound formula.
+    #[inline]
+    #[must_use]
+    pub fn has_formula(&self, sheet_id: SheetId, row: RowId, col: ColId) -> bool {
+        !self.cell_to_fid.is_empty() && self.cell_to_fid.contains_key(&(sheet_id, row, col))
+    }
+
     /// Takes accumulated dirty cell / structural notifications since the last
     /// call.
     pub fn take_dirty_changes(&mut self) -> DirtyChanges {

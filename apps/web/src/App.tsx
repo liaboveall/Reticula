@@ -69,7 +69,7 @@ export function App() {
     // The grid is on screen and takes input before the engine has anything
     // to show; the sheet's size arrives with the engine's first message.
     const grid = new Grid(element, {
-      subscribe: (subscription) => client.send({ kind: "subscribe", ...subscription }),
+      subscribe: (subscription) => client.send({ kind: "subscribe", sheet: 0, ...subscription }),
     });
 
     let shellMarked = false;

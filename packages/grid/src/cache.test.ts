@@ -5,6 +5,7 @@ import type { Page } from "./page.ts";
 
 function page(pageRow: number, pageCol: number, epoch = 1): Page {
   return {
+    sheet: 0,
     epoch,
     firstRow: pageRow * PAGE_ROWS,
     firstCol: pageCol * PAGE_COLS,

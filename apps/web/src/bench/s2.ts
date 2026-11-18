@@ -85,6 +85,7 @@ function syntheticPage(pageRow: number, pageCol: number, content: Content): Page
     }
   }
   return {
+    sheet: 0,
     epoch: 0,
     firstRow,
     firstCol,

@@ -63,6 +63,7 @@ export function release(engine: OpenEngine): void {
   engine.onPage = () => {};
   engine.client.send({
     kind: "subscribe",
+    sheet: 0,
     epoch: 0,
     firstRow: 0,
     rowCount: 0,

@@ -2,7 +2,15 @@
 // uses the package's main entry instead.
 export { PageCache } from "./cache.ts";
 export * from "./layout.ts";
-export { decodePage, isNumber, type Page } from "./page.ts";
+export {
+  decodePage,
+  isBool,
+  isError,
+  isFormula,
+  isNumber,
+  isTruncated,
+  type Page,
+} from "./page.ts";
 export {
   ALL_SHORTCUTS,
   type Frame,

@@ -71,7 +71,7 @@ const client = startEngine({
   onPage: (page) => grid.acceptPage(page),
 });
 const grid = new Grid(host, {
-  subscribe: (subscription) => client.send({ kind: "subscribe", ...subscription }),
+  subscribe: (subscription) => client.send({ kind: "subscribe", sheet: 0, ...subscription }),
 });
 const editor = new CellEditor(grid, host, {
   textOf: (cell) => typed.get(cellName(cell)) ?? grid.textAt(cell.row, cell.col) ?? "",
