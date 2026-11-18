@@ -16,6 +16,6 @@ workspace = true
 
 [dependencies]
 reticula-core = { workspace = true }
-serde = { workspace = true }
+serde = { workspace = true, features = ["std"] }
 tsify = { workspace = true }
 wasm-bindgen = { workspace = true }

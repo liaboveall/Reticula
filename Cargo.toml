@@ -24,7 +24,10 @@ reticula-core = { path = "crates/core" }
 # observable behaviour, so an upgrade is a deliberate, reviewed change.
 libm = "=0.2.16"
 
-serde = { version = "1.0.229", features = ["derive"] }
+hashbrown = { version = "=0.17.1", default-features = false }
+rustc-hash = { version = "2.1.3", default-features = false }
+serde = { version = "1.0.229", default-features = false, features = ["alloc", "derive"] }
+smallvec = { version = "=1.16.5", default-features = false, features = ["serde"] }
 tsify = { version = "0.5.8", default-features = false, features = ["js"] }
 wasm-bindgen = "=0.2.130"
 wasm-bindgen-test = "0.3.80"

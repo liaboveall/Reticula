@@ -12,9 +12,11 @@ use alloc::vec::Vec;
 use core::fmt::Write as _;
 
 use crate::format::NumberFormat;
+use crate::memory::try_reserve_heap;
 use crate::num;
 use crate::rng::Rng;
 use crate::sheet::Sheet;
+use crate::strings::StringTable;
 use crate::value::Value;
 
 /// Number of columns in the sample.
@@ -146,23 +148,23 @@ struct Dictionary {
 }
 
 impl Dictionary {
-    fn of(sheet: &mut Sheet, entries: &[&str]) -> Self {
-        let first = next_string(sheet);
+    fn of(strings: &mut StringTable, entries: &[&str]) -> Self {
+        let first = next_string(strings);
         for entry in entries {
-            sheet.add_string(entry);
+            strings.intern(entry);
         }
         Self { first }
     }
 
     /// Entries `prefix` followed by a number padded to `width` digits.
-    fn numbered(sheet: &mut Sheet, prefix: &str, width: usize, count: u32) -> Self {
-        let first = next_string(sheet);
+    fn numbered(strings: &mut StringTable, prefix: &str, width: usize, count: u32) -> Self {
+        let first = next_string(strings);
         let mut text = String::new();
         for number in 0..count {
             text.clear();
             // Writing to a `String` cannot fail.
             let _ = write!(text, "{prefix}{number:0width$}");
-            sheet.add_string(&text);
+            strings.intern(&text);
         }
         Self { first }
     }
@@ -172,8 +174,8 @@ impl Dictionary {
     }
 }
 
-fn next_string(sheet: &Sheet) -> u32 {
-    u32::try_from(sheet.strings().len()).unwrap_or(u32::MAX)
+fn next_string(strings: &StringTable) -> u32 {
+    u32::try_from(strings.len()).unwrap_or(u32::MAX)
 }
 
 struct Product {
@@ -187,21 +189,31 @@ struct Product {
 /// The same `seed` and `rows` always give the same sheet.
 #[must_use]
 pub fn generate(seed: u64, rows: u32) -> Sheet {
-    let mut sheet = Sheet::new(&FORMATS);
     if rows == 0 {
-        return sheet;
+        return Sheet::new(&FORMATS);
     }
-    let mut rng = Rng::from_seed(seed);
+    // Pre-warm linear memory in one step (~20 columns * 8 bytes * rows + slack)
+    // to avoid thousands of small `memory.grow` calls on WebAssembly.
+    let estimated_heap = (rows as usize)
+        .saturating_mul(COLUMNS)
+        .saturating_mul(size_of::<u64>())
+        .saturating_add(4 * 1024 * 1024);
+    let _ = try_reserve_heap(estimated_heap);
 
-    let headers = Dictionary::of(&mut sheet, &HEADERS);
-    let regions = Dictionary::of(&mut sheet, &REGIONS);
-    let cities = Dictionary::of(&mut sheet, &CITIES);
-    let channels = Dictionary::of(&mut sheet, &CHANNELS);
-    let categories = Dictionary::of(&mut sheet, &CATEGORIES);
-    let representatives = Dictionary::of(&mut sheet, &REPRESENTATIVES);
-    let notes = Dictionary::of(&mut sheet, &NOTES);
-    let skus = Dictionary::numbered(&mut sheet, "SKU-", 5, PRODUCTS);
-    let customers = Dictionary::numbered(&mut sheet, "C-", 6, CUSTOMERS);
+    let mut rng = Rng::from_seed(seed);
+    let mut strings = StringTable::with_capacity(22_100, 220_000);
+
+    let headers = Dictionary::of(&mut strings, &HEADERS);
+    let regions = Dictionary::of(&mut strings, &REGIONS);
+    let cities = Dictionary::of(&mut strings, &CITIES);
+    let channels = Dictionary::of(&mut strings, &CHANNELS);
+    let categories = Dictionary::of(&mut strings, &CATEGORIES);
+    let representatives = Dictionary::of(&mut strings, &REPRESENTATIVES);
+    let notes = Dictionary::of(&mut strings, &NOTES);
+    let skus = Dictionary::numbered(&mut strings, "SKU-", 5, PRODUCTS);
+    let customers = Dictionary::numbered(&mut strings, "C-", 6, CUSTOMERS);
+
+    let mut sheet = Sheet::with_base_formats(rows, &FORMATS, strings);
 
     let products: Vec<Product> = (0..PRODUCTS)
         .map(|_| {
@@ -215,11 +227,10 @@ pub fn generate(seed: u64, rows: u32) -> Sheet {
         })
         .collect();
 
-    let mut row = [Value::Empty; COLUMNS];
-    for (index, cell) in (0..).zip(row.iter_mut()) {
-        *cell = headers.entry(index);
+    for col in 0..COLUMNS {
+        let idx = u32::try_from(col).unwrap_or(0);
+        sheet.set_base_slot(0, col, headers.entry(idx));
     }
-    sheet.push_row(&row);
 
     let orders = u64::from(rows.saturating_sub(1));
     for order in 0..rows.saturating_sub(1) {
@@ -254,7 +265,7 @@ pub fn generate(seed: u64, rows: u32) -> Sheet {
             .checked_div(orders)
             .unwrap_or(0);
 
-        row = [
+        let row = [
             Value::Number(f64::from(FIRST_ORDER_NUMBER.saturating_add(order))),
             Value::Number(whole(FIRST_DAY.saturating_add(day))),
             regions.entry(city.checked_div(narrow(CITIES_PER_REGION)).unwrap_or(0)),
@@ -284,7 +295,12 @@ pub fn generate(seed: u64, rows: u32) -> Sheet {
                 Value::Empty
             },
         ];
-        sheet.push_row(&row);
+        let row_slot = order.saturating_add(1);
+        for (col, val) in row.into_iter().enumerate() {
+            if val != Value::Empty {
+                sheet.set_base_slot(row_slot, col, val);
+            }
+        }
     }
     sheet
 }

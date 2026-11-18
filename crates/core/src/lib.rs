@@ -33,9 +33,13 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+pub mod axis;
+pub mod decimal15;
 pub mod determinism;
 pub mod digest;
 pub mod format;
+pub mod id;
+pub mod memory;
 pub mod num;
 pub mod rng;
 pub mod sample;

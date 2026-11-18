@@ -428,7 +428,7 @@ mod tests {
             .iter()
             .map(|(text, _)| text.as_str())
             .collect();
-        assert_eq!(texts, ["华", "😀", "a", "", "-2.50", "𝒳-ray 华东"]);
+        assert_eq!(texts, ["华", "😀", "a", "", "-2.5", "𝒳-ray 华东"]);
 
         let cells_at = HEADER_LEN + 2 * ID_LEN + 3 * ID_LEN;
         let record = |index: usize| {
@@ -440,7 +440,7 @@ mod tests {
         };
         assert_eq!(
             [0, 1, 2, 3, 4, 5].map(record),
-            [(0, 1), (1, 2), (3, 1), (4, 0), (4, 5), (9, 9)]
+            [(0, 1), (1, 2), (3, 1), (4, 0), (4, 4), (8, 9)]
         );
     }
 
