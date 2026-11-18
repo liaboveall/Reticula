@@ -229,6 +229,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "reticula-formula"
+version = "0.0.0"
+dependencies = [
+ "reticula-core",
+ "serde",
+ "wasm-bindgen-test",
+]
+
+[[package]]
 name = "reticula-wasm"
 version = "0.0.0"
 dependencies = [
