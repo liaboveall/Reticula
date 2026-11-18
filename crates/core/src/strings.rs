@@ -120,6 +120,53 @@ impl StringTable {
         let count = u32::try_from(self.ends.len()).unwrap_or(u32::MAX);
         (0..count).map(move |id| (id, self.get(id)))
     }
+
+    /// Raw concatenated UTF-8 bytes of all strings, for snapshot encoding.
+    #[must_use]
+    pub fn raw_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// End byte offsets of each string entry, for snapshot encoding.
+    #[must_use]
+    pub fn raw_ends(&self) -> &[u32] {
+        &self.ends
+    }
+
+    /// Reconstructs a string table from raw UTF-8 bytes and monotonic end
+    /// offsets, validating UTF-8 boundaries and per-entry UTF-16 length limit.
+    #[must_use]
+    pub fn from_raw(bytes: Vec<u8>, ends: Vec<u32>, max_utf16_len: usize) -> Option<Self> {
+        let mut prev_end: u32 = 0;
+        for &end in &ends {
+            if end < prev_end || (end as usize) > bytes.len() {
+                return None;
+            }
+            let slice = bytes.get(prev_end as usize..end as usize)?;
+            let text = core::str::from_utf8(slice).ok()?;
+            if text.encode_utf16().count() > max_utf16_len {
+                return None;
+            }
+            prev_end = end;
+        }
+        if (prev_end as usize) != bytes.len() {
+            return None;
+        }
+        let mut buckets =
+            BucketMap::with_capacity_and_hasher(ends.len(), BuildHasherDefault::default());
+        let mut table = Self {
+            bytes,
+            ends,
+            buckets: BucketMap::default(),
+        };
+        let count = u32::try_from(table.ends.len()).ok()?;
+        for id in 0..count {
+            let hash = hash_str(table.get(id));
+            buckets.entry(hash).or_default().push(id);
+        }
+        table.buckets = buckets;
+        Some(table)
+    }
 }
 
 fn hash_str(text: &str) -> u64 {

@@ -208,6 +208,18 @@ impl IdAllocator {
         }
     }
 
+    /// Epoch of identities issued by this allocator.
+    #[must_use]
+    pub const fn epoch(&self) -> u8 {
+        self.epoch
+    }
+
+    /// Replica number of identities issued by this allocator.
+    #[must_use]
+    pub const fn replica(&self) -> u32 {
+        self.replica
+    }
+
     /// Next counter that will be issued.
     #[must_use]
     pub const fn next_counter(&self) -> u32 {

@@ -220,6 +220,8 @@ version = "0.0.0"
 dependencies = [
  "hashbrown",
  "libm",
+ "lz4_flex",
+ "postcard",
  "rustc-hash",
  "serde",
  "smallvec",

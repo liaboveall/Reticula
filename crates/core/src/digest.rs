@@ -22,6 +22,11 @@ impl Digest64 {
         }
     }
 
+    /// Adds one 32-bit value.
+    pub fn write_u32(&mut self, value: u32) {
+        self.write_u64(u64::from(value));
+    }
+
     /// Adds one 64-bit value.
     pub fn write_u64(&mut self, value: u64) {
         self.state = mix64(self.state ^ value).wrapping_add(0x9E37_79B9_7F4A_7C15);

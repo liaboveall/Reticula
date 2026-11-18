@@ -32,6 +32,7 @@ pub struct SlotMap {
     base_len: u32,
     next_slot: u32,
     extra: ExtraSlotMap,
+    extra_ids: Vec<u64>,
 }
 
 impl SlotMap {
@@ -43,7 +44,35 @@ impl SlotMap {
             base_len,
             next_slot: base_len,
             extra: ExtraSlotMap::default(),
+            extra_ids: Vec::new(),
         }
+    }
+
+    /// Reconstructs a slot map from `base_len` and ordered extra identities,
+    /// returning `None` if an extra identity duplicates an earlier entry or a
+    /// base identity, or if slot indices overflow `u32`.
+    #[must_use]
+    pub fn from_parts(base_len: u32, extra_ids: Vec<u64>) -> Option<Self> {
+        let extra_len = u32::try_from(extra_ids.len()).ok()?;
+        let next_slot = base_len.checked_add(extra_len)?;
+        let mut extra =
+            ExtraSlotMap::with_capacity_and_hasher(extra_ids.len(), BuildHasherDefault::default());
+        for (idx, &id) in extra_ids.iter().enumerate() {
+            if is_base_id(id) && id < u64::from(base_len) {
+                return None;
+            }
+            let offset = u32::try_from(idx).ok()?;
+            let slot = base_len.checked_add(offset)?;
+            if extra.insert(id, slot).is_some() {
+                return None;
+            }
+        }
+        Some(Self {
+            base_len,
+            next_slot,
+            extra,
+            extra_ids,
+        })
     }
 
     /// Number of slots reserved for the base run.
@@ -56,6 +85,23 @@ impl SlotMap {
     #[must_use]
     pub const fn slot_bound(&self) -> u32 {
         self.next_slot
+    }
+
+    /// Non-base identities in deterministic slot allocation order
+    /// (`slot = base_len + index`).
+    #[must_use]
+    pub fn extra_ids(&self) -> &[u64] {
+        &self.extra_ids
+    }
+
+    /// Reverse lookup from dense `slot` back to its 64-bit identity in O(1).
+    #[must_use]
+    pub fn slot_to_id(&self, slot: u32) -> Option<u64> {
+        if slot < self.base_len {
+            return Some(u64::from(slot));
+        }
+        let idx = slot.checked_sub(self.base_len)? as usize;
+        self.extra_ids.get(idx).copied()
     }
 
     /// Looks up the slot of `id` without allocating one if missing.
@@ -76,15 +122,17 @@ impl SlotMap {
         let slot = self.next_slot;
         self.next_slot = self.next_slot.checked_add(1)?;
         self.extra.insert(id, slot);
+        self.extra_ids.push(id);
         Some(slot)
     }
 
-    /// Approximate heap bytes owned by the extra-slot hash table.
+    /// Approximate heap bytes owned by the extra-slot tables.
     #[must_use]
     pub fn estimated_bytes(&self) -> usize {
         self.extra
             .capacity()
             .saturating_mul(size_of::<(u64, u32)>())
+            .saturating_add(self.extra_ids.capacity().saturating_mul(size_of::<u64>()))
     }
 }
 
@@ -289,6 +337,87 @@ impl Column {
         self.blocks
             .get(block_idx)
             .map_or(Value::EMPTY_BITS, |block| block.get(offset))
+    }
+
+    /// Reconstructs a column from decoded blocks and slot bound, validating
+    /// every block's internal invariants and every stored word via `check_word`.
+    pub fn try_from_blocks(
+        blocks: Vec<Block>,
+        len: u32,
+        mut check_word: impl FnMut(u64) -> bool,
+    ) -> Option<Self> {
+        let max_blocks = len.div_ceil(BLOCK_ROWS) as usize;
+        if blocks.len() > max_blocks {
+            return None;
+        }
+        for block in &blocks {
+            match block {
+                Block::Empty => {}
+                Block::Sparse(entries) => {
+                    if entries.is_empty() || entries.len() > SPARSE_LIMIT {
+                        return None;
+                    }
+                    let mut prev_offset: Option<u16> = None;
+                    for &(offset, bits) in entries {
+                        if u32::from(offset) >= BLOCK_ROWS || bits == Value::EMPTY_BITS {
+                            return None;
+                        }
+                        if let Some(prev) = prev_offset
+                            && offset <= prev
+                        {
+                            return None;
+                        }
+                        if !check_word(bits) {
+                            return None;
+                        }
+                        prev_offset = Some(offset);
+                    }
+                }
+                Block::Dense(words) => {
+                    if words.len() != BLOCK_ROWS as usize {
+                        return None;
+                    }
+                    for &bits in words {
+                        if !check_word(bits) {
+                            return None;
+                        }
+                    }
+                }
+            }
+        }
+        Some(Self { blocks, len })
+    }
+
+    /// Visits every non-empty `(slot, Value)` pair in ascending slot order.
+    pub fn for_each_non_empty(&self, mut visit: impl FnMut(u32, Value)) {
+        for (block_idx, block) in self.blocks.iter().enumerate() {
+            let Some(block_idx_u32) = u32::try_from(block_idx).ok() else {
+                break;
+            };
+            let Some(base_slot) = block_idx_u32.checked_mul(BLOCK_ROWS) else {
+                break;
+            };
+            match block {
+                Block::Empty => {}
+                Block::Sparse(entries) => {
+                    for &(offset, bits) in entries {
+                        if let Some(slot) = base_slot.checked_add(u32::from(offset)) {
+                            visit(slot, Value::unpack(bits));
+                        }
+                    }
+                }
+                Block::Dense(words) => {
+                    for (offset, &bits) in words.iter().enumerate() {
+                        if bits != Value::EMPTY_BITS
+                            && let Some(off_u32) = u32::try_from(offset).ok()
+                            && let Some(slot) = base_slot.checked_add(off_u32)
+                        {
+                            visit(slot, Value::unpack(bits));
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Packed words of slots `0..self.len`, in slot order.

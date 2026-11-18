@@ -554,6 +554,30 @@ impl Axis {
         Ok(())
     }
 
+    /// Validates that `targets` are non-empty, valid, pairwise non-overlapping
+    /// runs whose identities all exist on this axis (live or tombstoned).
+    pub fn validate_existing_runs(&self, targets: &[IdRun]) -> Result<(), AxisError> {
+        if targets.is_empty() {
+            return Err(AxisError::InvalidRun);
+        }
+        for (i, target) in targets.iter().enumerate() {
+            if !target.is_valid() {
+                return Err(AxisError::InvalidRun);
+            }
+            for earlier in targets.get(..i).unwrap_or(&[]) {
+                if Self::runs_overlap(*earlier, *target) {
+                    return Err(AxisError::DuplicateId);
+                }
+            }
+            for id in target.iter() {
+                if self.locate_id(id).is_none() {
+                    return Err(AxisError::TargetNotFound);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Increments the deletion count of every identity in `targets`.
     /// Validates all runs before mutating so an invalid input leaves the axis
     /// untouched.
