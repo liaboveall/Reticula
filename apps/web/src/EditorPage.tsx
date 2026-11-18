@@ -175,6 +175,10 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
       if (!force && key === lastInspectKey) {
         return;
       }
+      if (key !== lastInspectKey) {
+        inspectedRef.current = null;
+        setInspected(null);
+      }
       lastInspectKey = key;
       client.send({
         kind: "inspectCell",
@@ -207,6 +211,10 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
             break;
           }
           case "cellInspected": {
+            const cur = grid.selectionDetails();
+            if (!cur || cur.rowId !== message.rowId || cur.colId !== message.colId) {
+              break;
+            }
             const info: InspectedState = {
               rowId: message.rowId,
               colId: message.colId,
@@ -345,8 +353,16 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
     };
   }, []);
 
+  const matchingInspected =
+    inspected !== null &&
+    selection !== null &&
+    inspected.rowId === selection.rowId &&
+    inspected.colId === selection.colId
+      ? inspected
+      : null;
+
   const formulaBarValue =
-    editingText !== null ? editingText : (inspected?.raw ?? selection?.text ?? "");
+    editingText !== null ? editingText : (matchingInspected?.raw ?? selection?.text ?? "");
 
   const handleInsertRowAbove = () => {
     const grid = gridRef.current;
