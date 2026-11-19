@@ -56,6 +56,207 @@ pub fn detect_delimiter(text: &str) -> u8 {
     if tabs > commas { b'\t' } else { b',' }
 }
 
+/// Incremental RFC 4180 CSV/TSV parser supporting row-batched progress updates
+/// (`14-m1b.md` 5.6: report progress every `65,536` rows).
+#[derive(Debug)]
+pub struct CsvReader {
+    raw: alloc::vec::Vec<u8>,
+    text_offset: usize,
+    delimiter: u8,
+    sheet: Sheet,
+    pos: usize,
+    row_idx: u32,
+    col_idx: u32,
+    field_scratch: String,
+}
+
+impl CsvReader {
+    /// Validates UTF-8 (stripping an optional UTF-8 BOM `\u{FEFF}`) and prepares
+    /// incremental row parsing into a fresh [`Sheet`].
+    pub fn new(
+        id: SheetId,
+        name: String,
+        raw: alloc::vec::Vec<u8>,
+        delimiter_override: Option<u8>,
+    ) -> Result<Self, CsvError> {
+        let text_offset = if raw.starts_with(&[0xEF, 0xBB, 0xBF]) {
+            3
+        } else {
+            0
+        };
+        let body = raw.get(text_offset..).unwrap_or(&[]);
+        let text = core::str::from_utf8(body).map_err(|_| CsvError::InvalidUtf8)?;
+        let delimiter = delimiter_override.unwrap_or_else(|| detect_delimiter(text));
+        Ok(Self {
+            raw,
+            text_offset,
+            delimiter,
+            sheet: Sheet::standard(id, name),
+            pos: 0,
+            row_idx: 0,
+            col_idx: 0,
+            field_scratch: String::new(),
+        })
+    }
+
+    /// Rows completed so far.
+    #[must_use]
+    pub const fn rows_parsed(&self) -> u32 {
+        self.row_idx
+    }
+
+    /// Byte progress percentage (`0..=100`).
+    #[must_use]
+    pub fn progress_percent(&self) -> u8 {
+        let body_len = self.raw.len().saturating_sub(self.text_offset);
+        if body_len == 0 || self.pos >= body_len {
+            return 100;
+        }
+        let pct = self
+            .pos
+            .saturating_mul(100)
+            .checked_div(body_len)
+            .unwrap_or(100);
+        u8::try_from(pct.min(99)).unwrap_or(99)
+    }
+
+    /// Parses up to `max_rows` complete rows (`>= 1`), returning `Ok(true)` once
+    /// the entire input has been consumed or `Ok(false)` when yielding between
+    /// batches.
+    pub fn parse_rows(&mut self, max_rows: u32) -> Result<bool, CsvError> {
+        let body = self.raw.get(self.text_offset..).unwrap_or(&[]);
+        let text = core::str::from_utf8(body).map_err(|_| CsvError::InvalidUtf8)?;
+        let bytes = text.as_bytes();
+        let len = bytes.len();
+        let delimiter = self.delimiter;
+        let stop_row = self.row_idx.saturating_add(max_rows.max(1));
+
+        while self.pos < len && self.row_idx < stop_row {
+            self.field_scratch.clear();
+            let field_slice: &str = if bytes.get(self.pos) == Some(&b'"') {
+                self.pos = self.pos.saturating_add(1);
+                let mut closed = false;
+                while self.pos < len {
+                    let chunk_start = self.pos;
+                    while let Some(&b) = bytes.get(self.pos) {
+                        if b == b'"' {
+                            break;
+                        }
+                        self.pos = self.pos.saturating_add(1);
+                    }
+                    if let Some(piece) = text.get(chunk_start..self.pos) {
+                        self.field_scratch.push_str(piece);
+                    }
+                    if bytes.get(self.pos) == Some(&b'"') {
+                        if bytes.get(self.pos.saturating_add(1)) == Some(&b'"') {
+                            self.field_scratch.push('"');
+                            self.pos = self.pos.saturating_add(2);
+                        } else {
+                            self.pos = self.pos.saturating_add(1);
+                            closed = true;
+                            break;
+                        }
+                    }
+                }
+                if !closed {
+                    return Err(CsvError::UnclosedQuote);
+                }
+                while let Some(&b) = bytes.get(self.pos) {
+                    if b == delimiter || b == b'\r' || b == b'\n' {
+                        break;
+                    }
+                    self.pos = self.pos.saturating_add(1);
+                }
+                self.field_scratch.as_str()
+            } else {
+                let start = self.pos;
+                while let Some(&b) = bytes.get(self.pos) {
+                    if b == delimiter || b == b'\r' || b == b'\n' {
+                        break;
+                    }
+                    self.pos = self.pos.saturating_add(1);
+                }
+                text.get(start..self.pos).unwrap_or("")
+            };
+
+            if self.row_idx >= MAX_ROW_AXIS_LEN || self.col_idx >= MAX_COL_AXIS_LEN {
+                return Err(CsvError::DimensionsExceeded);
+            }
+            if self.row_idx >= self.sheet.rows() {
+                let _ = self
+                    .sheet
+                    .extend_base_rows_to(self.row_idx.saturating_add(1))
+                    .ok_or(CsvError::DimensionsExceeded)?;
+            }
+
+            if !field_slice.is_empty() {
+                write_inferred_csv_cell(
+                    &mut self.sheet,
+                    RowId(u64::from(self.row_idx)),
+                    ColId(u64::from(self.col_idx)),
+                    field_slice,
+                )?;
+            }
+
+            match bytes.get(self.pos).copied() {
+                Some(b) if b == delimiter => {
+                    self.pos = self.pos.saturating_add(1);
+                    self.col_idx = self.col_idx.saturating_add(1);
+                }
+                Some(b'\r') => {
+                    self.pos = self.pos.saturating_add(1);
+                    if bytes.get(self.pos) == Some(&b'\n') {
+                        self.pos = self.pos.saturating_add(1);
+                    }
+                    self.row_idx = self.row_idx.saturating_add(1);
+                    self.col_idx = 0;
+                    if self.row_idx.is_multiple_of(4096)
+                        && self.sheet.estimated_bytes() > MAX_WORKBOOK_BYTES
+                    {
+                        return Err(CsvError::WorkbookLimit(OpError::MemoryLimitExceeded));
+                    }
+                }
+                Some(b'\n') => {
+                    self.pos = self.pos.saturating_add(1);
+                    self.row_idx = self.row_idx.saturating_add(1);
+                    self.col_idx = 0;
+                    if self.row_idx.is_multiple_of(4096)
+                        && self.sheet.estimated_bytes() > MAX_WORKBOOK_BYTES
+                    {
+                        return Err(CsvError::WorkbookLimit(OpError::MemoryLimitExceeded));
+                    }
+                }
+                Some(_) => {
+                    self.pos = self.pos.saturating_add(1);
+                }
+                None => {
+                    if self.col_idx > 0 || !field_slice.is_empty() {
+                        self.row_idx = self.row_idx.saturating_add(1);
+                        self.col_idx = 0;
+                    }
+                }
+            }
+        }
+
+        if self.pos >= len {
+            if self.sheet.estimated_bytes() > MAX_WORKBOOK_BYTES {
+                return Err(CsvError::WorkbookLimit(OpError::MemoryLimitExceeded));
+            }
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Consumes the reader and returns the populated [`Sheet`].
+    pub fn finish(self) -> Result<Sheet, CsvError> {
+        if self.sheet.estimated_bytes() > MAX_WORKBOOK_BYTES {
+            return Err(CsvError::WorkbookLimit(OpError::MemoryLimitExceeded));
+        }
+        Ok(self.sheet)
+    }
+}
+
 /// Parses a UTF-8 CSV/TSV byte buffer into a fresh [`Sheet`] with sheet name
 /// `name` (stripping an optional UTF-8 BOM `\u{FEFF}`).
 pub fn import_csv_sheet(
@@ -64,137 +265,9 @@ pub fn import_csv_sheet(
     raw_bytes: &[u8],
     delimiter_override: Option<u8>,
 ) -> Result<Sheet, CsvError> {
-    let body = raw_bytes
-        .strip_prefix(&[0xEF, 0xBB, 0xBF])
-        .unwrap_or(raw_bytes);
-    let text = core::str::from_utf8(body).map_err(|_| CsvError::InvalidUtf8)?;
-    let delimiter = delimiter_override.unwrap_or_else(|| detect_delimiter(text));
-
-    // Pass 1: count rows & max columns while validating quote balance, or parse
-    // streaming row-by-row onto a standard sheet!
-    let mut sheet = Sheet::standard(id, name);
-    let mut row_idx: u32 = 0;
-    let mut col_idx: u32 = 0;
-    let mut max_cols_seen: u32 = 0;
-
-    let bytes = text.as_bytes();
-    let len = bytes.len();
-    let mut pos = 0usize;
-    let mut field_scratch = String::new();
-
-    while pos < len {
-        // Parse one field starting at `pos`.
-        field_scratch.clear();
-        let field_slice: &str = if bytes.get(pos) == Some(&b'"') {
-            pos = pos.saturating_add(1);
-            let mut closed = false;
-            while pos < len {
-                // Scan until next `"` so multi-byte UTF-8 spans copy cleanly.
-                let chunk_start = pos;
-                while let Some(&b) = bytes.get(pos) {
-                    if b == b'"' {
-                        break;
-                    }
-                    pos = pos.saturating_add(1);
-                }
-                if let Some(piece) = text.get(chunk_start..pos) {
-                    field_scratch.push_str(piece);
-                }
-                if bytes.get(pos) == Some(&b'"') {
-                    if bytes.get(pos.saturating_add(1)) == Some(&b'"') {
-                        field_scratch.push('"');
-                        pos = pos.saturating_add(2);
-                    } else {
-                        pos = pos.saturating_add(1);
-                        closed = true;
-                        break;
-                    }
-                }
-            }
-            if !closed {
-                return Err(CsvError::UnclosedQuote);
-            }
-            // Skip optional trailing spaces before delimiter/newline if any.
-            while let Some(&b) = bytes.get(pos) {
-                if b == delimiter || b == b'\r' || b == b'\n' {
-                    break;
-                }
-                pos = pos.saturating_add(1);
-            }
-            field_scratch.as_str()
-        } else {
-            let start = pos;
-            while let Some(&b) = bytes.get(pos) {
-                if b == delimiter || b == b'\r' || b == b'\n' {
-                    break;
-                }
-                pos = pos.saturating_add(1);
-            }
-            text.get(start..pos).unwrap_or("")
-        };
-
-        if row_idx >= MAX_ROW_AXIS_LEN || col_idx >= MAX_COL_AXIS_LEN {
-            return Err(CsvError::DimensionsExceeded);
-        }
-        // Grow row axis beyond DEFAULT_BASE_ROWS (1,048,576) up to MAX_ROW_AXIS_LEN if needed.
-        if row_idx >= sheet.rows() {
-            let extra = sheet
-                .extend_base_rows_to(row_idx.saturating_add(1))
-                .ok_or(CsvError::DimensionsExceeded)?;
-            let _ = extra;
-        }
-
-        if !field_slice.is_empty() {
-            write_inferred_csv_cell(
-                &mut sheet,
-                RowId(u64::from(row_idx)),
-                ColId(u64::from(col_idx)),
-                field_slice,
-            )?;
-        }
-        max_cols_seen = max_cols_seen.max(col_idx.saturating_add(1));
-
-        // Check terminator after field.
-        match bytes.get(pos).copied() {
-            Some(b) if b == delimiter => {
-                pos = pos.saturating_add(1);
-                col_idx = col_idx.saturating_add(1);
-                // If delimiter sits at very end of line or EOF, record the trailing empty cell.
-                if pos == len || matches!(bytes.get(pos), Some(b'\r' | b'\n')) {
-                    max_cols_seen = max_cols_seen.max(col_idx.saturating_add(1));
-                }
-            }
-            Some(b'\r') => {
-                pos = pos.saturating_add(1);
-                if bytes.get(pos) == Some(&b'\n') {
-                    pos = pos.saturating_add(1);
-                }
-                row_idx = row_idx.saturating_add(1);
-                col_idx = 0;
-                if row_idx.is_multiple_of(4096) && sheet.estimated_bytes() > MAX_WORKBOOK_BYTES {
-                    return Err(CsvError::WorkbookLimit(OpError::MemoryLimitExceeded));
-                }
-            }
-            Some(b'\n') => {
-                pos = pos.saturating_add(1);
-                row_idx = row_idx.saturating_add(1);
-                col_idx = 0;
-                if row_idx.is_multiple_of(4096) && sheet.estimated_bytes() > MAX_WORKBOOK_BYTES {
-                    return Err(CsvError::WorkbookLimit(OpError::MemoryLimitExceeded));
-                }
-            }
-            Some(_) => {
-                pos = pos.saturating_add(1);
-            }
-            None => {}
-        }
-    }
-
-    let _ = max_cols_seen;
-    if sheet.estimated_bytes() > MAX_WORKBOOK_BYTES {
-        return Err(CsvError::WorkbookLimit(OpError::MemoryLimitExceeded));
-    }
-    Ok(sheet)
+    let mut reader = CsvReader::new(id, name, raw_bytes.to_vec(), delimiter_override)?;
+    while !reader.parse_rows(65_536)? {}
+    reader.finish()
 }
 
 fn write_inferred_csv_cell(

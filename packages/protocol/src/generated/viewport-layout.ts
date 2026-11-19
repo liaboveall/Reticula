@@ -3,7 +3,7 @@
 // The layout of a viewport page, as the engine writes it. Each constant is
 // documented where it is defined: crates/core/src/viewport.rs.
 
-export const VERSION = 1;
+export const VERSION = 2;
 export const PAGE_ROWS = 64;
 export const PAGE_COLS = 16;
 export const HEADER_LEN = 32;
@@ -15,12 +15,20 @@ export const ROW_COUNT_AT = 16;
 export const COL_COUNT_AT = 18;
 export const TEXT_LEN_AT = 20;
 export const EPOCH_AT = 24;
+export const OVERFLOW_COUNT_AT = 28;
 export const ID_LEN = 8;
-export const CELL_LEN = 8;
+export const CELL_LEN = 12;
 export const CELL_TEXT_START_AT = 0;
 export const CELL_TEXT_LEN_AT = 4;
 export const CELL_STYLE_AT = 6;
-export const CELL_FLAGS_AT = 7;
+export const CELL_FLAGS_AT = 8;
+export const OVERFLOW_LEN = 12;
+export const OVERFLOW_TEXT_START_AT = 0;
+export const OVERFLOW_TEXT_LEN_AT = 4;
+export const OVERFLOW_ROW_OFFSET_AT = 6;
+export const OVERFLOW_ORIGIN_COL_AT = 8;
+export const OVERFLOW_STYLE_AT = 10;
+export const MAX_LEFT_OVERFLOW_LOOKBACK = 16;
 export const FLAG_NUMBER = 1;
 export const FLAG_BOOL = 2;
 export const FLAG_ERROR = 4;

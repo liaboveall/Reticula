@@ -1,31 +1,62 @@
-//! WebAssembly bindings: the entry point of the engine worker (`13-m1a.md` 6.1).
+//! WebAssembly bindings: the entry point of the engine worker (`13-m1a.md` 6.1
+//! & `14-m1b.md` 5–7).
 //!
 //! The engine is driven like a state machine. A command goes in through
 //! [`Engine::handle`], which may answer with an event; viewport pages the
 //! command made due are then taken out one at a time with
-//! [`Engine::take_page`]. Whenever [`Engine::has_pending_recalc`] remains true
-//! after a command, the worker yields to the event loop (`setTimeout(0)`) so
-//! incoming `Subscribe` or `EditCell` messages run without waiting, and then
-//! sends [`EngineCommand::ContinueRecalc`] for the next ~4 ms slice.
+//! [`Engine::take_page`], and WAL frames queued by mutating transactions are
+//! drained via [`Engine::take_pending_wal_frame`].
 //!
 //! Everything that crosses the worker boundary as a structured object is
 //! defined here and exported to TypeScript via `tsify`, so there is exactly one
 //! definition of each type.
 
 use std::collections::{HashSet, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 
+use reticula_core::csv::{CsvError, CsvReader, export_sheet_delimited};
+use reticula_core::format::parse_format_code;
 use reticula_core::id::{ColId, IdRun, RowId, SheetId};
-use reticula_core::ops::{Op, OpError};
+use reticula_core::ops::{CellInput, FormatPatch, FormatTarget, InverseOp, Op, OpError, Workbook};
+use reticula_core::sheet::Sheet;
+use reticula_core::style::{
+    BorderSet, BorderWeight, CellStyle, ColorPatch, ColorValue, HorizontalAlign, StylePatch,
+};
+use reticula_core::value::Value;
 use reticula_core::viewport::{self, PAGE_COLS, PAGE_ROWS, Page, PageRange};
+use reticula_formula::address::CellAddr;
+use reticula_formula::binder::BoundFormula;
 use reticula_formula::determinism;
 use reticula_formula::engine::{EditError, FormulaEngine, RecalcStatus};
+use reticula_formula::lang_service::{
+    self, CompletionItem, CompletionKind, FormulaAnalysis, FormulaDiagnostic, FormulaRefHighlight,
+    SignatureHelp, SyntaxTokenKind, SyntaxTokenSpan,
+};
 use reticula_formula::parser::ParseError;
+use reticula_wire::snapshot::{
+    SnapshotEncoder, SnapshotStep, decode_snapshot_any, encode_seed_stub_v1, encode_snapshot_v1,
+};
+use reticula_wire::v1::{WireOpV1, WireWalRecordV1};
+use reticula_wire::wal::{
+    WalCorruption, WalTailDisposition, encode_wal_init, encode_wal_record, replay_wal_records,
+    scan_wal,
+};
 use serde::{Deserialize, Serialize};
 use tsify::{Ts, Tsify};
 use wasm_bindgen::prelude::*;
 
 #[cfg(feature = "bench")]
 pub mod bench;
+pub mod clipboard;
+pub mod undo;
+
+use crate::clipboard::{
+    InternalClipboard, RectPos, build_fill_ops, build_paste_ops, copy_range, find_autofill_end_row,
+};
+use crate::undo::UndoStack;
+
+/// Maximum raw CSV/TSV file size accepted for import (`256 MiB`, `14-m1b.md` 5.6).
+pub const MAX_CSV_IMPORT_BYTES: usize = 256 * 1024 * 1024;
 
 /// Time budget per recalculation slice in milliseconds (`13-m1a.md` 5.6).
 const RECALC_SLICE_BUDGET_MS: f64 = 4.0;
@@ -34,6 +65,8 @@ const RECALC_CHECK_INTERVAL: usize = 256;
 /// Above this many dirty cell notifications in a single wave, re-enqueue all
 /// currently subscribed pages directly instead of mapping each cell to a page.
 const BULK_DIRTY_PAGE_THRESHOLD: usize = 2_048;
+
+static ENGINE_PANICKED: AtomicBool = AtomicBool::new(false);
 
 mod wire_u64 {
     use serde::de::{self, Visitor};
@@ -93,6 +126,8 @@ mod wire_opt_u64 {
     }
 }
 
+// ============================================================ Wire DTOs (tsify)
+
 /// Contiguous run of row or column identifiers (`firstId .. firstId + len`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Tsify)]
 #[serde(rename_all = "camelCase")]
@@ -114,7 +149,578 @@ impl From<WireIdRun> for IdRun {
     }
 }
 
-/// A message from the main thread to the engine worker (`13-m1a.md` 6.1).
+/// Row or column run paired with an explicit pixel size (`null` resets to default).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Tsify)]
+#[serde(rename_all = "camelCase")]
+pub struct WireAxisSize {
+    /// Target row/column run.
+    pub run: WireIdRun,
+    /// Custom height/width in CSS pixels, or `null` to restore default.
+    pub size_px: Option<u16>,
+}
+
+/// Worksheet tab descriptor in tab-bar order.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Tsify)]
+#[serde(rename_all = "camelCase")]
+pub struct SheetTabInfo {
+    /// Stable worksheet identifier.
+    pub id: u32,
+    /// Display name (`1..=31` UTF-16 code units).
+    pub name: String,
+}
+
+/// Theme-adaptive palette slot or explicit 24-bit RGB color.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Tsify)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum WireColorValue {
+    /// Semantic light/dark-adaptive palette slot (`0..7`).
+    Palette { slot: u8 },
+    /// 24-bit sRGB (`0x00RRGGBB`).
+    Rgb { rgb: u32 },
+}
+
+impl From<ColorValue> for WireColorValue {
+    fn from(c: ColorValue) -> Self {
+        match c {
+            ColorValue::Palette(slot) => Self::Palette { slot },
+            ColorValue::Rgb(rgb) => Self::Rgb { rgb },
+        }
+    }
+}
+
+impl From<WireColorValue> for ColorValue {
+    fn from(w: WireColorValue) -> Self {
+        match w {
+            WireColorValue::Palette { slot } => Self::Palette(slot),
+            WireColorValue::Rgb { rgb } => Self::Rgb(rgb),
+        }
+    }
+}
+
+/// Edge border stroke weight.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, Tsify)]
+#[serde(rename_all = "camelCase")]
+pub enum WireBorderWeight {
+    #[default]
+    None,
+    Thin,
+    Medium,
+}
+
+impl From<BorderWeight> for WireBorderWeight {
+    fn from(b: BorderWeight) -> Self {
+        match b {
+            BorderWeight::None => Self::None,
+            BorderWeight::Thin => Self::Thin,
+            BorderWeight::Medium => Self::Medium,
+        }
+    }
+}
+
+impl From<WireBorderWeight> for BorderWeight {
+    fn from(w: WireBorderWeight) -> Self {
+        match w {
+            WireBorderWeight::None => Self::None,
+            WireBorderWeight::Thin => Self::Thin,
+            WireBorderWeight::Medium => Self::Medium,
+        }
+    }
+}
+
+/// Horizontal cell alignment.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, Tsify)]
+#[serde(rename_all = "camelCase")]
+pub enum WireHorizontalAlign {
+    #[default]
+    Auto,
+    Left,
+    Center,
+    Right,
+}
+
+impl From<HorizontalAlign> for WireHorizontalAlign {
+    fn from(a: HorizontalAlign) -> Self {
+        match a {
+            HorizontalAlign::Auto => Self::Auto,
+            HorizontalAlign::Left => Self::Left,
+            HorizontalAlign::Center => Self::Center,
+            HorizontalAlign::Right => Self::Right,
+        }
+    }
+}
+
+impl From<WireHorizontalAlign> for HorizontalAlign {
+    fn from(w: WireHorizontalAlign) -> Self {
+        match w {
+            WireHorizontalAlign::Auto => Self::Auto,
+            WireHorizontalAlign::Left => Self::Left,
+            WireHorizontalAlign::Center => Self::Center,
+            WireHorizontalAlign::Right => Self::Right,
+        }
+    }
+}
+
+/// Resolved cell visual style indexed by `styleId` in viewport v2 pages.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, Tsify)]
+#[serde(rename_all = "camelCase")]
+pub struct WireCellStyle {
+    pub bold: bool,
+    pub italic: bool,
+    pub strikethrough: bool,
+    pub align: WireHorizontalAlign,
+    pub text_color: Option<WireColorValue>,
+    pub fill_color: Option<WireColorValue>,
+    pub border_top: WireBorderWeight,
+    pub border_right: WireBorderWeight,
+    pub border_bottom: WireBorderWeight,
+    pub border_left: WireBorderWeight,
+}
+
+impl From<CellStyle> for WireCellStyle {
+    fn from(s: CellStyle) -> Self {
+        Self {
+            bold: s.bold,
+            italic: s.italic,
+            strikethrough: s.strikethrough,
+            align: s.align.into(),
+            text_color: s.text_color.map(Into::into),
+            fill_color: s.fill_color.map(Into::into),
+            border_top: s.borders.top.into(),
+            border_right: s.borders.right.into(),
+            border_bottom: s.borders.bottom.into(),
+            border_left: s.borders.left.into(),
+        }
+    }
+}
+
+impl From<WireCellStyle> for CellStyle {
+    fn from(w: WireCellStyle) -> Self {
+        Self {
+            bold: w.bold,
+            italic: w.italic,
+            strikethrough: w.strikethrough,
+            align: w.align.into(),
+            text_color: w.text_color.map(Into::into),
+            fill_color: w.fill_color.map(Into::into),
+            borders: BorderSet {
+                top: w.border_top.into(),
+                right: w.border_right.into(),
+                bottom: w.border_bottom.into(),
+                left: w.border_left.into(),
+            },
+        }
+    }
+}
+
+/// Tri-state color override in [`WireStylePatch`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, Tsify)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum WireColorPatch {
+    #[default]
+    Keep,
+    Clear,
+    Set {
+        color: WireColorValue,
+    },
+}
+
+impl From<WireColorPatch> for ColorPatch {
+    fn from(w: WireColorPatch) -> Self {
+        match w {
+            WireColorPatch::Keep => Self::Keep,
+            WireColorPatch::Clear => Self::Clear,
+            WireColorPatch::Set { color } => Self::Set(color.into()),
+        }
+    }
+}
+
+/// Partial style override sent in [`EngineCommand::SetFormat`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, Tsify)]
+#[serde(rename_all = "camelCase")]
+pub struct WireStylePatch {
+    #[serde(default)]
+    pub bold: Option<bool>,
+    #[serde(default)]
+    pub italic: Option<bool>,
+    #[serde(default)]
+    pub strikethrough: Option<bool>,
+    #[serde(default)]
+    pub align: Option<WireHorizontalAlign>,
+    #[serde(default)]
+    pub text_color: WireColorPatch,
+    #[serde(default)]
+    pub fill_color: WireColorPatch,
+    #[serde(default)]
+    pub border_top: Option<WireBorderWeight>,
+    #[serde(default)]
+    pub border_right: Option<WireBorderWeight>,
+    #[serde(default)]
+    pub border_bottom: Option<WireBorderWeight>,
+    #[serde(default)]
+    pub border_left: Option<WireBorderWeight>,
+}
+
+impl From<WireStylePatch> for StylePatch {
+    fn from(w: WireStylePatch) -> Self {
+        Self {
+            bold: w.bold,
+            italic: w.italic,
+            strikethrough: w.strikethrough,
+            align: w.align.map(Into::into),
+            text_color: w.text_color.into(),
+            fill_color: w.fill_color.into(),
+            border_top: w.border_top.map(Into::into),
+            border_right: w.border_right.map(Into::into),
+            border_bottom: w.border_bottom.map(Into::into),
+            border_left: w.border_left.map(Into::into),
+        }
+    }
+}
+
+/// Target scope of [`EngineCommand::SetFormat`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Tsify)]
+#[serde(
+    tag = "scope",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum WireFormatTarget {
+    Cells {
+        rows: Vec<WireIdRun>,
+        cols: Vec<WireIdRun>,
+    },
+    Rows {
+        rows: Vec<WireIdRun>,
+    },
+    Cols {
+        cols: Vec<WireIdRun>,
+    },
+}
+
+impl From<WireFormatTarget> for FormatTarget {
+    fn from(w: WireFormatTarget) -> Self {
+        match w {
+            WireFormatTarget::Cells { rows, cols } => Self::Cells {
+                rows: rows.into_iter().map(IdRun::from).collect(),
+                cols: cols.into_iter().map(IdRun::from).collect(),
+            },
+            WireFormatTarget::Rows { rows } => {
+                Self::Rows(rows.into_iter().map(IdRun::from).collect())
+            }
+            WireFormatTarget::Cols { cols } => {
+                Self::Cols(cols.into_iter().map(IdRun::from).collect())
+            }
+        }
+    }
+}
+
+/// Number-format override sent in [`EngineCommand::SetFormat`].
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, Tsify)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum WireFormatPatch {
+    #[default]
+    Keep,
+    Clear,
+    /// Standard format code (`"General"`, `"0.00"`, `"#,##0.00"`, `"$#,##0.00"`,
+    /// `"¥#,##0.00"`, `"0.00%"`, `"yyyy-mm-dd"`, `"@"`, ...).
+    Set {
+        code: String,
+    },
+}
+
+/// Cardinal direction for `Ctrl+Arrow` / `Ctrl+Shift+Arrow` edge jumping.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Tsify)]
+#[serde(rename_all = "camelCase")]
+pub enum JumpDirection {
+    Up,
+    Down,
+    Left,
+    Right,
+}
+
+// Language service tsify wrappers (kept 1-to-1 with `reticula_formula::lang_service`)
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Tsify)]
+#[serde(rename_all = "camelCase")]
+pub enum WireSyntaxTokenKind {
+    Equals,
+    Function,
+    Reference,
+    SheetRef,
+    Number,
+    String,
+    Boolean,
+    Error,
+    Operator,
+    Paren,
+    Punctuation,
+    Unknown,
+}
+
+impl From<SyntaxTokenKind> for WireSyntaxTokenKind {
+    fn from(k: SyntaxTokenKind) -> Self {
+        match k {
+            SyntaxTokenKind::Equals => Self::Equals,
+            SyntaxTokenKind::Function => Self::Function,
+            SyntaxTokenKind::Reference => Self::Reference,
+            SyntaxTokenKind::SheetRef => Self::SheetRef,
+            SyntaxTokenKind::Number => Self::Number,
+            SyntaxTokenKind::String => Self::String,
+            SyntaxTokenKind::Boolean => Self::Boolean,
+            SyntaxTokenKind::Error => Self::Error,
+            SyntaxTokenKind::Operator => Self::Operator,
+            SyntaxTokenKind::Paren => Self::Paren,
+            SyntaxTokenKind::Punctuation => Self::Punctuation,
+            SyntaxTokenKind::Unknown => Self::Unknown,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Tsify)]
+#[serde(rename_all = "camelCase")]
+pub struct WireSyntaxTokenSpan {
+    pub start_utf16: u32,
+    pub end_utf16: u32,
+    pub kind: WireSyntaxTokenKind,
+    pub color_index: Option<u8>,
+    pub matched_bracket: bool,
+}
+
+impl From<SyntaxTokenSpan> for WireSyntaxTokenSpan {
+    fn from(s: SyntaxTokenSpan) -> Self {
+        Self {
+            start_utf16: s.start_utf16,
+            end_utf16: s.end_utf16,
+            kind: s.kind.into(),
+            color_index: s.color_index,
+            matched_bracket: s.matched_bracket,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Tsify)]
+#[serde(rename_all = "camelCase")]
+pub struct WireFormulaDiagnostic {
+    pub start_utf16: u32,
+    pub end_utf16: u32,
+    pub message: String,
+}
+
+impl From<FormulaDiagnostic> for WireFormulaDiagnostic {
+    fn from(d: FormulaDiagnostic) -> Self {
+        Self {
+            start_utf16: d.start_utf16,
+            end_utf16: d.end_utf16,
+            message: d.message,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Tsify)]
+#[serde(rename_all = "camelCase")]
+pub enum WireCompletionKind {
+    Function,
+    Sheet,
+}
+
+impl From<CompletionKind> for WireCompletionKind {
+    fn from(k: CompletionKind) -> Self {
+        match k {
+            CompletionKind::Function => Self::Function,
+            CompletionKind::Sheet => Self::Sheet,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Tsify)]
+#[serde(rename_all = "camelCase")]
+pub struct WireCompletionItem {
+    pub label: String,
+    pub insert_text: String,
+    pub replace_start_utf16: u32,
+    pub replace_end_utf16: u32,
+    pub kind: WireCompletionKind,
+    pub signature: String,
+    pub summary: String,
+}
+
+impl From<CompletionItem> for WireCompletionItem {
+    fn from(c: CompletionItem) -> Self {
+        Self {
+            label: c.label,
+            insert_text: c.insert_text,
+            replace_start_utf16: c.replace_start_utf16,
+            replace_end_utf16: c.replace_end_utf16,
+            kind: c.kind.into(),
+            signature: c.signature,
+            summary: c.summary,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Tsify)]
+#[serde(rename_all = "camelCase")]
+pub struct WireSignatureHelp {
+    pub name: String,
+    pub params: Vec<String>,
+    pub active_param: u32,
+    pub summary: String,
+}
+
+impl From<SignatureHelp> for WireSignatureHelp {
+    fn from(s: SignatureHelp) -> Self {
+        Self {
+            name: s.name,
+            params: s.params,
+            active_param: s.active_param,
+            summary: s.summary,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Tsify)]
+#[serde(rename_all = "camelCase")]
+pub struct WireFormulaRefHighlight {
+    pub start_utf16: u32,
+    pub end_utf16: u32,
+    pub color_index: u8,
+    pub sheet: u32,
+    pub first_row: u32,
+    pub last_row: u32,
+    pub first_col: u32,
+    pub last_col: u32,
+}
+
+impl From<FormulaRefHighlight> for WireFormulaRefHighlight {
+    fn from(r: FormulaRefHighlight) -> Self {
+        Self {
+            start_utf16: r.start_utf16,
+            end_utf16: r.end_utf16,
+            color_index: r.color_index,
+            sheet: r.sheet,
+            first_row: r.first_row,
+            last_row: r.last_row,
+            first_col: r.first_col,
+            last_col: r.last_col,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, Tsify)]
+#[serde(rename_all = "camelCase")]
+pub struct WireFormulaAnalysis {
+    pub is_formula: bool,
+    pub tokens: Vec<WireSyntaxTokenSpan>,
+    pub diagnostics: Vec<WireFormulaDiagnostic>,
+    pub completions: Vec<WireCompletionItem>,
+    pub signature: Option<WireSignatureHelp>,
+    pub references: Vec<WireFormulaRefHighlight>,
+    pub can_insert_ref: bool,
+    pub active_ref_span: Option<(u32, u32)>,
+}
+
+impl From<FormulaAnalysis> for WireFormulaAnalysis {
+    fn from(a: FormulaAnalysis) -> Self {
+        Self {
+            is_formula: a.is_formula,
+            tokens: a.tokens.into_iter().map(Into::into).collect(),
+            diagnostics: a.diagnostics.into_iter().map(Into::into).collect(),
+            completions: a.completions.into_iter().map(Into::into).collect(),
+            signature: a.signature.map(Into::into),
+            references: a.references.into_iter().map(Into::into).collect(),
+            can_insert_ref: a.can_insert_ref,
+            active_ref_span: a.active_ref_span,
+        }
+    }
+}
+
+// Persistence & Safe Mode DTOs
+
+/// Metadata returned by one time-sliced [`Engine::step_snapshot_stream`] call;
+/// binary chunk bytes are retrieved zero-copy via [`Engine::take_snapshot_chunk`].
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize, Tsify)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum WireSnapshotStep {
+    /// Internal scan step completed; yield or continue.
+    Progress,
+    /// Write the pending byte chunk (`takeSnapshotChunk()`) at `offset`.
+    Chunk { offset: f64, byte_len: u32 },
+    /// Write the pending header chunk (`takeSnapshotChunk()`) at `offset = 0`,
+    /// truncate file to `total_len`, and `flush()`.
+    Finished { total_len: f64 },
+}
+
+/// Summary of one tail WAL transaction shown in D-029 Safe Mode (`14-m1b.md` 7.3).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Tsify)]
+#[serde(rename_all = "camelCase")]
+pub struct WireWalTxnSummary {
+    #[serde(with = "wire_u64")]
+    #[tsify(type = "string")]
+    pub seq: u64,
+    pub timestamp_ms: f64,
+    pub label: String,
+}
+
+/// Result of inspecting a WAL file for corruption / Safe Mode recovery options.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Tsify)]
+#[serde(
+    tag = "status",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum WireWalInspection {
+    /// Clean or recoverable crash tail (`truncate_to_bytes` is `Some(n)` when a
+    /// torn final record or zero-padded tail should be truncated).
+    Valid {
+        #[serde(with = "wire_u64")]
+        #[tsify(type = "string")]
+        base_seq: u64,
+        #[serde(with = "wire_u64")]
+        #[tsify(type = "string")]
+        last_seq: u64,
+        record_count: u32,
+        truncate_to_bytes: Option<u32>,
+        tail_txns: Vec<WireWalTxnSummary>,
+    },
+    /// Unrecoverable mid-file or header corruption; enter D-029 Safe Mode.
+    Corrupted {
+        reason: String,
+        salvageable_count: u32,
+        salvageable_tail_txns: Vec<WireWalTxnSummary>,
+    },
+}
+
+/// Outcome of loading a snapshot + WAL into [`Engine`].
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Tsify)]
+#[serde(rename_all = "camelCase")]
+pub struct WireLoadOutcome {
+    pub info: EngineInfo,
+    pub sheet: SheetInfo,
+    pub replayed_txns: u32,
+    pub truncate_wal_to_bytes: Option<u32>,
+    pub recalc_frozen: bool,
+}
+
+/// Outcome of one 65,536-row step during [`Engine::step_csv_import`].
+#[allow(clippy::large_enum_variant)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Tsify)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum WireCsvImportStep {
+    Progress { rows_parsed: u32, percent: u8 },
+    Done { info: EngineInfo, sheet: SheetInfo },
+}
+
+// ================================================== EngineCommand & EngineEvent
+
+/// A message from the main thread to the engine worker (`13-m1a.md` 6.1 & `14-m1b.md` 6–7).
 #[derive(Debug, Deserialize, Tsify)]
 #[serde(
     tag = "kind",
@@ -131,8 +737,10 @@ pub enum EngineCommand {
         /// Number of rows, the header row included.
         rows: u32,
     },
+    /// Replace the document with a fresh empty standard workbook (`Sheet1`).
+    OpenEmpty,
     /// Declare the range of cells the grid wants to hold: what it shows plus a
-    /// margin around it. Replaces the previous subscription.
+    /// margin around it (pinned frozen-pane pages are retained automatically).
     Subscribe {
         /// Target sheet identifier (`0` for the primary sheet).
         #[serde(default)]
@@ -149,72 +757,208 @@ pub enum EngineCommand {
         /// Number of columns in the range.
         col_count: u32,
     },
-    /// Query the raw input / formula text and evaluation details of a single
-    /// cell (selected cell, formula bar, or `F2`).
+    /// Switch active worksheet tab and return its [`SheetInfo`].
+    SwitchSheet { sheet: u32 },
+    /// Inject pure calendar/randomness state prior to volatile recalculation (`14-m1b.md` 5.3).
+    SetEvalEnv {
+        now_serial: f64,
+        #[serde(with = "wire_u64")]
+        #[tsify(type = "string")]
+        seed: u64,
+        #[serde(default)]
+        timestamp_ms: Option<f64>,
+    },
+    /// Query the raw input / formula text, formatting and style of a single cell.
     InspectCell {
-        /// Sheet identifier.
         sheet: u32,
-        /// Row identifier (decimal `u64` string).
         #[serde(with = "wire_u64")]
         #[tsify(type = "string")]
         row_id: u64,
-        /// Column identifier (decimal `u64` string).
         #[serde(with = "wire_u64")]
         #[tsify(type = "string")]
         col_id: u64,
     },
-    /// Submit raw user input (`raw`) to `(sheet, row_id, col_id)` under E30
-    /// type inference and trigger incremental recalculation.
+    /// Submit raw user input (`raw`) to `(sheet, row_id, col_id)` under E30.
     EditCell {
-        /// Sheet identifier.
         sheet: u32,
-        /// Row identifier (decimal `u64` string).
         #[serde(with = "wire_u64")]
         #[tsify(type = "string")]
         row_id: u64,
-        /// Column identifier (decimal `u64` string).
         #[serde(with = "wire_u64")]
         #[tsify(type = "string")]
         col_id: u64,
-        /// Raw input string (`""`, `"=A2*B2"`, `"5%"`, `"2026-11-18"`, ...).
         raw: String,
     },
-    /// Clear all cells in the Cartesian product of `rows × cols`.
+    /// Clear values and formulas in `rows × cols` (preserving styles/formats).
     ClearCells {
-        /// Sheet identifier.
         sheet: u32,
-        /// Contiguous row ID runs.
         rows: Vec<WireIdRun>,
-        /// Contiguous column ID runs.
         cols: Vec<WireIdRun>,
     },
-    /// Insert `count` new rows after `after_row_id` (`null` inserts at the very
-    /// top of the sheet, before row 1).
+    /// Insert `count` new rows after `after_row_id` (`null` inserts before row 1).
     InsertRows {
-        /// Sheet identifier.
         sheet: u32,
-        /// Anchor row ID to insert after, or `null` to insert before the first row.
         #[serde(deserialize_with = "wire_opt_u64::deserialize")]
         #[tsify(type = "string | null")]
         after_row_id: Option<u64>,
-        /// Number of rows to insert (`>= 1`).
         count: u32,
     },
     /// Delete the specified row ID runs (tombstoning them on the row axis).
-    DeleteRows {
-        /// Sheet identifier.
+    DeleteRows { sheet: u32, rows: Vec<WireIdRun> },
+    /// Insert `count` new columns after `after_col_id` (`null` inserts before col A).
+    InsertCols {
         sheet: u32,
-        /// Contiguous row ID runs to delete.
-        rows: Vec<WireIdRun>,
+        #[serde(deserialize_with = "wire_opt_u64::deserialize")]
+        #[tsify(type = "string | null")]
+        after_col_id: Option<u64>,
+        count: u32,
     },
-    /// Advance an in-progress time-sliced recalculation by one ~4 ms budget
-    /// slice.
+    /// Delete the specified column ID runs.
+    DeleteCols { sheet: u32, cols: Vec<WireIdRun> },
+    /// Reorder `rows` to sit after `after_row_id` (`null` moves to top, with E25 handoff).
+    MoveRows {
+        sheet: u32,
+        rows: Vec<WireIdRun>,
+        #[serde(deserialize_with = "wire_opt_u64::deserialize")]
+        #[tsify(type = "string | null")]
+        after_row_id: Option<u64>,
+    },
+    /// Reorder `cols` to sit after `after_col_id` (`null` moves to left, with E25 handoff).
+    MoveCols {
+        sheet: u32,
+        cols: Vec<WireIdRun>,
+        #[serde(deserialize_with = "wire_opt_u64::deserialize")]
+        #[tsify(type = "string | null")]
+        after_col_id: Option<u64>,
+    },
+    /// Set or reset custom pixel heights on row runs.
+    ResizeRows {
+        sheet: u32,
+        sizes: Vec<WireAxisSize>,
+    },
+    /// Set or reset custom pixel widths on column runs.
+    ResizeCols {
+        sheet: u32,
+        sizes: Vec<WireAxisSize>,
+    },
+    /// Set frozen top row count and left column count (`0..=32`).
+    SetFreeze {
+        sheet: u32,
+        frozen_rows: u32,
+        frozen_cols: u32,
+    },
+    /// Apply number format and/or composable visual style patch to cells, rows, or columns.
+    SetFormat {
+        sheet: u32,
+        target: WireFormatTarget,
+        #[serde(default)]
+        number_format: WireFormatPatch,
+        #[serde(default)]
+        style: WireStylePatch,
+    },
+    /// Drag-fill from `src` across union rectangle `dst` (using constant-size
+    /// `Op::FillFormula` for formulas or series extrapolation for values).
+    FillRange {
+        sheet: u32,
+        src_first_row: u32,
+        src_row_count: u32,
+        src_first_col: u32,
+        src_col_count: u32,
+        dst_first_row: u32,
+        dst_row_count: u32,
+        dst_first_col: u32,
+        dst_col_count: u32,
+    },
+    /// Double-click fill handle: auto-fill downward to match adjacent column extent.
+    AutoFillDown {
+        sheet: u32,
+        src_first_row: u32,
+        src_row_count: u32,
+        src_first_col: u32,
+        src_col_count: u32,
+    },
+    /// Capture selection as TSV + HTML `<table>` and record internal clipboard state.
+    CopyRange {
+        sheet: u32,
+        first_row: u32,
+        row_count: u32,
+        first_col: u32,
+        col_count: u32,
+        cut: bool,
+    },
+    /// Paste internal or external (`text/html` / `text/plain`) clipboard content.
+    PasteClipboard {
+        sheet: u32,
+        dest_row: u32,
+        #[serde(default = "default_one")]
+        dest_row_count: u32,
+        dest_col: u32,
+        #[serde(default = "default_one")]
+        dest_col_count: u32,
+        tsv: String,
+        #[serde(default)]
+        html: Option<String>,
+    },
+    /// Create a new worksheet tab (`name` defaults to `"SheetN"`, E28 disambiguated).
+    AddSheet {
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
+        after_sheet: Option<u32>,
+    },
+    /// Rename an existing worksheet.
+    RenameSheet { sheet: u32, name: String },
+    /// Tombstone a worksheet (rejected if last visible worksheet).
+    DeleteSheet { sheet: u32 },
+    /// Reorder worksheet tab to sit after `after_sheet` (`null` moves to first tab).
+    MoveSheet {
+        sheet: u32,
+        after_sheet: Option<u32>,
+    },
+    /// Revert the most recent user transaction (`Ctrl+Z`).
+    Undo,
+    /// Re-apply the most recently undone user transaction (`Ctrl+Y` / `Ctrl+Shift+Z`).
+    Redo,
+    /// Formula-bar language service query (`< 0.2 ms`).
+    AnalyzeFormula {
+        sheet: u32,
+        source: String,
+        cursor_utf16: u32,
+    },
+    /// Cycle `$` absolute/relative locks at `cursor_utf16` (`F4`).
+    ToggleFormulaDollar { source: String, cursor_utf16: u32 },
+    /// Format a point-and-click cell/range selection for insertion into a formula.
+    FormatRangeRef {
+        host_sheet: u32,
+        target_sheet: u32,
+        r1: u32,
+        c1: u32,
+        r2: u32,
+        c2: u32,
+    },
+    /// Excel-style `Ctrl+Arrow` / `Ctrl+Shift+Arrow` data-region boundary jump.
+    JumpEdge {
+        sheet: u32,
+        row: u32,
+        col: u32,
+        dir: JumpDirection,
+        select: bool,
+    },
+    /// Jump to bottom-rightmost non-empty cell on `sheet` (`Ctrl+End` / `Ctrl+Shift+End`).
+    JumpUsedEnd { sheet: u32, select: bool },
+    /// Unfreeze recalculation after opening a document in Safe Mode without recalc.
+    ResumeRecalc,
+    /// Advance an in-progress time-sliced recalculation by one ~4 ms budget slice.
     ContinueRecalc,
     /// Run the determinism self-check. Answered by [`EngineEvent::SelfChecked`].
     SelfCheck,
 }
 
-/// A message from the engine worker to the main thread (`13-m1a.md` 6.1).
+const fn default_one() -> u32 {
+    1
+}
+
+/// A message from the engine worker to the main thread (`13-m1a.md` 6.1 & `14-m1b.md` 6–7).
 #[derive(Debug, PartialEq, Serialize, Tsify)]
 #[serde(
     tag = "kind",
@@ -223,96 +967,141 @@ pub enum EngineCommand {
 )]
 pub enum EngineEvent {
     /// A document is open and its cells can be subscribed to.
-    Ready {
-        /// Facts about the engine.
-        info: EngineInfo,
-        /// The sheet that was opened.
-        sheet: SheetInfo,
-    },
-    /// Structural edit (`InsertRows` / `DeleteRows`) completed.
+    Ready { info: EngineInfo, sheet: SheetInfo },
+    /// Structural, sheet-tab, resize, freeze, format, fill, or undo/redo change completed.
     SheetChanged {
-        /// Updated sheet dimensions.
         sheet: SheetInfo,
-        /// Elapsed time of the structural operation (plus any immediate slice)
-        /// in milliseconds.
         action_ms: f64,
-        /// Formulas recalculated synchronously within the initial slice.
         recalculated: u32,
     },
-    /// Raw formula/value inspection details for a cell.
-    CellInspected {
-        /// Sheet identifier.
+    /// Emitted when scrolling interns a new combined row×col style entry.
+    StylesUpdated {
         sheet: u32,
-        /// Row identifier (decimal `u64` string).
+        styles: Vec<WireCellStyle>,
+    },
+    /// Raw formula/value/format/style inspection details for a cell.
+    CellInspected {
+        sheet: u32,
         #[serde(with = "wire_u64")]
         #[tsify(type = "string")]
         row_id: u64,
-        /// Column identifier (decimal `u64` string).
         #[serde(with = "wire_u64")]
         #[tsify(type = "string")]
         col_id: u64,
-        /// Canonical A1 address (`"A1"`, `"V1"`).
         address: String,
-        /// Raw authoring string (`"=SUM(M2:M100001)"`, `"0%"`, ...).
         raw: String,
-        /// Formatted display string (`"123.45"`, `"0.00%"`, ...).
         display: String,
-        /// Whether the cell currently holds a bound formula.
         is_formula: bool,
-        /// Error literal (`"#DIV/0!"`, `#SPILL!`, `#CYCLE!`) if the cell value is an error.
         error: Option<String>,
+        format_code: String,
+        style: WireCellStyle,
     },
-    /// Partial progress emitted when recalculation yields at a 4 ms slice boundary.
-    RecalcProgress {
-        /// Formulas evaluated so far in this recalculation wave.
-        done: u32,
-        /// Total formulas queued in this wave.
-        total: u32,
+    /// Language-service tokens, diagnostics, completions, signature help, and colored refs.
+    FormulaAnalyzed { analysis: WireFormulaAnalysis },
+    /// Result of `F4` `$`-anchor cycling.
+    FormulaDollarToggled {
+        changed: bool,
+        source: String,
+        start_utf16: u32,
+        end_utf16: u32,
     },
-    /// Incremental recalculation (or value edit) finished.
-    RecalcDone {
-        /// Total formulas recalculated across the wave (`0` for pure value edits
-        /// with no dependents).
+    /// Formatted A1/cross-sheet reference string for point-and-click insertion.
+    RangeRefFormatted { reference: String },
+    /// Target cell coordinates answered for `JumpEdge` / `JumpUsedEnd`.
+    EdgeJumped {
+        sheet: u32,
+        row: u32,
+        col: u32,
+        select: bool,
+    },
+    /// Generated TSV + HTML `<table>` payload ready to write to system clipboard.
+    ClipboardCopied {
+        sheet: u32,
+        first_row: u32,
+        row_count: u32,
+        first_col: u32,
+        col_count: u32,
+        cut: bool,
+        tsv: String,
+        html: String,
+        fingerprint: String,
+    },
+    /// Paste transaction applied (with pasted target bounds so grid selects it).
+    ClipboardPasted {
+        sheet: SheetInfo,
+        dest_first_row: u32,
+        dest_row_count: u32,
+        dest_first_col: u32,
+        dest_col_count: u32,
         recalculated: u32,
-        /// Engine time spent marking dirty cells and evaluating formulas, in ms.
         elapsed_ms: f64,
     },
+    /// Partial progress emitted when recalculation yields at a 4 ms slice boundary.
+    RecalcProgress { done: u32, total: u32 },
+    /// Incremental recalculation (or value edit) finished.
+    RecalcDone {
+        recalculated: u32,
+        elapsed_ms: f64,
+        sheet: SheetInfo,
+    },
     /// Command was atomically rejected without mutating workbook state.
-    Rejected {
-        /// Human-readable rejection reason.
-        reason: String,
-    },
+    Rejected { reason: String },
     /// The determinism self-check has run.
-    SelfChecked {
-        /// Its result: 16 lowercase hexadecimal digits.
-        digest: String,
-    },
+    SelfChecked { digest: String },
 }
 
 /// Facts about the running engine.
-#[derive(Debug, PartialEq, Eq, Serialize, Tsify)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Tsify)]
 #[serde(rename_all = "camelCase")]
 pub struct EngineInfo {
     /// Version of the engine kernel.
     pub kernel_version: String,
 }
 
-/// Facts about an open sheet.
-#[derive(Clone, Debug, PartialEq, Serialize, Tsify)]
+/// Facts about the active worksheet and workbook undo/WAL state (`14-m1b.md` 6.2).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Tsify)]
 #[serde(rename_all = "camelCase")]
 pub struct SheetInfo {
-    /// Sheet identifier (`0` for primary sheet).
+    /// Active sheet identifier (`0` for primary sheet).
     pub sheet: u32,
-    /// Number of live rows.
+    /// Active worksheet name.
+    pub sheet_name: String,
+    /// Ordered list of live worksheet tabs.
+    pub sheets: Vec<SheetTabInfo>,
+    /// Number of live rows on the active sheet.
     pub rows: u32,
-    /// Number of live columns.
+    /// Number of live columns on the active sheet.
     pub cols: u32,
-    /// Total bound formulas in the workbook.
+    /// Frozen top row count (`0..=32`).
+    pub frozen_rows: u32,
+    /// Frozen left column count (`0..=32`).
+    pub frozen_cols: u32,
+    /// Sparse `(0-based visible row, custom height px)` pairs sorted by position.
+    pub custom_rows: Vec<(u32, u16)>,
+    /// Sparse `(0-based visible col, custom width px)` pairs sorted by position.
+    pub custom_cols: Vec<(u32, u16)>,
+    /// Resolved cell style table (`styleId` in viewport v2 pages indexes this array).
+    pub styles: Vec<WireCellStyle>,
+    /// Total bound formulas across the workbook.
     pub formula_count: u32,
     /// Seed the sheet was generated from (`0` if not from a sample).
     pub seed: u32,
-    /// How long generating it took, in milliseconds.
+    /// How long generating/loading it took, in milliseconds.
     pub generation_ms: f64,
+    /// Whether `Undo` is available.
+    pub can_undo: bool,
+    /// Whether `Redo` is available.
+    pub can_redo: bool,
+    /// Label of next `Undo` step, if any.
+    pub undo_label: Option<String>,
+    /// Label of next `Redo` step, if any.
+    pub redo_label: Option<String>,
+    /// Current highest WAL sequence number in memory.
+    #[serde(with = "wire_u64")]
+    #[tsify(type = "string")]
+    pub wal_seq: u64,
+    /// True if Safe Mode froze automatic recalculation.
+    pub recalc_frozen: bool,
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -324,6 +1113,11 @@ extern "C" {
     /// The worker's monotonic clock, in milliseconds.
     #[wasm_bindgen(js_namespace = performance, js_name = now)]
     fn performance_now() -> f64;
+
+    /// Optional Worker panic callback (`self.__reticulaOnWasmPanic`) invoked
+    /// immediately before WASM trap unwind so OPFS writes halt cleanly.
+    #[wasm_bindgen(js_namespace = globalThis, js_name = __reticulaOnWasmPanic, catch)]
+    fn try_notify_panic(message: &str) -> Result<(), JsValue>;
 }
 
 #[inline]
@@ -341,47 +1135,213 @@ fn now_ms() -> f64 {
     }
 }
 
-/// Runs once when the module is instantiated.
+/// Runs once when the module is instantiated (`14-m1b.md` 7.3).
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen(start)]
 fn start() {
-    // A panic in the engine is a bug. Report it where a developer will see it;
-    // the worker glue turns the resulting trap into a prompt to reload.
     std::panic::set_hook(Box::new(|info| {
-        console_error(&format!("engine panic: {info}"));
+        ENGINE_PANICKED.store(true, Ordering::SeqCst);
+        let msg = format!("engine panic: {info}");
+        console_error(&msg);
+        let _ = try_notify_panic(&msg);
     }));
 }
 
+/// Returns `true` if a WASM panic has occurred in this module instance.
+#[wasm_bindgen(js_name = hasEnginePanicked)]
+#[must_use]
+pub fn has_engine_panicked() -> bool {
+    ENGINE_PANICKED.load(Ordering::SeqCst)
+}
+
 /// Reserves `bytes` of linear memory through the Rust global allocator in one
-/// shot and immediately releases it into the allocator's free list (`13-m1a.md`
-/// 2.3 & 5.2).
+/// shot and immediately releases it into the allocator's free list.
 #[wasm_bindgen(js_name = reserveForBytes)]
 pub fn reserve_for_bytes(bytes: usize) -> bool {
     reticula_core::memory::try_reserve_heap(bytes)
 }
 
-/// The engine: one open workbook (`FormulaEngine`) and the grid's viewport
-/// subscription to it.
+/// Encodes the 16-byte `RTCLWAL1` header + initial `WireWalMetaV1` anchor frame.
+#[wasm_bindgen(js_name = encodeWalInit)]
+pub fn wasm_encode_wal_init(base_snapshot_seq: f64) -> Result<Vec<u8>, JsError> {
+    let base_seq = f64_to_u64(base_snapshot_seq)?;
+    encode_wal_init(base_seq).map_err(|e| JsError::new(&format!("WAL header encode failed: {e:?}")))
+}
+
+/// Inspects a raw `wal.log` buffer and classifies it as clean, recoverable tail,
+/// or mid-file/header corruption for D-029 Safe Mode (`14-m1b.md` 2.4 & 7.3).
+#[wasm_bindgen(js_name = inspectWal)]
+pub fn wasm_inspect_wal(
+    wal_bytes: &[u8],
+    expected_base_seq: f64,
+    last_flushed_seq: f64,
+) -> Result<Ts<WireWalInspection>, JsError> {
+    let base = f64_to_u64(expected_base_seq)?;
+    let flushed = f64_to_u64(last_flushed_seq)?;
+    let inspection = inspect_wal_inner(wal_bytes, base, flushed);
+    Ok(Ts::from_rust(&inspection)?)
+}
+
+fn inspect_wal_inner(
+    wal_bytes: &[u8],
+    expected_base_seq: u64,
+    last_flushed_seq: u64,
+) -> WireWalInspection {
+    match scan_wal(wal_bytes, expected_base_seq, last_flushed_seq) {
+        Ok(scan) => {
+            let truncate_to_bytes = match scan.tail {
+                WalTailDisposition::Clean => None,
+                WalTailDisposition::ZeroPaddedTail { valid_bytes }
+                | WalTailDisposition::TornFinalRecord { valid_bytes } => {
+                    u32::try_from(valid_bytes).ok()
+                }
+            };
+            let last_seq = scan.last_seq();
+            let record_count = u32::try_from(scan.records.len()).unwrap_or(u32::MAX);
+            let tail_txns = summarize_tail_records(&scan.records, 25);
+            WireWalInspection::Valid {
+                base_seq: scan.base_snapshot_seq,
+                last_seq,
+                record_count,
+                truncate_to_bytes,
+                tail_txns,
+            }
+        }
+        Err(corr) => match corr {
+            WalCorruption::InvalidHeader => WireWalInspection::Corrupted {
+                reason: String::from("WAL header magic or CRC-32 checksum is corrupted."),
+                salvageable_count: 0,
+                salvageable_tail_txns: Vec::new(),
+            },
+            WalCorruption::BaseSeqMismatch { found, expected } => WireWalInspection::Corrupted {
+                reason: format!(
+                    "WAL base snapshot sequence mismatch (found {found:?}, expected {expected})."
+                ),
+                salvageable_count: 0,
+                salvageable_tail_txns: Vec::new(),
+            },
+            WalCorruption::NonContiguousSeq {
+                offset,
+                expected_seq,
+                found_seq,
+            } => WireWalInspection::Corrupted {
+                reason: format!(
+                    "Non-contiguous WAL sequence at byte {offset} (expected {expected_seq}, found {found_seq})."
+                ),
+                salvageable_count: 0,
+                salvageable_tail_txns: Vec::new(),
+            },
+            WalCorruption::MidFileCorruption {
+                offset,
+                last_valid_seq,
+                salvageable_records,
+            } => {
+                let count = u32::try_from(salvageable_records.len()).unwrap_or(u32::MAX);
+                let tail = summarize_tail_records(&salvageable_records, 25);
+                WireWalInspection::Corrupted {
+                    reason: format!(
+                        "Mid-file WAL corruption at byte {offset} after sequence {last_valid_seq}."
+                    ),
+                    salvageable_count: count,
+                    salvageable_tail_txns: tail,
+                }
+            }
+        },
+    }
+}
+
+fn summarize_tail_records(records: &[WireWalRecordV1], max_tail: usize) -> Vec<WireWalTxnSummary> {
+    let skip = records.len().saturating_sub(max_tail);
+    records
+        .iter()
+        .skip(skip)
+        .map(|r| WireWalTxnSummary {
+            seq: r.seq,
+            #[expect(clippy::cast_precision_loss, reason = "epoch ms < 2^53 fits in f64")]
+            timestamp_ms: r.timestamp_ms as f64,
+            label: r.label.clone(),
+        })
+        .collect()
+}
+
+/// The engine: one open workbook (`FormulaEngine`), session undo/redo history,
+/// WAL frame outbox, optional streaming snapshot/CSV state machines, and the
+/// grid's freeze-aware viewport subscription.
 #[wasm_bindgen]
-#[derive(Debug, Default)]
 pub struct Engine {
     engine: FormulaEngine,
+    undo_stack: UndoStack,
+    clipboard: Option<InternalClipboard>,
+    wal_seq: u64,
+    last_timestamp_ms: u64,
+    pending_wal_frames: VecDeque<Vec<u8>>,
+    snapshot_encoder: Option<SnapshotEncoder>,
+    pending_snapshot_chunk: Option<Vec<u8>>,
+    csv_reader: Option<CsvReader>,
+    recalc_frozen: bool,
     seed: u32,
     generation_ms: f64,
     /// Sheet currently subscribed by the grid.
     subscribed_sheet: SheetId,
-    /// The pages the grid holds or is about to be sent.
-    subscribed: PageRange,
-    /// The subscription that pages are currently sent for.
+    subscribed_rows: (u32, u32),
+    subscribed_cols: (u32, u32),
+    subscribed_pages: Vec<Page>,
+    subscribed_set: HashSet<Page>,
+    /// The subscription epoch that pages are currently sent for.
     epoch: u32,
     /// Pages that are due, in the order they will be sent.
     due: VecDeque<Page>,
     /// O(1) membership set keeping `due` free of duplicates.
     due_set: HashSet<Page>,
+    /// Number of style entries sent in the latest `SheetInfo` / `StylesUpdated`.
+    last_sent_styles_len: usize,
+    /// Pending auxiliary event (such as `StylesUpdated` when scrolling interns a new style).
+    pending_aux_event: Option<EngineEvent>,
     /// Accumulated engine milliseconds spent across the active recalculation wave.
     recalc_elapsed_ms: f64,
     /// Scratch space for encoding pages.
     text: String,
+}
+
+impl std::fmt::Debug for Engine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Engine")
+            .field("wal_seq", &self.wal_seq)
+            .field("subscribed_sheet", &self.subscribed_sheet)
+            .field("recalc_frozen", &self.recalc_frozen)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for Engine {
+    fn default() -> Self {
+        Self {
+            engine: FormulaEngine::default(),
+            undo_stack: UndoStack::new(),
+            clipboard: None,
+            wal_seq: 0,
+            last_timestamp_ms: 0,
+            pending_wal_frames: VecDeque::new(),
+            snapshot_encoder: None,
+            pending_snapshot_chunk: None,
+            csv_reader: None,
+            recalc_frozen: false,
+            seed: 0,
+            generation_ms: 0.0,
+            subscribed_sheet: SheetId(0),
+            subscribed_rows: (0, 0),
+            subscribed_cols: (0, 0),
+            subscribed_pages: Vec::new(),
+            subscribed_set: HashSet::new(),
+            epoch: 0,
+            due: VecDeque::new(),
+            due_set: HashSet::new(),
+            last_sent_styles_len: 1,
+            pending_aux_event: None,
+            recalc_elapsed_ms: 0.0,
+            text: String::new(),
+        }
+    }
 }
 
 #[wasm_bindgen]
@@ -394,38 +1354,53 @@ impl Engine {
     }
 
     /// Carries out a command and returns the event that answers it, if the
-    /// command has one. Afterwards, take pages until there are none left, and
-    /// check [`Self::has_pending_recalc`].
+    /// command has one. Afterwards, drain WAL frames with
+    /// [`Self::take_pending_wal_frame`], take pages until none remain, and check
+    /// [`Self::has_pending_recalc`].
     ///
     /// # Errors
     ///
-    /// Fails if `command` is not a well-formed command; the engine is left
-    /// unchanged.
+    /// Fails if `command` is malformed or if the engine previously panicked.
     pub fn handle(
         &mut self,
         command: &Ts<EngineCommand>,
     ) -> Result<Option<Ts<EngineEvent>>, JsError> {
+        check_not_panicked()?;
         let cmd = command.to_rust()?;
         let event = self.handle_command(cmd);
         Ok(event.as_ref().map(Ts::from_rust).transpose()?)
     }
 
     /// Whether dirty formulas remain queued for subsequent [`EngineCommand::ContinueRecalc`]
-    /// slices.
+    /// slices (always `false` while Safe Mode `recalc_frozen` is active).
     #[wasm_bindgen(js_name = hasPendingRecalc)]
     #[must_use]
     pub fn has_pending_recalc(&self) -> bool {
-        self.engine.has_pending_recalc()
+        !self.recalc_frozen && self.engine.has_pending_recalc()
     }
 
-    /// Encodes the next page that is due and hands it over, or returns
+    /// Encodes the next viewport page that is due and hands it over, or returns
     /// nothing when the grid has been sent everything due.
     #[wasm_bindgen(js_name = takePage)]
     pub fn take_page(&mut self) -> Option<Vec<u8>> {
         let page = self.due.pop_front()?;
         self.due_set.remove(&page);
         let sheet_id = self.subscribed_sheet;
+        self.engine.prepare_page_styles(sheet_id, page);
         let sheet = self.engine.workbook().sheet(sheet_id)?;
+        if sheet.styles().entries().len() > self.last_sent_styles_len {
+            self.last_sent_styles_len = sheet.styles().entries().len();
+            self.pending_aux_event = Some(EngineEvent::StylesUpdated {
+                sheet: sheet_id.0,
+                styles: sheet
+                    .styles()
+                    .entries()
+                    .iter()
+                    .copied()
+                    .map(WireCellStyle::from)
+                    .collect(),
+            });
+        }
         let engine_ref = &self.engine;
         Some(viewport::encode_page_with_formulas(
             sheet,
@@ -435,6 +1410,328 @@ impl Engine {
             |r, c| engine_ref.has_formula(sheet_id, r, c),
         ))
     }
+
+    /// Takes an auxiliary event (such as [`EngineEvent::StylesUpdated`] emitted
+    /// if `takePage` lazily interned a cross-axis style).
+    #[wasm_bindgen(js_name = takeAuxEvent)]
+    pub fn take_aux_event(&mut self) -> Result<Option<Ts<EngineEvent>>, JsError> {
+        let ev = self.pending_aux_event.take();
+        Ok(ev.as_ref().map(Ts::from_rust).transpose()?)
+    }
+
+    /// Pops the next framed `RTCLWAL1` transaction record ready to append to
+    /// OPFS `wal.log`.
+    #[wasm_bindgen(js_name = takePendingWalFrame)]
+    pub fn take_pending_wal_frame(&mut self) -> Option<Vec<u8>> {
+        self.pending_wal_frames.pop_front()
+    }
+
+    /// Encodes a ~120-byte `SeedOrigin` snapshot stub when the current workbook
+    /// is an unmodified seeded sample (`14-m1b.md` 7.1), or returns `None`.
+    #[wasm_bindgen(js_name = encodeSeedStub)]
+    pub fn encode_seed_stub(&self) -> Result<Option<Vec<u8>>, JsError> {
+        check_not_panicked()?;
+        let Some(origin) = self.engine.workbook().seed_origin() else {
+            return Ok(None);
+        };
+        let bytes = encode_seed_stub_v1(origin, &[])
+            .map_err(|e| JsError::new(&format!("encodeSeedStub failed: {e:?}")))?;
+        Ok(Some(bytes))
+    }
+
+    /// Encodes a complete standalone `RTCLSNAP` v1 snapshot buffer (used for
+    /// `.rtcl` file export or immediate small-workbook saves). When
+    /// `compact_garbage` is true, purges tombstones and orphaned strings on the
+    /// exported image without invalidating the live session's `UndoStack`.
+    #[wasm_bindgen(js_name = encodeSnapshotFull)]
+    pub fn encode_snapshot_full(&mut self, compact_garbage: bool) -> Result<Vec<u8>, JsError> {
+        check_not_panicked()?;
+        if compact_garbage {
+            if !self.undo_stack.can_undo() && !self.undo_stack.can_redo() {
+                self.engine.compact_local_garbage();
+                let mut wb = self.engine.workbook().clone();
+                wb.clear_seed_origin();
+                return encode_snapshot_v1(&wb, &[])
+                    .map_err(|e| JsError::new(&format!("encodeSnapshotFull failed: {e:?}")));
+            }
+            let mut exported_wb = self.engine.workbook().clone();
+            exported_wb.clear_seed_origin();
+            exported_wb.compact_local_garbage();
+            return encode_snapshot_v1(&exported_wb, &[])
+                .map_err(|e| JsError::new(&format!("encodeSnapshotFull failed: {e:?}")));
+        }
+        let mut exported_wb = self.engine.workbook().clone();
+        exported_wb.clear_seed_origin();
+        encode_snapshot_v1(&exported_wb, &[])
+            .map_err(|e| JsError::new(&format!("encodeSnapshotFull failed: {e:?}")))
+    }
+
+    /// Starts a Copy-on-Write background `RTCLSNAP` v1 stream (`< 0.2 ms` fork)
+    /// and returns the `snapshotSeq` covered by this snapshot (`14-m1b.md` 2.3).
+    #[wasm_bindgen(js_name = startSnapshotStream)]
+    pub fn start_snapshot_stream(&mut self) -> Result<f64, JsError> {
+        check_not_panicked()?;
+        let mut fork_wb = self.engine.workbook().clone();
+        fork_wb.clear_seed_origin();
+        self.snapshot_encoder = Some(SnapshotEncoder::new(&fork_wb, Vec::new()));
+        self.pending_snapshot_chunk = None;
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "wal_seq < 2^53 fits exactly in f64"
+        )]
+        Ok(self.wal_seq as f64)
+    }
+
+    /// Advances the active CoW snapshot stream by up to `max_blocks` `4096`-row
+    /// column blocks; pull binary chunks via [`Self::take_snapshot_chunk`].
+    #[wasm_bindgen(js_name = stepSnapshotStream)]
+    pub fn step_snapshot_stream(
+        &mut self,
+        max_blocks: u32,
+    ) -> Result<Ts<WireSnapshotStep>, JsError> {
+        check_not_panicked()?;
+        let Some(ref mut enc) = self.snapshot_encoder else {
+            return Err(JsError::new("No active snapshot stream."));
+        };
+        let step = enc
+            .encode_step(self.engine.workbook(), max_blocks.max(1) as usize)
+            .map_err(|e| JsError::new(&format!("Snapshot step failed: {e:?}")))?;
+        let wire_step = match step {
+            SnapshotStep::Progress => WireSnapshotStep::Progress,
+            SnapshotStep::Chunk { offset, bytes } => {
+                let byte_len = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
+                self.pending_snapshot_chunk = Some(bytes);
+                #[expect(
+                    clippy::cast_precision_loss,
+                    reason = "snapshot offset < 4 GiB fits in f64"
+                )]
+                WireSnapshotStep::Chunk {
+                    offset: offset as f64,
+                    byte_len,
+                }
+            }
+            SnapshotStep::Finished {
+                header_bytes,
+                total_len,
+            } => {
+                self.pending_snapshot_chunk = Some(header_bytes);
+                self.snapshot_encoder = None;
+                #[expect(
+                    clippy::cast_precision_loss,
+                    reason = "snapshot size < 4 GiB fits in f64"
+                )]
+                WireSnapshotStep::Finished {
+                    total_len: total_len as f64,
+                }
+            }
+        };
+        Ok(Ts::from_rust(&wire_step)?)
+    }
+
+    /// Returns the `Uint8Array` chunk produced by the most recent
+    /// [`Self::step_snapshot_stream`] `Chunk` or `Finished` step.
+    #[wasm_bindgen(js_name = takeSnapshotChunk)]
+    pub fn take_snapshot_chunk(&mut self) -> Option<Vec<u8>> {
+        self.pending_snapshot_chunk.take()
+    }
+
+    /// Cancels any in-flight background snapshot stream.
+    #[wasm_bindgen(js_name = abortSnapshotStream)]
+    pub fn abort_snapshot_stream(&mut self) {
+        self.snapshot_encoder = None;
+        self.pending_snapshot_chunk = None;
+    }
+
+    /// Decodes a base snapshot (`RTCLSNAP` v1, `SeedOrigin` stub, or legacy `v0`)
+    /// and optionally replays `wal_bytes` on top of it (`14-m1b.md` 5.5 & 7.1–7.3).
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "single atomic WASM entrypoint avoids multi-call state drift during cold open / Safe Mode"
+    )]
+    #[wasm_bindgen(js_name = loadSnapshotAndWal)]
+    pub fn load_snapshot_and_wal(
+        &mut self,
+        snapshot_bytes: &[u8],
+        wal_bytes: &[u8],
+        expected_base_seq: f64,
+        last_flushed_seq: f64,
+        skip_tail_txns: u32,
+        recalculate: bool,
+        salvage_corrupt_mid: bool,
+        compact_after_replay: bool,
+    ) -> Result<Ts<WireLoadOutcome>, JsError> {
+        check_not_panicked()?;
+        let started = now_ms();
+        let base_seq = f64_to_u64(expected_base_seq)?;
+        let flushed_seq = f64_to_u64(last_flushed_seq)?;
+
+        if snapshot_bytes.len() > 4096 {
+            let _ = reticula_core::memory::try_reserve_heap(snapshot_bytes.len().saturating_mul(5));
+        }
+
+        let decoded = decode_snapshot_any(snapshot_bytes)
+            .map_err(|e| JsError::new(&format!("Snapshot decode failed: {e:?}")))?;
+        let mut new_engine = decoded.engine;
+        let mut truncate_wal_to_bytes: Option<u32> = None;
+        let mut replayed_txns: u32 = 0;
+        let mut final_seq = base_seq;
+
+        if !wal_bytes.is_empty() {
+            let records = match scan_wal(wal_bytes, base_seq, flushed_seq) {
+                Ok(scan) => {
+                    if let WalTailDisposition::ZeroPaddedTail { valid_bytes }
+                    | WalTailDisposition::TornFinalRecord { valid_bytes } = scan.tail
+                    {
+                        truncate_wal_to_bytes = u32::try_from(valid_bytes).ok();
+                    }
+                    scan.records
+                }
+                Err(WalCorruption::MidFileCorruption {
+                    salvageable_records,
+                    ..
+                }) if salvage_corrupt_mid => salvageable_records,
+                Err(corr) => {
+                    return Err(JsError::new(&format!("WAL corruption detected: {corr:?}")));
+                }
+            };
+
+            let applied_len = records.len().saturating_sub(skip_tail_txns as usize);
+            if let Some(last_rec) = records.get(applied_len.saturating_sub(1))
+                && applied_len > 0
+            {
+                final_seq = last_rec.seq;
+            }
+            replay_wal_records(
+                &mut new_engine,
+                &records,
+                skip_tail_txns as usize,
+                recalculate,
+            )
+            .map_err(|e| JsError::new(&format!("WAL replay failed: {e:?}")))?;
+            replayed_txns = u32::try_from(applied_len).unwrap_or(u32::MAX);
+
+            if compact_after_replay && replayed_txns > 0 && recalculate {
+                new_engine.compact_local_garbage();
+            }
+        }
+
+        let _ = new_engine.take_dirty_changes();
+        let first_live_sheet = new_engine
+            .workbook()
+            .live_sheets()
+            .next()
+            .map_or(SheetId(0), Sheet::id);
+
+        self.engine = new_engine;
+        self.undo_stack.clear();
+        self.clipboard = None;
+        self.wal_seq = final_seq;
+        self.pending_wal_frames.clear();
+        self.snapshot_encoder = None;
+        self.pending_snapshot_chunk = None;
+        self.csv_reader = None;
+        self.recalc_frozen = !recalculate;
+        self.seed = self
+            .engine
+            .workbook()
+            .seed_origin()
+            .and_then(|o| u32::try_from(o.seed).ok())
+            .unwrap_or(0);
+        self.generation_ms = now_ms() - started;
+        self.reset_subscription(first_live_sheet);
+
+        let sheet = self.sheet_info(first_live_sheet);
+        let outcome = WireLoadOutcome {
+            info: EngineInfo {
+                kernel_version: reticula_core::KERNEL_VERSION.to_owned(),
+            },
+            sheet,
+            replayed_txns,
+            truncate_wal_to_bytes,
+            recalc_frozen: self.recalc_frozen,
+        };
+        Ok(Ts::from_rust(&outcome)?)
+    }
+
+    /// Validates `raw_bytes` (`<= 256 MiB`, valid UTF-8) and begins row-batched
+    /// RFC 4180 CSV/TSV import (`14-m1b.md` 5.6). Returns `raw_bytes.len() as u32`.
+    #[wasm_bindgen(js_name = startCsvImport)]
+    pub fn start_csv_import(
+        &mut self,
+        sheet_name: &str,
+        raw_bytes: Vec<u8>,
+    ) -> Result<u32, JsError> {
+        check_not_panicked()?;
+        if raw_bytes.len() > MAX_CSV_IMPORT_BYTES {
+            return Err(JsError::new(
+                "CSV file exceeds the 256 MiB local import limit.",
+            ));
+        }
+        let total_len = u32::try_from(raw_bytes.len()).unwrap_or(u32::MAX);
+        let safe_name = sanitize_sheet_title(sheet_name);
+        let reader = CsvReader::new(SheetId(0), safe_name, raw_bytes, None)
+            .map_err(|e| JsError::new(&format_csv_error(e)))?;
+        self.csv_reader = Some(reader);
+        Ok(total_len)
+    }
+
+    /// Parses up to `max_rows` (`65,536` recommended) CSV rows and emits either
+    /// percentage progress or the completed [`SheetInfo`].
+    #[wasm_bindgen(js_name = stepCsvImport)]
+    pub fn step_csv_import(&mut self, max_rows: u32) -> Result<Ts<WireCsvImportStep>, JsError> {
+        check_not_panicked()?;
+        let started = now_ms();
+        let Some(mut reader) = self.csv_reader.take() else {
+            return Err(JsError::new("No active CSV import."));
+        };
+        let done = match reader.parse_rows(max_rows.max(1)) {
+            Ok(done) => done,
+            Err(err) => return Err(JsError::new(&format_csv_error(err))),
+        };
+        if !done {
+            let step = WireCsvImportStep::Progress {
+                rows_parsed: reader.rows_parsed(),
+                percent: reader.progress_percent(),
+            };
+            self.csv_reader = Some(reader);
+            return Ok(Ts::from_rust(&step)?);
+        }
+
+        let sheet = reader
+            .finish()
+            .map_err(|e| JsError::new(&format_csv_error(e)))?;
+        self.engine = FormulaEngine::from_workbook_clean(Workbook::from_sheet(sheet, None));
+        self.undo_stack.clear();
+        self.clipboard = None;
+        self.wal_seq = 0;
+        self.pending_wal_frames.clear();
+        self.snapshot_encoder = None;
+        self.pending_snapshot_chunk = None;
+        self.recalc_frozen = false;
+        self.seed = 0;
+        self.generation_ms = now_ms() - started;
+        self.reset_subscription(SheetId(0));
+
+        let step = WireCsvImportStep::Done {
+            info: EngineInfo {
+                kernel_version: reticula_core::KERNEL_VERSION.to_owned(),
+            },
+            sheet: self.sheet_info(SheetId(0)),
+        };
+        Ok(Ts::from_rust(&step)?)
+    }
+
+    /// Exports `sheet` as RFC 4180 UTF-8 CSV bytes (`14-m1b.md` 5.6).
+    #[wasm_bindgen(js_name = exportCsv)]
+    pub fn export_csv(&self, sheet: u32) -> Result<Vec<u8>, JsError> {
+        check_not_panicked()?;
+        let s = self
+            .engine
+            .workbook()
+            .sheet(SheetId(sheet))
+            .ok_or_else(|| JsError::new("Target sheet does not exist."))?;
+        Ok(export_sheet_delimited(s, b',').into_bytes())
+    }
 }
 
 impl Engine {
@@ -442,6 +1739,7 @@ impl Engine {
     pub fn handle_command(&mut self, command: EngineCommand) -> Option<EngineEvent> {
         match command {
             EngineCommand::OpenSample { seed, rows } => Some(self.open_sample(seed, rows)),
+            EngineCommand::OpenEmpty => Some(self.open_empty()),
             EngineCommand::Subscribe {
                 sheet,
                 epoch,
@@ -456,6 +1754,28 @@ impl Engine {
                     (first_row, row_count),
                     (first_col, col_count),
                 );
+                None
+            }
+            EngineCommand::SwitchSheet { sheet } => Some(self.switch_sheet(SheetId(sheet))),
+            EngineCommand::SetEvalEnv {
+                now_serial,
+                seed,
+                timestamp_ms,
+            } => {
+                if let Some(ts) = timestamp_ms
+                    && ts.is_finite()
+                    && ts >= 0.0
+                {
+                    #[expect(
+                        clippy::cast_possible_truncation,
+                        clippy::cast_sign_loss,
+                        reason = "guarded >= 0 finite"
+                    )]
+                    {
+                        self.last_timestamp_ms = ts as u64;
+                    }
+                }
+                self.engine.set_eval_env(now_serial, seed);
                 None
             }
             EngineCommand::InspectCell {
@@ -480,6 +1800,192 @@ impl Engine {
             EngineCommand::DeleteRows { sheet, rows } => {
                 Some(self.delete_rows(SheetId(sheet), rows))
             }
+            EngineCommand::InsertCols {
+                sheet,
+                after_col_id,
+                count,
+            } => Some(self.insert_cols(SheetId(sheet), after_col_id, count)),
+            EngineCommand::DeleteCols { sheet, cols } => {
+                Some(self.delete_cols(SheetId(sheet), cols))
+            }
+            EngineCommand::MoveRows {
+                sheet,
+                rows,
+                after_row_id,
+            } => Some(self.move_rows(SheetId(sheet), rows, after_row_id)),
+            EngineCommand::MoveCols {
+                sheet,
+                cols,
+                after_col_id,
+            } => Some(self.move_cols(SheetId(sheet), cols, after_col_id)),
+            EngineCommand::ResizeRows { sheet, sizes } => {
+                Some(self.resize_rows(SheetId(sheet), &sizes))
+            }
+            EngineCommand::ResizeCols { sheet, sizes } => {
+                Some(self.resize_cols(SheetId(sheet), &sizes))
+            }
+            EngineCommand::SetFreeze {
+                sheet,
+                frozen_rows,
+                frozen_cols,
+            } => Some(self.set_freeze(SheetId(sheet), frozen_rows, frozen_cols)),
+            EngineCommand::SetFormat {
+                sheet,
+                target,
+                number_format,
+                style,
+            } => Some(self.set_format(SheetId(sheet), target, number_format, style)),
+            EngineCommand::FillRange {
+                sheet,
+                src_first_row,
+                src_row_count,
+                src_first_col,
+                src_col_count,
+                dst_first_row,
+                dst_row_count,
+                dst_first_col,
+                dst_col_count,
+            } => Some(self.fill_range(
+                SheetId(sheet),
+                RectPos {
+                    first_row: src_first_row,
+                    row_count: src_row_count,
+                    first_col: src_first_col,
+                    col_count: src_col_count,
+                },
+                RectPos {
+                    first_row: dst_first_row,
+                    row_count: dst_row_count,
+                    first_col: dst_first_col,
+                    col_count: dst_col_count,
+                },
+            )),
+            EngineCommand::AutoFillDown {
+                sheet,
+                src_first_row,
+                src_row_count,
+                src_first_col,
+                src_col_count,
+            } => Some(self.auto_fill_down(
+                SheetId(sheet),
+                RectPos {
+                    first_row: src_first_row,
+                    row_count: src_row_count,
+                    first_col: src_first_col,
+                    col_count: src_col_count,
+                },
+            )),
+            EngineCommand::CopyRange {
+                sheet,
+                first_row,
+                row_count,
+                first_col,
+                col_count,
+                cut,
+            } => Some(self.copy_selection(
+                SheetId(sheet),
+                RectPos {
+                    first_row,
+                    row_count,
+                    first_col,
+                    col_count,
+                },
+                cut,
+            )),
+            EngineCommand::PasteClipboard {
+                sheet,
+                dest_row,
+                dest_row_count,
+                dest_col,
+                dest_col_count,
+                tsv,
+                html,
+            } => Some(self.paste_clipboard(
+                SheetId(sheet),
+                RectPos {
+                    first_row: dest_row,
+                    row_count: dest_row_count,
+                    first_col: dest_col,
+                    col_count: dest_col_count,
+                },
+                &tsv,
+                html.as_deref(),
+            )),
+            EngineCommand::AddSheet { name, after_sheet } => {
+                Some(self.add_sheet(name, after_sheet.map(SheetId)))
+            }
+            EngineCommand::RenameSheet { sheet, name } => {
+                Some(self.rename_sheet(SheetId(sheet), name))
+            }
+            EngineCommand::DeleteSheet { sheet } => Some(self.delete_sheet(SheetId(sheet))),
+            EngineCommand::MoveSheet { sheet, after_sheet } => {
+                Some(self.move_sheet(SheetId(sheet), after_sheet.map(SheetId)))
+            }
+            EngineCommand::Undo => Some(self.undo_txn()),
+            EngineCommand::Redo => Some(self.redo_txn()),
+            EngineCommand::AnalyzeFormula {
+                sheet,
+                source,
+                cursor_utf16,
+            } => {
+                let analysis = lang_service::analyze_formula(
+                    &source,
+                    cursor_utf16,
+                    self.engine.workbook(),
+                    SheetId(sheet),
+                );
+                Some(EngineEvent::FormulaAnalyzed {
+                    analysis: analysis.into(),
+                })
+            }
+            EngineCommand::ToggleFormulaDollar {
+                source,
+                cursor_utf16,
+            } => match lang_service::toggle_reference_dollar(&source, cursor_utf16) {
+                Some((updated, start_utf16, end_utf16)) => {
+                    Some(EngineEvent::FormulaDollarToggled {
+                        changed: true,
+                        source: updated,
+                        start_utf16,
+                        end_utf16,
+                    })
+                }
+                None => Some(EngineEvent::FormulaDollarToggled {
+                    changed: false,
+                    source,
+                    start_utf16: cursor_utf16,
+                    end_utf16: cursor_utf16,
+                }),
+            },
+            EngineCommand::FormatRangeRef {
+                host_sheet,
+                target_sheet,
+                r1,
+                c1,
+                r2,
+                c2,
+            } => Some(EngineEvent::RangeRefFormatted {
+                reference: lang_service::format_sheet_range_ref(
+                    self.engine.workbook(),
+                    SheetId(host_sheet),
+                    SheetId(target_sheet),
+                    r1,
+                    c1,
+                    r2,
+                    c2,
+                ),
+            }),
+            EngineCommand::JumpEdge {
+                sheet,
+                row,
+                col,
+                dir,
+                select,
+            } => Some(self.jump_edge(SheetId(sheet), row, col, dir, select)),
+            EngineCommand::JumpUsedEnd { sheet, select } => {
+                Some(self.jump_used_end(SheetId(sheet), select))
+            }
+            EngineCommand::ResumeRecalc => Some(self.resume_recalc()),
             EngineCommand::ContinueRecalc => self.continue_recalc(),
             EngineCommand::SelfCheck => {
                 let digest = determinism::to_hex(determinism::digest());
@@ -490,18 +1996,34 @@ impl Engine {
         }
     }
 
+    fn reset_subscription(&mut self, sheet_id: SheetId) {
+        self.subscribed_sheet = sheet_id;
+        self.subscribed_rows = (0, 0);
+        self.subscribed_cols = (0, 0);
+        self.subscribed_pages.clear();
+        self.subscribed_set.clear();
+        self.due.clear();
+        self.due_set.clear();
+        self.pending_aux_event = None;
+        self.recalc_elapsed_ms = 0.0;
+    }
+
     fn open_sample(&mut self, seed: u32, rows: u32) -> EngineEvent {
         let started = now_ms();
         self.engine = FormulaEngine::open_sample(u64::from(seed), rows);
         let generation_ms = now_ms() - started;
 
+        self.undo_stack.clear();
+        self.clipboard = None;
+        self.wal_seq = 0;
+        self.pending_wal_frames.clear();
+        self.snapshot_encoder = None;
+        self.pending_snapshot_chunk = None;
+        self.csv_reader = None;
+        self.recalc_frozen = false;
         self.seed = seed;
         self.generation_ms = generation_ms;
-        self.subscribed_sheet = SheetId(0);
-        self.subscribed = PageRange::default();
-        self.due.clear();
-        self.due_set.clear();
-        self.recalc_elapsed_ms = 0.0;
+        self.reset_subscription(SheetId(0));
         let _ = self.engine.take_dirty_changes();
 
         EngineEvent::Ready {
@@ -512,43 +2034,137 @@ impl Engine {
         }
     }
 
-    fn sheet_info(&self, sheet_id: SheetId) -> SheetInfo {
-        let (rows, cols) = self
-            .engine
-            .workbook()
-            .sheet(sheet_id)
-            .map_or((0, 0), |s| (s.rows(), s.cols()));
-        let formula_count = u32::try_from(self.engine.workbook().formulas().len()).unwrap_or(0);
+    fn open_empty(&mut self) -> EngineEvent {
+        let started = now_ms();
+        self.engine = FormulaEngine::new();
+        let generation_ms = now_ms() - started;
+
+        self.undo_stack.clear();
+        self.clipboard = None;
+        self.wal_seq = 0;
+        self.pending_wal_frames.clear();
+        self.snapshot_encoder = None;
+        self.pending_snapshot_chunk = None;
+        self.csv_reader = None;
+        self.recalc_frozen = false;
+        self.seed = 0;
+        self.generation_ms = generation_ms;
+        self.reset_subscription(SheetId(0));
+        let _ = self.engine.take_dirty_changes();
+
+        EngineEvent::Ready {
+            info: EngineInfo {
+                kernel_version: reticula_core::KERNEL_VERSION.to_owned(),
+            },
+            sheet: self.sheet_info(SheetId(0)),
+        }
+    }
+
+    fn sheet_info(&mut self, sheet_id: SheetId) -> SheetInfo {
+        self.engine.ensure_sheet_styles_interned(sheet_id);
+        let wb = self.engine.workbook();
+        let sheets: Vec<SheetTabInfo> = wb
+            .live_sheets()
+            .map(|s| SheetTabInfo {
+                id: s.id().0,
+                name: String::from(s.name()),
+            })
+            .collect();
+
+        let (sheet_name, rows, cols, frozen_rows, frozen_cols, custom_rows, custom_cols, styles) =
+            wb.sheet(sheet_id).map_or_else(
+                || {
+                    (
+                        String::new(),
+                        0,
+                        0,
+                        0,
+                        0,
+                        Vec::new(),
+                        Vec::new(),
+                        vec![WireCellStyle::default()],
+                    )
+                },
+                |s| {
+                    let mut cr: Vec<(u32, u16)> = s
+                        .row_heights()
+                        .iter()
+                        .filter_map(|(&r, &px)| s.row_axis().id_to_pos(r.0).map(|pos| (pos, px)))
+                        .collect();
+                    cr.sort_unstable_by_key(|&(pos, _)| pos);
+
+                    let mut cc: Vec<(u32, u16)> = s
+                        .col_widths()
+                        .iter()
+                        .filter_map(|(&c, &px)| s.col_axis().id_to_pos(c.0).map(|pos| (pos, px)))
+                        .collect();
+                    cc.sort_unstable_by_key(|&(pos, _)| pos);
+
+                    let st: Vec<WireCellStyle> = s
+                        .styles()
+                        .entries()
+                        .iter()
+                        .copied()
+                        .map(WireCellStyle::from)
+                        .collect();
+                    (
+                        String::from(s.name()),
+                        s.rows(),
+                        s.cols(),
+                        s.frozen_rows(),
+                        s.frozen_cols(),
+                        cr,
+                        cc,
+                        st,
+                    )
+                },
+            );
+        self.last_sent_styles_len = styles.len();
+
+        let formula_count = u32::try_from(wb.formulas().len()).unwrap_or(0);
         SheetInfo {
             sheet: sheet_id.0,
+            sheet_name,
+            sheets,
             rows,
             cols,
+            frozen_rows,
+            frozen_cols,
+            custom_rows,
+            custom_cols,
+            styles,
             formula_count,
             seed: self.seed,
             generation_ms: self.generation_ms,
+            can_undo: self.undo_stack.can_undo(),
+            can_redo: self.undo_stack.can_redo(),
+            undo_label: self.undo_stack.undo_label().map(String::from),
+            redo_label: self.undo_stack.redo_label().map(String::from),
+            wal_seq: self.wal_seq,
+            recalc_frozen: self.recalc_frozen,
         }
     }
 
     fn subscribe(&mut self, sheet_id: SheetId, epoch: u32, rows: (u32, u32), cols: (u32, u32)) {
-        let dims = self
+        let (dims, frozen) = self
             .engine
             .workbook()
             .sheet(sheet_id)
-            .map_or((0, 0), |s| (s.rows(), s.cols()));
-        let wanted = PageRange::covering(dims, rows, cols);
-        let sheet_changed = sheet_id != self.subscribed_sheet;
-        let held = if sheet_changed {
-            PageRange::default()
-        } else {
-            self.subscribed
-        };
+            .map_or(((0, 0), (0, 0)), |s| {
+                ((s.rows(), s.cols()), (s.frozen_rows(), s.frozen_cols()))
+            });
+        let base_range = PageRange::covering(dims, rows, cols);
+        let wanted = viewport::collect_wanted_pages_with_freeze(base_range, frozen.0, frozen.1);
+        let wanted_set: HashSet<Page> = wanted.iter().copied().collect();
 
+        let sheet_changed = sheet_id != self.subscribed_sheet;
         if sheet_changed {
             self.due.clear();
             self.due_set.clear();
+            self.subscribed_set.clear();
         } else {
             self.due.retain(|page| {
-                let keep = wanted.contains(*page);
+                let keep = wanted_set.contains(page);
                 if !keep {
                     self.due_set.remove(page);
                 }
@@ -556,29 +2172,63 @@ impl Engine {
             });
         }
 
-        for page in wanted.pages() {
-            if !held.contains(page) && self.due_set.insert(page) {
+        for &page in &wanted {
+            if !self.subscribed_set.contains(&page) && self.due_set.insert(page) {
                 self.due.push_back(page);
             }
         }
         self.subscribed_sheet = sheet_id;
-        self.subscribed = wanted;
+        self.subscribed_rows = rows;
+        self.subscribed_cols = cols;
+        self.subscribed_pages = wanted;
+        self.subscribed_set = wanted_set;
         self.epoch = epoch;
     }
 
+    fn refresh_subscription_extent(&mut self) {
+        if self.subscribed_pages.is_empty() {
+            return;
+        }
+        let sheet_id = self.subscribed_sheet;
+        let (dims, frozen) = self
+            .engine
+            .workbook()
+            .sheet(sheet_id)
+            .map_or(((0, 0), (0, 0)), |s| {
+                ((s.rows(), s.cols()), (s.frozen_rows(), s.frozen_cols()))
+            });
+        let base_range = PageRange::covering(dims, self.subscribed_rows, self.subscribed_cols);
+        let wanted = viewport::collect_wanted_pages_with_freeze(base_range, frozen.0, frozen.1);
+        let wanted_set: HashSet<Page> = wanted.iter().copied().collect();
+        self.due.retain(|page| {
+            let keep = wanted_set.contains(page);
+            if !keep {
+                self.due_set.remove(page);
+            }
+            keep
+        });
+        for &page in &wanted {
+            if !self.subscribed_set.contains(&page) && self.due_set.insert(page) {
+                self.due.push_back(page);
+            }
+        }
+        self.subscribed_pages = wanted;
+        self.subscribed_set = wanted_set;
+    }
+
     fn enqueue_page(&mut self, page: Page) {
-        if self.subscribed.contains(page) && self.due_set.insert(page) {
+        if self.subscribed_set.contains(&page) && self.due_set.insert(page) {
             self.due.push_back(page);
         }
     }
 
     fn flush_dirty_pages(&mut self) {
         let dirty = self.engine.take_dirty_changes();
-        if self.subscribed.is_empty() {
+        if self.subscribed_pages.is_empty() {
             return;
         }
         if dirty.structural || dirty.cells.len() > BULK_DIRTY_PAGE_THRESHOLD {
-            let pages: Vec<Page> = self.subscribed.pages().collect();
+            let pages = self.subscribed_pages.clone();
             for page in pages {
                 self.enqueue_page(page);
             }
@@ -599,8 +2249,17 @@ impl Engine {
                         row: r_pos / PAGE_ROWS,
                         col: c_pos / PAGE_COLS,
                     };
-                    if self.subscribed.contains(page) {
+                    if self.subscribed_set.contains(&page) {
                         to_enqueue.push(page);
+                    }
+                    // Also refresh the immediately rightward page (`col + 1`) if
+                    // left-overflow text could spill into it!
+                    let right_page = Page {
+                        row: r_pos / PAGE_ROWS,
+                        col: (c_pos / PAGE_COLS).saturating_add(1),
+                    };
+                    if self.subscribed_set.contains(&right_page) {
+                        to_enqueue.push(right_page);
                     }
                 }
             }
@@ -610,8 +2269,84 @@ impl Engine {
         }
     }
 
+    fn record_wal_and_mvcc(
+        &mut self,
+        label: &str,
+        ops: &[Op<BoundFormula>],
+        inverses: &[InverseOp<BoundFormula>],
+    ) {
+        if let Some(ref mut enc) = self.snapshot_encoder {
+            for inv in inverses {
+                record_inverse_on_snapshot_encoder(enc, inv);
+            }
+        }
+        self.wal_seq = self.wal_seq.saturating_add(1);
+        let rec = WireWalRecordV1 {
+            seq: self.wal_seq,
+            timestamp_ms: self.last_timestamp_ms,
+            label: String::from(label),
+            ops: ops.iter().map(WireOpV1::from).collect(),
+        };
+        if let Ok(frame) = encode_wal_record(&rec) {
+            self.pending_wal_frames.push_back(frame);
+        }
+    }
+
+    fn execute_user_txn(
+        &mut self,
+        label: String,
+        ops: Vec<Op<BoundFormula>>,
+    ) -> Result<(), OpError> {
+        let saved = ops.clone();
+        let inverses = self.engine.apply_txn(ops)?;
+        self.record_wal_and_mvcc(&label, &saved, &inverses);
+        self.undo_stack
+            .record_txn(label, &saved, inverses, self.engine.workbook());
+        Ok(())
+    }
+
+    fn run_initial_recalc_slice(&mut self) -> u32 {
+        if self.recalc_frozen || !self.engine.has_pending_recalc() {
+            return 0;
+        }
+        let slice_start = now_ms();
+        match self.engine.recalc_with_budget(RECALC_CHECK_INTERVAL, |_| {
+            now_ms() - slice_start >= RECALC_SLICE_BUDGET_MS
+        }) {
+            RecalcStatus::Complete { recalculated: n } => {
+                self.recalc_elapsed_ms = 0.0;
+                n
+            }
+            RecalcStatus::InProgress { done, .. } => {
+                self.recalc_elapsed_ms += now_ms() - slice_start;
+                done
+            }
+        }
+    }
+
+    fn switch_sheet(&mut self, sheet_id: SheetId) -> EngineEvent {
+        if self.engine.workbook().live_sheet(sheet_id).is_none() {
+            return EngineEvent::Rejected {
+                reason: String::from("Target worksheet does not exist."),
+            };
+        }
+        self.subscribed_sheet = sheet_id;
+        self.subscribed_pages.clear();
+        self.subscribed_set.clear();
+        self.due.clear();
+        self.due_set.clear();
+        EngineEvent::SheetChanged {
+            sheet: self.sheet_info(sheet_id),
+            action_ms: 0.0,
+            recalculated: 0,
+        }
+    }
+
     fn inspect_cell(&self, sheet_id: SheetId, row_id: RowId, col_id: ColId) -> Option<EngineEvent> {
         let info = self.engine.inspect_cell(sheet_id, row_id, col_id)?;
+        let sheet = self.engine.workbook().sheet(sheet_id)?;
+        let format_code = String::from(sheet.effective_format_by_id(row_id, col_id).code_str());
+        let style = WireCellStyle::from(sheet.effective_style_by_id(row_id, col_id));
         Some(EngineEvent::CellInspected {
             sheet: sheet_id.0,
             row_id: row_id.0,
@@ -621,6 +2356,8 @@ impl Engine {
             display: info.display,
             is_formula: info.is_formula,
             error: info.error,
+            format_code,
+            style,
         })
     }
 
@@ -632,20 +2369,51 @@ impl Engine {
         raw: &str,
     ) -> EngineEvent {
         let started = now_ms();
-        if let Err(err) = self.engine.edit_cell_raw(sheet_id, row_id, col_id, raw) {
-            return EngineEvent::Rejected {
-                reason: format_edit_error(err),
-            };
-        }
+        let addr_label = cell_label(self.engine.workbook(), sheet_id, row_id, col_id);
+        let inv = match self.engine.edit_cell_raw(sheet_id, row_id, col_id, raw) {
+            Ok(inv) => inv,
+            Err(err) => {
+                return EngineEvent::Rejected {
+                    reason: format_edit_error(err),
+                };
+            }
+        };
+
+        // Reconstruct the applied single-cell `Op::SetCells` from post-state for WAL & Redo.
+        let post_snap = self
+            .engine
+            .workbook()
+            .cell_snapshot(sheet_id, row_id, col_id);
+        let fwd_op = Op::SetCells {
+            sheet: sheet_id,
+            edits: vec![reticula_core::ops::CellEdit {
+                row: row_id,
+                col: col_id,
+                input: post_snap
+                    .as_ref()
+                    .map_or(CellInput::Empty, |s| s.input.clone()),
+                format: post_snap
+                    .and_then(|s| s.explicit_format)
+                    .map_or(FormatPatch::Keep, FormatPatch::Set),
+            }],
+        };
+        let label = format!("Edit {addr_label}");
+        let ops = vec![fwd_op];
+        self.record_wal_and_mvcc(&label, &ops, core::slice::from_ref(&inv));
+        self.undo_stack
+            .record_txn(label, &ops, vec![inv], self.engine.workbook());
+
         let apply_ms = now_ms() - started;
         self.recalc_elapsed_ms += apply_ms;
         self.flush_dirty_pages();
 
-        if !self.engine.has_pending_recalc() {
+        if self.recalc_frozen || !self.engine.has_pending_recalc() {
             let elapsed_ms = core::mem::take(&mut self.recalc_elapsed_ms);
+            let sheet = self.sheet_info(self.subscribed_sheet);
             return EngineEvent::RecalcDone {
                 recalculated: 0,
                 elapsed_ms,
+                sheet,
             };
         }
         self.step_recalc_slice()
@@ -663,7 +2431,7 @@ impl Engine {
             rows: rows.into_iter().map(IdRun::from).collect(),
             cols: cols.into_iter().map(IdRun::from).collect(),
         };
-        if let Err(err) = self.engine.apply_op(op) {
+        if let Err(err) = self.execute_user_txn(String::from("Clear cells"), vec![op]) {
             return EngineEvent::Rejected {
                 reason: format_op_error(err),
             };
@@ -671,11 +2439,13 @@ impl Engine {
         self.recalc_elapsed_ms += now_ms() - started;
         self.flush_dirty_pages();
 
-        if !self.engine.has_pending_recalc() {
+        if self.recalc_frozen || !self.engine.has_pending_recalc() {
             let elapsed_ms = core::mem::take(&mut self.recalc_elapsed_ms);
+            let sheet = self.sheet_info(self.subscribed_sheet);
             return EngineEvent::RecalcDone {
                 recalculated: 0,
                 elapsed_ms,
+                sheet,
             };
         }
         self.step_recalc_slice()
@@ -703,29 +2473,18 @@ impl Engine {
             after: after_row_id.map(RowId),
             ids,
         };
-        if let Err(err) = self.engine.apply_op(op) {
+        let label = if count == 1 {
+            String::from("Insert row")
+        } else {
+            format!("Insert {count} rows")
+        };
+        if let Err(err) = self.execute_user_txn(label, vec![op]) {
             return EngineEvent::Rejected {
                 reason: format_op_error(err),
             };
         }
-        let mut recalculated = 0;
-        if self.engine.has_pending_recalc() {
-            let slice_start = now_ms();
-            match self.engine.recalc_with_budget(RECALC_CHECK_INTERVAL, |_| {
-                now_ms() - slice_start >= RECALC_SLICE_BUDGET_MS
-            }) {
-                RecalcStatus::Complete { recalculated: n } => {
-                    recalculated = n;
-                    self.recalc_elapsed_ms = 0.0;
-                }
-                RecalcStatus::InProgress { done, .. } => {
-                    recalculated = done;
-                    self.recalc_elapsed_ms += now_ms() - slice_start;
-                }
-            }
-        }
+        let recalculated = self.run_initial_recalc_slice();
         let action_ms = now_ms() - started;
-        // Recompute clipped subscription bounds against updated row count and push dirty pages.
         self.refresh_subscription_extent();
         self.flush_dirty_pages();
         EngineEvent::SheetChanged {
@@ -746,27 +2505,12 @@ impl Engine {
             sheet: sheet_id,
             ids: rows.into_iter().map(IdRun::from).collect(),
         };
-        if let Err(err) = self.engine.apply_op(op) {
+        if let Err(err) = self.execute_user_txn(String::from("Delete rows"), vec![op]) {
             return EngineEvent::Rejected {
                 reason: format_op_error(err),
             };
         }
-        let mut recalculated = 0;
-        if self.engine.has_pending_recalc() {
-            let slice_start = now_ms();
-            match self.engine.recalc_with_budget(RECALC_CHECK_INTERVAL, |_| {
-                now_ms() - slice_start >= RECALC_SLICE_BUDGET_MS
-            }) {
-                RecalcStatus::Complete { recalculated: n } => {
-                    recalculated = n;
-                    self.recalc_elapsed_ms = 0.0;
-                }
-                RecalcStatus::InProgress { done, .. } => {
-                    recalculated = done;
-                    self.recalc_elapsed_ms += now_ms() - slice_start;
-                }
-            }
-        }
+        let recalculated = self.run_initial_recalc_slice();
         let action_ms = now_ms() - started;
         self.refresh_subscription_extent();
         self.flush_dirty_pages();
@@ -777,30 +2521,627 @@ impl Engine {
         }
     }
 
-    fn refresh_subscription_extent(&mut self) {
-        if self.subscribed.is_empty() {
-            return;
+    fn insert_cols(
+        &mut self,
+        sheet_id: SheetId,
+        after_col_id: Option<u64>,
+        count: u32,
+    ) -> EngineEvent {
+        if count == 0 {
+            return EngineEvent::Rejected {
+                reason: String::from("Column count must be at least 1."),
+            };
         }
-        let dims = self
+        let started = now_ms();
+        let Some(ids) = self.engine.allocator_mut().alloc_run(count) else {
+            return EngineEvent::Rejected {
+                reason: String::from("Identifier counter exhausted."),
+            };
+        };
+        let op = Op::InsertCols {
+            sheet: sheet_id,
+            after: after_col_id.map(ColId),
+            ids,
+        };
+        let label = if count == 1 {
+            String::from("Insert column")
+        } else {
+            format!("Insert {count} columns")
+        };
+        if let Err(err) = self.execute_user_txn(label, vec![op]) {
+            return EngineEvent::Rejected {
+                reason: format_op_error(err),
+            };
+        }
+        let recalculated = self.run_initial_recalc_slice();
+        let action_ms = now_ms() - started;
+        self.refresh_subscription_extent();
+        self.flush_dirty_pages();
+        EngineEvent::SheetChanged {
+            sheet: self.sheet_info(sheet_id),
+            action_ms,
+            recalculated,
+        }
+    }
+
+    fn delete_cols(&mut self, sheet_id: SheetId, cols: Vec<WireIdRun>) -> EngineEvent {
+        if cols.is_empty() {
+            return EngineEvent::Rejected {
+                reason: String::from("Select at least one column to delete."),
+            };
+        }
+        let started = now_ms();
+        let op = Op::DeleteCols {
+            sheet: sheet_id,
+            ids: cols.into_iter().map(IdRun::from).collect(),
+        };
+        if let Err(err) = self.execute_user_txn(String::from("Delete columns"), vec![op]) {
+            return EngineEvent::Rejected {
+                reason: format_op_error(err),
+            };
+        }
+        let recalculated = self.run_initial_recalc_slice();
+        let action_ms = now_ms() - started;
+        self.refresh_subscription_extent();
+        self.flush_dirty_pages();
+        EngineEvent::SheetChanged {
+            sheet: self.sheet_info(sheet_id),
+            action_ms,
+            recalculated,
+        }
+    }
+
+    fn move_rows(
+        &mut self,
+        sheet_id: SheetId,
+        rows: Vec<WireIdRun>,
+        after_row_id: Option<u64>,
+    ) -> EngineEvent {
+        if rows.is_empty() {
+            return EngineEvent::Rejected {
+                reason: String::from("Select at least one row to move."),
+            };
+        }
+        let started = now_ms();
+        let op = Op::MoveRows {
+            sheet: sheet_id,
+            ids: rows.into_iter().map(IdRun::from).collect(),
+            after: after_row_id.map(RowId),
+        };
+        if let Err(err) = self.execute_user_txn(String::from("Move rows"), vec![op]) {
+            return EngineEvent::Rejected {
+                reason: format_op_error(err),
+            };
+        }
+        let recalculated = self.run_initial_recalc_slice();
+        let action_ms = now_ms() - started;
+        self.refresh_subscription_extent();
+        self.flush_dirty_pages();
+        EngineEvent::SheetChanged {
+            sheet: self.sheet_info(sheet_id),
+            action_ms,
+            recalculated,
+        }
+    }
+
+    fn move_cols(
+        &mut self,
+        sheet_id: SheetId,
+        cols: Vec<WireIdRun>,
+        after_col_id: Option<u64>,
+    ) -> EngineEvent {
+        if cols.is_empty() {
+            return EngineEvent::Rejected {
+                reason: String::from("Select at least one column to move."),
+            };
+        }
+        let started = now_ms();
+        let op = Op::MoveCols {
+            sheet: sheet_id,
+            ids: cols.into_iter().map(IdRun::from).collect(),
+            after: after_col_id.map(ColId),
+        };
+        if let Err(err) = self.execute_user_txn(String::from("Move columns"), vec![op]) {
+            return EngineEvent::Rejected {
+                reason: format_op_error(err),
+            };
+        }
+        let recalculated = self.run_initial_recalc_slice();
+        let action_ms = now_ms() - started;
+        self.refresh_subscription_extent();
+        self.flush_dirty_pages();
+        EngineEvent::SheetChanged {
+            sheet: self.sheet_info(sheet_id),
+            action_ms,
+            recalculated,
+        }
+    }
+
+    fn resize_rows(&mut self, sheet_id: SheetId, sizes: &[WireAxisSize]) -> EngineEvent {
+        let started = now_ms();
+        let op = Op::ResizeRows {
+            sheet: sheet_id,
+            sizes: sizes
+                .iter()
+                .map(|s| (IdRun::from(s.run), s.size_px))
+                .collect(),
+        };
+        if let Err(err) = self.execute_user_txn(String::from("Resize rows"), vec![op]) {
+            return EngineEvent::Rejected {
+                reason: format_op_error(err),
+            };
+        }
+        let action_ms = now_ms() - started;
+        let _ = self.engine.take_dirty_changes();
+        EngineEvent::SheetChanged {
+            sheet: self.sheet_info(sheet_id),
+            action_ms,
+            recalculated: 0,
+        }
+    }
+
+    fn resize_cols(&mut self, sheet_id: SheetId, sizes: &[WireAxisSize]) -> EngineEvent {
+        let started = now_ms();
+        let op = Op::ResizeCols {
+            sheet: sheet_id,
+            sizes: sizes
+                .iter()
+                .map(|s| (IdRun::from(s.run), s.size_px))
+                .collect(),
+        };
+        if let Err(err) = self.execute_user_txn(String::from("Resize columns"), vec![op]) {
+            return EngineEvent::Rejected {
+                reason: format_op_error(err),
+            };
+        }
+        let action_ms = now_ms() - started;
+        let _ = self.engine.take_dirty_changes();
+        EngineEvent::SheetChanged {
+            sheet: self.sheet_info(sheet_id),
+            action_ms,
+            recalculated: 0,
+        }
+    }
+
+    fn set_freeze(&mut self, sheet_id: SheetId, frozen_rows: u32, frozen_cols: u32) -> EngineEvent {
+        let started = now_ms();
+        let op = Op::SetFreeze {
+            sheet: sheet_id,
+            frozen_rows,
+            frozen_cols,
+        };
+        if let Err(err) = self.execute_user_txn(String::from("Freeze panes"), vec![op]) {
+            return EngineEvent::Rejected {
+                reason: format_op_error(err),
+            };
+        }
+        let action_ms = now_ms() - started;
+        let _ = self.engine.take_dirty_changes();
+        self.refresh_subscription_extent();
+        EngineEvent::SheetChanged {
+            sheet: self.sheet_info(sheet_id),
+            action_ms,
+            recalculated: 0,
+        }
+    }
+
+    fn set_format(
+        &mut self,
+        sheet_id: SheetId,
+        target: WireFormatTarget,
+        number_format: WireFormatPatch,
+        style: WireStylePatch,
+    ) -> EngineEvent {
+        let started = now_ms();
+        let nf_patch = match number_format {
+            WireFormatPatch::Keep => FormatPatch::Keep,
+            WireFormatPatch::Clear => FormatPatch::Clear,
+            WireFormatPatch::Set { code } => match parse_format_code(&code) {
+                Some(fmt) => FormatPatch::Set(fmt),
+                None => {
+                    return EngineEvent::Rejected {
+                        reason: format!("Unsupported number format code: {code}"),
+                    };
+                }
+            },
+        };
+        let op = Op::SetFormat {
+            sheet: sheet_id,
+            target: target.into(),
+            number_format: nf_patch,
+            style: style.into(),
+        };
+        if let Err(err) = self.execute_user_txn(String::from("Format cells"), vec![op]) {
+            return EngineEvent::Rejected {
+                reason: format_op_error(err),
+            };
+        }
+        // Pre-intern styles BEFORE encoding dirty pages so `style_id` in pages matches `SheetInfo.styles`!
+        let sheet_meta = self.sheet_info(sheet_id);
+        self.flush_dirty_pages();
+        EngineEvent::SheetChanged {
+            sheet: sheet_meta,
+            action_ms: now_ms() - started,
+            recalculated: 0,
+        }
+    }
+
+    fn fill_range(&mut self, sheet_id: SheetId, src: RectPos, dst: RectPos) -> EngineEvent {
+        let started = now_ms();
+        let ops = match build_fill_ops(self.engine.workbook(), sheet_id, src, dst) {
+            Ok(ops) => ops,
+            Err(reason) => return EngineEvent::Rejected { reason },
+        };
+        if ops.is_empty() {
+            return EngineEvent::SheetChanged {
+                sheet: self.sheet_info(sheet_id),
+                action_ms: 0.0,
+                recalculated: 0,
+            };
+        }
+        if let Err(err) = self.execute_user_txn(String::from("Auto-fill"), ops) {
+            return EngineEvent::Rejected {
+                reason: format_op_error(err),
+            };
+        }
+        let recalculated = self.run_initial_recalc_slice();
+        let sheet_meta = self.sheet_info(sheet_id);
+        self.flush_dirty_pages();
+        EngineEvent::SheetChanged {
+            sheet: sheet_meta,
+            action_ms: now_ms() - started,
+            recalculated,
+        }
+    }
+
+    fn auto_fill_down(&mut self, sheet_id: SheetId, src: RectPos) -> EngineEvent {
+        let Some(end_row_incl) = find_autofill_end_row(self.engine.workbook(), sheet_id, src)
+        else {
+            return EngineEvent::SheetChanged {
+                sheet: self.sheet_info(sheet_id),
+                action_ms: 0.0,
+                recalculated: 0,
+            };
+        };
+        let dst = RectPos {
+            first_row: src.first_row,
+            row_count: end_row_incl.saturating_add(1).saturating_sub(src.first_row),
+            first_col: src.first_col,
+            col_count: src.col_count,
+        };
+        self.fill_range(sheet_id, src, dst)
+    }
+
+    fn copy_selection(&mut self, sheet_id: SheetId, rect: RectPos, cut: bool) -> EngineEvent {
+        match copy_range(self.engine.workbook(), sheet_id, rect, cut) {
+            Ok((payload, internal)) => {
+                self.clipboard = Some(internal);
+                EngineEvent::ClipboardCopied {
+                    sheet: sheet_id.0,
+                    first_row: rect.first_row,
+                    row_count: rect.row_count,
+                    first_col: rect.first_col,
+                    col_count: rect.col_count,
+                    cut,
+                    tsv: payload.tsv,
+                    html: payload.html,
+                    fingerprint: payload.fingerprint,
+                }
+            }
+            Err(reason) => EngineEvent::Rejected { reason },
+        }
+    }
+
+    fn paste_clipboard(
+        &mut self,
+        sheet_id: SheetId,
+        dest: RectPos,
+        tsv: &str,
+        html: Option<&str>,
+    ) -> EngineEvent {
+        let started = now_ms();
+        let mut clip_clone = self.clipboard.clone();
+        let (ops, applied_rect) = match build_paste_ops(
+            self.engine.workbook(),
+            sheet_id,
+            dest,
+            tsv,
+            html,
+            &mut clip_clone,
+        ) {
+            Ok(res) => res,
+            Err(reason) => return EngineEvent::Rejected { reason },
+        };
+        if !ops.is_empty() {
+            if let Err(err) = self.execute_user_txn(String::from("Paste"), ops) {
+                return EngineEvent::Rejected {
+                    reason: format_op_error(err),
+                };
+            }
+            self.clipboard = clip_clone;
+        }
+        let recalculated = self.run_initial_recalc_slice();
+        let sheet_meta = self.sheet_info(sheet_id);
+        self.flush_dirty_pages();
+        EngineEvent::ClipboardPasted {
+            sheet: sheet_meta,
+            dest_first_row: applied_rect.first_row,
+            dest_row_count: applied_rect.row_count,
+            dest_first_col: applied_rect.first_col,
+            dest_col_count: applied_rect.col_count,
+            recalculated,
+            elapsed_ms: now_ms() - started,
+        }
+    }
+
+    fn add_sheet(&mut self, name: Option<String>, after_sheet: Option<SheetId>) -> EngineEvent {
+        let started = now_ms();
+        let new_id = self.engine.alloc_sheet_id();
+        let default_num = self
             .engine
             .workbook()
-            .sheet(self.subscribed_sheet)
-            .map_or((0, 0), |s| (s.rows(), s.cols()));
-        let pages: Vec<Page> = self.subscribed.pages().collect();
-        if let (Some(first), Some(last)) = (pages.first(), pages.last()) {
-            let first_row = first.row.saturating_mul(PAGE_ROWS);
-            let row_count =
-                (last.row.saturating_add(1).saturating_sub(first.row)).saturating_mul(PAGE_ROWS);
-            let first_col = first.col.saturating_mul(PAGE_COLS);
-            let col_count =
-                (last.col.saturating_add(1).saturating_sub(first.col)).saturating_mul(PAGE_COLS);
-            self.subscribed =
-                PageRange::covering(dims, (first_row, row_count), (first_col, col_count));
+            .live_sheets()
+            .count()
+            .saturating_add(1);
+        let req_name = name.unwrap_or_else(|| format!("Sheet{default_num}"));
+        let after =
+            after_sheet.or_else(|| self.engine.workbook().live_sheets().last().map(Sheet::id));
+        let op = Op::AddSheet {
+            sheet: new_id,
+            name: req_name,
+            after,
+        };
+        if let Err(err) = self.execute_user_txn(String::from("Add sheet"), vec![op]) {
+            return EngineEvent::Rejected {
+                reason: format_op_error(err),
+            };
+        }
+        let _ = self.engine.take_dirty_changes();
+        self.subscribed_sheet = new_id;
+        self.subscribed_pages.clear();
+        self.subscribed_set.clear();
+        self.due.clear();
+        self.due_set.clear();
+        EngineEvent::SheetChanged {
+            sheet: self.sheet_info(new_id),
+            action_ms: now_ms() - started,
+            recalculated: 0,
+        }
+    }
+
+    fn rename_sheet(&mut self, sheet_id: SheetId, name: String) -> EngineEvent {
+        let started = now_ms();
+        let op = Op::RenameSheet {
+            sheet: sheet_id,
+            name,
+        };
+        if let Err(err) = self.execute_user_txn(String::from("Rename sheet"), vec![op]) {
+            return EngineEvent::Rejected {
+                reason: format_op_error(err),
+            };
+        }
+        self.flush_dirty_pages();
+        EngineEvent::SheetChanged {
+            sheet: self.sheet_info(self.subscribed_sheet),
+            action_ms: now_ms() - started,
+            recalculated: 0,
+        }
+    }
+
+    fn delete_sheet(&mut self, sheet_id: SheetId) -> EngineEvent {
+        let started = now_ms();
+        let op = Op::DeleteSheet { sheet: sheet_id };
+        if let Err(err) = self.execute_user_txn(String::from("Delete sheet"), vec![op]) {
+            return EngineEvent::Rejected {
+                reason: format_op_error(err),
+            };
+        }
+        let recalculated = self.run_initial_recalc_slice();
+        if self.subscribed_sheet == sheet_id
+            && let Some(next_live) = self.engine.workbook().live_sheets().next().map(Sheet::id)
+        {
+            self.subscribed_sheet = next_live;
+            self.subscribed_pages.clear();
+            self.subscribed_set.clear();
+            self.due.clear();
+            self.due_set.clear();
+        }
+        self.flush_dirty_pages();
+        EngineEvent::SheetChanged {
+            sheet: self.sheet_info(self.subscribed_sheet),
+            action_ms: now_ms() - started,
+            recalculated,
+        }
+    }
+
+    fn move_sheet(&mut self, sheet_id: SheetId, after_sheet: Option<SheetId>) -> EngineEvent {
+        let started = now_ms();
+        let op = Op::MoveSheet {
+            sheet: sheet_id,
+            after: after_sheet,
+        };
+        if let Err(err) = self.execute_user_txn(String::from("Move sheet"), vec![op]) {
+            return EngineEvent::Rejected {
+                reason: format_op_error(err),
+            };
+        }
+        let _ = self.engine.take_dirty_changes();
+        EngineEvent::SheetChanged {
+            sheet: self.sheet_info(self.subscribed_sheet),
+            action_ms: now_ms() - started,
+            recalculated: 0,
+        }
+    }
+
+    fn undo_txn(&mut self) -> EngineEvent {
+        let started = now_ms();
+        let Some(entry) = self.undo_stack.pop_undo() else {
+            return EngineEvent::SheetChanged {
+                sheet: self.sheet_info(self.subscribed_sheet),
+                action_ms: 0.0,
+                recalculated: 0,
+            };
+        };
+        let ops = entry.undo_ops.clone();
+        match self.engine.apply_txn(ops.clone()) {
+            Ok(inverses) => {
+                let wal_label = format!("Undo: {}", entry.label);
+                self.record_wal_and_mvcc(&wal_label, &ops, &inverses);
+                self.undo_stack.push_redo(entry);
+            }
+            Err(err) => {
+                self.undo_stack.push_undo_back(entry);
+                return EngineEvent::Rejected {
+                    reason: format_op_error(err),
+                };
+            }
+        }
+        let recalculated = self.run_initial_recalc_slice();
+        self.ensure_subscribed_sheet_live();
+        self.refresh_subscription_extent();
+        let sheet_meta = self.sheet_info(self.subscribed_sheet);
+        self.flush_dirty_pages();
+        EngineEvent::SheetChanged {
+            sheet: sheet_meta,
+            action_ms: now_ms() - started,
+            recalculated,
+        }
+    }
+
+    fn redo_txn(&mut self) -> EngineEvent {
+        let started = now_ms();
+        let Some(entry) = self.undo_stack.pop_redo() else {
+            return EngineEvent::SheetChanged {
+                sheet: self.sheet_info(self.subscribed_sheet),
+                action_ms: 0.0,
+                recalculated: 0,
+            };
+        };
+        let ops = entry.redo_ops.clone();
+        match self.engine.apply_txn(ops.clone()) {
+            Ok(inverses) => {
+                let wal_label = format!("Redo: {}", entry.label);
+                self.record_wal_and_mvcc(&wal_label, &ops, &inverses);
+                self.undo_stack.push_undo_back(entry);
+            }
+            Err(err) => {
+                self.undo_stack.push_redo(entry);
+                return EngineEvent::Rejected {
+                    reason: format_op_error(err),
+                };
+            }
+        }
+        let recalculated = self.run_initial_recalc_slice();
+        self.ensure_subscribed_sheet_live();
+        self.refresh_subscription_extent();
+        let sheet_meta = self.sheet_info(self.subscribed_sheet);
+        self.flush_dirty_pages();
+        EngineEvent::SheetChanged {
+            sheet: sheet_meta,
+            action_ms: now_ms() - started,
+            recalculated,
+        }
+    }
+
+    fn ensure_subscribed_sheet_live(&mut self) {
+        if self
+            .engine
+            .workbook()
+            .live_sheet(self.subscribed_sheet)
+            .is_none()
+            && let Some(first_live) = self.engine.workbook().live_sheets().next().map(Sheet::id)
+        {
+            self.subscribed_sheet = first_live;
+            self.subscribed_pages.clear();
+            self.subscribed_set.clear();
+            self.due.clear();
+            self.due_set.clear();
+        }
+    }
+
+    fn jump_edge(
+        &self,
+        sheet_id: SheetId,
+        row: u32,
+        col: u32,
+        dir: JumpDirection,
+        select: bool,
+    ) -> EngineEvent {
+        let Some(sheet) = self.engine.workbook().sheet(sheet_id) else {
+            return EngineEvent::EdgeJumped {
+                sheet: sheet_id.0,
+                row,
+                col,
+                select,
+            };
+        };
+        let rows = sheet.rows();
+        let cols = sheet.cols();
+        if rows == 0 || cols == 0 {
+            return EngineEvent::EdgeJumped {
+                sheet: sheet_id.0,
+                row: 0,
+                col: 0,
+                select,
+            };
+        }
+        let r0 = row.min(rows.saturating_sub(1));
+        let c0 = col.min(cols.saturating_sub(1));
+        let (nr, nc) = compute_jump_target(self.engine.workbook(), sheet, sheet_id, r0, c0, dir);
+        EngineEvent::EdgeJumped {
+            sheet: sheet_id.0,
+            row: nr,
+            col: nc,
+            select,
+        }
+    }
+
+    fn jump_used_end(&self, sheet_id: SheetId, select: bool) -> EngineEvent {
+        let (mut max_r, mut max_c) = self
+            .engine
+            .workbook()
+            .sheet(sheet_id)
+            .and_then(Sheet::used_extent)
+            .unwrap_or((0, 0));
+        if let Some(sheet) = self.engine.workbook().sheet(sheet_id) {
+            let start = (sheet_id, RowId(0), ColId(0));
+            let end = (sheet_id, RowId(u64::MAX), ColId(u64::MAX));
+            for (&(_, r_id, c_id), _) in self.engine.workbook().formulas().range(start..=end) {
+                if let (Some(rp), Some(cp)) = (
+                    sheet.row_axis().id_to_pos(r_id.0),
+                    sheet.col_axis().id_to_pos(c_id.0),
+                ) {
+                    max_r = max_r.max(rp);
+                    max_c = max_c.max(cp);
+                }
+            }
+        }
+        EngineEvent::EdgeJumped {
+            sheet: sheet_id.0,
+            row: max_r,
+            col: max_c,
+            select,
+        }
+    }
+
+    fn resume_recalc(&mut self) -> EngineEvent {
+        self.recalc_frozen = false;
+        let wb = self.engine.workbook().clone();
+        self.engine = FormulaEngine::from_workbook_recalc_all(wb);
+        self.flush_dirty_pages();
+        let pages = self.subscribed_pages.clone();
+        for p in pages {
+            self.enqueue_page(p);
+        }
+        EngineEvent::SheetChanged {
+            sheet: self.sheet_info(self.subscribed_sheet),
+            action_ms: 0.0,
+            recalculated: u32::try_from(self.engine.workbook().formulas().len()).unwrap_or(0),
         }
     }
 
     fn continue_recalc(&mut self) -> Option<EngineEvent> {
-        if !self.engine.has_pending_recalc() {
+        if self.recalc_frozen || !self.engine.has_pending_recalc() {
             return None;
         }
         Some(self.step_recalc_slice())
@@ -819,12 +3160,281 @@ impl Engine {
             RecalcStatus::InProgress { done, total } => EngineEvent::RecalcProgress { done, total },
             RecalcStatus::Complete { recalculated } => {
                 let elapsed_ms = core::mem::take(&mut self.recalc_elapsed_ms);
+                let sheet = self.sheet_info(self.subscribed_sheet);
                 EngineEvent::RecalcDone {
                     recalculated,
                     elapsed_ms,
+                    sheet,
                 }
             }
         }
+    }
+}
+
+// ====================================================== Internal pure helpers
+
+fn check_not_panicked() -> Result<(), JsError> {
+    if ENGINE_PANICKED.load(Ordering::SeqCst) {
+        return Err(JsError::new(
+            "Engine halted after an unrecoverable internal panic; reload to recover.",
+        ));
+    }
+    Ok(())
+}
+
+fn f64_to_u64(val: f64) -> Result<u64, JsError> {
+    if !val.is_finite() || val < 0.0 || val > 9_007_199_254_740_991.0 {
+        return Err(JsError::new(
+            "Sequence number must be a safe non-negative integer.",
+        ));
+    }
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "validated in 0..=2^53-1"
+    )]
+    Ok(val as u64)
+}
+
+fn sanitize_sheet_title(raw: &str) -> String {
+    let cleaned: String = raw
+        .trim()
+        .chars()
+        .map(|c| match c {
+            ':' | '\\' | '/' | '?' | '*' | '[' | ']' => '_',
+            other => other,
+        })
+        .take(31)
+        .collect();
+    if cleaned.is_empty() {
+        String::from("Imported")
+    } else {
+        cleaned
+    }
+}
+
+fn cell_label(
+    wb: &Workbook<BoundFormula>,
+    sheet_id: SheetId,
+    row_id: RowId,
+    col_id: ColId,
+) -> String {
+    let Some(sheet) = wb.sheet(sheet_id) else {
+        return String::from("cell");
+    };
+    let (Some(r), Some(c)) = (
+        sheet.row_axis().id_to_pos(row_id.0),
+        sheet.col_axis().id_to_pos(col_id.0),
+    ) else {
+        return String::from("cell");
+    };
+    let mut out = String::new();
+    CellAddr {
+        col: c,
+        row: r,
+        abs_col: false,
+        abs_row: false,
+    }
+    .write_a1(&mut out);
+    out
+}
+
+fn record_inverse_on_snapshot_encoder(enc: &mut SnapshotEncoder, inv: &InverseOp<BoundFormula>) {
+    match inv {
+        InverseOp::RestoreCells { sheet, cells } => {
+            for c in cells {
+                let prior = match &c.input {
+                    CellInput::Formula { formula, .. } => Some(formula.clone()),
+                    CellInput::Empty | CellInput::Scalar(_) => None,
+                };
+                enc.record_formula_before_edit((*sheet, c.row, c.col), prior);
+            }
+        }
+        InverseOp::RestoreFilledRange {
+            sheet,
+            rows,
+            cols,
+            prior_non_empty,
+        } => {
+            for c in prior_non_empty {
+                let prior = match &c.input {
+                    CellInput::Formula { formula, .. } => Some(formula.clone()),
+                    CellInput::Empty | CellInput::Scalar(_) => None,
+                };
+                enc.record_formula_before_edit((*sheet, c.row, c.col), prior);
+            }
+            for r_run in rows {
+                for raw_r in r_run.iter() {
+                    for c_run in cols {
+                        for raw_c in c_run.iter() {
+                            enc.record_formula_before_edit(
+                                (*sheet, RowId(raw_r), ColId(raw_c)),
+                                None,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        InverseOp::RestoreMovedRows { rewritten, .. }
+        | InverseOp::RestoreMovedCols { rewritten, .. } => {
+            for (k, prior_f) in rewritten {
+                enc.record_formula_before_edit(*k, Some(prior_f.clone()));
+            }
+        }
+        _ => {}
+    }
+}
+
+fn compute_jump_target(
+    wb: &Workbook<BoundFormula>,
+    sheet: &Sheet,
+    sheet_id: SheetId,
+    r0: u32,
+    c0: u32,
+    dir: JumpDirection,
+) -> (u32, u32) {
+    let rows = sheet.rows();
+    let cols = sheet.cols();
+    let is_occ = |r: u32, c: u32| -> bool {
+        let (Some(r_id), Some(c_id)) =
+            (sheet.row_axis().pos_to_id(r), sheet.col_axis().pos_to_id(c))
+        else {
+            return false;
+        };
+        !matches!(sheet.value_by_id(RowId(r_id), ColId(c_id)), Value::Empty)
+            || wb.formula(sheet_id, RowId(r_id), ColId(c_id)).is_some()
+    };
+
+    // O(1) fast path when jumping vertically along a completely empty column!
+    if matches!(dir, JumpDirection::Up | JumpDirection::Down)
+        && let Some(c_id) = sheet.col_axis().pos_to_id(c0)
+    {
+        let col_empty = sheet
+            .col_slots()
+            .get(c_id)
+            .and_then(|slot| sheet.raw_columns().get(slot as usize))
+            .is_none_or(|col| col.blocks().is_empty());
+        if col_empty && !is_occ(r0, c0) {
+            // Check if any formula exists in `c_id` (rare if cached value is Empty).
+            let has_any_formula = wb
+                .formulas()
+                .range(
+                    (sheet_id, RowId(0), ColId(0))..=(sheet_id, RowId(u64::MAX), ColId(u64::MAX)),
+                )
+                .any(|(&(_, _, fc), _)| fc == ColId(c_id));
+            if !has_any_formula {
+                return match dir {
+                    JumpDirection::Up => (0, c0),
+                    JumpDirection::Down => (rows.saturating_sub(1), c0),
+                    _ => (r0, c0),
+                };
+            }
+        }
+    }
+
+    match dir {
+        JumpDirection::Down => {
+            if r0.saturating_add(1) >= rows {
+                return (r0, c0);
+            }
+            if is_occ(r0, c0) && is_occ(r0 + 1, c0) {
+                let mut r = r0 + 1;
+                while r + 1 < rows && is_occ(r + 1, c0) {
+                    r += 1;
+                }
+                (r, c0)
+            } else {
+                let mut r = r0 + 1;
+                while r < rows {
+                    if is_occ(r, c0) {
+                        return (r, c0);
+                    }
+                    r += 1;
+                }
+                (rows - 1, c0)
+            }
+        }
+        JumpDirection::Up => {
+            if r0 == 0 {
+                return (0, c0);
+            }
+            if is_occ(r0, c0) && is_occ(r0 - 1, c0) {
+                let mut r = r0 - 1;
+                while r > 0 && is_occ(r - 1, c0) {
+                    r -= 1;
+                }
+                (r, c0)
+            } else {
+                let mut r = r0 - 1;
+                loop {
+                    if is_occ(r, c0) {
+                        return (r, c0);
+                    }
+                    if r == 0 {
+                        return (0, c0);
+                    }
+                    r -= 1;
+                }
+            }
+        }
+        JumpDirection::Right => {
+            if c0.saturating_add(1) >= cols {
+                return (r0, c0);
+            }
+            if is_occ(r0, c0) && is_occ(r0, c0 + 1) {
+                let mut c = c0 + 1;
+                while c + 1 < cols && is_occ(r0, c + 1) {
+                    c += 1;
+                }
+                (r0, c)
+            } else {
+                let mut c = c0 + 1;
+                while c < cols {
+                    if is_occ(r0, c) {
+                        return (r0, c);
+                    }
+                    c += 1;
+                }
+                (r0, cols - 1)
+            }
+        }
+        JumpDirection::Left => {
+            if c0 == 0 {
+                return (r0, 0);
+            }
+            if is_occ(r0, c0) && is_occ(r0, c0 - 1) {
+                let mut c = c0 - 1;
+                while c > 0 && is_occ(r0, c - 1) {
+                    c -= 1;
+                }
+                (r0, c)
+            } else {
+                let mut c = c0 - 1;
+                loop {
+                    if is_occ(r0, c) {
+                        return (r0, c);
+                    }
+                    if c == 0 {
+                        return (r0, 0);
+                    }
+                    c -= 1;
+                }
+            }
+        }
+    }
+}
+
+fn format_csv_error(err: CsvError) -> String {
+    match err {
+        CsvError::InvalidUtf8 => String::from("CSV file is not valid UTF-8 text."),
+        CsvError::UnclosedQuote => {
+            String::from("CSV file contains an unclosed double-quoted field.")
+        }
+        CsvError::DimensionsExceeded => {
+            String::from("CSV dimensions exceed worksheet limits (2,000,000 rows × 16,384 cols).")
+        }
+        CsvError::WorkbookLimit(op) => format_op_error(op),
     }
 }
 
@@ -900,7 +3510,11 @@ mod tests {
         };
         assert_eq!(sheet.rows, 500);
         assert_eq!(sheet.cols, 22);
-        assert_eq!(sheet.formula_count, 500); // 499 M-col formulas + V2 SUM
+        assert_eq!(sheet.formula_count, 500);
+
+        // Seed stub for unmodified sample should be < 200 bytes (`14-m1b.md` 7.1).
+        let stub = eng.encode_seed_stub().unwrap().expect("seed stub");
+        assert!(stub.len() < 200, "stub.len()={}", stub.len());
 
         // Subscribe to top-left 64 rows x 22 cols (2 pages: (0,0) and (0,1)).
         assert!(
@@ -931,6 +3545,7 @@ mod tests {
             address,
             raw,
             is_formula,
+            format_code,
             ..
         } = inspected
         else {
@@ -939,8 +3554,9 @@ mod tests {
         assert_eq!(address, "V2");
         assert_eq!(raw, "=SUM(M2:M500)");
         assert!(is_formula);
+        assert_eq!(format_code, "0.00");
 
-        // Edit V1 (`row_id = 0, col_id = 21`) to `5%` -> triggers recalculation & dirty pages!
+        // Edit V1 (`row_id = 0, col_id = 21`) to `5%` -> triggers recalculation, WAL frame & undo!
         let mut ev = eng
             .handle_command(EngineCommand::EditCell {
                 sheet: 0,
@@ -952,14 +3568,22 @@ mod tests {
         while matches!(ev, EngineEvent::RecalcProgress { .. }) {
             ev = eng.handle_command(EngineCommand::ContinueRecalc).unwrap();
         }
-        let EngineEvent::RecalcDone { recalculated, .. } = ev else {
+        let EngineEvent::RecalcDone {
+            recalculated,
+            sheet: post_edit_sheet,
+            ..
+        } = ev
+        else {
             panic!("expected RecalcDone, got {ev:?}");
         };
         assert_eq!(recalculated, 500);
-        // Both subscribed pages ((0,0) has M2..M64; (0,1) has V1 & V2) must be re-queued!
-        assert!(eng.take_page().is_some());
-        assert!(eng.take_page().is_some());
-        assert!(eng.take_page().is_none());
+        assert!(post_edit_sheet.can_undo);
+        assert_eq!(post_edit_sheet.undo_label.as_deref(), Some("Edit V1"));
+        assert_eq!(post_edit_sheet.wal_seq, 1);
+        let wal_frame_1 = eng.take_pending_wal_frame().expect("wal frame 1");
+        assert!(!wal_frame_1.is_empty());
+
+        while eng.take_page().is_some() {}
 
         // Insert 1 row at the very top (`after_row_id: None`) -> rows becomes 501, V2 becomes V3!
         let ins = eng
@@ -973,25 +3597,30 @@ mod tests {
             panic!("expected SheetChanged");
         };
         assert_eq!(s2.rows, 501);
+        assert_eq!(s2.wal_seq, 2);
+        let wal_frame_2 = eng.take_pending_wal_frame().expect("wal frame 2");
         while eng.take_page().is_some() {}
 
-        let inspected_after = eng
-            .handle_command(EngineCommand::InspectCell {
-                sheet: 0,
-                row_id: 1,
-                col_id: 21,
-            })
-            .unwrap();
-        let EngineEvent::CellInspected {
-            address: addr2,
-            raw: raw2,
-            ..
-        } = inspected_after
-        else {
-            panic!("expected CellInspected");
+        // Replay `stub + wal_frame_1 + wal_frame_2` into a fresh Engine and verify bit-identical digest!
+        let mut full_wal = encode_wal_init(0).unwrap();
+        full_wal.extend_from_slice(&wal_frame_1);
+        full_wal.extend_from_slice(&wal_frame_2);
+
+        let expected_digest = eng.engine.workbook().logical_digest();
+        let mut reloaded = Engine::new();
+        let decoded = decode_snapshot_any(&stub).unwrap();
+        reloaded.engine = decoded.engine;
+        let scan = scan_wal(&full_wal, 0, 2).unwrap();
+        replay_wal_records(&mut reloaded.engine, &scan.records, 0, true).unwrap();
+        assert_eq!(reloaded.engine.workbook().logical_digest(), expected_digest);
+
+        // Undo InsertRows -> rows returns to 500!
+        let undone = eng.handle_command(EngineCommand::Undo).unwrap();
+        let EngineEvent::SheetChanged { sheet: s_undo, .. } = undone else {
+            panic!("expected SheetChanged on Undo");
         };
-        assert_eq!(addr2, "V3");
-        assert_eq!(raw2, "=SUM(M3:M501)");
+        assert_eq!(s_undo.rows, 500);
+        assert!(s_undo.can_redo);
 
         // Malformed formula is rejected without mutating state.
         let rej = eng
@@ -1003,5 +3632,75 @@ mod tests {
             })
             .unwrap();
         assert!(matches!(rej, EngineEvent::Rejected { .. }));
+    }
+
+    #[test]
+    fn freeze_panes_pin_pages_and_jump_edge_follows_excel_rules() {
+        let mut eng = Engine::new();
+        let _ = eng.handle_command(EngineCommand::OpenEmpty).unwrap();
+        // Set A1..A3 = 1, 2, 3 and A10 = 99
+        for (r, v) in [(0_u64, "1"), (1, "2"), (2, "3"), (9, "99")] {
+            let _ = eng.handle_command(EngineCommand::EditCell {
+                sheet: 0,
+                row_id: r,
+                col_id: 0,
+                raw: String::from(v),
+            });
+        }
+        // Jump Down from A1 -> A3 (end of contiguous block) -> A10 (next non-empty) -> bottom edge!
+        let j1 = eng
+            .handle_command(EngineCommand::JumpEdge {
+                sheet: 0,
+                row: 0,
+                col: 0,
+                dir: JumpDirection::Down,
+                select: false,
+            })
+            .unwrap();
+        assert_eq!(
+            j1,
+            EngineEvent::EdgeJumped {
+                sheet: 0,
+                row: 2,
+                col: 0,
+                select: false
+            }
+        );
+        let j2 = eng
+            .handle_command(EngineCommand::JumpEdge {
+                sheet: 0,
+                row: 2,
+                col: 0,
+                dir: JumpDirection::Down,
+                select: false,
+            })
+            .unwrap();
+        assert_eq!(
+            j2,
+            EngineEvent::EdgeJumped {
+                sheet: 0,
+                row: 9,
+                col: 0,
+                select: false
+            }
+        );
+
+        // Freeze top 1 row, then subscribe deep down at row 10,000 -> page (0,0) stays pinned!
+        let _ = eng
+            .handle_command(EngineCommand::SetFreeze {
+                sheet: 0,
+                frozen_rows: 1,
+                frozen_cols: 0,
+            })
+            .unwrap();
+        eng.handle_command(EngineCommand::Subscribe {
+            sheet: 0,
+            epoch: 2,
+            first_row: 10_000,
+            row_count: 32,
+            first_col: 0,
+            col_count: 8,
+        });
+        assert!(eng.subscribed_set.contains(&Page { row: 0, col: 0 }));
     }
 }

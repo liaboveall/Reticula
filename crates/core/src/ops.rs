@@ -1763,6 +1763,34 @@ impl<F: FormulaPayload> Workbook<F> {
         out
     }
 
+    /// Returns `(cell_key, formula)` for every formula whose range endpoint
+    /// currently references any row in `ids` on `sheet_id` (`O(affected)`).
+    #[must_use]
+    pub fn formulas_touching_row_endpoints(
+        &self,
+        sheet_id: SheetId,
+        ids: &[IdRun],
+    ) -> Vec<(WorkbookCellKey, F)> {
+        self.collect_row_endpoint_candidates(sheet_id, ids)
+            .into_iter()
+            .filter_map(|k| self.formulas.get(&k).cloned().map(|f| (k, f)))
+            .collect()
+    }
+
+    /// Returns `(cell_key, formula)` for every formula whose range endpoint
+    /// currently references any column in `ids` on `sheet_id` (`O(affected)`).
+    #[must_use]
+    pub fn formulas_touching_col_endpoints(
+        &self,
+        sheet_id: SheetId,
+        ids: &[IdRun],
+    ) -> Vec<(WorkbookCellKey, F)> {
+        self.collect_col_endpoint_candidates(sheet_id, ids)
+            .into_iter()
+            .filter_map(|k| self.formulas.get(&k).cloned().map(|f| (k, f)))
+            .collect()
+    }
+
     fn apply_resize_rows(
         &mut self,
         sheet_id: SheetId,

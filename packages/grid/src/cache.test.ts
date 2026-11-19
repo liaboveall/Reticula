@@ -15,7 +15,9 @@ function page(pageRow: number, pageCol: number, epoch = 1): Page {
     rowIds: new BigUint64Array(PAGE_ROWS),
     colIds: new BigUint64Array(PAGE_COLS),
     texts: [],
-    flags: new Uint8Array(PAGE_ROWS * PAGE_COLS),
+    styleIds: new Uint16Array(PAGE_ROWS * PAGE_COLS),
+    flags: new Uint16Array(PAGE_ROWS * PAGE_COLS),
+    overflows: [],
     byteLength: 0,
   };
 }
@@ -124,5 +126,22 @@ describe("the page cache", () => {
       { firstId: "10", len: 3 },
       { firstId: "50", len: 1 },
     ]);
+  });
+
+  test("retains pinned freeze-pane strips when scrolled deep into the sheet", () => {
+    const cache = new PageCache();
+    cache.retain(span(0, 2, 0, 2), 2, 1);
+    const corner = page(0, 0);
+    const topRight = page(0, 1);
+    cache.accept(corner);
+    cache.accept(topRight);
+
+    // Scroll main viewport down to page row 7800 (row ~500,000) and col page 1..3:
+    // corner (0,0) and top strip (0,1) must stay pinned!
+    cache.retain(span(7800, 7802, 1, 3), 2, 1);
+    expect(cache.get(0, 0)).toBe(corner);
+    expect(cache.get(0, 1)).toBe(topRight);
+    expect(cache.accept(page(7800, 0))).toBe(true); // left freeze strip
+    expect(cache.accept(page(50, 1))).toBe(false); // unpinned middle page
   });
 });

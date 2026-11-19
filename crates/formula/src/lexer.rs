@@ -288,6 +288,14 @@ fn lex_error_literal(input: &str, start_byte: usize) -> Result<(CalcError, usize
     let mut end = start_byte.saturating_add(1);
     while let Some(&b) = bytes.get(end) {
         if b.is_ascii_alphanumeric() || b == b'/' || b == b'!' || b == b'?' {
+            if b == b'/'
+                && end.saturating_sub(start_byte) == 4
+                && input
+                    .get(start_byte..end)
+                    .is_some_and(|s| s.eq_ignore_ascii_case("#N/A"))
+            {
+                break;
+            }
             end = end.saturating_add(1);
             if b == b'!' || b == b'?' {
                 break;

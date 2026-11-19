@@ -12,7 +12,7 @@ function packet(): ArrayBuffer {
   return bytes.buffer;
 }
 
-describe("a page encoded by the engine", () => {
+describe("a v2 page encoded by the engine", () => {
   const page = decodePage(packet());
 
   test("says where it belongs", () => {
@@ -30,13 +30,14 @@ describe("a page encoded by the engine", () => {
     expect([...page.colIds]).toEqual(fixture.colIds);
   });
 
-  test("gives every cell the text and the v1 flags the engine gave it", () => {
+  test("gives every cell the text, styleId, and v2 flags the engine gave it", () => {
     const cells = fixture.cells.map((row, rowIndex) =>
       row.map((_, colIndex) => {
         const cell = rowIndex * page.colCount + colIndex;
         const flags = page.flags[cell] ?? 0;
         return {
           text: page.texts[cell],
+          styleId: page.styleIds[cell] ?? 0,
           number: isNumber(flags),
           bool: isBool(flags),
           error: isError(flags),
@@ -48,9 +49,11 @@ describe("a page encoded by the engine", () => {
     expect(cells).toEqual(fixture.cells);
   });
 
+  test("decodes left-overflow text records across page boundaries", () => {
+    expect(page.overflows).toEqual(fixture.overflows);
+  });
+
   test("slices text by UTF-16 code units, not by bytes or characters", () => {
-    // The first cell ends in a character that takes four bytes and two code
-    // units; counting either way wrongly would shift every cell after it.
     expect(fixture.cells[0][0].text).toBe("品名 😀");
     expect(page.texts[0]).toBe("品名 😀");
     expect(page.texts[1]).toBe(fixture.cells[0][1].text);
@@ -75,8 +78,7 @@ describe("a packet that is not a page", () => {
     expect(() => decodePage(longer.buffer)).toThrow(/its header describes/);
   });
 
-  test("is rejected when its cells do not account for all of its text", () => {
-    // One more byte of text than the cell records cover.
+  test("is rejected when its cells and overflows do not account for all of its text", () => {
     const longer = new Uint8Array(fixture.hex.length / 2 + 1);
     longer.set(new Uint8Array(packet()));
     longer[longer.length - 1] = 0x21;

@@ -1630,6 +1630,7 @@ version = "0.0.0"
 dependencies = [
  "reticula-core",
  "reticula-formula",
+ "reticula-wire",
  "serde",
  "tsify",
  "wasm-bindgen",

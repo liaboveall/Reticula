@@ -6,35 +6,36 @@ import type { Page } from "./page.ts";
 const KEY_STRIDE = 2 ** 20;
 
 /**
- * The pages the grid holds: exactly those of its current subscription.
- *
- * The engine and the grid keep the same account of which pages the grid has
- * without ever exchanging it. The engine sends a page once when a subscription
- * starts to cover it. The grid, in turn, drops a page the moment it subscribes
- * to a range that no longer covers it, and discards a page that arrives after
- * that. So a page the engine believes the grid holds is either here or on its
- * way, and a page that returns to the range is sent again.
+ * The pages the grid holds: its active viewport subscription plus pinned
+ * top/left/corner freeze-pane strips (`14-m1b.md` 2.5).
  */
 export class PageCache {
   #pages = new Map<number, Page>();
   #span: Span = EMPTY_SPAN;
+  #pinnedRowPages = 0;
+  #pinnedColPages = 0;
 
-  /** The span of pages being held. */
+  /** The span of main viewport pages being held. */
   get span(): Span {
     return this.#span;
   }
 
-  /** Number of pages held. */
+  /** Number of pages held (viewport + pinned freeze strips). */
   get size(): number {
     return this.#pages.size;
   }
 
-  /** Changes which pages to hold and drops the ones outside the new span. */
-  retain(span: Span): void {
+  /**
+   * Updates the active viewport span (and optional frozen row/col counts) and
+   * evicts pages outside both the active span and pinned freeze strips.
+   */
+  retain(span: Span, frozenRows = 0, frozenCols = 0): void {
     this.#span = span;
-    for (const [key, page] of this.#pages) {
+    this.#pinnedRowPages = frozenRows > 0 ? Math.floor((frozenRows - 1) / PAGE_ROWS) + 1 : 0;
+    this.#pinnedColPages = frozenCols > 0 ? Math.floor((frozenCols - 1) / PAGE_COLS) + 1 : 0;
+    for (const [k, page] of this.#pages) {
       if (!this.#wants(page)) {
-        this.#pages.delete(key);
+        this.#pages.delete(k);
       }
     }
   }
@@ -62,6 +63,12 @@ export class PageCache {
   rowIdAt(row: number): bigint | undefined {
     const pageRow = Math.floor(row / PAGE_ROWS);
     const offset = row - pageRow * PAGE_ROWS;
+    for (let col = 0; col < this.#pinnedColPages; col++) {
+      const page = this.get(pageRow, col);
+      if (page && offset >= 0 && offset < page.rowCount) {
+        return page.rowIds[offset];
+      }
+    }
     for (let col = this.#span.firstCol; col < this.#span.endCol; col++) {
       const page = this.get(pageRow, col);
       if (page && offset >= 0 && offset < page.rowCount) {
@@ -75,6 +82,12 @@ export class PageCache {
   colIdAt(col: number): bigint | undefined {
     const pageCol = Math.floor(col / PAGE_COLS);
     const offset = col - pageCol * PAGE_COLS;
+    for (let row = 0; row < this.#pinnedRowPages; row++) {
+      const page = this.get(row, pageCol);
+      if (page && offset >= 0 && offset < page.colCount) {
+        return page.colIds[offset];
+      }
+    }
     for (let row = this.#span.firstRow; row < this.#span.endRow; row++) {
       const page = this.get(row, pageCol);
       if (page && offset >= 0 && offset < page.colCount) {
@@ -87,20 +100,36 @@ export class PageCache {
   clear(): void {
     this.#pages.clear();
     this.#span = EMPTY_SPAN;
+    this.#pinnedRowPages = 0;
+    this.#pinnedColPages = 0;
   }
 
   #wants(page: Page): boolean {
     const pageRow = page.firstRow / PAGE_ROWS;
     const pageCol = page.firstCol / PAGE_COLS;
     const span = this.#span;
-    return (
-      Number.isInteger(pageRow) &&
-      Number.isInteger(pageCol) &&
+    if (
+      !Number.isInteger(pageRow) ||
+      !Number.isInteger(pageCol) ||
+      span.firstRow === span.endRow ||
+      span.firstCol === span.endCol
+    ) {
+      return false;
+    }
+    if (
       pageRow >= span.firstRow &&
       pageRow < span.endRow &&
       pageCol >= span.firstCol &&
       pageCol < span.endCol
-    );
+    ) {
+      return true;
+    }
+    const inTopStrip =
+      pageRow < this.#pinnedRowPages && pageCol >= span.firstCol && pageCol < span.endCol;
+    const inLeftStrip =
+      pageCol < this.#pinnedColPages && pageRow >= span.firstRow && pageRow < span.endRow;
+    const inCorner = pageRow < this.#pinnedRowPages && pageCol < this.#pinnedColPages;
+    return inTopStrip || inLeftStrip || inCorner;
   }
 }
 

@@ -67,7 +67,8 @@ function syntheticPage(pageRow: number, pageCol: number, content: Content): Page
   const rowCount = Math.min(PAGE_ROWS, SHEET.rows - firstRow);
   const colCount = Math.min(PAGE_COLS, SHEET.cols - firstCol);
   const texts = new Array<string>(rowCount * colCount);
-  const flags = new Uint8Array(rowCount * colCount);
+  const flags = new Uint16Array(rowCount * colCount);
+  const styleIds = new Uint16Array(rowCount * colCount);
   // Seeded by the page, so that a page looks the same whenever it is made.
   const random = new Random(
     Math.imul(pageRow + 1, 0x9e3779b1) ^ Math.imul(pageCol + 1, 0x85ebca6b),
@@ -94,7 +95,9 @@ function syntheticPage(pageRow: number, pageCol: number, content: Content): Page
     rowIds: new BigUint64Array(rowCount),
     colIds: new BigUint64Array(colCount),
     texts,
+    styleIds,
     flags,
+    overflows: [],
     byteLength: 0,
   };
 }

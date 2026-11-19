@@ -16,6 +16,7 @@ use std::fmt::Write as _;
 use reticula_core::format::NumberFormat;
 use reticula_core::id::{ColId, RowId};
 use reticula_core::sheet::Sheet;
+use reticula_core::style::StylePatch;
 use reticula_core::value::{CalcError, Value};
 use reticula_core::viewport::{self, Page};
 
@@ -78,12 +79,20 @@ fn layout() -> String {
         COL_COUNT_AT,
         TEXT_LEN_AT,
         EPOCH_AT,
+        OVERFLOW_COUNT_AT,
         ID_LEN,
         CELL_LEN,
         CELL_TEXT_START_AT,
         CELL_TEXT_LEN_AT,
         CELL_STYLE_AT,
         CELL_FLAGS_AT,
+        OVERFLOW_LEN,
+        OVERFLOW_TEXT_START_AT,
+        OVERFLOW_TEXT_LEN_AT,
+        OVERFLOW_ROW_OFFSET_AT,
+        OVERFLOW_ORIGIN_COL_AT,
+        OVERFLOW_STYLE_AT,
+        MAX_LEFT_OVERFLOW_LOOKBACK,
         FLAG_NUMBER,
         FLAG_BOOL,
         FLAG_ERROR,
@@ -147,12 +156,31 @@ fn fixture() -> String {
 
     let first_row = viewport::PAGE_ROWS;
     let first_col = viewport::PAGE_COLS;
+    // Put a bold cell inside the page `(first_row + 2, first_col)` (`styleId = 1`)
+    // and an overflowing left-aligned text cell at `(first_row + 3, first_col - 2)`!
+    sheet.set_cell_style_patch(
+        RowId(u64::from(first_row + 2)),
+        ColId(u64::from(first_col)),
+        StylePatch {
+            bold: Some(true),
+            ..StylePatch::default()
+        },
+    );
+    let overflow_sid = sheet
+        .add_string("跨页左侧溢出长文本 Left overflow")
+        .unwrap();
+    sheet.set_value_by_id(
+        RowId(u64::from(first_row + 3)),
+        ColId(u64::from(first_col - 2)),
+        Value::Text(overflow_sid),
+    );
     let is_formula = |r: RowId, c: ColId| {
         (r == RowId(u64::from(first_row + 1)) && c == ColId(u64::from(first_col)))
             || (r == RowId(u64::from(first_row + 6)) && c == ColId(u64::from(first_col)))
     };
 
     let page = Page { row: 1, col: 1 };
+    viewport::prepare_page_styles(&mut sheet, page);
     let bytes =
         viewport::encode_page_with_formulas(&sheet, page, EPOCH, &mut String::new(), is_formula);
 
@@ -206,19 +234,29 @@ fn fixture() -> String {
             let number = matches!(value, Value::Number(_));
             let boolean = matches!(value, Value::Bool(_));
             let error = matches!(value, Value::Error(_));
-            let formula = is_formula(RowId(sheet.row_id(row)), ColId(sheet.col_id(col)));
+            let r_id = RowId(sheet.row_id(row));
+            let c_id = ColId(sheet.col_id(col));
+            let formula = is_formula(r_id, c_id);
+            let style_id = sheet.effective_style_id(r_id, c_id).0;
             if col > first_col {
                 out.push_str(", ");
             }
             let _ = write!(
                 out,
-                "{{ text: {}, number: {number}, bool: {boolean}, error: {error}, formula: {formula}, truncated: {truncated} }}",
+                "{{ text: {}, styleId: {style_id}, number: {number}, bool: {boolean}, error: {error}, formula: {formula}, truncated: {truncated} }}",
                 quoted(&text)
             );
         }
         out.push_str("],\n");
     }
-    out.push_str("  ],\n} as const;\n");
+    out.push_str("  ],\n");
+    let _ = writeln!(
+        out,
+        "  overflows: [{{ rowOffset: 3, originCol: {}, styleId: 0, text: {} }}],",
+        first_col - 2,
+        quoted("跨页左侧溢出长文本 Left overflow")
+    );
+    out.push_str("} as const;\n");
     out
 }
 

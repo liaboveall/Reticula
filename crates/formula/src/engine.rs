@@ -411,6 +411,60 @@ impl FormulaEngine {
         &self.workbook
     }
 
+    /// Interns resolved styles for `page` on `sheet_id` before immutable
+    /// viewport page encoding.
+    pub fn prepare_page_styles(&mut self, sheet_id: SheetId, page: reticula_core::viewport::Page) {
+        if let Some(sheet) = self.workbook.sheet_mut(sheet_id) {
+            reticula_core::viewport::prepare_page_styles(sheet, page);
+        }
+    }
+
+    /// Pre-interns combined `col × row` and `cell` styles on `sheet_id` so the
+    /// sheet's style table covers visible combinations before `SheetInfo` is
+    /// sent to the main thread.
+    pub fn ensure_sheet_styles_interned(&mut self, sheet_id: SheetId) {
+        let Some(sheet) = self.workbook.sheet_mut(sheet_id) else {
+            return;
+        };
+        if sheet.col_styles().is_empty()
+            && sheet.row_styles().is_empty()
+            && sheet.cell_styles().is_empty()
+        {
+            return;
+        }
+        let mut col_patches = Vec::new();
+        for &cp in sheet.col_styles().values() {
+            if !col_patches.contains(&cp) {
+                col_patches.push(cp);
+                if col_patches.len() >= 64 {
+                    break;
+                }
+            }
+        }
+        let mut row_patches = Vec::new();
+        for &rp in sheet.row_styles().values() {
+            if !row_patches.contains(&rp) {
+                row_patches.push(rp);
+                if row_patches.len() >= 64 {
+                    break;
+                }
+            }
+        }
+        let base = reticula_core::style::CellStyle::default();
+        for &cp in &col_patches {
+            let col_s = cp.apply_to(base);
+            let _ = sheet.styles_mut().intern(col_s);
+            for &rp in &row_patches {
+                let _ = sheet.styles_mut().intern(rp.apply_to(col_s));
+            }
+        }
+        let cell_keys: Vec<(RowId, ColId)> = sheet.cell_styles().keys().copied().collect();
+        for (r, c) in cell_keys {
+            let eff = sheet.effective_style_by_id(r, c);
+            let _ = sheet.styles_mut().intern(eff);
+        }
+    }
+
     /// Allocates and returns a fresh [`SheetId`] from the workbook's sheet
     /// counter for [`Op::AddSheet`].
     pub fn alloc_sheet_id(&mut self) -> SheetId {

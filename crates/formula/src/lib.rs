@@ -39,6 +39,7 @@ pub mod dep_graph;
 pub mod determinism;
 pub mod engine;
 pub mod functions;
+pub mod lang_service;
 pub mod lexer;
 pub mod parser;
 pub mod value_eval;
