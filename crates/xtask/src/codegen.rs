@@ -341,6 +341,15 @@ fn benchmarks() -> Result<String> {
     let b2_p50 = wasm["b2_sum_1m"]["p50_ms"].as_f64().unwrap_or(0.0);
     let b3_p50 = wasm["b3_full_recalc_1m"]["p50_ms"].as_f64().unwrap_or(0.0);
     let b5_p50 = wasm["b5_chain_1m"]["p50_ms"].as_f64().unwrap_or(0.0);
+    let b1_load_p50 = wasm["b1_b11_20m_with_1m_formulas"]["load_ms"]["p50_ms"].as_f64();
+    let b11_save_p50 = wasm["b1_b11_20m_with_1m_formulas"]["save_ms"]["p50_ms"].as_f64();
+    let b11_probe_p95 = wasm["b1_b11_20m_with_1m_formulas"]["save_probe_ms"]["p95_ms"].as_f64();
+    let b12_load_p50 = wasm["b12_50m_limit"]["load_ms"]["p50_ms"].as_f64();
+    let b12_save_p50 = wasm["b12_50m_limit"]["save_ms"]["p50_ms"].as_f64();
+    let b12_recalc_p50 = wasm["b12_50m_limit"]["recalc_100k_ms"]["p50_ms"].as_f64();
+    let b12_peak_mib = wasm["b12_50m_limit"]["peak_wasm_memory_bytes"]
+        .as_f64()
+        .map(|b| b / (1024.0 * 1024.0));
 
     let opt_num = |v: Option<f64>| -> String {
         match v {
@@ -367,6 +376,13 @@ fn benchmarks() -> Result<String> {
         "  browser: {},",
         quoted(&format!("Chrome {browser_ver}"))
     );
+    let _ = writeln!(out, "  b1Load20m1mP50Ms: {},", opt_num(b1_load_p50));
+    let _ = writeln!(out, "  b11Save20m1mP50Ms: {},", opt_num(b11_save_p50));
+    let _ = writeln!(out, "  b11ProbeP95Ms: {},", opt_num(b11_probe_p95));
+    let _ = writeln!(out, "  b12Load50mP50Ms: {},", opt_num(b12_load_p50));
+    let _ = writeln!(out, "  b12Save50mP50Ms: {},", opt_num(b12_save_p50));
+    let _ = writeln!(out, "  b12Recalc100kP50Ms: {},", opt_num(b12_recalc_p50));
+    let _ = writeln!(out, "  b12PeakWasmMiB: {},", opt_num(b12_peak_mib));
     let _ = writeln!(out, "  b4Incremental100kP50Ms: {b4_p50:.2},");
     let _ = writeln!(out, "  b4Incremental100kP95Ms: {b4_p95:.2},");
     let _ = writeln!(out, "  b7aInsertTopMeanUs: {b7a_mean_us:.1},");

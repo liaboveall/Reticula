@@ -54,9 +54,10 @@ export function LandingPage({ onOpenApp }: LandingPageProps) {
           </h1>
           <p className="landing-lead">
             Reticula runs its entire calculation engine inside a dedicated Web Worker: run-encoded
-            64-bit row and column axes, 8-byte NaN-boxed columnar blocks, Excel-compatible
-            15-significant-digit arithmetic, and interruptible 4 ms time-sliced recalculation,
-            paired with a custom Canvas2D grid that never touches the DOM per cell.
+            64-bit row and column axes, Copy-on-Write 8-byte NaN-boxed columnar blocks, 69
+            Excel-compatible functions with 15-significant-digit arithmetic, OPFS crash-safe local
+            persistence with offline Service Worker support, and a custom Canvas2D grid that never
+            touches the DOM per cell.
           </p>
           <div className="landing-actions">
             <a
@@ -105,6 +106,40 @@ export function LandingPage({ onOpenApp }: LandingPageProps) {
             </span>
           </div>
           <div className="metric-card">
+            <span className="metric-label">20M Cells + 1M Formulas Load (B1)</span>
+            <strong className="metric-value">
+              {BENCHMARKS.b1Load20m1mP50Ms !== null
+                ? `${Math.round(BENCHMARKS.b1Load20m1mP50Ms)} ms`
+                : "≤ 2.0 s"}
+            </strong>
+            <span className="metric-detail">
+              OPFS v1 snapshot decode + DepGraph + first page (CoW save{" "}
+              {BENCHMARKS.b11Save20m1mP50Ms !== null
+                ? `${Math.round(BENCHMARKS.b11Save20m1mP50Ms)} ms`
+                : "≤ 2.5 s"}
+              , probe p95 {BENCHMARKS.b11ProbeP95Ms ?? "—"} ms)
+            </span>
+          </div>
+          <div className="metric-card">
+            <span className="metric-label">50M-Cell Upper Limit (B12)</span>
+            <strong className="metric-value">
+              {BENCHMARKS.b12Load50mP50Ms !== null
+                ? `${Math.round(BENCHMARKS.b12Load50mP50Ms)} ms`
+                : "≤ 3.0 s"}
+            </strong>
+            <span className="metric-detail">
+              1M×50 load (CoW save{" "}
+              {BENCHMARKS.b12Save50mP50Ms !== null
+                ? `${Math.round(BENCHMARKS.b12Save50mP50Ms)} ms`
+                : "≤ 4.0 s"}
+              , 100k recalc {BENCHMARKS.b12Recalc100kP50Ms ?? "—"} ms, peak{" "}
+              {BENCHMARKS.b12PeakWasmMiB !== null
+                ? `${Math.round(BENCHMARKS.b12PeakWasmMiB)} MiB`
+                : "≤ 1.2 GiB"}
+              )
+            </span>
+          </div>
+          <div className="metric-card">
             <span className="metric-label">Cold First-Visit Load (B10)</span>
             <strong className="metric-value">{startupValue}</strong>
             <span className="metric-detail">{startupNote}</span>
@@ -135,10 +170,10 @@ export function LandingPage({ onOpenApp }: LandingPageProps) {
               • Hidden CodeMirror 6 IME cell editor
             </text>
             <text x="28" y="122" className="arch-item">
-              • Plain-text formula bar &amp; selection
+              • CodeMirror 6 formula bar &amp; multi-select
             </text>
             <text x="28" y="146" className="arch-item">
-              • Adaptive 64×16 page cache
+              • Freeze panes &amp; 64×16 page cache
             </text>
 
             <path d="M 296 72 L 548 72" className="arch-arrow" />
@@ -150,7 +185,7 @@ export function LandingPage({ onOpenApp }: LandingPageProps) {
             <path d="M 560 124 L 308 124" className="arch-arrow" />
             <polygon points="308,119 296,124 308,129" className="arch-arrow-head" />
             <text x="428" y="146" textAnchor="middle" className="arch-edge">
-              Zero-Copy ArrayBuffer Viewport Pages (v1)
+              Zero-Copy ArrayBuffer Viewport Pages (v2)
             </text>
 
             <rect x="568" y="20" width="280" height="150" rx="8" className="arch-box" />
@@ -161,10 +196,10 @@ export function LandingPage({ onOpenApp }: LandingPageProps) {
               • Run-encoded 64-bit axes + tombstones
             </text>
             <text x="584" y="98" className="arch-item">
-              • 8B NaN-boxed sparse/dense columns
+              • CoW 8B NaN-boxed blocks + OPFS/WAL
             </text>
             <text x="584" y="122" className="arch-item">
-              • Anchor-ordered range DepGraph
+              • Anchor-ordered DepGraph + lang service
             </text>
             <text x="584" y="146" className="arch-item">
               • Non-recursive 4 ms sliced evaluator
