@@ -146,6 +146,9 @@ mod tests {
         fs::write(dir.join("index.html.br"), b"BR_INDEX_PAYLOAD").unwrap();
         fs::write(dir.join("index.html.gz"), b"GZ_INDEX_PAYLOAD").unwrap();
 
+        fs::write(dir.join("sw.js"), b"/* sw */").unwrap();
+        fs::write(dir.join("sw.js.br"), b"BR_SW_PAYLOAD").unwrap();
+
         fs::write(dir.join("assets/app-123.js"), b"console.log(1);").unwrap();
         fs::write(dir.join("assets/app-123.js.gz"), b"GZ_JS_PAYLOAD").unwrap();
 
@@ -222,6 +225,18 @@ mod tests {
         assert!(spa_lower.contains("content-encoding: br\r\n"));
         assert!(spa_lower.contains("cache-control: no-cache\r\n"));
         assert!(spa_resp.ends_with("\r\n\r\nBR_INDEX_PAYLOAD"));
+
+        // 5. /sw.js -> precompressed brotli with Cache-Control: no-cache (`14-m1b.md` 7.4)
+        let sw_resp = send_raw_http(
+            addr,
+            "GET /sw.js HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: br\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        let sw_lower = sw_resp.to_ascii_lowercase();
+        assert!(sw_resp.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(sw_lower.contains("content-encoding: br\r\n"));
+        assert!(sw_lower.contains("cache-control: no-cache\r\n"));
+        assert!(sw_resp.ends_with("\r\n\r\nBR_SW_PAYLOAD"));
 
         handle.abort();
         let _ = fs::remove_dir_all(&site);

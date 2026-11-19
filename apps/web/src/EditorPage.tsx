@@ -37,6 +37,7 @@ import {
   type SnapshotSaveResult,
 } from "./hooks.ts";
 import type { LocalModalMode } from "./LocalModals.tsx";
+import { createSwClient, type SwClientHandle } from "./sw-client.ts";
 
 const LazyLocalModals = lazy(() => import("./LocalModals.tsx"));
 
@@ -335,6 +336,7 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
   const formulaBarRef = useRef<FormulaBarHandle | null>(null);
   const clientRef = useRef<EngineClient | null>(null);
   const startWorkerFnRef = useRef<((docId: string, initialCmd: HostCommand) => void) | null>(null);
+  const swClientRef = useRef<SwClientHandle | null>(null);
 
   const activeDocIdRef = useRef<string>(initialRoute.current.docId);
   const activeDocTitleRef = useRef<string>(
@@ -365,6 +367,8 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
   const [lockOverlay, setLockOverlay] = useState<LockOverlayState | null>(null);
   const [modalMode, setModalMode] = useState<LocalModalMode | null>(null);
   const [quotaBanner, setQuotaBanner] = useState<string | null>(null);
+  const [swUpdateReady, setSwUpdateReady] = useState(false);
+  const [swUpdating, setSwUpdating] = useState(false);
   const [csvProgress, setCsvProgress] = useState<{
     readonly rowsParsed: number;
     readonly percent: number;
@@ -1333,15 +1337,55 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
       };
     }
 
+    const flushAndCloseDoc = (): Promise<void> => {
+      if (workerTerminatedRef.current || !clientRef.current) {
+        return Promise.resolve();
+      }
+      clientRef.current.sendHost({ kind: "flushAndCloseForUpdate" });
+      return new Promise<void>((resolve) => {
+        const cap = window.setTimeout(resolve, 1_500);
+        closeWaiters.push(() => {
+          window.clearTimeout(cap);
+          resolve();
+        });
+      });
+    };
+
+    let swStartTimer = 0;
+    const ensureSwClient = (): SwClientHandle => {
+      if (!swClientRef.current) {
+        swClientRef.current = createSwClient({
+          tabId: tabIdRef.current,
+          onUpdateReady: (ready) => setSwUpdateReady(ready),
+          onDrainForUpdate: flushAndCloseDoc,
+        });
+      }
+      return swClientRef.current;
+    };
+
     let shellMarked = false;
+    let firstScreenMarked = false;
     const stopMarking = grid.watchFrames((frame) => {
       if (!shellMarked) {
         shellMarked = true;
         performance.mark(MARKS.shell);
       }
-      if (frame.cells > 0 && frame.missing === 0) {
+      if (!firstScreenMarked && frame.cells > 0 && frame.missing === 0) {
+        firstScreenMarked = true;
         performance.mark(MARKS.firstScreen);
-        stopMarking();
+      }
+      if (frame.missing === 0 && (frame.cells > 0 || grid.stats().pagesHeld > 0)) {
+        if (!swClientRef.current && swStartTimer === 0) {
+          // Defer Service Worker registration until after first-screen paint so
+          // cold-start B10 latency is completely unaffected (`14-m1b.md` 7.4).
+          swStartTimer = window.setTimeout(() => {
+            swStartTimer = 0;
+            ensureSwClient();
+          }, 0);
+        }
+        if (firstScreenMarked) {
+          stopMarking();
+        }
       }
     });
 
@@ -1365,16 +1409,12 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
             clientRef.current?.sendHost({ kind: "forceCompactSnapshot" });
             return new Promise<SnapshotSaveResult>((resolve) => compactWaiters.push(resolve));
           },
-          flushAndClose: () => {
-            if (workerTerminatedRef.current || !clientRef.current) {
-              return Promise.resolve();
-            }
-            clientRef.current.sendHost({ kind: "flushAndCloseForUpdate" });
-            return new Promise<void>((resolve) => closeWaiters.push(resolve));
-          },
+          flushAndClose: flushAndCloseDoc,
           spinWorker: (ms) => {
             clientRef.current?.sendHost({ kind: "debugSpinWorker", ms });
           },
+          swStatus: () => ensureSwClient().status(),
+          checkSwUpdate: () => ensureSwClient().checkForUpdate(),
         })
       : undefined;
     const timer = window.setInterval(() => setStats(grid.stats()), STATUS_INTERVAL_MS);
@@ -1382,7 +1422,10 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
     return () => {
       window.clearInterval(timer);
       window.clearTimeout(yieldWatchdog);
+      window.clearTimeout(swStartTimer);
       locksWatch?.close();
+      swClientRef.current?.dispose();
+      swClientRef.current = null;
       stopMarking();
       removeHooks?.();
       editor.destroy();
@@ -2222,6 +2265,36 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
               className="tip-close"
               aria-label="Dismiss storage warning"
               onClick={() => setQuotaBanner(null)}
+            >
+              ×
+            </button>
+          </div>
+        </div>
+      )}
+
+      {swUpdateReady && (
+        <div className="sw-update-banner" role="status" data-testid="sw-update-banner">
+          <span>
+            A new version of Reticula is ready. Confirming flushes all open tabs and reloads safely.
+          </span>
+          <div className="quota-banner-actions">
+            <button
+              type="button"
+              className="tip-action"
+              data-testid="sw-update-btn"
+              disabled={swUpdating}
+              onClick={() => {
+                setSwUpdating(true);
+                void swClientRef.current?.applyUpdate().catch(() => setSwUpdating(false));
+              }}
+            >
+              {swUpdating ? "Updating…" : "Update now"}
+            </button>
+            <button
+              type="button"
+              className="tip-close"
+              aria-label="Dismiss update notification"
+              onClick={() => setSwUpdateReady(false)}
             >
               ×
             </button>

@@ -6,12 +6,23 @@ export default defineConfig(({ mode }) => ({
   server: { port: 5273, strictPort: true },
   preview: { port: 5274, strictPort: true },
   worker: { format: "es" },
-  // `--mode spikes` builds, instead of the app, the pages that experiments
-  // are run on: the one that is measured and the one for checking input
-  // methods. They go into a directory of their own, so that nothing of them
-  // ships.
+  // `--mode spikes` builds the experiment pages apart from the app.
+  // `--mode sw` compiles the hand-written Service Worker (`src/sw.ts`) into
+  // `dist/sw.js` without clearing the app build output (`14-m1b.md` 7.4).
   build:
     mode === "spikes"
       ? { outDir: "dist-spikes", rolldownOptions: { input: ["bench.html", "ime.html"] } }
-      : {},
+      : mode === "sw"
+        ? {
+            outDir: "dist",
+            emptyOutDir: false,
+            rolldownOptions: {
+              input: "src/sw.ts",
+              output: {
+                entryFileNames: "sw.js",
+                format: "iife",
+              },
+            },
+          }
+        : {},
 }));

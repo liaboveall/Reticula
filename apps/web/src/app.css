@@ -481,6 +481,18 @@ body {
   cursor: pointer;
 }
 
+.sw-update-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 6px 12px;
+  background: var(--shell-accent-soft);
+  border-bottom: 1px solid var(--shell-line);
+  font-size: 12.5px;
+  color: var(--shell-text);
+}
+
 .frozen-recalc-banner {
   display: flex;
   align-items: center;

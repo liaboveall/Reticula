@@ -2,6 +2,14 @@ import type { Grid, GridStats } from "@reticula/grid";
 import type { SafeModeInfo } from "./engine/client.ts";
 import type { StorageBackendKind } from "./engine/storage.ts";
 
+export interface SwStatus {
+  readonly supported: boolean;
+  readonly registered: boolean;
+  readonly controlled: boolean;
+  readonly waiting: boolean;
+  readonly buildId: string | null;
+}
+
 export interface HookDocStatus {
   readonly docId: string;
   readonly title: string;
@@ -55,6 +63,10 @@ export interface Hooks {
   flushAndClose(): Promise<void>;
   /** Busy-waits the engine worker for `ms` (for testing the 500 ms takeover watchdog). */
   spinWorker(ms: number): void;
+  /** Current Service Worker offline shell registration and active build ID. */
+  swStatus(): Promise<SwStatus>;
+  /** Triggers an immediate Service Worker update check (`registration.update()`). */
+  checkSwUpdate(): Promise<void>;
 }
 
 declare global {
@@ -73,6 +85,8 @@ export interface HookExtras {
   readonly compactSnapshot: () => Promise<SnapshotSaveResult>;
   readonly flushAndClose: () => Promise<void>;
   readonly spinWorker: (ms: number) => void;
+  readonly swStatus: () => Promise<SwStatus>;
+  readonly checkSwUpdate: () => Promise<void>;
 }
 
 export function installHooks(grid: Grid, extras: HookExtras): () => void {
@@ -87,6 +101,8 @@ export function installHooks(grid: Grid, extras: HookExtras): () => void {
     compactSnapshot: extras.compactSnapshot,
     flushAndClose: extras.flushAndClose,
     spinWorker: extras.spinWorker,
+    swStatus: extras.swStatus,
+    checkSwUpdate: extras.checkSwUpdate,
   };
   window.__reticula = hooks;
   return () => {

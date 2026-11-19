@@ -4,6 +4,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::compat::sha256_hex;
 use crate::util::{self, Result, node, pnpm};
 use crate::wasm::report_sizes;
 
@@ -57,6 +58,12 @@ pub fn build() -> Result {
 
     let dist_dir = util::root().join(DIST);
     inject_preloads(&dist_dir)?;
+
+    util::step("vite build (service worker)");
+    pnpm()
+        .args(["--filter", APP, "exec", "vite", "build", "--mode", "sw"])
+        .run()?;
+    inject_sw_manifest(&dist_dir)?;
 
     util::step("precompress");
     // Compression happens here, once, at the highest setting; servers only
@@ -136,6 +143,87 @@ fn inject_preloads(dist_dir: &Path) -> Result {
     }
     fs::write(&index_path, updated)
         .map_err(|e| format!("cannot write {}: {e}", index_path.display()))
+}
+
+/// Computes a deterministic `BUILD_ID` and precache URL manifest from the built
+/// `dist/` output and injects both into `dist/sw.js` prior to precompression
+/// (`14-m1b.md` 7.4).
+fn inject_sw_manifest(dist_dir: &Path) -> Result {
+    let mut urls = vec![String::from("/index.html")];
+    let assets_dir = dist_dir.join("assets");
+    let mut asset_names = Vec::new();
+    for entry in fs::read_dir(&assets_dir)
+        .map_err(|e| format!("cannot read {}: {e}", assets_dir.display()))?
+    {
+        let entry = entry.map_err(|e| format!("read_dir entry: {e}"))?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if name.ends_with(".br") || name.ends_with(".gz") {
+            continue;
+        }
+        asset_names.push(name.to_owned());
+    }
+    asset_names.sort();
+    for name in asset_names {
+        urls.push(format!("/assets/{name}"));
+    }
+
+    // Hash every precached file's path + raw content to derive `BUILD_ID`.
+    let mut hash_input = Vec::new();
+    for url in &urls {
+        let rel = url.trim_start_matches('/');
+        let file_path = dist_dir.join(rel);
+        let bytes = fs::read(&file_path).map_err(|e| {
+            format!(
+                "cannot read {} for SW manifest hash: {e}",
+                file_path.display()
+            )
+        })?;
+        hash_input.extend_from_slice(url.as_bytes());
+        hash_input.push(0);
+        hash_input.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+        hash_input.extend_from_slice(&bytes);
+    }
+    let full_hex = sha256_hex(&hash_input);
+    let build_id = &full_hex[..16];
+    let manifest_json =
+        serde_json::to_string(&urls).map_err(|e| format!("serialize SW precache manifest: {e}"))?;
+
+    let sw_path = dist_dir.join("sw.js");
+    let sw_src = fs::read_to_string(&sw_path)
+        .map_err(|e| format!("cannot read {}: {e}", sw_path.display()))?;
+
+    let id_token = "__RETICULA_BUILD_ID__";
+    if !sw_src.contains(id_token) {
+        return Err(format!(
+            "placeholder {id_token} not found in {}",
+            sw_path.display()
+        ));
+    }
+    let list_placeholder = [
+        "[\"__RETICULA_PRECACHE__\"]",
+        "['__RETICULA_PRECACHE__']",
+        "[`__RETICULA_PRECACHE__`]",
+    ]
+    .into_iter()
+    .find(|pat| sw_src.contains(pat))
+    .ok_or_else(|| {
+        format!(
+            "placeholder [\"__RETICULA_PRECACHE__\"] not found in {}",
+            sw_path.display()
+        )
+    })?;
+    let updated = sw_src
+        .replace(id_token, build_id)
+        .replacen(list_placeholder, &manifest_json, 1);
+    fs::write(&sw_path, updated).map_err(|e| format!("cannot write {}: {e}", sw_path.display()))?;
+    println!(
+        "  injected SW manifest: build_id={build_id}, {} precached file(s)",
+        urls.len()
+    );
+    Ok(())
 }
 
 fn check_budgets(dist_dir: &Path) -> Result {
