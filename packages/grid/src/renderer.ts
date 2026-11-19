@@ -1,8 +1,37 @@
+import type { WireCellStyle } from "@reticula/protocol";
 import { PAGE_COLS, PAGE_ROWS } from "@reticula/protocol/viewport";
 import type { PageCache } from "./cache.ts";
-import { columnName, isEmpty, type Metrics, type Scroll, type Size, type Span } from "./layout.ts";
+import {
+  type Box,
+  columnName,
+  defaultLayout,
+  frozenPixels,
+  isEmpty,
+  type Metrics,
+  type Scroll,
+  type SheetLayout,
+  type SheetSize,
+  type Size,
+  type Span,
+} from "./layout.ts";
 import { isBool, isError, isNumber } from "./page.ts";
-import type { Theme } from "./theme.ts";
+import { rgbToHex, type Theme } from "./theme.ts";
+
+export type GridCellStyle = WireCellStyle;
+
+/** Colored formula reference highlight overlay (`0..7`). */
+export interface FormulaReferenceOverlay {
+  readonly colorIndex: number;
+  readonly firstRow: number;
+  readonly lastRow: number;
+  readonly firstCol: number;
+  readonly lastCol: number;
+}
+
+/** Active row or column drag-reorder drop indicator. */
+export type ReorderGuide =
+  | { readonly axis: "row"; readonly beforeRow: number }
+  | { readonly axis: "col"; readonly beforeCol: number };
 
 /** Everything one frame is drawn from. */
 export interface Frame {
@@ -14,12 +43,30 @@ export interface Frame {
   readonly theme: Theme;
   /** Scroll position, already aligned to device pixels. */
   readonly scroll: Scroll;
-  /** The cells at least partly in view. */
+  /** The scrollable cells at least partly in view. */
   readonly visible: Span;
   readonly cache: PageCache;
   readonly selection: { readonly row: number; readonly col: number } | null;
-  /** Optional multi-cell rectangular selection span (`firstRow..endRow`, `firstCol..endCol`). */
+  /** Primary rectangular selection span (`firstRow..endRow`, `firstCol..endCol`). */
   readonly selectionRange?: Span | null;
+  /** All selected spans when Ctrl multi-selection is active (includes `selectionRange`). */
+  readonly selectionRanges?: readonly Span[];
+  /** Sheet dimensions (optional for standalone microbenchmarks). */
+  readonly sheet?: SheetSize;
+  /** Sparse row/col sizes and freeze counts. */
+  readonly layout?: SheetLayout;
+  /** Sheet style table indexed by `styleId`. */
+  readonly styles?: readonly GridCellStyle[];
+  /** Colored formula reference rectangles on the active sheet. */
+  readonly formulaReferences?: readonly FormulaReferenceOverlay[];
+  /** Dashed preview span while dragging the fill handle. */
+  readonly fillPreview?: Span | null;
+  /** Copied/cut source span (drawn with dashed border when active). */
+  readonly clipboardRange?: { readonly span: Span; readonly cut: boolean } | null;
+  /** Blue insertion line while dragging selected rows/columns to reorder. */
+  readonly reorderGuide?: ReorderGuide | null;
+  /** Whether to draw the `6×6` fill handle at the bottom-right of `selectionRange`. */
+  readonly showFillHandle?: boolean;
 }
 
 export interface FrameCounts {
@@ -31,16 +78,9 @@ export interface FrameCounts {
   missing: number;
 }
 
-/**
- * The renderer's shortcuts. All of them are on, unless a measurement turns
- * one off to find out what it is worth.
- */
 export interface Shortcuts {
-  /** Remember the measured width of each string. */
   readonly cacheWidths: boolean;
-  /** Clip only text that is wider than its cell, not every text. */
   readonly clipOnlyOverwide: boolean;
-  /** Set the drawing state when it changes, not for every cell. */
   readonly batchState: boolean;
 }
 
@@ -52,13 +92,9 @@ export const ALL_SHORTCUTS: Shortcuts = {
 
 /** Space between a cell's edge and its text. */
 const PADDING = 6;
+/** Fill handle square side in CSS pixels (`14-m1b.md` 6.3). */
+export const FILL_HANDLE_SIZE = 6;
 
-/**
- * Cached widths of strings in one font.
- *
- * Whether a text fits its cell decides between a plain draw and a clipped
- * one, and clipping is the expensive path.
- */
 class TextWidths {
   #shortcuts: Shortcuts;
   #font = "";
@@ -68,7 +104,6 @@ class TextWidths {
     this.#shortcuts = shortcuts;
   }
 
-  /** Call with the context's current font before asking for widths. */
   use(font: string): void {
     if (font === this.#font) {
       return;
@@ -77,9 +112,9 @@ class TextWidths {
     this.#widths.clear();
   }
 
-  fits(context: CanvasRenderingContext2D, text: string, room: number): boolean {
+  measure(context: CanvasRenderingContext2D, text: string): number {
     if (!this.#shortcuts.cacheWidths) {
-      return context.measureText(text).width <= room;
+      return context.measureText(text).width;
     }
     let width = this.#widths.get(text);
     if (width === undefined) {
@@ -89,11 +124,14 @@ class TextWidths {
       }
       this.#widths.set(text, width);
     }
-    return width <= room;
+    return width;
+  }
+
+  fits(context: CanvasRenderingContext2D, text: string, room: number): boolean {
+    return this.measure(context, text) <= room;
   }
 }
 
-/** The part of one page that is in view. */
 interface Part {
   readonly pageRow: number;
   readonly pageCol: number;
@@ -103,8 +141,17 @@ interface Part {
   readonly endCol: number;
 }
 
-/** The pages the visible cells are in, each cut down to what is visible of it. */
+interface Quadrant {
+  readonly clip: Box;
+  readonly span: Span;
+  readonly scrollTop: number;
+  readonly scrollLeft: number;
+}
+
 function partsOf(visible: Span): Part[] {
+  if (isEmpty(visible)) {
+    return [];
+  }
   const parts: Part[] = [];
   const lastPageRow = Math.floor((visible.endRow - 1) / PAGE_ROWS);
   const lastPageCol = Math.floor((visible.endCol - 1) / PAGE_COLS);
@@ -127,6 +174,23 @@ function partsOf(visible: Span): Part[] {
   return parts;
 }
 
+function resolveColor(
+  color:
+    | { readonly kind: "palette"; readonly slot: number }
+    | { readonly kind: "rgb"; readonly rgb: number }
+    | null
+    | undefined,
+  palette: readonly string[],
+): string | null {
+  if (!color) {
+    return null;
+  }
+  if (color.kind === "rgb") {
+    return rgbToHex(color.rgb);
+  }
+  return palette[color.slot & 7] ?? null;
+}
+
 /** Draws frames onto one canvas. */
 export class Renderer {
   #context: CanvasRenderingContext2D;
@@ -134,7 +198,6 @@ export class Renderer {
   #widths: TextWidths;
 
   constructor(canvas: HTMLCanvasElement, shortcuts: Shortcuts = ALL_SHORTCUTS) {
-    // The grid is opaque; saying so lets the browser skip blending the canvas.
     const context = canvas.getContext("2d", { alpha: false });
     if (!context) {
       throw new Error("this browser cannot draw on a 2D canvas");
@@ -142,6 +205,42 @@ export class Renderer {
     this.#context = context;
     this.#shortcuts = shortcuts;
     this.#widths = new TextWidths(shortcuts);
+  }
+
+  /** Measures the widest cached text in `col` across `rows` for double-click auto-fit. */
+  measureColumnFitWidth(
+    theme: Theme,
+    cache: PageCache,
+    styles: readonly GridCellStyle[] | undefined,
+    col: number,
+    firstRow: number,
+    endRow: number,
+  ): number {
+    const ctx = this.#context;
+    let maxW = 48;
+    const headerLabel = columnName(col);
+    ctx.font = `600 ${theme.fontSize}px ${theme.fontFamily}`;
+    maxW = Math.max(maxW, Math.ceil(ctx.measureText(headerLabel).width + 2 * PADDING + 12));
+
+    for (let r = firstRow; r < endRow; r++) {
+      const page = cache.pageOf(r, col);
+      if (!page || r >= page.firstRow + page.rowCount || col >= page.firstCol + page.colCount) {
+        continue;
+      }
+      const idx = (r - page.firstRow) * page.colCount + (col - page.firstCol);
+      const text = page.texts[idx];
+      if (!text) {
+        continue;
+      }
+      const styleId = page.styleIds[idx] ?? 0;
+      const st = styleId > 0 ? styles?.[styleId] : undefined;
+      ctx.font = fontForStyle(theme, st);
+      const w = Math.ceil(ctx.measureText(text).width + 2 * PADDING + 6);
+      if (w > maxW) {
+        maxW = Math.min(600, w);
+      }
+    }
+    return maxW;
   }
 
   draw(frame: Frame): FrameCounts {
@@ -153,132 +252,433 @@ export class Renderer {
     context.fillStyle = theme.background;
     context.fillRect(0, 0, size.width, size.height);
 
-    // Where the top left corner of cell (0, 0) is.
-    const originX = metrics.headerWidth - scroll.left;
-    const originY = metrics.headerHeight - scroll.top;
+    const layout = frame.layout ?? defaultLayout(metrics);
+    const sheet: SheetSize = frame.sheet ?? {
+      rows: Math.max(visible.endRow, layout.frozenRows),
+      cols: Math.max(visible.endCol, layout.frozenCols),
+    };
+    const fz = frozenPixels(metrics, sheet, size, layout);
     const right = size.width - metrics.scrollbarSize;
     const bottom = size.height - metrics.scrollbarSize;
 
-    if (!isEmpty(visible)) {
-      const parts = partsOf(visible);
-      this.#placeholders(frame, parts, originX, originY, counts);
-      this.#selectionFill(frame, originX, originY, right, bottom);
-      this.#lines(frame, originX, originY, right, bottom);
-      this.#text(frame, parts, originX, originY, counts);
-      this.#selection(frame, originX, originY, right, bottom);
+    const quadrants = buildQuadrants(metrics, size, scroll, visible, fz);
+    for (const q of quadrants) {
+      if (q.clip.width <= 0 || q.clip.height <= 0 || isEmpty(q.span)) {
+        continue;
+      }
+      const needOuterClip = quadrants.length > 1;
+      if (needOuterClip) {
+        context.save();
+        context.beginPath();
+        context.rect(q.clip.left, q.clip.top, q.clip.width, q.clip.height);
+        context.clip();
+      }
+
+      const originX = metrics.headerWidth - q.scrollLeft;
+      const originY = metrics.headerHeight - q.scrollTop;
+      const parts = partsOf(q.span);
+
+      this.#placeholders(frame, layout, parts, originX, originY, counts);
+      this.#cellBackgrounds(frame, layout, parts, originX, originY);
+      this.#selectionFills(frame, layout, q, originX, originY);
+      this.#lines(frame, layout, q, originX, originY);
+      this.#cellBorders(frame, layout, parts, originX, originY);
+      this.#textAndOverflows(frame, layout, sheet, q, parts, originX, originY, counts);
+      this.#formulaRefs(frame, layout, q, originX, originY);
+      this.#clipboardOutline(frame, layout, q, originX, originY);
+      this.#selectionOutlines(frame, layout, q, originX, originY);
+      this.#fillPreviewOutline(frame, layout, q, originX, originY);
+
+      if (needOuterClip) {
+        context.restore();
+      }
     }
-    this.#headers(frame, originX, originY, right, bottom);
+
+    this.#headers(frame, layout, sheet, fz, right, bottom);
+    this.#freezeDividers(frame, fz, right, bottom);
+    this.#reorderGuide(frame, layout, sheet, fz, right, bottom);
     return counts;
   }
 
-  /** A plain fill where a page has not arrived. */
   #placeholders(
     frame: Frame,
+    layout: SheetLayout,
     parts: readonly Part[],
     originX: number,
     originY: number,
     counts: FrameCounts,
   ): void {
     const context = this.#context;
-    const { rowHeight, colWidth } = frame.metrics;
     context.fillStyle = frame.theme.placeholder;
     for (const part of parts) {
       if (frame.cache.get(part.pageRow, part.pageCol)) {
         continue;
       }
-      context.fillRect(
-        originX + part.firstCol * colWidth,
-        originY + part.firstRow * rowHeight,
-        (part.endCol - part.firstCol) * colWidth,
-        (part.endRow - part.firstRow) * rowHeight,
-      );
+      const x0 = originX + layout.colAxis.offsetOf(part.firstCol);
+      const x1 = originX + layout.colAxis.offsetOf(part.endCol);
+      const y0 = originY + layout.rowAxis.offsetOf(part.firstRow);
+      const y1 = originY + layout.rowAxis.offsetOf(part.endRow);
+      context.fillRect(x0, y0, x1 - x0, y1 - y0);
       counts.missing += (part.endRow - part.firstRow) * (part.endCol - part.firstCol);
     }
   }
 
-  /** Semi-transparent tint across a multi-cell selection, leaving the active cell crisp. */
-  #selectionFill(
+  #cellBackgrounds(
     frame: Frame,
+    layout: SheetLayout,
+    parts: readonly Part[],
     originX: number,
     originY: number,
-    right: number,
-    bottom: number,
   ): void {
-    const range = frame.selectionRange;
-    if (!range) {
-      return;
-    }
-    const multi = range.endRow - range.firstRow > 1 || range.endCol - range.firstCol > 1;
-    if (!multi) {
-      return;
-    }
-    const { metrics, theme, visible, selection } = frame;
-    const firstRow = Math.max(visible.firstRow, range.firstRow);
-    const endRow = Math.min(visible.endRow, range.endRow);
-    const firstCol = Math.max(visible.firstCol, range.firstCol);
-    const endCol = Math.min(visible.endCol, range.endCol);
-    if (firstRow >= endRow || firstCol >= endCol) {
+    const styles = frame.styles;
+    if (!styles || styles.length <= 1) {
       return;
     }
     const context = this.#context;
-    const x0 = Math.max(metrics.headerWidth, originX + firstCol * metrics.colWidth);
-    const y0 = Math.max(metrics.headerHeight, originY + firstRow * metrics.rowHeight);
-    const x1 = Math.min(right, originX + endCol * metrics.colWidth);
-    const y1 = Math.min(bottom, originY + endRow * metrics.rowHeight);
-    if (x1 <= x0 || y1 <= y0) {
+    const palette = frame.theme.paletteFill;
+    let currentFill = "";
+
+    for (const part of parts) {
+      const page = frame.cache.get(part.pageRow, part.pageCol);
+      if (!page) {
+        continue;
+      }
+      for (let col = part.firstCol; col < part.endCol; col++) {
+        const x = originX + layout.colAxis.offsetOf(col);
+        const w = layout.colAxis.sizeOf(col);
+        for (let row = part.firstRow; row < part.endRow; row++) {
+          const cellIndex: number = (row - page.firstRow) * page.colCount + (col - page.firstCol);
+          const styleId = page.styleIds[cellIndex] ?? 0;
+          if (styleId === 0) {
+            continue;
+          }
+          const fill = resolveColor(styles[styleId]?.fillColor, palette);
+          if (!fill) {
+            continue;
+          }
+          if (fill !== currentFill) {
+            context.fillStyle = fill;
+            currentFill = fill;
+          }
+          const y = originY + layout.rowAxis.offsetOf(row);
+          const h = layout.rowAxis.sizeOf(row);
+          context.fillRect(x, y, w, h);
+        }
+      }
+    }
+  }
+
+  #selectionFills(
+    frame: Frame,
+    layout: SheetLayout,
+    q: Quadrant,
+    originX: number,
+    originY: number,
+  ): void {
+    const ranges =
+      frame.selectionRanges && frame.selectionRanges.length > 0
+        ? frame.selectionRanges
+        : frame.selectionRange
+          ? [frame.selectionRange]
+          : [];
+    if (ranges.length === 0) {
       return;
     }
-    context.fillStyle = theme.selectionFill;
-    context.fillRect(x0, y0, x1 - x0, y1 - y0);
+    const context = this.#context;
+    const { theme, selection } = frame;
+    const clipRight = q.clip.left + q.clip.width;
+    const clipBottom = q.clip.top + q.clip.height;
+
+    for (const range of ranges) {
+      const multi =
+        ranges.length > 1 || range.endRow - range.firstRow > 1 || range.endCol - range.firstCol > 1;
+      if (!multi) {
+        continue;
+      }
+      const firstRow = Math.max(q.span.firstRow, range.firstRow);
+      const endRow = Math.min(q.span.endRow, range.endRow);
+      const firstCol = Math.max(q.span.firstCol, range.firstCol);
+      const endCol = Math.min(q.span.endCol, range.endCol);
+      if (firstRow >= endRow || firstCol >= endCol) {
+        continue;
+      }
+      const x0 = Math.max(q.clip.left, originX + layout.colAxis.offsetOf(firstCol));
+      const y0 = Math.max(q.clip.top, originY + layout.rowAxis.offsetOf(firstRow));
+      const x1 = Math.min(clipRight, originX + layout.colAxis.offsetOf(endCol));
+      const y1 = Math.min(clipBottom, originY + layout.rowAxis.offsetOf(endRow));
+      if (x1 > x0 && y1 > y0) {
+        context.fillStyle = theme.selectionFill;
+        context.fillRect(x0, y0, x1 - x0, y1 - y0);
+      }
+    }
 
     if (
       selection &&
-      selection.row >= firstRow &&
-      selection.row < endRow &&
-      selection.col >= firstCol &&
-      selection.col < endCol
+      (ranges.length > 1 ||
+        (frame.selectionRange &&
+          (frame.selectionRange.endRow - frame.selectionRange.firstRow > 1 ||
+            frame.selectionRange.endCol - frame.selectionRange.firstCol > 1))) &&
+      selection.row >= q.span.firstRow &&
+      selection.row < q.span.endRow &&
+      selection.col >= q.span.firstCol &&
+      selection.col < q.span.endCol
     ) {
-      const ax0 = Math.max(metrics.headerWidth, originX + selection.col * metrics.colWidth);
-      const ay0 = Math.max(metrics.headerHeight, originY + selection.row * metrics.rowHeight);
-      const ax1 = Math.min(right, originX + (selection.col + 1) * metrics.colWidth);
-      const ay1 = Math.min(bottom, originY + (selection.row + 1) * metrics.rowHeight);
+      const ax0 = Math.max(q.clip.left, originX + layout.colAxis.offsetOf(selection.col));
+      const ay0 = Math.max(q.clip.top, originY + layout.rowAxis.offsetOf(selection.row));
+      const ax1 = Math.min(clipRight, originX + layout.colAxis.offsetOf(selection.col + 1));
+      const ay1 = Math.min(clipBottom, originY + layout.rowAxis.offsetOf(selection.row + 1));
       if (ax1 > ax0 && ay1 > ay0) {
-        context.fillStyle = theme.background;
+        // Restore either the cell's own background fill or sheet background on active anchor cell.
+        let activeBg = theme.background;
+        const page = frame.cache.pageOf(selection.row, selection.col);
+        if (
+          page &&
+          frame.styles &&
+          selection.row < page.firstRow + page.rowCount &&
+          selection.col < page.firstCol + page.colCount
+        ) {
+          const idx =
+            (selection.row - page.firstRow) * page.colCount + (selection.col - page.firstCol);
+          const sid = page.styleIds[idx] ?? 0;
+          const resolved =
+            sid > 0 ? resolveColor(frame.styles[sid]?.fillColor, theme.paletteFill) : null;
+          if (resolved) {
+            activeBg = resolved;
+          }
+        }
+        context.fillStyle = activeBg;
         context.fillRect(ax0, ay0, ax1 - ax0, ay1 - ay0);
       }
     }
   }
 
-  /** The text of the cells, page by page. */
-  #text(
+  #lines(frame: Frame, layout: SheetLayout, q: Quadrant, originX: number, originY: number): void {
+    const context = this.#context;
+    const { theme, scale } = frame;
+    const width = Math.max(1, Math.round(scale)) / scale;
+    const snap = (position: number) => Math.round(position * scale) / scale - width / 2;
+
+    const clipRight = q.clip.left + q.clip.width;
+    const clipBottom = q.clip.top + q.clip.height;
+    const endX = Math.min(clipRight, originX + layout.colAxis.offsetOf(q.span.endCol));
+    const endY = Math.min(clipBottom, originY + layout.rowAxis.offsetOf(q.span.endRow));
+
+    context.beginPath();
+    for (let row = q.span.firstRow + 1; row <= q.span.endRow; row++) {
+      const y = snap(originY + layout.rowAxis.offsetOf(row));
+      context.moveTo(q.clip.left, y);
+      context.lineTo(endX, y);
+    }
+    for (let col = q.span.firstCol + 1; col <= q.span.endCol; col++) {
+      const x = snap(originX + layout.colAxis.offsetOf(col));
+      context.moveTo(x, q.clip.top);
+      context.lineTo(x, endY);
+    }
+    context.lineWidth = width;
+    context.strokeStyle = theme.line;
+    context.stroke();
+  }
+
+  #cellBorders(
     frame: Frame,
+    layout: SheetLayout,
+    parts: readonly Part[],
+    originX: number,
+    originY: number,
+  ): void {
+    const styles = frame.styles;
+    if (!styles || styles.length <= 1) {
+      return;
+    }
+    const context = this.#context;
+    const { theme, scale } = frame;
+    const thinPx = Math.max(1, Math.round(scale)) / scale;
+    const snap = (p: number) => Math.round(p * scale) / scale - thinPx / 2;
+
+    let hasThin = false;
+    let hasMed = false;
+    const thinSegs: number[] = [];
+    const medSegs: number[] = [];
+
+    const pushSeg = (
+      weight: "none" | "thin" | "medium",
+      x1: number,
+      y1: number,
+      x2: number,
+      y2: number,
+    ) => {
+      if (weight === "thin") {
+        hasThin = true;
+        thinSegs.push(x1, y1, x2, y2);
+      } else if (weight === "medium") {
+        hasMed = true;
+        medSegs.push(x1, y1, x2, y2);
+      }
+    };
+
+    for (const part of parts) {
+      const page = frame.cache.get(part.pageRow, part.pageCol);
+      if (!page) {
+        continue;
+      }
+      for (let col = part.firstCol; col < part.endCol; col++) {
+        const x0 = originX + layout.colAxis.offsetOf(col);
+        const x1 = x0 + layout.colAxis.sizeOf(col);
+        for (let row = part.firstRow; row < part.endRow; row++) {
+          const cell = (row - page.firstRow) * page.colCount + (col - page.firstCol);
+          const sid = page.styleIds[cell] ?? 0;
+          if (sid === 0) {
+            continue;
+          }
+          const st = styles[sid];
+          if (!st) {
+            continue;
+          }
+          if (
+            st.borderTop === "none" &&
+            st.borderRight === "none" &&
+            st.borderBottom === "none" &&
+            st.borderLeft === "none"
+          ) {
+            continue;
+          }
+          const y0 = originY + layout.rowAxis.offsetOf(row);
+          const y1 = y0 + layout.rowAxis.sizeOf(row);
+          pushSeg(st.borderTop, x0, snap(y0), x1, snap(y0));
+          pushSeg(st.borderBottom, x0, snap(y1), x1, snap(y1));
+          pushSeg(st.borderLeft, snap(x0), y0, snap(x0), y1);
+          pushSeg(st.borderRight, snap(x1), y0, snap(x1), y1);
+        }
+      }
+    }
+
+    if (hasThin) {
+      context.beginPath();
+      for (let i = 0; i < thinSegs.length; i += 4) {
+        context.moveTo(thinSegs[i] ?? 0, thinSegs[i + 1] ?? 0);
+        context.lineTo(thinSegs[i + 2] ?? 0, thinSegs[i + 3] ?? 0);
+      }
+      context.lineWidth = 1;
+      context.strokeStyle = theme.text;
+      context.stroke();
+    }
+    if (hasMed) {
+      context.beginPath();
+      for (let i = 0; i < medSegs.length; i += 4) {
+        context.moveTo(medSegs[i] ?? 0, medSegs[i + 1] ?? 0);
+        context.lineTo(medSegs[i + 2] ?? 0, medSegs[i + 3] ?? 0);
+      }
+      context.lineWidth = 2;
+      context.strokeStyle = theme.text;
+      context.stroke();
+    }
+  }
+
+  #textAndOverflows(
+    frame: Frame,
+    layout: SheetLayout,
+    sheet: SheetSize,
+    q: Quadrant,
     parts: readonly Part[],
     originX: number,
     originY: number,
     counts: FrameCounts,
   ): void {
     const context = this.#context;
-    const { metrics, theme, cache } = frame;
-    const { rowHeight, colWidth } = metrics;
+    const { theme, cache, styles } = frame;
     const { clipOnlyOverwide, batchState } = this.#shortcuts;
-    const room = colWidth - 2 * PADDING;
 
-    context.font = theme.font;
+    let currentFont = theme.font;
+    context.font = currentFont;
     context.textBaseline = "middle";
     let currentFill = theme.text;
     context.fillStyle = currentFill;
-    this.#widths.use(theme.font);
+    this.#widths.use(currentFont);
     let aligned: CanvasTextAlign | null = null;
+
+    const isCellOccupied = (r: number, c: number): boolean => {
+      const p = cache.pageOf(r, c);
+      if (!p || r >= p.firstRow + p.rowCount || c >= p.firstCol + p.colCount) {
+        return false;
+      }
+      return (p.texts[(r - p.firstRow) * p.colCount + (c - p.firstCol)] ?? "") !== "";
+    };
 
     for (const part of parts) {
       const page = cache.get(part.pageRow, part.pageCol);
       if (!page) {
         continue;
       }
-      // Column by column: a column mostly holds one kind of value, so the
-      // alignment and fill colour rarely change from one cell to the next.
+
+      // 1. Cross-page left-overflow candidates (`14-m1b.md` 6.2) entering `part.firstCol`:
+      if (part.firstCol === page.firstCol && page.overflows.length > 0) {
+        for (const ov of page.overflows) {
+          const row = page.firstRow + ov.rowOffset;
+          if (row < part.firstRow || row >= part.endRow || ov.originCol >= q.span.firstCol) {
+            continue;
+          }
+          // Only enters if `(row, part.firstCol)` itself is empty!
+          if (isCellOccupied(row, part.firstCol)) {
+            continue;
+          }
+          const st = ov.styleId > 0 ? styles?.[ov.styleId] : undefined;
+          const font = fontForStyle(theme, st);
+          if (currentFont !== font) {
+            context.font = font;
+            currentFont = font;
+            this.#widths.use(font);
+          }
+          const originStart = originX + layout.colAxis.offsetOf(ov.originCol);
+          const textW = this.#widths.measure(context, ov.text);
+          const pageEdgeX = originX + layout.colAxis.offsetOf(part.firstCol);
+          if (originStart + PADDING + textW <= pageEdgeX) {
+            continue;
+          }
+          // Find how many empty columns to the right `ov.text` can spill across.
+          let stopCol = part.firstCol + 1;
+          const maxLookRight = Math.min(sheet.cols, part.endCol + 8);
+          while (
+            stopCol < maxLookRight &&
+            originX + layout.colAxis.offsetOf(stopCol) < originStart + PADDING + textW &&
+            !isCellOccupied(row, stopCol)
+          ) {
+            stopCol++;
+          }
+          const stopX = originX + layout.colAxis.offsetOf(stopCol);
+          const clipStart = Math.max(q.clip.left, pageEdgeX);
+          const clipEnd = Math.min(q.clip.left + q.clip.width, stopX - PADDING);
+          if (clipEnd <= clipStart) {
+            continue;
+          }
+          const fill = resolveColor(st?.textColor, theme.paletteText) ?? theme.text;
+          if (currentFill !== fill) {
+            context.fillStyle = fill;
+            currentFill = fill;
+          }
+          if (aligned !== "left") {
+            context.textAlign = "left";
+            aligned = "left";
+          }
+          const y = originY + layout.rowAxis.offsetOf(row);
+          const h = layout.rowAxis.sizeOf(row);
+          context.save();
+          context.beginPath();
+          context.rect(clipStart, y, clipEnd - clipStart, h);
+          context.clip();
+          context.fillText(ov.text, originStart + PADDING, y + h / 2);
+          context.restore();
+          counts.clipped++;
+        }
+      }
+
+      // 2. Cells inside `part` (column by column for canvas state locality).
       for (let col = part.firstCol; col < part.endCol; col++) {
-        const x = originX + col * colWidth;
+        const x = originX + layout.colAxis.offsetOf(col);
+        const colW = layout.colAxis.sizeOf(col);
+        const baseRoom = colW - 2 * PADDING;
+        if (baseRoom <= 0) {
+          continue;
+        }
         for (let row = part.firstRow; row < part.endRow; row++) {
           const cell = (row - page.firstRow) * page.colCount + (col - page.firstCol);
           const text = page.texts[cell];
@@ -286,18 +686,35 @@ export class Renderer {
             continue;
           }
           const flags = page.flags[cell] ?? 0;
+          const styleId = page.styleIds[cell] ?? 0;
+          const st = styleId > 0 ? styles?.[styleId] : undefined;
+
           const number = isNumber(flags);
           const error = isError(flags);
           const centered = error || isBool(flags);
-          const y = originY + row * rowHeight;
-          const align: CanvasTextAlign = number ? "right" : centered ? "center" : "left";
-          const fill = error ? theme.errorText : theme.text;
+
+          const font = fontForStyle(theme, st);
+          const align: CanvasTextAlign =
+            st && st.align !== "auto" ? st.align : number ? "right" : centered ? "center" : "left";
+          const fill = error
+            ? theme.errorText
+            : (resolveColor(st?.textColor, theme.paletteText) ?? theme.text);
+
           if (!batchState) {
-            context.font = theme.font;
+            context.font = font;
+            currentFont = font;
+            this.#widths.use(font);
             context.textBaseline = "middle";
             context.fillStyle = fill;
+            currentFill = fill;
             context.textAlign = align;
+            aligned = align;
           } else {
+            if (currentFont !== font) {
+              context.font = font;
+              currentFont = font;
+              this.#widths.use(font);
+            }
             if (aligned !== align) {
               context.textAlign = align;
               aligned = align;
@@ -307,173 +724,460 @@ export class Renderer {
               currentFill = fill;
             }
           }
-          const textX = number ? x + colWidth - PADDING : centered ? x + colWidth / 2 : x + PADDING;
-          if (clipOnlyOverwide && this.#widths.fits(context, text, room)) {
-            context.fillText(text, textX, y + rowHeight / 2);
+
+          const y = originY + layout.rowAxis.offsetOf(row);
+          const rowH = layout.rowAxis.sizeOf(row);
+          const midY = y + rowH / 2;
+          const textX =
+            align === "right"
+              ? x + colW - PADDING
+              : align === "center"
+                ? x + colW / 2
+                : x + PADDING;
+
+          // Expand available room into rightward empty neighbors for left-aligned text!
+          let effectiveRoom = baseRoom;
+          if (
+            align === "left" &&
+            !number &&
+            !centered &&
+            !this.#widths.fits(context, text, baseRoom)
+          ) {
+            const neededW = this.#widths.measure(context, text);
+            let stopCol = col + 1;
+            const maxCol = Math.min(sheet.cols, q.span.endCol + 8);
+            while (
+              stopCol < maxCol &&
+              layout.colAxis.offsetOf(stopCol) - layout.colAxis.offsetOf(col) - 2 * PADDING <
+                neededW &&
+              !isCellOccupied(row, stopCol)
+            ) {
+              stopCol++;
+            }
+            effectiveRoom =
+              layout.colAxis.offsetOf(stopCol) - layout.colAxis.offsetOf(col) - 2 * PADDING;
+          }
+
+          if (clipOnlyOverwide && this.#widths.fits(context, text, effectiveRoom)) {
+            context.fillText(text, textX, midY);
           } else {
             context.save();
             context.beginPath();
-            context.rect(x + PADDING, y, room, rowHeight);
+            context.rect(x + PADDING, y, Math.max(0, effectiveRoom), rowH);
             context.clip();
-            context.fillText(text, textX, y + rowHeight / 2);
+            context.fillText(text, textX, midY);
             context.restore();
             counts.clipped++;
           }
+
+          if (st?.strikethrough) {
+            const w = Math.min(effectiveRoom, this.#widths.measure(context, text));
+            const lineX0 =
+              align === "right" ? textX - w : align === "center" ? textX - w / 2 : textX;
+            context.fillRect(lineX0, Math.round(midY), w, 1);
+          }
+
           counts.cells++;
         }
       }
     }
   }
 
-  /** The lines between cells, as one path. */
-  #lines(frame: Frame, originX: number, originY: number, right: number, bottom: number): void {
+  #formulaRefs(
+    frame: Frame,
+    layout: SheetLayout,
+    q: Quadrant,
+    originX: number,
+    originY: number,
+  ): void {
+    const refs = frame.formulaReferences;
+    if (!refs || refs.length === 0) {
+      return;
+    }
     const context = this.#context;
-    const { metrics, theme, visible, scale } = frame;
-    const width = Math.max(1, Math.round(scale)) / scale;
-    const snap = (position: number) => Math.round(position * scale) / scale - width / 2;
-
-    const endX = Math.min(right, originX + visible.endCol * metrics.colWidth);
-    const endY = Math.min(bottom, originY + visible.endRow * metrics.rowHeight);
+    const { theme } = frame;
+    context.save();
     context.beginPath();
-    for (let row = visible.firstRow + 1; row <= visible.endRow; row++) {
-      const y = snap(originY + row * metrics.rowHeight);
-      context.moveTo(metrics.headerWidth, y);
-      context.lineTo(endX, y);
+    context.rect(q.clip.left, q.clip.top, q.clip.width, q.clip.height);
+    context.clip();
+    context.lineWidth = 1.5;
+    context.setLineDash([4, 3]);
+
+    for (const ref of refs) {
+      const endRow = ref.lastRow + 1;
+      const endCol = ref.lastCol + 1;
+      if (
+        endRow <= q.span.firstRow ||
+        ref.firstRow >= q.span.endRow ||
+        endCol <= q.span.firstCol ||
+        ref.firstCol >= q.span.endCol
+      ) {
+        continue;
+      }
+      const x0 = originX + layout.colAxis.offsetOf(ref.firstCol);
+      const y0 = originY + layout.rowAxis.offsetOf(ref.firstRow);
+      const w = layout.colAxis.offsetOf(endCol) - layout.colAxis.offsetOf(ref.firstCol);
+      const h = layout.rowAxis.offsetOf(endRow) - layout.rowAxis.offsetOf(ref.firstRow);
+      const slot = ref.colorIndex & 7;
+      context.fillStyle = theme.refFills[slot] ?? theme.selectionFill;
+      context.fillRect(x0 + 1, y0 + 1, Math.max(0, w - 2), Math.max(0, h - 2));
+      context.strokeStyle = theme.refStrokes[slot] ?? theme.selection;
+      context.strokeRect(x0 + 0.75, y0 + 0.75, Math.max(0, w - 1.5), Math.max(0, h - 1.5));
     }
-    for (let col = visible.firstCol + 1; col <= visible.endCol; col++) {
-      const x = snap(originX + col * metrics.colWidth);
-      context.moveTo(x, metrics.headerHeight);
-      context.lineTo(x, endY);
-    }
-    context.lineWidth = width;
-    context.strokeStyle = theme.line;
-    context.stroke();
+
+    context.restore();
   }
 
-  #selection(frame: Frame, originX: number, originY: number, right: number, bottom: number): void {
-    const { metrics, theme, visible, selection, selectionRange } = frame;
-    const context = this.#context;
-
-    if (
-      selectionRange &&
-      (selectionRange.endRow - selectionRange.firstRow > 1 ||
-        selectionRange.endCol - selectionRange.firstCol > 1)
-    ) {
-      const rx0 = originX + selectionRange.firstCol * metrics.colWidth;
-      const ry0 = originY + selectionRange.firstRow * metrics.rowHeight;
-      const rw = (selectionRange.endCol - selectionRange.firstCol) * metrics.colWidth;
-      const rh = (selectionRange.endRow - selectionRange.firstRow) * metrics.rowHeight;
-      if (
-        rx0 < right &&
-        ry0 < bottom &&
-        rx0 + rw > metrics.headerWidth &&
-        ry0 + rh > metrics.headerHeight
-      ) {
-        context.save();
-        context.beginPath();
-        context.rect(
-          metrics.headerWidth,
-          metrics.headerHeight,
-          Math.max(0, right - metrics.headerWidth),
-          Math.max(0, bottom - metrics.headerHeight),
-        );
-        context.clip();
-        context.lineWidth = 1.5;
-        context.strokeStyle = theme.selection;
-        context.strokeRect(rx0 - 0.5, ry0 - 0.5, rw, rh);
-        context.restore();
-      }
+  #clipboardOutline(
+    frame: Frame,
+    layout: SheetLayout,
+    q: Quadrant,
+    originX: number,
+    originY: number,
+  ): void {
+    const cb = frame.clipboardRange;
+    if (!cb) {
+      return;
     }
-
+    const r = cb.span;
     if (
-      !selection ||
-      selection.row < visible.firstRow ||
-      selection.row >= visible.endRow ||
-      selection.col < visible.firstCol ||
-      selection.col >= visible.endCol
+      r.endRow <= q.span.firstRow ||
+      r.firstRow >= q.span.endRow ||
+      r.endCol <= q.span.firstCol ||
+      r.firstCol >= q.span.endCol
     ) {
       return;
     }
-    context.lineWidth = 2;
-    context.strokeStyle = theme.selection;
-    context.strokeRect(
-      originX + selection.col * metrics.colWidth - 1,
-      originY + selection.row * metrics.rowHeight - 1,
-      metrics.colWidth,
-      metrics.rowHeight,
-    );
+    const context = this.#context;
+    const x0 = originX + layout.colAxis.offsetOf(r.firstCol);
+    const y0 = originY + layout.rowAxis.offsetOf(r.firstRow);
+    const w = layout.colAxis.offsetOf(r.endCol) - layout.colAxis.offsetOf(r.firstCol);
+    const h = layout.rowAxis.offsetOf(r.endRow) - layout.rowAxis.offsetOf(r.firstRow);
+
+    context.save();
+    context.beginPath();
+    context.rect(q.clip.left, q.clip.top, q.clip.width, q.clip.height);
+    context.clip();
+    context.lineWidth = 1.75;
+    context.setLineDash(cb.cut ? [5, 3] : [3, 3]);
+    context.strokeStyle = frame.theme.selection;
+    context.strokeRect(x0 + 0.5, y0 + 0.5, Math.max(0, w - 1), Math.max(0, h - 1));
+    context.restore();
   }
 
-  /** The strips of column names and row numbers. They cover whatever scrolled under them. */
-  #headers(frame: Frame, originX: number, originY: number, right: number, bottom: number): void {
+  #selectionOutlines(
+    frame: Frame,
+    layout: SheetLayout,
+    q: Quadrant,
+    originX: number,
+    originY: number,
+  ): void {
+    const { theme, selection, selectionRange } = frame;
+    const ranges =
+      frame.selectionRanges && frame.selectionRanges.length > 0
+        ? frame.selectionRanges
+        : selectionRange
+          ? [selectionRange]
+          : [];
+    const context = this.#context;
+
+    context.save();
+    context.beginPath();
+    context.rect(q.clip.left, q.clip.top, q.clip.width, q.clip.height);
+    context.clip();
+
+    for (let i = 0; i < ranges.length; i++) {
+      const range = ranges[i];
+      if (!range) {
+        continue;
+      }
+      const isPrimary = i === ranges.length - 1;
+      const singlePrimary =
+        isPrimary &&
+        ranges.length === 1 &&
+        range.endRow - range.firstRow === 1 &&
+        range.endCol - range.firstCol === 1;
+      if (singlePrimary) {
+        continue;
+      }
+      if (
+        range.endRow <= q.span.firstRow ||
+        range.firstRow >= q.span.endRow ||
+        range.endCol <= q.span.firstCol ||
+        range.firstCol >= q.span.endCol
+      ) {
+        continue;
+      }
+      const rx0 = originX + layout.colAxis.offsetOf(range.firstCol);
+      const ry0 = originY + layout.rowAxis.offsetOf(range.firstRow);
+      const rw = layout.colAxis.offsetOf(range.endCol) - layout.colAxis.offsetOf(range.firstCol);
+      const rh = layout.rowAxis.offsetOf(range.endRow) - layout.rowAxis.offsetOf(range.firstRow);
+      context.lineWidth = 1.5;
+      context.strokeStyle = theme.selection;
+      context.strokeRect(rx0 - 0.5, ry0 - 0.5, rw, rh);
+    }
+
+    if (
+      selection &&
+      selection.row >= q.span.firstRow &&
+      selection.row < q.span.endRow &&
+      selection.col >= q.span.firstCol &&
+      selection.col < q.span.endCol
+    ) {
+      context.lineWidth = 2;
+      context.strokeStyle = theme.selection;
+      context.strokeRect(
+        originX + layout.colAxis.offsetOf(selection.col) - 1,
+        originY + layout.rowAxis.offsetOf(selection.row) - 1,
+        layout.colAxis.sizeOf(selection.col),
+        layout.rowAxis.sizeOf(selection.row),
+      );
+    }
+
+    // Draw `6×6` fill handle at the bottom-right corner of the primary `selectionRange`!
+    if (
+      frame.showFillHandle !== false &&
+      selectionRange &&
+      (!frame.selectionRanges || frame.selectionRanges.length <= 1)
+    ) {
+      const brRow = selectionRange.endRow - 1;
+      const brCol = selectionRange.endCol - 1;
+      if (
+        brRow >= q.span.firstRow &&
+        brRow < q.span.endRow &&
+        brCol >= q.span.firstCol &&
+        brCol < q.span.endCol
+      ) {
+        const hx = originX + layout.colAxis.offsetOf(selectionRange.endCol);
+        const hy = originY + layout.rowAxis.offsetOf(selectionRange.endRow);
+        const half = FILL_HANDLE_SIZE / 2;
+        context.fillStyle = theme.background;
+        context.fillRect(hx - half - 1, hy - half - 1, FILL_HANDLE_SIZE + 2, FILL_HANDLE_SIZE + 2);
+        context.fillStyle = theme.selection;
+        context.fillRect(hx - half, hy - half, FILL_HANDLE_SIZE, FILL_HANDLE_SIZE);
+      }
+    }
+
+    context.restore();
+  }
+
+  #fillPreviewOutline(
+    frame: Frame,
+    layout: SheetLayout,
+    q: Quadrant,
+    originX: number,
+    originY: number,
+  ): void {
+    const preview = frame.fillPreview;
+    if (!preview || isEmpty(preview)) {
+      return;
+    }
+    if (
+      preview.endRow <= q.span.firstRow ||
+      preview.firstRow >= q.span.endRow ||
+      preview.endCol <= q.span.firstCol ||
+      preview.firstCol >= q.span.endCol
+    ) {
+      return;
+    }
+    const context = this.#context;
+    const x0 = originX + layout.colAxis.offsetOf(preview.firstCol);
+    const y0 = originY + layout.rowAxis.offsetOf(preview.firstRow);
+    const w = layout.colAxis.offsetOf(preview.endCol) - layout.colAxis.offsetOf(preview.firstCol);
+    const h = layout.rowAxis.offsetOf(preview.endRow) - layout.rowAxis.offsetOf(preview.firstRow);
+
+    context.save();
+    context.beginPath();
+    context.rect(q.clip.left, q.clip.top, q.clip.width, q.clip.height);
+    context.clip();
+    context.lineWidth = 1.5;
+    context.setLineDash([4, 3]);
+    context.strokeStyle = frame.theme.selection;
+    context.strokeRect(x0 - 0.5, y0 - 0.5, w, h);
+    context.restore();
+  }
+
+  #headers(
+    frame: Frame,
+    layout: SheetLayout,
+    sheet: SheetSize,
+    fz: { frozenRows: number; frozenCols: number; height: number; width: number },
+    right: number,
+    bottom: number,
+  ): void {
     const context = this.#context;
     const { size, metrics, theme, visible, selection, selectionRange, scale } = frame;
-    const { rowHeight, colWidth, headerHeight, headerWidth } = metrics;
+    const { headerHeight, headerWidth } = metrics;
+    const ranges =
+      frame.selectionRanges && frame.selectionRanges.length > 0
+        ? frame.selectionRanges
+        : selectionRange
+          ? [selectionRange]
+          : selection
+            ? [
+                {
+                  firstRow: selection.row,
+                  endRow: selection.row + 1,
+                  firstCol: selection.col,
+                  endCol: selection.col + 1,
+                },
+              ]
+            : [];
 
     context.fillStyle = theme.headerBackground;
     context.fillRect(0, 0, size.width, headerHeight);
     context.fillRect(0, 0, headerWidth, size.height);
 
-    const activeCols: Span | null = selectionRange
-      ? selectionRange
-      : selection
-        ? {
-            firstRow: selection.row,
-            endRow: selection.row + 1,
-            firstCol: selection.col,
-            endCol: selection.col + 1,
-          }
-        : null;
-
-    if (activeCols && !isEmpty(visible)) {
-      context.fillStyle = theme.headerSelected;
-      const c0 = Math.max(visible.firstCol, activeCols.firstCol);
-      const c1 = Math.min(visible.endCol, activeCols.endCol);
-      if (c0 < c1) {
-        const x = Math.max(headerWidth, originX + c0 * colWidth);
-        const end = Math.min(right, originX + c1 * colWidth);
-        context.fillRect(x, 0, Math.max(0, end - x), headerHeight);
-      }
-      const r0 = Math.max(visible.firstRow, activeCols.firstRow);
-      const r1 = Math.min(visible.endRow, activeCols.endRow);
-      if (r0 < r1) {
-        const y = Math.max(headerHeight, originY + r0 * rowHeight);
-        const end = Math.min(bottom, originY + r1 * rowHeight);
-        context.fillRect(0, y, headerWidth, Math.max(0, end - y));
-      }
-    }
-
-    context.font = theme.font;
-    context.textBaseline = "middle";
-    context.textAlign = "center";
-    context.fillStyle = theme.headerText;
-
-    for (let col = visible.firstCol; col < visible.endCol; col++) {
-      context.fillText(columnName(col), originX + col * colWidth + colWidth / 2, headerHeight / 2);
-    }
-    for (let row = visible.firstRow; row < visible.endRow; row++) {
-      context.fillText(String(row + 1), headerWidth / 2, originY + row * rowHeight + rowHeight / 2);
-    }
-
     const width = Math.max(1, Math.round(scale)) / scale;
     const snap = (position: number) => Math.round(position * scale) / scale - width / 2;
-    context.beginPath();
-    for (let col = visible.firstCol + 1; col <= visible.endCol; col++) {
-      const x = snap(originX + col * colWidth);
-      if (x > headerWidth) {
-        context.moveTo(x, 0);
-        context.lineTo(x, headerHeight);
+
+    const drawColStrip = (
+      firstCol: number,
+      endCol: number,
+      scrollLeft: number,
+      clipLeft: number,
+      clipRight: number,
+    ) => {
+      if (firstCol >= endCol || clipRight <= clipLeft) {
+        return;
       }
-    }
-    for (let row = visible.firstRow + 1; row <= visible.endRow; row++) {
-      const y = snap(originY + row * rowHeight);
-      if (y > headerHeight) {
-        context.moveTo(0, y);
-        context.lineTo(headerWidth, y);
+      const ox = headerWidth - scrollLeft;
+      context.save();
+      context.beginPath();
+      context.rect(clipLeft, 0, clipRight - clipLeft, headerHeight);
+      context.clip();
+
+      context.fillStyle = theme.headerSelected;
+      for (const r of ranges) {
+        const c0 = Math.max(firstCol, r.firstCol);
+        const c1 = Math.min(endCol, r.endCol);
+        if (c0 < c1) {
+          const x = Math.max(clipLeft, ox + layout.colAxis.offsetOf(c0));
+          const end = Math.min(clipRight, ox + layout.colAxis.offsetOf(c1));
+          if (end > x) {
+            context.fillRect(x, 0, end - x, headerHeight);
+          }
+        }
       }
+
+      context.font = theme.font;
+      context.textBaseline = "middle";
+      context.textAlign = "center";
+      context.fillStyle = theme.headerText;
+      for (let col = firstCol; col < endCol; col++) {
+        const cx = ox + layout.colAxis.offsetOf(col);
+        const cw = layout.colAxis.sizeOf(col);
+        context.fillText(columnName(col), cx + cw / 2, headerHeight / 2);
+      }
+
+      context.beginPath();
+      for (let col = firstCol + 1; col <= endCol; col++) {
+        const x = snap(ox + layout.colAxis.offsetOf(col));
+        if (x > clipLeft) {
+          context.moveTo(x, 0);
+          context.lineTo(x, headerHeight);
+        }
+      }
+      context.lineWidth = width;
+      context.strokeStyle = theme.headerLine;
+      context.stroke();
+      context.restore();
+    };
+
+    const drawRowStrip = (
+      firstRow: number,
+      endRow: number,
+      scrollTop: number,
+      clipTop: number,
+      clipBottom: number,
+    ) => {
+      if (firstRow >= endRow || clipBottom <= clipTop) {
+        return;
+      }
+      const oy = headerHeight - scrollTop;
+      context.save();
+      context.beginPath();
+      context.rect(0, clipTop, headerWidth, clipBottom - clipTop);
+      context.clip();
+
+      context.fillStyle = theme.headerSelected;
+      for (const r of ranges) {
+        const r0 = Math.max(firstRow, r.firstRow);
+        const r1 = Math.min(endRow, r.endRow);
+        if (r0 < r1) {
+          const y = Math.max(clipTop, oy + layout.rowAxis.offsetOf(r0));
+          const end = Math.min(clipBottom, oy + layout.rowAxis.offsetOf(r1));
+          if (end > y) {
+            context.fillRect(0, y, headerWidth, end - y);
+          }
+        }
+      }
+
+      context.font = theme.font;
+      context.textBaseline = "middle";
+      context.textAlign = "center";
+      context.fillStyle = theme.headerText;
+      for (let row = firstRow; row < endRow; row++) {
+        const ry = oy + layout.rowAxis.offsetOf(row);
+        const rh = layout.rowAxis.sizeOf(row);
+        context.fillText(String(row + 1), headerWidth / 2, ry + rh / 2);
+      }
+
+      context.beginPath();
+      for (let row = firstRow + 1; row <= endRow; row++) {
+        const y = snap(oy + layout.rowAxis.offsetOf(row));
+        if (y > clipTop) {
+          context.moveTo(0, y);
+          context.lineTo(headerWidth, y);
+        }
+      }
+      context.lineWidth = width;
+      context.strokeStyle = theme.headerLine;
+      context.stroke();
+      context.restore();
+    };
+
+    if (fz.frozenCols > 0) {
+      drawColStrip(0, fz.frozenCols, 0, headerWidth, Math.min(right, headerWidth + fz.width));
     }
-    context.fillStyle = theme.headerBackground;
+    drawColStrip(
+      visible.firstCol,
+      visible.endCol,
+      frame.scroll.left,
+      headerWidth + fz.width,
+      right,
+    );
+
+    if (fz.frozenRows > 0) {
+      drawRowStrip(0, fz.frozenRows, 0, headerHeight, Math.min(bottom, headerHeight + fz.height));
+    }
+    drawRowStrip(
+      visible.firstRow,
+      visible.endRow,
+      frame.scroll.top,
+      headerHeight + fz.height,
+      bottom,
+    );
+
+    // Top-left select-all corner button + subtle triangle affordance.
+    const allSelected =
+      sheet.rows > 0 &&
+      sheet.cols > 0 &&
+      selectionRange?.firstRow === 0 &&
+      selectionRange.endRow === sheet.rows &&
+      selectionRange.firstCol === 0 &&
+      selectionRange.endCol === sheet.cols;
+    context.fillStyle = allSelected ? theme.headerSelected : theme.headerBackground;
     context.fillRect(0, 0, headerWidth, headerHeight);
+    context.fillStyle = theme.headerLine;
+    context.beginPath();
+    context.moveTo(headerWidth - 5, headerHeight - 13);
+    context.lineTo(headerWidth - 5, headerHeight - 5);
+    context.lineTo(headerWidth - 13, headerHeight - 5);
+    context.closePath();
+    context.fill();
+
+    context.beginPath();
     context.moveTo(snap(headerWidth), 0);
     context.lineTo(snap(headerWidth), size.height);
     context.moveTo(0, snap(headerHeight));
@@ -482,4 +1186,159 @@ export class Renderer {
     context.strokeStyle = theme.headerLine;
     context.stroke();
   }
+
+  #freezeDividers(
+    frame: Frame,
+    fz: { frozenRows: number; frozenCols: number; height: number; width: number },
+    right: number,
+    bottom: number,
+  ): void {
+    if (fz.frozenRows <= 0 && fz.frozenCols <= 0) {
+      return;
+    }
+    const context = this.#context;
+    const { metrics, theme } = frame;
+    context.save();
+    context.lineWidth = 2;
+    context.strokeStyle = theme.freezeLine;
+    context.beginPath();
+    if (fz.frozenRows > 0) {
+      const y = Math.round(metrics.headerHeight + fz.height);
+      context.moveTo(0, y);
+      context.lineTo(right, y);
+    }
+    if (fz.frozenCols > 0) {
+      const x = Math.round(metrics.headerWidth + fz.width);
+      context.moveTo(x, 0);
+      context.lineTo(x, bottom);
+    }
+    context.stroke();
+    context.restore();
+  }
+
+  #reorderGuide(
+    frame: Frame,
+    layout: SheetLayout,
+    sheet: SheetSize,
+    fz: { frozenRows: number; frozenCols: number; height: number; width: number },
+    right: number,
+    bottom: number,
+  ): void {
+    const guide = frame.reorderGuide;
+    if (!guide) {
+      return;
+    }
+    const context = this.#context;
+    const { metrics, theme, scroll } = frame;
+    context.save();
+    context.lineWidth = 2.5;
+    context.strokeStyle = theme.selection;
+    context.beginPath();
+    if (guide.axis === "row") {
+      const r = Math.min(sheet.rows, Math.max(0, guide.beforeRow));
+      const effTop = r <= fz.frozenRows ? 0 : scroll.top;
+      const y = Math.round(metrics.headerHeight + layout.rowAxis.offsetOf(r) - effTop);
+      if (y >= metrics.headerHeight && y <= bottom) {
+        context.moveTo(0, y);
+        context.lineTo(right, y);
+      }
+    } else {
+      const c = Math.min(sheet.cols, Math.max(0, guide.beforeCol));
+      const effLeft = c <= fz.frozenCols ? 0 : scroll.left;
+      const x = Math.round(metrics.headerWidth + layout.colAxis.offsetOf(c) - effLeft);
+      if (x >= metrics.headerWidth && x <= right) {
+        context.moveTo(x, 0);
+        context.lineTo(x, bottom);
+      }
+    }
+    context.stroke();
+    context.restore();
+  }
+}
+
+function buildQuadrants(
+  metrics: Metrics,
+  size: Size,
+  scroll: Scroll,
+  visible: Span,
+  fz: { frozenRows: number; frozenCols: number; height: number; width: number },
+): Quadrant[] {
+  const right = size.width - metrics.scrollbarSize;
+  const bottom = size.height - metrics.scrollbarSize;
+  const hw = metrics.headerWidth;
+  const hh = metrics.headerHeight;
+  const splitX = Math.min(right, hw + fz.width);
+  const splitY = Math.min(bottom, hh + fz.height);
+
+  const out: Quadrant[] = [];
+  if (fz.frozenRows > 0 && fz.frozenCols > 0) {
+    out.push({
+      clip: {
+        left: hw,
+        top: hh,
+        width: Math.max(0, splitX - hw),
+        height: Math.max(0, splitY - hh),
+      },
+      span: { firstRow: 0, endRow: fz.frozenRows, firstCol: 0, endCol: fz.frozenCols },
+      scrollTop: 0,
+      scrollLeft: 0,
+    });
+  }
+  if (fz.frozenRows > 0) {
+    out.push({
+      clip: {
+        left: splitX,
+        top: hh,
+        width: Math.max(0, right - splitX),
+        height: Math.max(0, splitY - hh),
+      },
+      span: {
+        firstRow: 0,
+        endRow: fz.frozenRows,
+        firstCol: visible.firstCol,
+        endCol: visible.endCol,
+      },
+      scrollTop: 0,
+      scrollLeft: scroll.left,
+    });
+  }
+  if (fz.frozenCols > 0) {
+    out.push({
+      clip: {
+        left: hw,
+        top: splitY,
+        width: Math.max(0, splitX - hw),
+        height: Math.max(0, bottom - splitY),
+      },
+      span: {
+        firstRow: visible.firstRow,
+        endRow: visible.endRow,
+        firstCol: 0,
+        endCol: fz.frozenCols,
+      },
+      scrollTop: scroll.top,
+      scrollLeft: 0,
+    });
+  }
+  out.push({
+    clip: {
+      left: splitX,
+      top: splitY,
+      width: Math.max(0, right - splitX),
+      height: Math.max(0, bottom - splitY),
+    },
+    span: visible,
+    scrollTop: scroll.top,
+    scrollLeft: scroll.left,
+  });
+  return out;
+}
+
+function fontForStyle(theme: Theme, style: GridCellStyle | undefined): string {
+  if (!style || (!style.bold && !style.italic)) {
+    return theme.font;
+  }
+  const weight = style.bold ? "700 " : "";
+  const slant = style.italic ? "italic " : "";
+  return `${slant}${weight}${theme.fontSize}px ${theme.fontFamily}`;
 }

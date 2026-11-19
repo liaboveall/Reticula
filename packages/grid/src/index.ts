@@ -11,17 +11,29 @@ export {
   coalesceIdRuns,
   type FrameReport,
   Grid,
+  type GridContextTarget,
   type GridOptions,
   type GridStats,
   type IdRun,
   type Selection,
+  type SelectionScope,
+  type SheetConfig,
   type Subscription,
 } from "./grid.ts";
 export {
   type Box,
   columnName,
+  type HeaderHit,
+  headerHitAt,
   type Metrics,
   type Scroll,
+  type SheetLayout,
   type SheetSize,
   type Span,
+  SparseAxis,
 } from "./layout.ts";
+export type {
+  FormulaReferenceOverlay,
+  GridCellStyle,
+} from "./renderer.ts";
+export { REF_COLORS_DARK, REF_COLORS_LIGHT } from "./theme.ts";

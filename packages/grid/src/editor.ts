@@ -24,7 +24,6 @@ export type EditorEvent =
   | {
       readonly kind: "key";
       readonly key: string;
-      /** What became of the key press. */
       readonly outcome:
         | "input method"
         | "moved"
@@ -43,11 +42,26 @@ export interface CellEditorOptions {
   /** Called when the user presses `Delete` or `Backspace` while navigating. */
   readonly onClear?: () => void;
   /** Called whenever the live editor text or active editing cell changes (for formula bar sync). */
-  readonly onTextChange?: (text: string, editing: CellPosition | null) => void;
+  readonly onTextChange?: (text: string, editing: CellPosition | null, cursorUtf16: number) => void;
+  /** Called when `F4` is pressed inside an active formula edit. */
+  readonly onToggleDollar?: (text: string, cursorUtf16: number) => void;
+  /** Returns `true` when clicking the grid should insert a formula reference instead of committing. */
+  readonly isPointAndClickActive?: () => boolean;
+  /** `Ctrl+Arrow` / `Ctrl+Shift+Arrow` data-edge jump request. */
+  readonly onJumpEdge?: (dir: "up" | "down" | "left" | "right", select: boolean) => void;
+  /** `Ctrl+End` / `Ctrl+Shift+End` jump to last used cell. */
+  readonly onJumpUsedEnd?: (select: boolean) => void;
+  /** `Ctrl+Z` undo shortcut. */
+  readonly onUndo?: () => void;
+  /** `Ctrl+Y` / `Ctrl+Shift+Z` redo shortcut. */
+  readonly onRedo?: () => void;
+  /** `Ctrl+C` / `Ctrl+X` copy or cut gesture while navigating. */
+  readonly onCopy?: (cut: boolean, clipboardData: DataTransfer | null) => void;
+  /** `Ctrl+V` paste gesture while navigating. */
+  readonly onPaste?: (tsv: string, html: string | null) => void;
   readonly onEvent?: (event: EditorEvent) => void;
 }
 
-/** How far each key moves the selection: rows, then columns. */
 const STEPS: Readonly<Record<string, readonly [number, number]>> = {
   ArrowUp: [-1, 0],
   ArrowDown: [1, 0],
@@ -55,15 +69,15 @@ const STEPS: Readonly<Record<string, readonly [number, number]>> = {
   ArrowRight: [0, 1],
 };
 
+const JUMP_DIRS: Readonly<Record<string, "up" | "down" | "left" | "right">> = {
+  ArrowUp: "up",
+  ArrowDown: "down",
+  ArrowLeft: "left",
+  ArrowRight: "right",
+};
+
 /**
- * The editor of the selected cell (`13-m1a.md` 6.2).
- *
- * Always present and focused on the active cell, invisible until an edit
- * starts. Distinguishes two entry modes matching Excel:
- * - `"input"` mode (direct typing or IME composition): pressing an arrow key
- *   outside IME composition commits the cell and moves the grid selection;
- * - `"edit"` mode (`F2`, double-click, or formula bar): arrow keys move the
- *   text caret inside the editor without leaving the cell.
+ * The editor of the selected cell (`13-m1a.md` 6.2 & `14-m1b.md` 6.1–6.3).
  */
 export class CellEditor {
   #grid: Grid;
@@ -71,7 +85,6 @@ export class CellEditor {
   #options: CellEditorOptions;
   #box: HTMLDivElement;
   #view: EditorView;
-  /** The cell being edited, while one is. */
   #cell: CellPosition | null = null;
   #mode: "input" | "edit" = "input";
   #suppressAutoStart = false;
@@ -90,16 +103,19 @@ export class CellEditor {
       state: EditorState.create({
         extensions: [
           EditorView.contentAttributes.of({ "aria-label": "Cell editor" }),
-          // A cell's text is one line; whatever would add another is refused.
           EditorState.transactionFilter.of((transaction) =>
             transaction.newDoc.lines > 1 ? [] : transaction,
           ),
           EditorView.updateListener.of((update) => {
-            if (update.docChanged) {
+            if (update.docChanged || (this.#cell && update.selectionSet)) {
               if (!this.#suppressAutoStart && !this.#cell && update.state.doc.length > 0) {
                 this.#start("typing", "input");
               }
-              this.#options.onTextChange?.(update.state.doc.toString(), this.#cell);
+              this.#options.onTextChange?.(
+                update.state.doc.toString(),
+                this.#cell,
+                update.state.selection.main.head,
+              );
             }
           }),
           EditorView.domEventHandlers({
@@ -115,7 +131,11 @@ export class CellEditor {
             },
             compositionend: (event) => {
               this.#note({ kind: "composition", phase: "end", data: event.data });
-              this.#options.onTextChange?.(this.text, this.#cell);
+              this.#options.onTextChange?.(
+                this.text,
+                this.#cell,
+                this.#view.state.selection.main.head,
+              );
             },
             copy: (event) => this.#onClipboard(event, "copy"),
             cut: (event) => this.#onClipboard(event, "cut"),
@@ -131,27 +151,26 @@ export class CellEditor {
     this.#place();
   }
 
-  /** The cell being edited, or `null` while navigating. */
   get editing(): CellPosition | null {
     return this.#cell;
   }
 
-  /** Current entry mode while editing (`"input"` or `"edit"`). */
   get editMode(): "input" | "edit" {
     return this.#mode;
   }
 
-  /** The text typed so far. */
   get text(): string {
     return this.#view.state.doc.toString();
   }
 
-  /** Whether an input method is composing text in the editor. */
+  get cursorUtf16(): number {
+    return this.#view.state.selection.main.head;
+  }
+
   get composing(): boolean {
     return this.#view.composing || this.#view.compositionStarted;
   }
 
-  /** Gives the editor the keyboard. */
   focus(): void {
     this.#view.focus();
   }
@@ -178,33 +197,49 @@ export class CellEditor {
     } else {
       this.#mode = "edit";
     }
-    this.#options.onTextChange?.(this.text, this.#cell);
+    this.#options.onTextChange?.(this.text, this.#cell, this.#view.state.selection.main.head);
     if (focusEditor) {
       this.#view.focus();
     }
   }
 
   /**
-   * Synchronizes live text typed in the external formula bar without stealing
-   * keyboard focus away from the formula bar `<input>`.
+   * Synchronizes live text typed in the external CodeMirror formula bar without
+   * stealing keyboard focus away from the formula bar.
    */
-  setTextExternal(text: string): void {
+  setTextExternal(text: string, cursorUtf16?: number): void {
     if (!this.#cell) {
       this.startEdit("formulaBar", text, false);
       return;
     }
     this.#mode = "edit";
-    if (this.text !== text) {
+    const head = Math.min(text.length, Math.max(0, cursorUtf16 ?? text.length));
+    if (this.text !== text || this.#view.state.selection.main.head !== head) {
       this.#suppressAutoStart = true;
       this.#view.dispatch({
         changes: { from: 0, to: this.#view.state.doc.length, insert: text },
-        selection: { anchor: text.length },
+        selection: { anchor: head },
       });
       this.#suppressAutoStart = false;
     }
   }
 
-  /** Commits an active edit initiated or modified from the formula bar and moves down. */
+  /** Applies an `F4` toggle or point-and-click reference edit to the active editor. */
+  applyTextAndSelection(text: string, anchorUtf16: number, headUtf16 = anchorUtf16): void {
+    if (!this.#cell) {
+      this.startEdit("formulaBar", text, false);
+    }
+    const clampedAnchor = Math.min(text.length, Math.max(0, anchorUtf16));
+    const clampedHead = Math.min(text.length, Math.max(0, headUtf16));
+    this.#suppressAutoStart = true;
+    this.#view.dispatch({
+      changes: { from: 0, to: this.#view.state.doc.length, insert: text },
+      selection: { anchor: clampedAnchor, head: clampedHead },
+    });
+    this.#suppressAutoStart = false;
+    this.#options.onTextChange?.(text, this.#cell, clampedHead);
+  }
+
   commitExternal(moveDown = true): void {
     const cell = this.#commit();
     if (cell && moveDown) {
@@ -214,7 +249,6 @@ export class CellEditor {
     this.#view.focus();
   }
 
-  /** Cancels an active edit from the formula bar and returns focus to the grid. */
   cancelExternal(): void {
     const cell = this.#cell;
     if (cell) {
@@ -240,7 +274,6 @@ export class CellEditor {
     this.#view.focus();
   };
 
-  /** Keeps the editor on its cell. Runs at the end of every frame the grid draws. */
   #place = (): void => {
     const cell = this.#cell ?? this.#grid.selection;
     const box = cell
@@ -274,11 +307,10 @@ export class CellEditor {
     this.#grid.reveal(cell.row, cell.col);
     this.#box.dataset.editing = "";
     this.#place();
-    this.#options.onTextChange?.(this.text, this.#cell);
+    this.#options.onTextChange?.(this.text, this.#cell, this.#view.state.selection.main.head);
     this.#note({ kind: "started", cause });
   }
 
-  /** Empties the editor and hides it again. */
   #finish(): void {
     this.#cell = null;
     this.#mode = "input";
@@ -287,7 +319,7 @@ export class CellEditor {
     this.#clear();
     this.#suppressAutoStart = false;
     this.#place();
-    this.#options.onTextChange?.("", null);
+    this.#options.onTextChange?.("", null, 0);
   }
 
   #clear(): void {
@@ -322,9 +354,15 @@ export class CellEditor {
     if (event.isComposing || event.keyCode === 229 || view.composing || view.compositionStarted) {
       return "input method";
     }
-    const plain = !event.ctrlKey && !event.metaKey && !event.altKey;
+    const mod = event.ctrlKey || event.metaKey;
+    const plain = !mod && !event.altKey;
 
     if (this.#cell) {
+      if (event.key === "F4" && this.text.startsWith("=")) {
+        event.preventDefault();
+        this.#options.onToggleDollar?.(this.text, view.state.selection.main.head);
+        return "swallowed";
+      }
       if (event.key === "Enter" || event.key === "Tab") {
         const cell = this.#commit();
         if (cell) {
@@ -339,8 +377,6 @@ export class CellEditor {
         this.#note({ kind: "cancelled", cell });
         return "cancelled";
       }
-      // In `"input"` mode (direct typing without F2), plain arrow keys commit
-      // the cell and step the grid selection, matching Excel.
       if (this.#mode === "input" && plain && !event.shiftKey && STEPS[event.key]) {
         const cell = this.#commit();
         if (cell) {
@@ -352,6 +388,46 @@ export class CellEditor {
       return "passed";
     }
 
+    // Undo / Redo / Select All while navigating (`Ctrl/Cmd + Z/Y/A`).
+    if (mod && !event.altKey) {
+      const lower = event.key.toLowerCase();
+      if (lower === "z") {
+        event.preventDefault();
+        if (event.shiftKey) {
+          this.#options.onRedo?.();
+        } else {
+          this.#options.onUndo?.();
+        }
+        return "swallowed";
+      }
+      if (lower === "y" && !event.shiftKey) {
+        event.preventDefault();
+        this.#options.onRedo?.();
+        return "swallowed";
+      }
+      if (lower === "a" && !event.shiftKey) {
+        event.preventDefault();
+        this.#grid.selectAll();
+        return "swallowed";
+      }
+      const jumpDir = JUMP_DIRS[event.key];
+      if (jumpDir && this.#options.onJumpEdge) {
+        event.preventDefault();
+        this.#options.onJumpEdge(jumpDir, event.shiftKey);
+        return "moved";
+      }
+      if (event.key === "Home") {
+        event.preventDefault();
+        this.#grid.jumpTo(0, 0, event.shiftKey);
+        return "moved";
+      }
+      if (event.key === "End" && this.#options.onJumpUsedEnd) {
+        event.preventDefault();
+        this.#options.onJumpUsedEnd(event.shiftKey);
+        return "moved";
+      }
+    }
+
     if (plain && STEPS[event.key]) {
       const [rows, cols] = STEPS[event.key] ?? [0, 0];
       if (event.shiftKey) {
@@ -360,6 +436,32 @@ export class CellEditor {
         this.#grid.moveSelection(rows, cols);
       }
       return "moved";
+    }
+    if (plain && event.key === "PageDown") {
+      event.preventDefault();
+      this.#grid.pageVertical(1, event.shiftKey);
+      return "moved";
+    }
+    if (plain && event.key === "PageUp") {
+      event.preventDefault();
+      this.#grid.pageVertical(-1, event.shiftKey);
+      return "moved";
+    }
+    if (plain && event.key === "Home") {
+      const cur = this.#grid.selection;
+      if (cur) {
+        event.preventDefault();
+        this.#grid.jumpTo(cur.row, 0, event.shiftKey);
+        return "moved";
+      }
+    }
+    if (plain && event.key === "End") {
+      const cur = this.#grid.selection;
+      if (cur && this.#grid.sheetSize.cols > 0) {
+        event.preventDefault();
+        this.#grid.jumpTo(cur.row, this.#grid.sheetSize.cols - 1, event.shiftKey);
+        return "moved";
+      }
     }
     if (plain && (event.key === "Enter" || event.key === "Tab")) {
       this.#move(event);
@@ -374,6 +476,7 @@ export class CellEditor {
       return "swallowed";
     }
     if (event.key === "Escape") {
+      this.#grid.setClipboardRange(null);
       return "swallowed";
     }
     return "passed";
@@ -393,12 +496,21 @@ export class CellEditor {
       return false;
     }
     event.preventDefault();
+    if (type === "paste") {
+      const tsv = event.clipboardData?.getData("text/plain") ?? "";
+      const html = event.clipboardData?.getData("text/html") || null;
+      this.#options.onPaste?.(tsv, html);
+    } else {
+      this.#options.onCopy?.(type === "cut", event.clipboardData);
+    }
     return true;
   }
 
-  /** A click elsewhere in the grid accepts the edit before the selection moves there. */
   #onPointerDown = (event: PointerEvent): void => {
     if (!this.#cell || (event.target instanceof Node && this.#box.contains(event.target))) {
+      return;
+    }
+    if (this.#options.isPointAndClickActive?.()) {
       return;
     }
     delete this.#box.dataset.editing;

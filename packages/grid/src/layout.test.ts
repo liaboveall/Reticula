@@ -7,8 +7,11 @@ import {
   clampScroll,
   columnName,
   EMPTY_SPAN,
+  headerHitAt,
   type Metrics,
   pagesToHold,
+  type SheetLayout,
+  SparseAxis,
   scrollAtThumb,
   scrollLimits,
   scrollToReveal,
@@ -306,5 +309,68 @@ describe("bringing a cell into view", () => {
   test("a cell larger than the area is aligned at its start", () => {
     const tall = { ...metrics, rowHeight: 500 };
     expect(scrollToReveal(tall, size, { top: 0, left: 0 }, 3, 0)).toEqual({ top: 1500, left: 0 });
+  });
+});
+
+describe("sparse axis metrics and frozen panes", () => {
+  test("SparseAxis matches naive cumulative offsets and inverse lookup", () => {
+    const custom: [number, number][] = [
+      [2, 55],
+      [3, 16],
+      [10, 80],
+    ];
+    const axis = new SparseAxis(20, custom);
+    const customMap = new Map(custom);
+    let expectedOffset = 0;
+    for (let pos = 0; pos < 25; pos++) {
+      const sz = customMap.get(pos) ?? 20;
+      expect(axis.offsetOf(pos)).toBe(expectedOffset);
+      expect(axis.sizeOf(pos)).toBe(sz);
+      for (let px = expectedOffset; px < expectedOffset + sz; px += 7) {
+        expect(axis.indexAtOffset(px)).toBe(pos);
+      }
+      expectedOffset += sz;
+    }
+    expect(axis.totalSize(25)).toBe(expectedOffset);
+  });
+
+  test("frozen rows and columns pin top/left coordinates and skip scrollToReveal", () => {
+    const layout: SheetLayout = {
+      rowAxis: new SparseAxis(20, [[0, 30]]),
+      colAxis: new SparseAxis(100, [[0, 140]]),
+      frozenRows: 1,
+      frozenCols: 1,
+    };
+    const scroll = { top: 400, left: 300 };
+    // Pinned corner (0, 0) stays at (headerWidth, headerHeight) regardless of scroll!
+    expect(cellBox(metrics, scroll, 0, 0, size, sheet, layout)).toEqual({
+      left: 50,
+      top: 30,
+      width: 140,
+      height: 30,
+    });
+    expect(cellAt(metrics, sheet, scroll, size, 60, 40, layout)).toEqual({ row: 0, col: 0 });
+    // Point below frozen row 0 (`y = 30 + 35 = 65`) hits scrolled row (`400 + 35 = 435` -> row 21).
+    expect(cellAt(metrics, sheet, scroll, size, 60, 65, layout)).toEqual({ row: 21, col: 0 });
+    // Revealing a frozen row/col leaves scroll untouched.
+    expect(scrollToReveal(metrics, size, scroll, 0, 0, sheet, layout)).toEqual(scroll);
+  });
+
+  test("headerHitAt distinguishes corner, headers, and resize dividers", () => {
+    expect(headerHitAt(metrics, sheet, { top: 0, left: 0 }, size, 25, 15)).toEqual({
+      kind: "corner",
+    });
+    expect(headerHitAt(metrics, sheet, { top: 0, left: 0 }, size, 90, 15)).toEqual({
+      kind: "col",
+      col: 0,
+    });
+    expect(headerHitAt(metrics, sheet, { top: 0, left: 0 }, size, 149, 15)).toEqual({
+      kind: "colResize",
+      col: 0,
+    });
+    expect(headerHitAt(metrics, sheet, { top: 0, left: 0 }, size, 25, 49)).toEqual({
+      kind: "rowResize",
+      row: 0,
+    });
   });
 });
