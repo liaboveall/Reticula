@@ -5,6 +5,7 @@
 //! runs exactly what a developer runs.
 
 mod codegen;
+mod compat;
 mod qa;
 mod rust;
 mod setup;
@@ -35,6 +36,7 @@ Commands:
   codegen [--check]       Write the TypeScript files generated from the Rust sources;
                           --check only reports whether they are up to date.
   digest [--update]       Print the determinism digest; --update records it as expected.
+  compat [--freeze v1]    Verify frozen wire v1 SHA-256 hashes (or generate/freeze v1 fixtures).
   diff [--count <n>] [--out <file>]
                           Differential evaluation against ironcalc_base and formualizer-eval.
   fuzz [--cpu-seconds <s>] [--threads <n>] [--affinity <mask>]
@@ -91,6 +93,7 @@ fn run(args: &[String]) -> Result {
         }
         "codegen" => codegen::run(Flags::parse(rest, &["check"], &[])?.has("check")),
         "digest" => digest(&Flags::parse(rest, &["update"], &[])?),
+        "compat" => compat::run(&Flags::parse(rest, &[], &["freeze"])?),
         "diff" => qa::diff(&Flags::parse(rest, &[], &["count", "out"])?),
         "fuzz" => qa::fuzz(&Flags::parse(
             rest,
@@ -129,6 +132,7 @@ fn check(flags: &Flags) -> Result {
     let everything = !flags.has("rust") && !flags.has("web");
     if everything || flags.has("rust") {
         rust::check()?;
+        compat::check()?;
         setup::check_workflow_pins()?;
     }
     if everything || flags.has("web") {
@@ -200,6 +204,7 @@ fn e2e(flags: &Flags) -> Result {
 
 fn ci() -> Result {
     rust::check()?;
+    compat::check()?;
     setup::check_workflow_pins()?;
     rust::test()?;
     rust::test_wasm()?;

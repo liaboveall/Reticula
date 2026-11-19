@@ -1,13 +1,14 @@
-//! Property-based tests (`proptest`) for `reticula-core` and `reticula-formula`
-//! (`13-m1a.md` 7.1).
+//! Property-based tests (`proptest`) for `reticula-core`, `reticula-formula`
+//! and `reticula-wire` (`13-m1a.md` 7.1 & `14-m1b.md` 8.1).
 
 use proptest::prelude::*;
 use reticula_core::axis::Axis;
 use reticula_core::format::{CurrencySymbol, NumberFormat};
 use reticula_core::id::{ColId, IdAllocator, IdRun, RowId, SheetId, pack_id};
 use reticula_core::ops::{
-    CellEdit, CellInput, FormatPatch, FormatTarget, FormulaMode, Op, ScalarValue,
+    CellEdit, CellInput, FormatPatch, FormatTarget, FormulaMode, Op, ScalarValue, Workbook,
 };
+use reticula_core::sheet::Sheet;
 use reticula_core::style::{BorderWeight, ColorPatch, ColorValue, HorizontalAlign, StylePatch};
 use reticula_core::value::CalcError;
 use reticula_formula::address::CellAddr;
@@ -18,6 +19,12 @@ use reticula_formula::binder::{
 };
 use reticula_formula::engine::{FormulaEngine, RecalcStatus};
 use reticula_formula::parser::parse_formula;
+use reticula_wire::snapshot::{decode_snapshot_any, encode_snapshot_v1};
+use reticula_wire::v1::{WireOpV1, WireReplicaWatermarkV1, WireWalRecordV1};
+use reticula_wire::wal::{
+    WalCorruption, WalTailDisposition, encode_wal_complete, encode_wal_record, replay_wal_records,
+    scan_wal,
+};
 
 // ============================================================================
 // 1. Axis vs naive Vec<(u64, u32)> model
@@ -922,7 +929,10 @@ proptest! {
         col_count in 1_u32..4,
         axis_mutations in prop::collection::vec((0_u8..4, 0_u32..12), 0..6),
     ) {
-        let mut eng_plan = FormulaEngine::new();
+        let mut eng_plan = FormulaEngine::from_workbook_clean(Workbook::from_sheet(
+            Sheet::with_axes(SheetId(0), String::from("Sheet1"), 64, 16),
+            None,
+        ));
         let s0 = SheetId(0);
         let s1 = eng_plan.alloc_sheet_id();
         eng_plan
@@ -1055,5 +1065,293 @@ proptest! {
             eng_plan.workbook().logical_digest(),
             eng_individual.workbook().logical_digest()
         );
+    }
+}
+
+// ============================================================================
+// 9. `wire::v1` operations & `RTCLSNAP` v1 snapshot round-trip (`14-m1b.md` 8.1 ③)
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(50))]
+
+    #[test]
+    fn prop_wire_v1_ops_and_snapshot_round_trip(
+        steps in prop::collection::vec((0_u8..10, 0_u32..10, 0_u32..5, -500_i32..500), 1..20),
+        replica in 1_u32..100,
+        last_client_seq in 0_u64..10_000,
+        max_id_counter in 0_u32..100_000,
+    ) {
+        let mut eng_direct = FormulaEngine::from_workbook_clean(Workbook::from_sheet(
+            Sheet::with_axes(SheetId(0), String::from("Sheet1"), 48, 12),
+            None,
+        ));
+        let mut eng_replayed = eng_direct.clone();
+        let s0 = SheetId(0);
+
+        for (r, c) in [(0_u64, 0_u64), (1, 0), (2, 0), (0, 1), (1, 1)] {
+            let raw = format!("{}", (r + 1) * 10 + c);
+            eng_direct.edit_cell_raw(s0, RowId(r), ColId(c), &raw).unwrap();
+            eng_replayed.edit_cell_raw(s0, RowId(r), ColId(c), &raw).unwrap();
+        }
+        eng_direct.edit_cell_raw(s0, RowId(0), ColId(2), "=SUM(A1:B3)").unwrap();
+        eng_replayed.edit_cell_raw(s0, RowId(0), ColId(2), "=SUM(A1:B3)").unwrap();
+        eng_direct.recalc_all();
+        eng_replayed.recalc_all();
+
+        for (kind, r_seed, c_seed, num_seed) in steps {
+            let (row, col, r_after) = {
+                let sh = eng_direct.workbook().sheet(s0).unwrap();
+                let r_pos = r_seed % sh.rows().min(12);
+                let c_pos = c_seed % sh.cols().min(6);
+                let after_pos = (r_seed + 3) % sh.rows().min(12);
+                (
+                    RowId(sh.row_id(r_pos)),
+                    ColId(sh.col_id(c_pos)),
+                    RowId(sh.row_id(after_pos)),
+                )
+            };
+
+            let op_opt: Option<Op<BoundFormula>> = match kind {
+                0 => Some(Op::SetCells {
+                    sheet: s0,
+                    edits: vec![CellEdit {
+                        row,
+                        col,
+                        input: CellInput::Scalar(ScalarValue::Number(f64::from(num_seed) / 4.0)),
+                        format: FormatPatch::Set(NumberFormat::Fixed {
+                            decimals: 2,
+                            thousands: true,
+                        }),
+                    }],
+                }),
+                1 => {
+                    let f = BoundFormula::parse_and_bind(
+                        "=A1*2+$B$1",
+                        FormulaMode::Dynamic,
+                        eng_direct.workbook(),
+                        s0,
+                    )
+                    .unwrap();
+                    let tpl = templatize_formula(&f, row, col);
+                    Some(Op::FillFormula {
+                        sheet: s0,
+                        rows: vec![IdRun::new(row.0, 1).unwrap()],
+                        cols: vec![IdRun::new(col.0, 1).unwrap()],
+                        template: tpl,
+                    })
+                }
+                2 => {
+                    let ins = eng_direct.allocator_mut().alloc_run(2).unwrap();
+                    let _ = eng_replayed.allocator_mut().alloc_run(2);
+                    Some(Op::InsertRows {
+                        sheet: s0,
+                        after: Some(row),
+                        ids: ins,
+                    })
+                }
+                3 => {
+                    if row != r_after {
+                        Some(Op::MoveRows {
+                            sheet: s0,
+                            ids: vec![IdRun::new(row.0, 1).unwrap()],
+                            after: Some(r_after),
+                        })
+                    } else {
+                        None
+                    }
+                }
+                4 => Some(Op::ResizeRows {
+                    sheet: s0,
+                    sizes: vec![(IdRun::new(row.0, 1).unwrap(), Some(28 + (r_seed as u16 * 2)))],
+                }),
+                5 => Some(Op::SetFreeze {
+                    sheet: s0,
+                    frozen_rows: r_seed % 4,
+                    frozen_cols: c_seed % 3,
+                }),
+                6 => Some(Op::SetFormat {
+                    sheet: s0,
+                    target: FormatTarget::Rows(vec![IdRun::new(row.0, 1).unwrap()]),
+                    number_format: FormatPatch::Set(NumberFormat::Currency {
+                        symbol: CurrencySymbol::Eur,
+                        decimals: 2,
+                    }),
+                    style: StylePatch {
+                        italic: Some(true),
+                        fill_color: ColorPatch::Set(ColorValue::Rgb(0x112233)),
+                        border_left: Some(BorderWeight::Thin),
+                        ..StylePatch::default()
+                    },
+                }),
+                7 => Some(Op::AddSheet {
+                    sheet: eng_direct.alloc_sheet_id(),
+                    name: String::from("Extra Sheet"),
+                    after: Some(s0),
+                }),
+                8 => Some(Op::ClearRange {
+                    sheet: s0,
+                    rows: vec![IdRun::new(row.0, 1).unwrap()],
+                    cols: vec![IdRun::new(col.0, 1).unwrap()],
+                }),
+                _ => Some(Op::SetCells {
+                    sheet: s0,
+                    edits: vec![CellEdit {
+                        row,
+                        col,
+                        input: CellInput::Scalar(ScalarValue::Text(format!("s{num_seed}"))),
+                        format: FormatPatch::Keep,
+                    }],
+                }),
+            };
+
+            if let Some(op) = op_opt {
+                if matches!(op, Op::AddSheet { .. }) {
+                    let _ = eng_replayed.alloc_sheet_id();
+                }
+                let wire_op = WireOpV1::from(&op);
+                let encoded = postcard::to_allocvec(&wire_op).unwrap();
+                let decoded_wire: WireOpV1 = postcard::from_bytes(&encoded).unwrap();
+                let roundtripped_op = Op::<BoundFormula>::try_from(decoded_wire).unwrap();
+
+                let r1 = eng_direct.apply_op(op);
+                let r2 = eng_replayed.apply_op(roundtripped_op);
+                prop_assert_eq!(r1.is_ok(), r2.is_ok());
+            }
+        }
+
+        eng_direct.recalc_all();
+        eng_replayed.recalc_all();
+        prop_assert_eq!(
+            eng_direct.workbook().logical_digest(),
+            eng_replayed.workbook().logical_digest()
+        );
+
+        let wm = vec![WireReplicaWatermarkV1 {
+            replica,
+            last_client_seq,
+            max_id_counter,
+        }];
+        let snap_bytes = encode_snapshot_v1(eng_direct.workbook(), &wm).unwrap();
+        let decoded = decode_snapshot_any(&snap_bytes).unwrap();
+        prop_assert_eq!(decoded.watermarks, wm);
+        prop_assert_eq!(
+            decoded.engine.workbook().logical_digest(),
+            eng_direct.workbook().logical_digest()
+        );
+    }
+}
+
+// ============================================================================
+// 10. `RTCLWAL1` tail truncation, zero-padding & mid-file corruption (`14-m1b.md` 8.1 ④)
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(80))]
+
+    #[test]
+    fn prop_wal_v1_tail_truncation_zero_pad_and_mid_corruption(
+        base_seq in 0_u64..500,
+        values in prop::collection::vec(-10_000_i32..10_000, 2..8),
+        extra_tail_cut_frac in 0_usize..1000,
+        zero_pad_len in 0_usize..512,
+        mid_flip_frac in 0_usize..1000,
+        flip_mask in 1_u8..=255,
+    ) {
+        let mut records = Vec::with_capacity(values.len());
+        let mut ref_eng = FormulaEngine::new();
+        for (i, &v) in values.iter().enumerate() {
+            let seq = base_seq + (i as u64) + 1;
+            let op: Op<BoundFormula> = Op::SetCells {
+                sheet: SheetId(0),
+                edits: vec![CellEdit {
+                    row: RowId(i as u64),
+                    col: ColId(0),
+                    input: CellInput::Scalar(ScalarValue::Number(f64::from(v) / 10.0)),
+                    format: FormatPatch::Keep,
+                }],
+            };
+            ref_eng.apply_op(op.clone()).unwrap();
+            records.push(WireWalRecordV1 {
+                seq,
+                timestamp_ms: 1_760_000_000_000 + seq,
+                label: format!("Txn {seq}"),
+                ops: vec![WireOpV1::from(&op)],
+            });
+        }
+        ref_eng.recalc_all();
+        let expected_digest = ref_eng.workbook().logical_digest();
+        let last_flushed_seq = base_seq + (records.len() as u64);
+
+        let committed_bytes = encode_wal_complete(base_seq, &records).unwrap();
+
+        // (a) Append an extra unflushed record (`last_flushed_seq + 1`), truncate at
+        //     an arbitrary byte offset inside it, and optionally append `0x00` padding:
+        //     all committed `records` MUST be recovered intact!
+        let extra_op: Op<BoundFormula> = Op::SetCells {
+            sheet: SheetId(0),
+            edits: vec![CellEdit {
+                row: RowId(99),
+                col: ColId(0),
+                input: CellInput::Scalar(ScalarValue::Number(999.0)),
+                format: FormatPatch::Keep,
+            }],
+        };
+        let extra_frame = encode_wal_record(&WireWalRecordV1 {
+            seq: last_flushed_seq + 1,
+            timestamp_ms: 1_760_000_999_999,
+            label: String::from("Unflushed crash tail"),
+            ops: vec![WireOpV1::from(&extra_op)],
+        })
+        .unwrap();
+
+        let cut = extra_tail_cut_frac % extra_frame.len(); // `0..extra_frame.len() - 1`
+        let mut with_tail = committed_bytes.clone();
+        with_tail.extend_from_slice(&extra_frame[..cut]);
+        if cut == 0 && zero_pad_len > 0 {
+            with_tail.extend(std::iter::repeat_n(0_u8, zero_pad_len));
+        }
+
+        let scan = scan_wal(&with_tail, base_seq, last_flushed_seq).unwrap();
+        prop_assert_eq!(scan.records.len(), records.len());
+        prop_assert_eq!(scan.valid_bytes, committed_bytes.len());
+        if cut == 0 && zero_pad_len == 0 {
+            prop_assert_eq!(scan.tail, WalTailDisposition::Clean);
+        } else if cut == 0 {
+            prop_assert_eq!(
+                scan.tail,
+                WalTailDisposition::ZeroPaddedTail {
+                    valid_bytes: committed_bytes.len()
+                }
+            );
+        } else {
+            let tail_ok = matches!(
+                scan.tail,
+                WalTailDisposition::TornFinalRecord { .. }
+                    | WalTailDisposition::ZeroPaddedTail { .. }
+            );
+            prop_assert!(tail_ok);
+        }
+
+        let mut replayed = FormulaEngine::new();
+        replay_wal_records(&mut replayed, &scan.records, 0, true).unwrap();
+        prop_assert_eq!(replayed.workbook().logical_digest(), expected_digest);
+
+        // (b) Flip any non-zero mask in any mid-file byte (header, meta, or any
+        //     record `0 .. records.len() - 1`): MUST be detected as corruption!
+        let prefix_before_last =
+            encode_wal_complete(base_seq, &records[..records.len() - 1]).unwrap();
+        let flip_pos = mid_flip_frac % prefix_before_last.len();
+        let mut tampered = committed_bytes;
+        tampered[flip_pos] ^= flip_mask;
+        let err = scan_wal(&tampered, base_seq, last_flushed_seq).unwrap_err();
+        let corrupt_ok = matches!(
+            err,
+            WalCorruption::InvalidHeader
+                | WalCorruption::BaseSeqMismatch { .. }
+                | WalCorruption::NonContiguousSeq { .. }
+                | WalCorruption::MidFileCorruption { .. }
+        );
+        prop_assert!(corrupt_ok);
     }
 }

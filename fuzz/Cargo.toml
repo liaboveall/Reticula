@@ -30,6 +30,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "fuzz_wal"
+path = "fuzz_targets/fuzz_wal.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "fuzz_ops"
 path = "fuzz_targets/fuzz_ops.rs"
 test = false

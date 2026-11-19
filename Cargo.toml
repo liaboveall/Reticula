@@ -6,6 +6,7 @@ members = [
     "crates/kernel-bench",
     "crates/server",
     "crates/wasm",
+    "crates/wire",
     "crates/xtask",
     "spikes/determinism",
 ]
@@ -21,6 +22,7 @@ publish = false
 [workspace.dependencies]
 reticula-core = { path = "crates/core" }
 reticula-formula = { path = "crates/formula" }
+reticula-wire = { path = "crates/wire" }
 
 # Pinned exactly: results of the math functions are part of the engine's
 # observable behaviour, so an upgrade is a deliberate, reviewed change.

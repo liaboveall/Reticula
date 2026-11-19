@@ -1606,9 +1606,11 @@ dependencies = [
  "formualizer-eval",
  "formualizer-parse",
  "ironcalc_base",
+ "postcard",
  "proptest",
  "reticula-core",
  "reticula-formula",
+ "reticula-wire",
  "serde",
  "serde_json",
 ]
@@ -1631,6 +1633,18 @@ dependencies = [
  "serde",
  "tsify",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "reticula-wire"
+version = "0.0.0"
+dependencies = [
+ "lz4_flex",
+ "postcard",
+ "reticula-core",
+ "reticula-formula",
+ "serde",
+ "wasm-bindgen-test",
 ]
 
 [[package]]
@@ -2393,6 +2407,7 @@ version = "0.0.0"
 dependencies = [
  "reticula-core",
  "reticula-formula",
+ "reticula-wire",
  "serde_json",
 ]
 

@@ -10,10 +10,15 @@ const WASM_TARGET: &str = "wasm32-unknown-unknown";
 const NO_STD_TARGET: &str = "wasm32v1-none";
 
 /// Crates that make up the engine kernel, by directory name under `crates/`.
-const KERNEL_CRATES: [&str; 2] = ["core", "formula"];
+const KERNEL_CRATES: [&str; 3] = ["core", "formula", "wire"];
 
 /// Packages that are compiled to WebAssembly.
-const WASM_PACKAGES: [&str; 3] = ["reticula-core", "reticula-formula", "reticula-wasm"];
+const WASM_PACKAGES: [&str; 4] = [
+    "reticula-core",
+    "reticula-formula",
+    "reticula-wire",
+    "reticula-wasm",
+];
 
 pub fn check() -> Result {
     util::step("rustfmt");

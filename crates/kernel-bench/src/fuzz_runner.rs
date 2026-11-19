@@ -1,18 +1,25 @@
-//! Multi-threaded mutation & `arbitrary` fuzz runner (`13-m1a.md` 7.3).
+//! Multi-threaded mutation & `arbitrary` fuzz runner (`14-m1b.md` 8.1).
 //!
-//! Runs the four shared harnesses (`fuzz_one_parser`, `fuzz_one_snapshot`,
-//! `fuzz_one_ops`, `fuzz_one_eval`) across `threads` worker threads until
-//! cumulative CPU time exceeds `target_cpu_seconds`.
+//! Runs all five shared harnesses (`fuzz_one_parser`, `fuzz_one_snapshot`,
+//! `fuzz_one_wal`, `fuzz_one_ops`, `fuzz_one_eval`) across `threads` worker
+//! threads until cumulative CPU time exceeds `target_cpu_seconds`.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use reticula_core::id::{ColId, RowId, SheetId};
+use reticula_core::ops::{CellEdit, CellInput, FormatPatch, Op, ScalarValue};
 use reticula_core::rng::Rng;
+use reticula_formula::binder::BoundFormula;
 use reticula_formula::engine::FormulaEngine;
+use reticula_wire::snapshot::{encode_seed_stub_v1, encode_snapshot_v1};
+use reticula_wire::v1::{WireOpV1, WireWalRecordV1};
+use reticula_wire::wal::encode_wal_complete;
 use serde::Serialize;
 
-use crate::fuzz_harnesses::{fuzz_one_eval, fuzz_one_ops, fuzz_one_parser, fuzz_one_snapshot};
+use crate::fuzz_harnesses::{
+    fuzz_one_eval, fuzz_one_ops, fuzz_one_parser, fuzz_one_snapshot, fuzz_one_wal,
+};
 
 /// Summary of a completed fuzzing campaign.
 #[derive(Clone, Debug, Serialize)]
@@ -23,10 +30,12 @@ pub struct FuzzReport {
     pub wall_seconds: f64,
     /// Cumulative CPU-seconds (`wall_seconds * threads`).
     pub cpu_seconds: f64,
-    /// Total parser/lexer/E30 executions.
+    /// Total parser/lexer/E30/CSV executions.
     pub parser_execs: u64,
-    /// Total `RTCLSNAP` snapshot decode executions.
+    /// Total `RTCLSNAP` v0 & v1 snapshot decode executions.
     pub snapshot_execs: u64,
+    /// Total `RTCLWAL1` WAL scan & replay executions.
+    pub wal_execs: u64,
     /// Total structured operation-sequence executions.
     pub ops_execs: u64,
     /// Total `BoundExpr` evaluator executions.
@@ -35,7 +44,7 @@ pub struct FuzzReport {
     pub seed_corpus_count: usize,
 }
 
-const DICT_TOKENS: [&[u8]; 18] = [
+const DICT_TOKENS: [&[u8]; 20] = [
     b"=SUM(A1:B10)",
     b"=ROUND(J2*K2*(1-L2-$V$1),2)",
     b"='Sheet 1'!$A$1:$XFD$1048576",
@@ -44,20 +53,22 @@ const DICT_TOKENS: [&[u8]; 18] = [
     b"=-2^3^2",
     b"=IF(AND(A1>0,OR(B1,NOT(C1))),IFERROR(1/0,IFNA(#N/A,42)),0)",
     b"=ROW()*100+COLUMN(B:D)+SUM(1:5)",
+    b"=VLOOKUP(\"SKU-1\",Data!A1:B10,2,FALSE)+SUMIF(A1:A5,\"alpha*\",B1:B5)",
     b"1900-02-29",
     b"9999-12-31",
     b"-0.0%",
     b"#SPILL!",
     b"#CYCLE!",
-    b"RTCLSNAP\x00\x00\x00\x00",
+    b"RTCLSNAP\x01\x00\x00\x00",
+    b"RTCLWAL1\x01\x00\x00\x00",
     b"\xff\xff\xff\xff\x7f\xfc\x00\x04\x00\x00\x00\xff",
     b"((((((((((((((((1))))))))))))))))",
     b"=CONCAT(TRIM(\"  a  b \"),MID(\"hello\",2,3))",
-    b"=A1+B1+A1",
+    b"a,\"b\"\"c\nline2\",=not_formula\r\n1,2,3\r\n",
 ];
 
-/// Builds initial seed corpus buffers (including real `RTCLSNAP` snapshots so
-/// byte mutations explore deep decoder paths).
+/// Builds initial seed corpus buffers (including real `RTCLSNAP` v0/v1
+/// snapshots and `RTCLWAL1` framed logs so mutations explore deep decoder paths).
 #[must_use]
 pub fn build_seed_corpus() -> Vec<Vec<u8>> {
     let mut seeds: Vec<Vec<u8>> = DICT_TOKENS.iter().map(|s| s.to_vec()).collect();
@@ -67,18 +78,54 @@ pub fn build_seed_corpus() -> Vec<Vec<u8>> {
     let _ = eng.edit_cell_raw(SheetId(0), RowId(1), ColId(0), "hello");
     let _ = eng.edit_cell_raw(SheetId(0), RowId(0), ColId(1), "=SUM(A1:A2)");
     eng.recalc_all();
-    if let Ok(snap) = eng.encode_snapshot() {
-        seeds.push(snap);
+    if let Ok(snap_v0) = eng.encode_snapshot() {
+        seeds.push(snap_v0);
+    }
+    if let Ok(snap_v1) = encode_snapshot_v1(eng.workbook(), &[]) {
+        seeds.push(snap_v1);
     }
 
     let sample_eng = FormulaEngine::open_sample(7, 25);
-    if let Ok(snap2) = sample_eng.encode_snapshot() {
+    if let Ok(snap2) = encode_snapshot_v1(sample_eng.workbook(), &[]) {
         seeds.push(snap2);
     }
+    if let Some(origin) = sample_eng.workbook().seed_origin()
+        && let Ok(stub) = encode_seed_stub_v1(origin, &[])
+    {
+        seeds.push(stub);
+    }
+
+    let wal_op: Op<BoundFormula> = Op::SetCells {
+        sheet: SheetId(0),
+        edits: vec![CellEdit {
+            row: RowId(0),
+            col: ColId(0),
+            input: CellInput::Scalar(ScalarValue::Number(123.0)),
+            format: FormatPatch::Keep,
+        }],
+    };
+    let wal_records = vec![
+        WireWalRecordV1 {
+            seq: 1,
+            timestamp_ms: 1_760_000_000_001,
+            label: String::from("Edit A1"),
+            ops: vec![WireOpV1::from(&wal_op)],
+        },
+        WireWalRecordV1 {
+            seq: 2,
+            timestamp_ms: 1_760_000_000_002,
+            label: String::from("Edit A1 again"),
+            ops: vec![WireOpV1::from(&wal_op)],
+        },
+    ];
+    if let Ok(wal_bytes) = encode_wal_complete(0, &wal_records) {
+        seeds.push(wal_bytes);
+    }
+
     seeds
 }
 
-/// Runs all four fuzz targets in parallel across `threads` threads until
+/// Runs all five fuzz targets in parallel across `threads` threads until
 /// `threads * wall_elapsed >= target_cpu_seconds`.
 pub fn run_fuzz_campaign(target_cpu_seconds: u64, threads: usize) -> FuzzReport {
     let worker_count = threads.max(1);
@@ -89,6 +136,7 @@ pub fn run_fuzz_campaign(target_cpu_seconds: u64, threads: usize) -> FuzzReport 
 
     let parser_execs = AtomicU64::new(0);
     let snapshot_execs = AtomicU64::new(0);
+    let wal_execs = AtomicU64::new(0);
     let ops_execs = AtomicU64::new(0);
     let eval_execs = AtomicU64::new(0);
 
@@ -98,6 +146,7 @@ pub fn run_fuzz_campaign(target_cpu_seconds: u64, threads: usize) -> FuzzReport 
             let seeds_ref = &seeds;
             let p_cnt = &parser_execs;
             let s_cnt = &snapshot_execs;
+            let w_cnt = &wal_execs;
             let o_cnt = &ops_execs;
             let e_cnt = &eval_execs;
 
@@ -107,13 +156,14 @@ pub fn run_fuzz_campaign(target_cpu_seconds: u64, threads: usize) -> FuzzReport 
                 let mut buf = Vec::with_capacity(512);
                 let mut local_p = 0_u64;
                 let mut local_s = 0_u64;
+                let mut local_w = 0_u64;
                 let mut local_o = 0_u64;
                 let mut local_e = 0_u64;
                 let mut iter = 0_u64;
 
                 while started.elapsed() < wall_budget {
                     mutate_input(&mut rng, seeds_ref, &mut buf);
-                    match iter & 3 {
+                    match iter % 5 {
                         0 => {
                             fuzz_one_parser(&buf);
                             local_p += 1;
@@ -123,6 +173,10 @@ pub fn run_fuzz_campaign(target_cpu_seconds: u64, threads: usize) -> FuzzReport 
                             local_s += 1;
                         }
                         2 => {
+                            fuzz_one_wal(&buf);
+                            local_w += 1;
+                        }
+                        3 => {
                             fuzz_one_ops(&buf);
                             local_o += 1;
                         }
@@ -140,6 +194,7 @@ pub fn run_fuzz_campaign(target_cpu_seconds: u64, threads: usize) -> FuzzReport 
 
                 p_cnt.fetch_add(local_p, Ordering::Relaxed);
                 s_cnt.fetch_add(local_s, Ordering::Relaxed);
+                w_cnt.fetch_add(local_w, Ordering::Relaxed);
                 o_cnt.fetch_add(local_o, Ordering::Relaxed);
                 e_cnt.fetch_add(local_e, Ordering::Relaxed);
             });
@@ -153,6 +208,7 @@ pub fn run_fuzz_campaign(target_cpu_seconds: u64, threads: usize) -> FuzzReport 
         cpu_seconds: wall_seconds * (worker_count as f64),
         parser_execs: parser_execs.load(Ordering::Relaxed),
         snapshot_execs: snapshot_execs.load(Ordering::Relaxed),
+        wal_execs: wal_execs.load(Ordering::Relaxed),
         ops_execs: ops_execs.load(Ordering::Relaxed),
         eval_execs: eval_execs.load(Ordering::Relaxed),
         seed_corpus_count,

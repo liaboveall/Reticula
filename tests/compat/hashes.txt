@@ -1,0 +1,5 @@
+# Frozen SHA-256 manifest for wire v1 schema and compatibility fixtures (D-020).
+4e86a1c9fd217754792ed070d2670385d64e3132505b379f5145b787ea20a46d  crates/wire/src/v1.rs
+daf592b316cbc492f6231cc913106448fdcd426de533e88b5d2d9ef262fce7eb  tests/compat/v1/base.rtclsnap
+9b1a799613cef41361ee850ad38341974c66cd8c632cd6f7d20484c10c094aa3  tests/compat/v1/expected_digest.txt
+87527a8adb698277f9d1c0a6780ee8e77a09ee871ec38a2d1161cfa1fd63e2b8  tests/compat/v1/replay.rtclwal

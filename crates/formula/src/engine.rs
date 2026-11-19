@@ -178,13 +178,29 @@ impl FormulaEngine {
     #[must_use]
     pub fn from_workbook_clean(workbook: Workbook<BoundFormula>) -> Self {
         let count = workbook.formulas().len();
-        let mut engine = Self {
+        let mut dep_graph = DepGraph::new();
+        let mut slots = Vec::with_capacity(count);
+        let states = vec![STATE_CLEAN; count];
+        let mut cell_to_fid = FxMap::with_capacity_and_hasher(count, BuildHasherDefault::default());
+        let mut volatile_set = BTreeSet::new();
+
+        for (&key, formula) in workbook.formulas() {
+            let fid = u32::try_from(slots.len()).unwrap_or(0);
+            let reg = dep_graph.register(fid, key.0, formula);
+            if formula.is_volatile() {
+                volatile_set.insert(fid);
+            }
+            slots.push(Some(FormulaSlot { key, reg }));
+            cell_to_fid.insert(key, fid);
+        }
+
+        Self {
             workbook,
-            dep_graph: DepGraph::new(),
-            slots: Vec::with_capacity(count),
-            states: Vec::with_capacity(count),
+            dep_graph,
+            slots,
+            states,
             free_slots: Vec::new(),
-            cell_to_fid: FxMap::with_capacity_and_hasher(count, BuildHasherDefault::default()),
+            cell_to_fid,
             non_clean_in_col: FxMap::default(),
             dirty_queue: Vec::new(),
             dirty_cursor: 0,
@@ -192,19 +208,9 @@ impl FormulaEngine {
             call_stack: Vec::new(),
             wave_done: 0,
             changes: DirtyChanges::default(),
-            volatile_set: BTreeSet::new(),
+            volatile_set,
             env: EvalEnv::default(),
-        };
-        let keys_and_formulas: Vec<(WorkbookCellKey, BoundFormula)> = engine
-            .workbook
-            .formulas()
-            .iter()
-            .map(|(&k, f)| (k, f.clone()))
-            .collect();
-        for (key, formula) in keys_and_formulas {
-            let _ = engine.insert_slot(key, &formula, false);
         }
-        engine
     }
 
     /// Rebuilds an engine from `workbook` and marks every formula dirty for a

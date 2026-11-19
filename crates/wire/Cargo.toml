@@ -1,0 +1,22 @@
+[package]
+name = "reticula-wire"
+description = "Frozen versioned wire formats, CoW streaming snapshots (RTCLSNAP v1) and CRC-framed WAL (RTCLWAL1)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+lz4_flex = { workspace = true }
+postcard = { workspace = true }
+reticula-core = { workspace = true }
+reticula-formula = { workspace = true }
+serde = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = { workspace = true }

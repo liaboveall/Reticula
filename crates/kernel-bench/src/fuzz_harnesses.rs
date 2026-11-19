@@ -1,34 +1,45 @@
 //! Structured and byte-level fuzz harnesses shared by `cargo-fuzz` (`fuzz/`)
-//! and `cargo xtask fuzz` (`09-quality.md` & `13-m1a.md` 7.3).
+//! and `cargo xtask fuzz` (`09-quality.md` & `14-m1b.md` 8.1).
 //!
 //! Covers:
 //! 1. `fuzz_one_parser`: arbitrary byte/UTF-8 inputs to lexer, parser, pretty
-//!    printer and E30 input type inference;
-//! 2. `fuzz_one_snapshot`: arbitrary byte slices fed into `decode_snapshot`;
-//! 3. `fuzz_one_ops`: `arbitrary::Unstructured`-generated valid and adversarial
-//!    operation sequences applied to a small workbook;
-//! 4. `fuzz_one_eval`: arbitrary `BoundExpr` syntax trees + arbitrary cell
+//!    printer, E30 input type inference, and RFC 4180 CSV parser;
+//! 2. `fuzz_one_snapshot`: arbitrary byte slices fed into `RTCLSNAP` v0 & v1 decoders;
+//! 3. `fuzz_one_wal`: arbitrary byte slices fed into `RTCLWAL1` scanner & replay;
+//! 4. `fuzz_one_ops`: `arbitrary::Unstructured`-generated valid and adversarial
+//!    M1b operation sequences + `WireOpV1` round-trip;
+//! 5. `fuzz_one_eval`: arbitrary `BoundExpr` syntax trees + arbitrary cell
 //!    contents evaluated in `FormulaEngine`.
 
 use arbitrary::Unstructured;
+use reticula_core::csv::import_csv_sheet;
 use reticula_core::format::NumberFormat;
 use reticula_core::id::{ColId, IdRun, RowId, SheetId, pack_id};
-use reticula_core::input::infer_input;
+use reticula_core::input::{infer_input, infer_input_scalar_only};
 use reticula_core::ops::{
-    CellEdit, CellInput, FormatPatch, FormulaMode, Op, RawFormula, ScalarValue, Workbook,
+    CellEdit, CellInput, FormatPatch, FormatTarget, FormulaMode, Op, RawFormula, ScalarValue,
+    Workbook,
 };
 use reticula_core::snapshot::decode_snapshot;
+use reticula_core::style::{BorderWeight, ColorPatch, ColorValue, HorizontalAlign, StylePatch};
 use reticula_core::value::CalcError;
 use reticula_formula::ast::{BinaryOp, Literal, UnaryOp};
-use reticula_formula::binder::{BoundExpr, BoundFormula, BoundRef};
+use reticula_formula::binder::{BoundExpr, BoundFormula, BoundRef, templatize_formula};
 use reticula_formula::engine::FormulaEngine;
 use reticula_formula::lexer::tokenize;
 use reticula_formula::parser::{parse_expr, parse_formula};
+use reticula_wire::snapshot::decode_snapshot_any;
+use reticula_wire::v1::WireOpV1;
+use reticula_wire::wal::{replay_wal_records, scan_wal};
 
-/// Target 1: formula lexer, Pratt parser, AST printer, and E30 input inference.
+/// Target 1: formula lexer, Pratt parser, AST printer, E30 input inference, and CSV.
 pub fn fuzz_one_parser(data: &[u8]) {
     let text = String::from_utf8_lossy(data);
     let _ = infer_input(&text);
+    let _ = infer_input_scalar_only(&text);
+    if data.len() <= 2048 {
+        let _ = import_csv_sheet(SheetId(0), String::from("CSV"), data, None);
+    }
     let _ = tokenize(&text);
     if let Ok(ast) = parse_expr(&text) {
         let printed = ast.to_formula_string();
@@ -40,33 +51,43 @@ pub fn fuzz_one_parser(data: &[u8]) {
     }
 }
 
-/// Target 2: untrusted `RTCLSNAP` v0 binary snapshot decoder.
+/// Target 2: untrusted `RTCLSNAP` v0 & v1 binary snapshot decoders.
 pub fn fuzz_one_snapshot(data: &[u8]) {
     let _ = decode_snapshot::<RawFormula>(data);
-    let _ = FormulaEngine::decode_snapshot(data);
+    let _ = decode_snapshot_any(data);
 }
 
-/// Target 3: structured valid + invalid operation sequences on a workbook.
+/// Target 3: untrusted `RTCLWAL1` CRC-framed log scanner and replay.
+pub fn fuzz_one_wal(data: &[u8]) {
+    let _ = scan_wal(data, 0, 5);
+    if let Ok(scan) = scan_wal(data, 0, 0) {
+        let mut eng = FormulaEngine::new();
+        let _ = replay_wal_records(&mut eng, &scan.records, 0, true);
+    }
+}
+
+/// Target 4: structured valid + invalid M1b operation sequences on an engine.
+#[allow(clippy::too_many_lines)]
 pub fn fuzz_one_ops(data: &[u8]) {
     let mut u = Unstructured::new(data);
-    let mut wb: Workbook<RawFormula> = Workbook::new();
-    let count: u8 = u.int_in_range(0..=32).unwrap_or(0);
+    let mut eng = FormulaEngine::new();
+    let count: u8 = u.int_in_range(0..=24).unwrap_or(0);
 
     for _ in 0..count {
         let sheet = if u.ratio(7, 8).unwrap_or(true) {
             SheetId(0)
         } else {
-            SheetId(u.arbitrary().unwrap_or(1))
+            SheetId(u.int_in_range(0..=3).unwrap_or(1))
         };
-        let kind: u8 = u.int_in_range(0..=5).unwrap_or(0);
-        let op = match kind {
+        let kind: u8 = u.int_in_range(0..=15).unwrap_or(0);
+        let op: Op<BoundFormula> = match kind {
             0 => {
-                let n: usize = u.int_in_range(0..=16).unwrap_or(0);
+                let n: usize = u.int_in_range(0..=8).unwrap_or(0);
                 let mut edits = Vec::with_capacity(n);
                 for _ in 0..n {
                     let row = arb_row_id(&mut u);
                     let col = arb_col_id(&mut u);
-                    let input = arb_raw_cell_input(&mut u);
+                    let input = arb_bound_cell_input(&mut u);
                     let format = match u.int_in_range(0_u8..=2).unwrap_or(0) {
                         0 => FormatPatch::Keep,
                         1 => FormatPatch::Set(NumberFormat::Fixed2),
@@ -93,8 +114,8 @@ pub fn fuzz_one_ops(data: &[u8]) {
                     None
                 };
                 let ids = if u.ratio(3, 4).unwrap_or(true) {
-                    let len = u.int_in_range(1_u32..=8).unwrap_or(1);
-                    wb.allocator_mut().alloc_run(len).unwrap_or(IdRun {
+                    let len = u.int_in_range(1_u32..=4).unwrap_or(1);
+                    eng.allocator_mut().alloc_run(len).unwrap_or(IdRun {
                         first_id: 0,
                         len: 1,
                     })
@@ -116,24 +137,105 @@ pub fn fuzz_one_ops(data: &[u8]) {
                 sheet,
                 ids: vec![arb_id_run(&mut u)],
             },
-            _ => Op::DeleteCols {
+            5 => Op::DeleteCols {
                 sheet,
                 ids: vec![arb_id_run(&mut u)],
             },
+            6 => Op::UndeleteRows {
+                sheet,
+                ids: vec![arb_id_run(&mut u)],
+            },
+            7 => Op::MoveRows {
+                sheet,
+                ids: vec![arb_id_run(&mut u)],
+                after: if u.arbitrary().unwrap_or(false) {
+                    Some(arb_row_id(&mut u))
+                } else {
+                    None
+                },
+            },
+            8 => Op::MoveCols {
+                sheet,
+                ids: vec![arb_id_run(&mut u)],
+                after: if u.arbitrary().unwrap_or(false) {
+                    Some(arb_col_id(&mut u))
+                } else {
+                    None
+                },
+            },
+            9 => Op::ResizeRows {
+                sheet,
+                sizes: vec![(arb_id_run(&mut u), u.arbitrary().unwrap_or(Some(30)))],
+            },
+            10 => Op::SetFreeze {
+                sheet,
+                frozen_rows: u.int_in_range(0_u32..=40).unwrap_or(0),
+                frozen_cols: u.int_in_range(0_u32..=40).unwrap_or(0),
+            },
+            11 => Op::SetFormat {
+                sheet,
+                target: FormatTarget::Cells {
+                    rows: vec![arb_id_run(&mut u)],
+                    cols: vec![arb_id_run(&mut u)],
+                },
+                number_format: FormatPatch::Set(NumberFormat::Percent),
+                style: StylePatch {
+                    bold: Some(true),
+                    align: Some(HorizontalAlign::Center),
+                    text_color: ColorPatch::Set(ColorValue::Palette(1)),
+                    border_top: Some(BorderWeight::Thin),
+                    ..StylePatch::default()
+                },
+            },
+            12 => {
+                let f = BoundFormula {
+                    mode: FormulaMode::Dynamic,
+                    root: arb_bound_expr(&mut u, 2),
+                };
+                let tpl = templatize_formula(&f, RowId(0), ColId(0));
+                Op::FillFormula {
+                    sheet,
+                    rows: vec![IdRun {
+                        first_id: u.int_in_range(0_u64..=8).unwrap_or(0),
+                        len: u.int_in_range(1_u32..=4).unwrap_or(1),
+                    }],
+                    cols: vec![IdRun {
+                        first_id: u.int_in_range(0_u64..=4).unwrap_or(0),
+                        len: 1,
+                    }],
+                    template: tpl,
+                }
+            }
+            13 => Op::AddSheet {
+                sheet: SheetId(u.int_in_range(1_u32..=4).unwrap_or(1)),
+                name: String::from("FuzzTab"),
+                after: Some(SheetId(0)),
+            },
+            14 => Op::DeleteSheet { sheet },
+            _ => Op::UndeleteSheet { sheet },
         };
 
-        let before = wb.logical_digest();
-        match wb.apply(op) {
+        let wire = WireOpV1::from(&op);
+        if let Ok(bytes) = postcard::to_allocvec(&wire)
+            && let Ok(decoded_w) = postcard::from_bytes::<WireOpV1>(&bytes)
+        {
+            let _ = Op::<BoundFormula>::try_from(decoded_w);
+        }
+
+        let before = eng.workbook().logical_digest();
+        match eng.apply_op(op) {
             Ok(inv) => {
                 if u.ratio(1, 4).unwrap_or(false) {
-                    let _ = wb.apply_inverse(inv);
+                    let _ = eng.apply_inverse(inv);
                 }
             }
             Err(_) => {
-                assert_eq!(wb.logical_digest(), before);
+                assert_eq!(eng.workbook().logical_digest(), before);
             }
         }
     }
+    eng.recalc_all();
+    let _ = Workbook::<RawFormula>::new();
 }
 
 /// Target 4: arbitrary `BoundExpr` trees + arbitrary sheet cell values fed into
@@ -228,23 +330,17 @@ fn arb_scalar(u: &mut Unstructured<'_>) -> ScalarValue {
     }
 }
 
-fn arb_raw_cell_input(u: &mut Unstructured<'_>) -> CellInput<RawFormula> {
+fn arb_bound_cell_input(u: &mut Unstructured<'_>) -> CellInput<BoundFormula> {
     match u.int_in_range(0_u8..=2).unwrap_or(0) {
         0 => CellInput::Empty,
         1 => CellInput::Scalar(arb_scalar(u)),
-        _ => {
-            let len = u.int_in_range(0_usize..=32).unwrap_or(0);
-            let bytes = u.bytes(len).unwrap_or(&[]);
-            let mut s = String::from("=");
-            s.push_str(&String::from_utf8_lossy(bytes));
-            CellInput::Formula {
-                formula: RawFormula {
-                    source: s,
-                    mode: FormulaMode::Dynamic,
-                },
-                cached: None,
-            }
-        }
+        _ => CellInput::Formula {
+            formula: BoundFormula {
+                mode: FormulaMode::Dynamic,
+                root: arb_bound_expr(u, 2),
+            },
+            cached: None,
+        },
     }
 }
 
@@ -354,10 +450,45 @@ fn arb_bound_expr(u: &mut Unstructured<'_>, depth: usize) -> BoundExpr {
             }
         }
         _ => {
-            const FUNCS: [&str; 24] = [
-                "SUM", "AVERAGE", "COUNT", "COUNTA", "MIN", "MAX", "IF", "AND", "OR", "NOT",
-                "IFERROR", "IFNA", "ABS", "ROUND", "INT", "TRUNC", "MOD", "SQRT", "POWER", "LEN",
-                "TRIM", "MID", "ISBLANK", "ROW",
+            const FUNCS: [&str; 38] = [
+                "SUM",
+                "AVERAGE",
+                "COUNT",
+                "COUNTA",
+                "MIN",
+                "MAX",
+                "IF",
+                "AND",
+                "OR",
+                "NOT",
+                "IFERROR",
+                "IFNA",
+                "ABS",
+                "ROUND",
+                "INT",
+                "TRUNC",
+                "MOD",
+                "SQRT",
+                "POWER",
+                "LEN",
+                "TRIM",
+                "MID",
+                "ISBLANK",
+                "ROW",
+                "VLOOKUP",
+                "HLOOKUP",
+                "INDEX",
+                "MATCH",
+                "CHOOSE",
+                "ROWS",
+                "COUNTBLANK",
+                "COUNTIF",
+                "SUMIF",
+                "DATE",
+                "EDATE",
+                "FLOOR",
+                "SEARCH",
+                "TEXT",
             ];
             let idx = u.int_in_range(0_usize..=FUNCS.len() - 1).unwrap_or(0);
             let argc = u.int_in_range(0_usize..=4).unwrap_or(1);
