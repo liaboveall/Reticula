@@ -29,7 +29,7 @@ export interface Theme {
   readonly fontSize: number;
 }
 
-const LIGHT_PALETTE_TEXT = [
+export const LIGHT_PALETTE_TEXT = [
   "#334155",
   "#dc2626",
   "#c2410c",
@@ -40,7 +40,7 @@ const LIGHT_PALETTE_TEXT = [
   "#0f766e",
 ] as const;
 
-const DARK_PALETTE_TEXT = [
+export const DARK_PALETTE_TEXT = [
   "#cbd5e1",
   "#f87171",
   "#fb923c",
@@ -51,7 +51,7 @@ const DARK_PALETTE_TEXT = [
   "#2dd4bf",
 ] as const;
 
-const LIGHT_PALETTE_FILL = [
+export const LIGHT_PALETTE_FILL = [
   "#f1f5f9",
   "#fee2e2",
   "#ffedd5",
@@ -62,7 +62,7 @@ const LIGHT_PALETTE_FILL = [
   "#ccfbf1",
 ] as const;
 
-const DARK_PALETTE_FILL = [
+export const DARK_PALETTE_FILL = [
   "#252b36",
   "#3f1d22",
   "#3f2817",

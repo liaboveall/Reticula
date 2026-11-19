@@ -45,10 +45,16 @@ function run(engine: Engine, command: EngineCommand): void {
     if (event) {
       scope.postMessage(event);
     }
-    // Each page is handed over rather than copied: the buffer moves to the
-    // main thread and is gone from this one.
+    // Collect due pages first so any cross-axis styles lazily interned during
+    // `takePage` are posted via `takeAuxEvent` BEFORE the page buffers arrive.
+    const pages: ArrayBuffer[] = [];
     for (let page = engine.takePage(); page; page = engine.takePage()) {
-      const buffer = page.buffer as ArrayBuffer;
+      pages.push(page.buffer as ArrayBuffer);
+    }
+    for (let aux = engine.takeAuxEvent(); aux; aux = engine.takeAuxEvent()) {
+      scope.postMessage(aux);
+    }
+    for (const buffer of pages) {
       scope.postMessage(buffer, [buffer]);
     }
     scheduleContinue();

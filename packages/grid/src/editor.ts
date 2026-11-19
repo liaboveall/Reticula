@@ -1,5 +1,7 @@
 import { EditorState } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
+import type { WireFormulaAnalysis } from "@reticula/protocol";
+import { formulaDecorationExtension, setFormulaAnalysisEffect } from "./formula-input.ts";
 import type { Grid } from "./grid.ts";
 
 /** A cell, by position. */
@@ -45,6 +47,8 @@ export interface CellEditorOptions {
   readonly onTextChange?: (text: string, editing: CellPosition | null, cursorUtf16: number) => void;
   /** Called when `F4` is pressed inside an active formula edit. */
   readonly onToggleDollar?: (text: string, cursorUtf16: number) => void;
+  /** Optional hook for accepting formula completions (`Tab` / navigated `Enter`) during in-cell editing. */
+  readonly onFormulaKeyDown?: (event: KeyboardEvent, text: string, cursorUtf16: number) => boolean;
   /** Returns `true` when clicking the grid should insert a formula reference instead of committing. */
   readonly isPointAndClickActive?: () => boolean;
   /** `Ctrl+Arrow` / `Ctrl+Shift+Arrow` data-edge jump request. */
@@ -106,6 +110,7 @@ export class CellEditor {
           EditorState.transactionFilter.of((transaction) =>
             transaction.newDoc.lines > 1 ? [] : transaction,
           ),
+          formulaDecorationExtension(),
           EditorView.updateListener.of((update) => {
             if (update.docChanged || (this.#cell && update.selectionSet)) {
               if (!this.#suppressAutoStart && !this.#cell && update.state.doc.length > 0) {
@@ -240,6 +245,13 @@ export class CellEditor {
     this.#options.onTextChange?.(text, this.#cell, clampedHead);
   }
 
+  /** Updates live formula syntax/reference/diagnostic decorations on the cell editor. */
+  setFormulaAnalysis(analysis: WireFormulaAnalysis | null): void {
+    this.#view.dispatch({
+      effects: setFormulaAnalysisEffect.of(analysis),
+    });
+  }
+
   commitExternal(moveDown = true): void {
     const cell = this.#commit();
     if (cell && moveDown) {
@@ -256,6 +268,13 @@ export class CellEditor {
       this.#note({ kind: "cancelled", cell });
     }
     this.#view.focus();
+  }
+
+  /** Closes the in-grid overlay without emitting `cancelled` or stealing focus (used when switching tabs mid-formula). */
+  clearSilent(): void {
+    if (this.#cell) {
+      this.#finish();
+    }
   }
 
   destroy(): void {
@@ -358,6 +377,12 @@ export class CellEditor {
     const plain = !mod && !event.altKey;
 
     if (this.#cell) {
+      if (
+        this.text.startsWith("=") &&
+        this.#options.onFormulaKeyDown?.(event, this.text, view.state.selection.main.head)
+      ) {
+        return "swallowed";
+      }
       if (event.key === "F4" && this.text.startsWith("=")) {
         event.preventDefault();
         this.#options.onToggleDollar?.(this.text, view.state.selection.main.head);

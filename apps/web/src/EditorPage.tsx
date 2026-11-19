@@ -1,7 +1,28 @@
-import { CellEditor, Grid, type GridStats, type Selection } from "@reticula/grid";
-import type { EngineInfo, SheetInfo } from "@reticula/protocol";
-import { useEffect, useRef, useState } from "react";
+import {
+  CellEditor,
+  DARK_PALETTE_FILL,
+  DARK_PALETTE_TEXT,
+  Grid,
+  type GridContextTarget,
+  type GridStats,
+  LIGHT_PALETTE_FILL,
+  LIGHT_PALETTE_TEXT,
+  type Selection,
+} from "@reticula/grid";
+import type {
+  EngineInfo,
+  SheetInfo,
+  SheetTabInfo,
+  WireCellStyle,
+  WireCompletionItem,
+  WireFormatPatch,
+  WireFormulaAnalysis,
+  WireHorizontalAlign,
+  WireStylePatch,
+} from "@reticula/protocol";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { type EngineClient, startEngine } from "./engine/client.ts";
+import { FormulaBar, type FormulaBarHandle } from "./FormulaBar.tsx";
 import { BENCHMARKS } from "./generated/benchmarks.ts";
 import { hooksRequested, installHooks } from "./hooks.ts";
 
@@ -11,6 +32,7 @@ type EngineState =
   | { status: "failed"; message: string };
 
 interface InspectedState {
+  readonly sheet: number;
   readonly rowId: string;
   readonly colId: string;
   readonly address: string;
@@ -18,7 +40,43 @@ interface InspectedState {
   readonly display: string;
   readonly isFormula: boolean;
   readonly error: string | null;
+  readonly formatCode: string;
+  readonly style: WireCellStyle;
 }
+
+interface ActiveEditSession {
+  hostSheet: number;
+  row: number;
+  col: number;
+  rowId: string;
+  colId: string;
+  address: string;
+  source: string;
+  cursorUtf16: number;
+  canInsertRef: boolean;
+  activeRefSpan: [number, number] | null;
+  pointPickedSpan: [number, number] | null;
+}
+
+interface CopiedSnapshot {
+  readonly sheet: number;
+  readonly firstRow: number;
+  readonly rowCount: number;
+  readonly firstCol: number;
+  readonly colCount: number;
+  readonly cut: boolean;
+  readonly tsv: string;
+  readonly html: string;
+}
+
+type ContextMenuState =
+  | { readonly kind: "grid"; readonly target: GridContextTarget }
+  | {
+      readonly kind: "tab";
+      readonly clientX: number;
+      readonly clientY: number;
+      readonly tab: SheetTabInfo;
+    };
 
 /** How often the status bar refreshes frame-work statistics. */
 const STATUS_INTERVAL_MS = 500;
@@ -29,11 +87,58 @@ const MARKS = {
   firstScreen: "reticula:first-screen",
 } as const;
 
+const NUMBER_FORMAT_OPTIONS: readonly { readonly code: string; readonly label: string }[] = [
+  { code: "General", label: "General" },
+  { code: "0", label: "Integer (0)" },
+  { code: "0.00", label: "Number (0.00)" },
+  { code: "#,##0.00", label: "Thousands (#,##0.00)" },
+  { code: "$#,##0.00", label: "USD ($#,##0.00)" },
+  { code: "¥#,##0.00", label: "CNY (¥#,##0.00)" },
+  { code: "€#,##0.00", label: "EUR (€#,##0.00)" },
+  { code: "0%", label: "Percent (0%)" },
+  { code: "0.00%", label: "Percent (0.00%)" },
+  { code: "0.00E+00", label: "Scientific (0.00E+00)" },
+  { code: "yyyy-mm-dd", label: "Date (yyyy-mm-dd)" },
+  { code: "yyyy-mm-dd hh:mm", label: "DateTime (yyyy-mm-dd hh:mm)" },
+  { code: "@", label: "Plain Text (@)" },
+];
+
 const integer = new Intl.NumberFormat("en-US");
 const milliseconds = new Intl.NumberFormat("en-US", {
   minimumFractionDigits: 1,
   maximumFractionDigits: 1,
 });
+
+function computeLocalExcelSerialNow(): number {
+  const now = new Date();
+  const localMs = Date.UTC(
+    now.getFullYear(),
+    now.getMonth(),
+    now.getDate(),
+    now.getHours(),
+    now.getMinutes(),
+    now.getSeconds(),
+    now.getMilliseconds(),
+  );
+  return 25569 + localMs / 86_400_000;
+}
+
+function nextEvalSeed(): string {
+  const words = new Uint32Array(2);
+  crypto.getRandomValues(words);
+  const hi = BigInt(words[0] ?? 0);
+  const lo = BigInt(words[1] ?? 0);
+  return ((hi << 32n) | lo).toString();
+}
+
+function sendEvalEnv(client: EngineClient): void {
+  client.send({
+    kind: "setEvalEnv",
+    nowSerial: computeLocalExcelSerialNow(),
+    seed: nextEvalSeed(),
+    timestampMs: Date.now(),
+  });
+}
 
 export interface EditorPageProps {
   readonly onNavigateHome: () => void;
@@ -143,18 +248,153 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
   const hostRef = useRef<HTMLDivElement>(null);
   const gridRef = useRef<Grid | null>(null);
   const editorRef = useRef<CellEditor | null>(null);
+  const formulaBarRef = useRef<FormulaBarHandle | null>(null);
   const clientRef = useRef<EngineClient | null>(null);
+
+  const activeSheetRef = useRef<number>(0);
   const inspectedRef = useRef<InspectedState | null>(null);
-  const pendingRowActionRef = useRef<"inserted" | "deleted">("inserted");
+  const editSessionRef = useRef<ActiveEditSession | null>(null);
+  const analysisRef = useRef<WireFormulaAnalysis | null>(null);
+  const lastCopiedRef = useRef<CopiedSnapshot | null>(null);
+  const pendingActionVerbRef = useRef<string>("updated");
 
   const [engine, setEngine] = useState<EngineState>({ status: "starting" });
   const [stats, setStats] = useState<GridStats | null>(null);
   const [selection, setSelection] = useState<Selection | null>(null);
   const [inspected, setInspected] = useState<InspectedState | null>(null);
   const [editingText, setEditingText] = useState<string | null>(null);
+  const [formulaAnalysis, setFormulaAnalysis] = useState<WireFormulaAnalysis | null>(null);
   const [recalcMessage, setRecalcMessage] = useState<string | null>(null);
   const [rejectedReason, setRejectedReason] = useState<string | null>(null);
   const [showTip, setShowTip] = useState(true);
+  const [isDark, setIsDark] = useState<boolean>(() =>
+    typeof window !== "undefined"
+      ? window.matchMedia("(prefers-color-scheme: dark)").matches
+      : false,
+  );
+  const [colorPopover, setColorPopover] = useState<"text" | "fill" | null>(null);
+  const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
+  const [renamingSheet, setRenamingSheet] = useState<{ id: number; draft: string } | null>(null);
+
+  useEffect(() => {
+    const mq = window.matchMedia("(prefers-color-scheme: dark)");
+    const onChange = (e: MediaQueryListEvent) => setIsDark(e.matches);
+    mq.addEventListener("change", onChange);
+    return () => mq.removeEventListener("change", onChange);
+  }, []);
+
+  useEffect(() => {
+    if (!contextMenu && !colorPopover) {
+      return;
+    }
+    const dismiss = (event: MouseEvent) => {
+      const target = event.target;
+      if (
+        target instanceof Element &&
+        (target.closest(".context-menu") || target.closest(".color-popover-wrap"))
+      ) {
+        return;
+      }
+      setContextMenu(null);
+      setColorPopover(null);
+    };
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setContextMenu(null);
+        setColorPopover(null);
+      }
+    };
+    window.addEventListener("mousedown", dismiss);
+    window.addEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("mousedown", dismiss);
+      window.removeEventListener("keydown", onKey);
+    };
+  }, [contextMenu, colorPopover]);
+
+  const syncGridFormulaRefs = useCallback(
+    (grid: Grid, analysis: WireFormulaAnalysis | null, sheetId: number) => {
+      if (!analysis?.isFormula || !editSessionRef.current) {
+        grid.setFormulaReferences([]);
+        return;
+      }
+      grid.setFormulaReferences(
+        analysis.references
+          .filter((r) => r.sheet === sheetId)
+          .map((r) => ({
+            colorIndex: r.colorIndex,
+            firstRow: r.firstRow,
+            lastRow: r.lastRow,
+            firstCol: r.firstCol,
+            lastCol: r.lastCol,
+          })),
+      );
+    },
+    [],
+  );
+
+  const clearEditState = useCallback((grid: Grid, editor: CellEditor) => {
+    editSessionRef.current = null;
+    analysisRef.current = null;
+    setEditingText(null);
+    setFormulaAnalysis(null);
+    editor.setFormulaAnalysis(null);
+    grid.setFormulaReferences([]);
+  }, []);
+
+  const ensureEditSession = useCallback(
+    (grid: Grid, initialSource: string, cursorUtf16: number): ActiveEditSession | null => {
+      if (editSessionRef.current) {
+        return editSessionRef.current;
+      }
+      const sel = grid.selectionDetails();
+      if (!sel) {
+        return null;
+      }
+      const rowId = sel.rowId ?? grid.rowIdAt(sel.row);
+      const colId = sel.colId ?? grid.colIdAt(sel.col) ?? String(sel.col);
+      if (rowId === null) {
+        return null;
+      }
+      const session: ActiveEditSession = {
+        hostSheet: activeSheetRef.current,
+        row: sel.row,
+        col: sel.col,
+        rowId,
+        colId,
+        address: sel.name,
+        source: initialSource,
+        cursorUtf16,
+        canInsertRef: initialSource === "=",
+        activeRefSpan: null,
+        pointPickedSpan: null,
+      };
+      editSessionRef.current = session;
+      return session;
+    },
+    [],
+  );
+
+  const requestAnalyze = useCallback((client: EngineClient, grid: Grid, editor: CellEditor) => {
+    const session = editSessionRef.current;
+    if (!session?.source.startsWith("=")) {
+      analysisRef.current = null;
+      setFormulaAnalysis(null);
+      editor.setFormulaAnalysis(null);
+      grid.setFormulaReferences([]);
+      if (session) {
+        session.canInsertRef = false;
+        session.activeRefSpan = null;
+      }
+      return;
+    }
+    client.send({
+      kind: "analyzeFormula",
+      sheet: session.hostSheet,
+      source: session.source,
+      cursorUtf16: session.cursorUtf16,
+    });
+  }, []);
 
   useEffect(() => {
     const element = hostRef.current;
@@ -171,7 +411,8 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
         setInspected(null);
         return;
       }
-      const key = `${sel.rowId}:${sel.colId}`;
+      const sheetId = activeSheetRef.current;
+      const key = `${sheetId}:${sel.rowId}:${sel.colId}`;
       if (!force && key === lastInspectKey) {
         return;
       }
@@ -182,7 +423,7 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
       lastInspectKey = key;
       client.send({
         kind: "inspectCell",
-        sheet: 0,
+        sheet: sheetId,
         rowId: sel.rowId,
         colId: sel.colId,
       });
@@ -193,29 +434,65 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
         switch (message.kind) {
           case "ready":
             performance.mark(MARKS.engineReady);
+            activeSheetRef.current = message.sheet.sheet;
             grid.setSheet(message.sheet);
             setEngine({ status: "ready", info: message.info, sheet: message.sheet });
             break;
           case "sheetChanged": {
-            grid.updateSheet(message.sheet);
+            const switched = message.sheet.sheet !== activeSheetRef.current;
+            activeSheetRef.current = message.sheet.sheet;
+            if (switched) {
+              lastInspectKey = "";
+              inspectedRef.current = null;
+              setInspected(null);
+              grid.setSheet(message.sheet);
+              const cp = lastCopiedRef.current;
+              if (cp && cp.sheet === message.sheet.sheet) {
+                grid.setClipboardRange(
+                  {
+                    firstRow: cp.firstRow,
+                    endRow: cp.firstRow + cp.rowCount,
+                    firstCol: cp.firstCol,
+                    endCol: cp.firstCol + cp.colCount,
+                  },
+                  cp.cut,
+                );
+              }
+            } else {
+              grid.updateSheet(message.sheet);
+            }
+            syncGridFormulaRefs(grid, analysisRef.current, message.sheet.sheet);
             setEngine((prev) =>
               prev.status === "ready" ? { ...prev, sheet: message.sheet } : prev,
             );
-            const verb = pendingRowActionRef.current;
+            const verb = pendingActionVerbRef.current;
+            pendingActionVerbRef.current = "updated";
             const extra =
               message.recalculated > 0
                 ? `, recalculated ${integer.format(message.recalculated)} cells`
                 : "";
-            setRecalcMessage(`${verb} rows in ${milliseconds.format(message.actionMs)} ms${extra}`);
+            setRecalcMessage(`${verb} in ${milliseconds.format(message.actionMs)} ms${extra}`);
             requestInspect(grid.selectionDetails(), true);
+            break;
+          }
+          case "stylesUpdated": {
+            if (message.sheet === activeSheetRef.current) {
+              grid.setStyles(message.styles);
+            }
             break;
           }
           case "cellInspected": {
             const cur = grid.selectionDetails();
-            if (!cur || cur.rowId !== message.rowId || cur.colId !== message.colId) {
+            if (
+              !cur ||
+              message.sheet !== activeSheetRef.current ||
+              cur.rowId !== message.rowId ||
+              cur.colId !== message.colId
+            ) {
               break;
             }
             const info: InspectedState = {
+              sheet: message.sheet,
               rowId: message.rowId,
               colId: message.colId,
               address: message.address,
@@ -223,9 +500,137 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
               display: message.display,
               isFormula: message.isFormula,
               error: message.error ?? null,
+              formatCode: message.formatCode,
+              style: message.style,
             };
             inspectedRef.current = info;
             setInspected(info);
+            break;
+          }
+          case "formulaAnalyzed": {
+            if (!editSessionRef.current) {
+              break;
+            }
+            analysisRef.current = message.analysis;
+            editSessionRef.current.canInsertRef = message.analysis.canInsertRef;
+            editSessionRef.current.activeRefSpan = message.analysis.activeRefSpan ?? null;
+            setFormulaAnalysis(message.analysis);
+            editor.setFormulaAnalysis(message.analysis);
+            syncGridFormulaRefs(grid, message.analysis, activeSheetRef.current);
+            break;
+          }
+          case "formulaDollarToggled": {
+            const session = editSessionRef.current;
+            if (!session || !message.changed) {
+              break;
+            }
+            session.source = message.source;
+            session.cursorUtf16 = message.endUtf16;
+            session.pointPickedSpan = null;
+            setEditingText(message.source);
+            formulaBarRef.current?.applyTextAndSelection(
+              message.source,
+              message.startUtf16,
+              message.endUtf16,
+            );
+            if (activeSheetRef.current === session.hostSheet) {
+              editor.applyTextAndSelection(message.source, message.startUtf16, message.endUtf16);
+            }
+            requestAnalyze(client, grid, editor);
+            break;
+          }
+          case "rangeRefFormatted": {
+            const session = editSessionRef.current;
+            if (!session) {
+              break;
+            }
+            const span = session.pointPickedSpan ??
+              session.activeRefSpan ?? [session.cursorUtf16, session.cursorUtf16];
+            const repStart = Math.max(0, Math.min(session.source.length, span[0]));
+            const repEnd = Math.max(repStart, Math.min(session.source.length, span[1]));
+            const nextSource =
+              session.source.slice(0, repStart) + message.reference + session.source.slice(repEnd);
+            const nextEnd = repStart + message.reference.length;
+            session.source = nextSource;
+            session.cursorUtf16 = nextEnd;
+            session.pointPickedSpan = [repStart, nextEnd];
+            setEditingText(nextSource);
+            formulaBarRef.current?.applyTextAndSelection(nextSource, nextEnd, nextEnd);
+            if (activeSheetRef.current === session.hostSheet) {
+              editor.setTextExternal(nextSource, nextEnd);
+            }
+            requestAnalyze(client, grid, editor);
+            break;
+          }
+          case "edgeJumped": {
+            if (message.sheet === activeSheetRef.current) {
+              grid.jumpTo(message.row, message.col, message.select);
+            }
+            break;
+          }
+          case "clipboardCopied": {
+            const snap: CopiedSnapshot = {
+              sheet: message.sheet,
+              firstRow: message.firstRow,
+              rowCount: message.rowCount,
+              firstCol: message.firstCol,
+              colCount: message.colCount,
+              cut: message.cut,
+              tsv: message.tsv,
+              html: message.html,
+            };
+            lastCopiedRef.current = snap;
+            if (message.sheet === activeSheetRef.current) {
+              grid.setClipboardRange(
+                {
+                  firstRow: message.firstRow,
+                  endRow: message.firstRow + message.rowCount,
+                  firstCol: message.firstCol,
+                  endCol: message.firstCol + message.colCount,
+                },
+                message.cut,
+              );
+            }
+            if (typeof navigator !== "undefined" && navigator.clipboard) {
+              if (typeof ClipboardItem !== "undefined" && navigator.clipboard.write) {
+                const item = new ClipboardItem({
+                  "text/plain": new Blob([message.tsv], { type: "text/plain" }),
+                  "text/html": new Blob([message.html], { type: "text/html" }),
+                });
+                void navigator.clipboard.write([item]).catch(() => {
+                  void navigator.clipboard.writeText?.(message.tsv).catch(() => {});
+                });
+              } else {
+                void navigator.clipboard.writeText?.(message.tsv).catch(() => {});
+              }
+            }
+            break;
+          }
+          case "clipboardPasted": {
+            activeSheetRef.current = message.sheet.sheet;
+            grid.updateSheet(message.sheet);
+            setEngine((prev) =>
+              prev.status === "ready" ? { ...prev, sheet: message.sheet } : prev,
+            );
+            if (lastCopiedRef.current?.cut) {
+              lastCopiedRef.current = null;
+              grid.setClipboardRange(null);
+            }
+            if (message.destRowCount > 0 && message.destColCount > 0) {
+              grid.selectRange(
+                { row: message.destFirstRow, col: message.destFirstCol },
+                {
+                  row: message.destFirstRow + message.destRowCount - 1,
+                  col: message.destFirstCol + message.destColCount - 1,
+                },
+              );
+            }
+            const extra =
+              message.recalculated > 0
+                ? `, recalculated ${integer.format(message.recalculated)} cells`
+                : "";
+            setRecalcMessage(`pasted in ${milliseconds.format(message.elapsedMs)} ms${extra}`);
+            requestInspect(grid.selectionDetails(), true);
             break;
           }
           case "recalcProgress":
@@ -235,6 +640,10 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
             break;
           case "recalcDone":
             setRejectedReason(null);
+            grid.updateSheet(message.sheet);
+            setEngine((prev) =>
+              prev.status === "ready" ? { ...prev, sheet: message.sheet } : prev,
+            );
             if (message.recalculated > 0) {
               setRecalcMessage(
                 `recalculated ${integer.format(message.recalculated)} cells in ${milliseconds.format(message.elapsedMs)} ms`,
@@ -261,14 +670,121 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
     });
     clientRef.current = client;
 
+    const isPointAndClickActive = (): boolean => {
+      const session = editSessionRef.current;
+      if (!session?.source.startsWith("=")) {
+        return false;
+      }
+      return (
+        session.pointPickedSpan !== null || session.canInsertRef || session.activeRefSpan !== null
+      );
+    };
+
     const grid = new Grid(element, {
-      subscribe: (subscription) => client.send({ kind: "subscribe", sheet: 0, ...subscription }),
+      subscribe: (subscription) =>
+        client.send({ kind: "subscribe", sheet: activeSheetRef.current, ...subscription }),
       onSelectionChange: (sel) => {
         setSelection(sel);
+        setContextMenu(null);
         requestInspect(sel);
       },
       onActivateEdit: () => {
         editor.startEdit("doubleClick");
+      },
+      onResizeRows: (sizes) => {
+        pendingActionVerbRef.current = "resized rows";
+        client.send({
+          kind: "resizeRows",
+          sheet: activeSheetRef.current,
+          sizes: sizes.map((s) => ({ run: s.run, sizePx: s.sizePx ?? undefined })),
+        });
+      },
+      onResizeCols: (sizes) => {
+        pendingActionVerbRef.current = "resized columns";
+        client.send({
+          kind: "resizeCols",
+          sheet: activeSheetRef.current,
+          sizes: sizes.map((s) => ({ run: s.run, sizePx: s.sizePx ?? undefined })),
+        });
+      },
+      onMoveRows: (rows, afterRowId) => {
+        pendingActionVerbRef.current = "moved rows";
+        client.send({
+          kind: "moveRows",
+          sheet: activeSheetRef.current,
+          rows: [...rows],
+          afterRowId,
+        });
+      },
+      onMoveCols: (cols, afterColId) => {
+        pendingActionVerbRef.current = "moved columns";
+        client.send({
+          kind: "moveCols",
+          sheet: activeSheetRef.current,
+          cols: [...cols],
+          afterColId,
+        });
+      },
+      onFillRange: (src, dst) => {
+        pendingActionVerbRef.current = "filled range";
+        sendEvalEnv(client);
+        client.send({
+          kind: "fillRange",
+          sheet: activeSheetRef.current,
+          srcFirstRow: src.firstRow,
+          srcRowCount: src.endRow - src.firstRow,
+          srcFirstCol: src.firstCol,
+          srcColCount: src.endCol - src.firstCol,
+          dstFirstRow: dst.firstRow,
+          dstRowCount: dst.endRow - dst.firstRow,
+          dstFirstCol: dst.firstCol,
+          dstColCount: dst.endCol - dst.firstCol,
+        });
+        grid.selectRange(
+          { row: dst.firstRow, col: dst.firstCol },
+          { row: dst.endRow - 1, col: dst.endCol - 1 },
+        );
+      },
+      onAutoFillDown: (src) => {
+        pendingActionVerbRef.current = "auto-filled column";
+        sendEvalEnv(client);
+        client.send({
+          kind: "autoFillDown",
+          sheet: activeSheetRef.current,
+          srcFirstRow: src.firstRow,
+          srcRowCount: src.endRow - src.firstRow,
+          srcFirstCol: src.firstCol,
+          srcColCount: src.endCol - src.firstCol,
+        });
+      },
+      onPointAndClickRange: (range) => {
+        if (!isPointAndClickActive()) {
+          return false;
+        }
+        const session = editSessionRef.current;
+        if (!session) {
+          return false;
+        }
+        if (session.pointPickedSpan === null) {
+          session.pointPickedSpan = session.activeRefSpan ?? [
+            session.cursorUtf16,
+            session.cursorUtf16,
+          ];
+        }
+        client.send({
+          kind: "formatRangeRef",
+          hostSheet: session.hostSheet,
+          targetSheet: activeSheetRef.current,
+          r1: range.firstRow,
+          c1: range.firstCol,
+          r2: Math.max(range.firstRow, range.endRow - 1),
+          c2: Math.max(range.firstCol, range.endCol - 1),
+        });
+        return true;
+      },
+      onContextMenu: (target) => {
+        setColorPopover(null);
+        setContextMenu({ kind: "grid", target });
       },
     });
     gridRef.current = grid;
@@ -281,6 +797,7 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
           cur.row === cell.row &&
           cur.col === cell.col &&
           inspectedRef.current &&
+          inspectedRef.current.sheet === activeSheetRef.current &&
           inspectedRef.current.rowId === cur.rowId &&
           inspectedRef.current.colId === cur.colId
         ) {
@@ -289,33 +806,152 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
         return grid.textAt(cell.row, cell.col) ?? "";
       },
       onCommit: (cell, raw) => {
-        const rowId = grid.rowIdAt(cell.row);
+        const session = editSessionRef.current;
+        clearEditState(grid, editor);
+        const sheet = session ? session.hostSheet : activeSheetRef.current;
+        const rowId = session ? session.rowId : grid.rowIdAt(cell.row);
         const sel = grid.selectionDetails();
-        const colId =
-          sel && sel.col === cell.col && sel.colId !== null ? sel.colId : String(cell.col);
+        const colId = session
+          ? session.colId
+          : sel && sel.col === cell.col && sel.colId !== null
+            ? sel.colId
+            : (grid.colIdAt(cell.col) ?? String(cell.col));
         if (rowId !== null) {
+          sendEvalEnv(client);
           client.send({
             kind: "editCell",
-            sheet: 0,
+            sheet,
             rowId,
             colId,
             raw,
           });
         }
+        if (session && activeSheetRef.current !== session.hostSheet) {
+          client.send({ kind: "switchSheet", sheet: session.hostSheet });
+        }
       },
       onClear: () => {
         const runs = grid.selectedCellRuns();
         if (runs) {
+          pendingActionVerbRef.current = "cleared cells";
           client.send({
             kind: "clearCells",
-            sheet: 0,
+            sheet: activeSheetRef.current,
             rows: runs.rows,
             cols: runs.cols,
           });
         }
       },
-      onTextChange: (text, editingCell) => {
-        setEditingText(editingCell ? text : null);
+      onTextChange: (text, editingCell, cursorUtf16) => {
+        if (!editingCell) {
+          // If cross-sheet point-and-click cleared the floating overlay silently, keep formula bar session intact.
+          if (
+            editSessionRef.current &&
+            activeSheetRef.current !== editSessionRef.current.hostSheet
+          ) {
+            return;
+          }
+          clearEditState(grid, editor);
+          return;
+        }
+        const session = ensureEditSession(grid, text, cursorUtf16);
+        if (session) {
+          if (session.source !== text) {
+            session.pointPickedSpan = null;
+          }
+          session.source = text;
+          session.cursorUtf16 = cursorUtf16;
+          session.canInsertRef = text === "=";
+        }
+        setEditingText(text);
+        requestAnalyze(client, grid, editor);
+      },
+      onToggleDollar: (text, cursorUtf16) => {
+        client.send({ kind: "toggleFormulaDollar", source: text, cursorUtf16 });
+      },
+      onFormulaKeyDown: (event, text, cursorUtf16) => {
+        return formulaBarRef.current?.handleAssistKeyDown(event, text, cursorUtf16) ?? false;
+      },
+      isPointAndClickActive,
+      onJumpEdge: (dir, select) => {
+        const cur = grid.selection;
+        if (cur) {
+          client.send({
+            kind: "jumpEdge",
+            sheet: activeSheetRef.current,
+            row: cur.row,
+            col: cur.col,
+            dir,
+            select,
+          });
+        }
+      },
+      onJumpUsedEnd: (select) => {
+        client.send({
+          kind: "jumpUsedEnd",
+          sheet: activeSheetRef.current,
+          select,
+        });
+      },
+      onUndo: () => {
+        pendingActionVerbRef.current = "undid action";
+        client.send({ kind: "undo" });
+      },
+      onRedo: () => {
+        pendingActionVerbRef.current = "redid action";
+        client.send({ kind: "redo" });
+      },
+      onCopy: (cut, clipboardData) => {
+        const range = grid.selectionRange;
+        if (!range) {
+          return;
+        }
+        // Seed single-cell display text synchronously when available; Worker follows up with full TSV+HTML.
+        if (
+          clipboardData &&
+          range.endRow - range.firstRow === 1 &&
+          range.endCol - range.firstCol === 1
+        ) {
+          const single = grid.textAt(range.firstRow, range.firstCol);
+          if (single !== null) {
+            clipboardData.setData("text/plain", single);
+          }
+        }
+        client.send({
+          kind: "copyRange",
+          sheet: activeSheetRef.current,
+          firstRow: range.firstRow,
+          rowCount: range.endRow - range.firstRow,
+          firstCol: range.firstCol,
+          colCount: range.endCol - range.firstCol,
+          cut,
+        });
+      },
+      onPaste: (tsv, html) => {
+        const range = grid.selectionRange;
+        if (!range) {
+          return;
+        }
+        let effTsv = tsv;
+        let effHtml = html ?? undefined;
+        if (effTsv.length === 0 && !effHtml && lastCopiedRef.current) {
+          effTsv = lastCopiedRef.current.tsv;
+          effHtml = lastCopiedRef.current.html;
+        }
+        if (effTsv.length === 0 && !effHtml) {
+          return;
+        }
+        sendEvalEnv(client);
+        client.send({
+          kind: "pasteClipboard",
+          sheet: activeSheetRef.current,
+          destRow: range.firstRow,
+          destRowCount: range.endRow - range.firstRow,
+          destCol: range.firstCol,
+          destColCount: range.endCol - range.firstCol,
+          tsv: effTsv,
+          html: effHtml,
+        });
       },
     });
     editorRef.current = editor;
@@ -351,11 +987,13 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
       gridRef.current = null;
       clientRef.current = null;
     };
-  }, []);
+  }, [clearEditState, ensureEditSession, requestAnalyze, syncGridFormulaRefs]);
 
+  const activeSheetId = engine.status === "ready" ? engine.sheet.sheet : 0;
   const matchingInspected =
     inspected !== null &&
     selection !== null &&
+    inspected.sheet === activeSheetId &&
     inspected.rowId === selection.rowId &&
     inspected.colId === selection.colId
       ? inspected
@@ -364,21 +1002,127 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
   const formulaBarValue =
     editingText !== null ? editingText : (matchingInspected?.raw ?? selection?.text ?? "");
 
-  const handleInsertRowAbove = () => {
+  const nameBoxText = editSessionRef.current
+    ? editSessionRef.current.hostSheet !== activeSheetId
+      ? `${engine.status === "ready" ? (engine.sheet.sheets.find((s) => s.id === editSessionRef.current?.hostSheet)?.name ?? "Sheet") : "Sheet"}!${editSessionRef.current.address}`
+      : editSessionRef.current.address
+    : selection
+      ? selection.name
+      : "—";
+
+  const handleFormulaBarChange = (next: string, cursorUtf16: number) => {
+    const grid = gridRef.current;
+    const editor = editorRef.current;
+    const client = clientRef.current;
+    if (!grid || !editor || !client) {
+      return;
+    }
+    const session = ensureEditSession(grid, next, cursorUtf16);
+    if (!session) {
+      return;
+    }
+    if (session.source !== next) {
+      session.pointPickedSpan = null;
+    }
+    session.source = next;
+    session.cursorUtf16 = cursorUtf16;
+    if (next === "=") {
+      session.canInsertRef = true;
+    }
+    setEditingText(next);
+    if (activeSheetRef.current === session.hostSheet) {
+      editor.setTextExternal(next, cursorUtf16);
+    }
+    requestAnalyze(client, grid, editor);
+  };
+
+  const handleFormulaBarCommit = (moveDown: boolean) => {
+    const grid = gridRef.current;
+    const editor = editorRef.current;
+    const client = clientRef.current;
+    if (!grid || !editor || !client) {
+      return;
+    }
+    const session = editSessionRef.current;
+    if (session && activeSheetRef.current !== session.hostSheet) {
+      const { hostSheet, rowId, colId, source } = session;
+      clearEditState(grid, editor);
+      sendEvalEnv(client);
+      client.send({ kind: "editCell", sheet: hostSheet, rowId, colId, raw: source });
+      client.send({ kind: "switchSheet", sheet: hostSheet });
+      editor.focus();
+      return;
+    }
+    setEditingText(null);
+    editor.commitExternal(moveDown);
+  };
+
+  const handleFormulaBarCancel = () => {
+    const grid = gridRef.current;
+    const editor = editorRef.current;
+    const client = clientRef.current;
+    if (!grid || !editor || !client) {
+      return;
+    }
+    const session = editSessionRef.current;
+    clearEditState(grid, editor);
+    if (session && activeSheetRef.current !== session.hostSheet) {
+      client.send({ kind: "switchSheet", sheet: session.hostSheet });
+    }
+    editor.cancelExternal();
+  };
+
+  const handleAcceptCompletion = (
+    currentSource: string,
+    item: WireCompletionItem,
+    fromFormulaBar: boolean,
+  ) => {
+    const grid = gridRef.current;
+    const editor = editorRef.current;
+    const client = clientRef.current;
+    if (!grid || !editor || !client) {
+      return;
+    }
+    const start = Math.max(0, Math.min(currentSource.length, item.replaceStartUtf16));
+    const end = Math.max(start, Math.min(currentSource.length, item.replaceEndUtf16));
+    const nextSource = currentSource.slice(0, start) + item.insertText + currentSource.slice(end);
+    const nextCursor = start + item.insertText.length;
+
+    const session = ensureEditSession(grid, nextSource, nextCursor);
+    if (session) {
+      session.source = nextSource;
+      session.cursorUtf16 = nextCursor;
+      session.pointPickedSpan = null;
+    }
+    setEditingText(nextSource);
+    formulaBarRef.current?.applyTextAndSelection(nextSource, nextCursor, nextCursor);
+    if (!session || activeSheetRef.current === session.hostSheet) {
+      editor.applyTextAndSelection(nextSource, nextCursor, nextCursor);
+    }
+    if (fromFormulaBar) {
+      formulaBarRef.current?.focus();
+    } else {
+      editor.focus();
+    }
+    requestAnalyze(client, grid, editor);
+  };
+
+  const handleInsertRow = (below: boolean) => {
     const grid = gridRef.current;
     const client = clientRef.current;
     if (!grid || !client) {
       return;
     }
-    const targetRow = selection ? selection.range.firstRow : 0;
-    const afterRowId = targetRow === 0 ? null : grid.rowIdAt(targetRow - 1);
-    if (targetRow > 0 && afterRowId === null) {
+    const baseRow = selection ? (below ? selection.range.endRow - 1 : selection.range.firstRow) : 0;
+    const afterPos = below ? baseRow : baseRow - 1;
+    const afterRowId = afterPos < 0 ? null : grid.rowIdAt(afterPos);
+    if (afterPos >= 0 && afterRowId === null) {
       return;
     }
-    pendingRowActionRef.current = "inserted";
+    pendingActionVerbRef.current = "inserted rows";
     client.send({
       kind: "insertRows",
-      sheet: 0,
+      sheet: activeSheetRef.current,
       afterRowId,
       count: 1,
     });
@@ -395,12 +1139,184 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
     if (!rows || rows.length === 0) {
       return;
     }
-    pendingRowActionRef.current = "deleted";
+    pendingActionVerbRef.current = "deleted rows";
     client.send({
       kind: "deleteRows",
-      sheet: 0,
+      sheet: activeSheetRef.current,
       rows,
     });
+    editorRef.current?.focus();
+  };
+
+  const handleInsertCol = (right: boolean) => {
+    const grid = gridRef.current;
+    const client = clientRef.current;
+    if (!grid || !client) {
+      return;
+    }
+    const baseCol = selection ? (right ? selection.range.endCol - 1 : selection.range.firstCol) : 0;
+    const afterPos = right ? baseCol : baseCol - 1;
+    const afterColId = afterPos < 0 ? null : grid.colIdAt(afterPos);
+    if (afterPos >= 0 && afterColId === null) {
+      return;
+    }
+    pendingActionVerbRef.current = "inserted columns";
+    client.send({
+      kind: "insertCols",
+      sheet: activeSheetRef.current,
+      afterColId,
+      count: 1,
+    });
+    editorRef.current?.focus();
+  };
+
+  const handleDeleteSelectedCols = () => {
+    const grid = gridRef.current;
+    const client = clientRef.current;
+    if (!grid || !client) {
+      return;
+    }
+    const cols = grid.selectedColRuns();
+    if (!cols || cols.length === 0) {
+      return;
+    }
+    pendingActionVerbRef.current = "deleted columns";
+    client.send({
+      kind: "deleteCols",
+      sheet: activeSheetRef.current,
+      cols,
+    });
+    editorRef.current?.focus();
+  };
+
+  const applyFormat = (patch: { numberFormat?: WireFormatPatch; style?: WireStylePatch }) => {
+    const grid = gridRef.current;
+    const client = clientRef.current;
+    if (!grid || !client) {
+      return;
+    }
+    const target = grid.selectedFormatTarget();
+    if (!target) {
+      return;
+    }
+    pendingActionVerbRef.current = "formatted cells";
+    client.send({
+      kind: "setFormat",
+      sheet: activeSheetRef.current,
+      target,
+      ...patch,
+    });
+    editorRef.current?.focus();
+  };
+
+  const handleFreezeChange = (value: string) => {
+    const client = clientRef.current;
+    if (!client) {
+      return;
+    }
+    let frozenRows = 0;
+    let frozenCols = 0;
+    if (value === "row1") {
+      frozenRows = 1;
+    } else if (value === "col1") {
+      frozenCols = 1;
+    } else if (value === "row1col1") {
+      frozenRows = 1;
+      frozenCols = 1;
+    } else if (value === "active" && selection) {
+      frozenRows = Math.min(32, selection.row);
+      frozenCols = Math.min(32, selection.col);
+      if (frozenRows === 0 && frozenCols === 0) {
+        frozenRows = 1;
+      }
+    }
+    pendingActionVerbRef.current = "updated freeze panes";
+    client.send({
+      kind: "setFreeze",
+      sheet: activeSheetRef.current,
+      frozenRows,
+      frozenCols,
+    });
+    editorRef.current?.focus();
+  };
+
+  const handleSwitchSheet = (targetId: number) => {
+    const grid = gridRef.current;
+    const editor = editorRef.current;
+    const client = clientRef.current;
+    if (!grid || !editor || !client || targetId === activeSheetRef.current) {
+      return;
+    }
+    const session = editSessionRef.current;
+    if (
+      session?.source.startsWith("=") &&
+      (session.pointPickedSpan !== null || session.canInsertRef || session.activeRefSpan !== null)
+    ) {
+      // Cross-sheet point-and-click mode: hide in-cell box on old sheet and keep FormulaBar active!
+      editor.clearSilent();
+      client.send({ kind: "switchSheet", sheet: targetId });
+      formulaBarRef.current?.focus();
+      return;
+    }
+    if (editor.editing) {
+      editor.commitExternal(false);
+    }
+    clearEditState(grid, editor);
+    pendingActionVerbRef.current = "switched sheet";
+    client.send({ kind: "switchSheet", sheet: targetId });
+    editor.focus();
+  };
+
+  const handleContextClipboard = async (mode: "cut" | "copy" | "paste") => {
+    const grid = gridRef.current;
+    const client = clientRef.current;
+    setContextMenu(null);
+    if (!grid || !client) {
+      return;
+    }
+    const range = grid.selectionRange;
+    if (!range) {
+      return;
+    }
+    if (mode === "cut" || mode === "copy") {
+      client.send({
+        kind: "copyRange",
+        sheet: activeSheetRef.current,
+        firstRow: range.firstRow,
+        rowCount: range.endRow - range.firstRow,
+        firstCol: range.firstCol,
+        colCount: range.endCol - range.firstCol,
+        cut: mode === "cut",
+      });
+      editorRef.current?.focus();
+      return;
+    }
+    let tsv = "";
+    let html: string | undefined;
+    try {
+      if (typeof navigator !== "undefined" && navigator.clipboard?.readText) {
+        tsv = await navigator.clipboard.readText();
+      }
+    } catch {
+      // Fall back to internal clipboard when browser blocks async clipboard read.
+    }
+    if (tsv.length === 0 && lastCopiedRef.current) {
+      tsv = lastCopiedRef.current.tsv;
+      html = lastCopiedRef.current.html;
+    }
+    if (tsv.length > 0 || html) {
+      sendEvalEnv(client);
+      client.send({
+        kind: "pasteClipboard",
+        sheet: activeSheetRef.current,
+        destRow: range.firstRow,
+        destRowCount: range.endRow - range.firstRow,
+        destCol: range.firstCol,
+        destColCount: range.endCol - range.firstCol,
+        tsv,
+        html,
+      });
+    }
     editorRef.current?.focus();
   };
 
@@ -414,7 +1330,26 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
     editorRef.current?.focus();
   };
 
+  const readySheet = engine.status === "ready" ? engine.sheet : null;
   const canDeleteRows = selection !== null && selection.rowId !== null;
+  const canDeleteCols = selection !== null && selection.colId !== null;
+  const hasSelection = readySheet !== null && selection !== null;
+  const activeStyle = matchingInspected?.style;
+  const activeFormatCode = matchingInspected?.formatCode ?? "General";
+  const currentFreezeValue = readySheet
+    ? readySheet.frozenRows === 0 && readySheet.frozenCols === 0
+      ? "none"
+      : readySheet.frozenRows === 1 && readySheet.frozenCols === 0
+        ? "row1"
+        : readySheet.frozenRows === 0 && readySheet.frozenCols === 1
+          ? "col1"
+          : readySheet.frozenRows === 1 && readySheet.frozenCols === 1
+            ? "row1col1"
+            : "active"
+    : "none";
+
+  const textPalette = isDark ? DARK_PALETTE_TEXT : LIGHT_PALETTE_TEXT;
+  const fillPalette = isDark ? DARK_PALETTE_FILL : LIGHT_PALETTE_FILL;
 
   return (
     <div className="app">
@@ -429,10 +1364,11 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
         >
           <h1>Reticula</h1>
         </a>
-        {engine.status === "ready" && (
+        {readySheet && (
           <span className="document" data-testid="document">
-            Sample sales data · {integer.format(engine.sheet.rows)} rows × {engine.sheet.cols}{" "}
-            columns · {integer.format(engine.sheet.formulaCount)} formulas
+            {readySheet.seed !== 0 ? "Sample sales data" : readySheet.sheetName} ·{" "}
+            {integer.format(readySheet.rows)} rows × {readySheet.cols} columns ·{" "}
+            {integer.format(readySheet.formulaCount)} formulas
           </span>
         )}
         <span className="titlebar-spacer" />
@@ -440,9 +1376,41 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
           <button
             type="button"
             className="toolbar-btn"
+            data-testid="undo-btn"
+            disabled={!readySheet?.canUndo}
+            onClick={() => {
+              pendingActionVerbRef.current = "undid action";
+              clientRef.current?.send({ kind: "undo" });
+              editorRef.current?.focus();
+            }}
+            title={
+              readySheet?.undoLabel ? `Undo ${readySheet.undoLabel} (Ctrl+Z)` : "Undo (Ctrl+Z)"
+            }
+          >
+            ↶ Undo
+          </button>
+          <button
+            type="button"
+            className="toolbar-btn"
+            data-testid="redo-btn"
+            disabled={!readySheet?.canRedo}
+            onClick={() => {
+              pendingActionVerbRef.current = "redid action";
+              clientRef.current?.send({ kind: "redo" });
+              editorRef.current?.focus();
+            }}
+            title={
+              readySheet?.redoLabel ? `Redo ${readySheet.redoLabel} (Ctrl+Y)` : "Redo (Ctrl+Y)"
+            }
+          >
+            ↷ Redo
+          </button>
+          <button
+            type="button"
+            className="toolbar-btn"
             data-testid="insert-row-above"
-            disabled={engine.status !== "ready"}
-            onClick={handleInsertRowAbove}
+            disabled={!readySheet}
+            onClick={() => handleInsertRow(false)}
             title="Insert 1 row above the selected row (at row 1 if nothing is selected)"
           >
             + Insert Row Above
@@ -451,7 +1419,7 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
             type="button"
             className="toolbar-btn"
             data-testid="delete-rows"
-            disabled={engine.status !== "ready" || !canDeleteRows}
+            disabled={!readySheet || !canDeleteRows}
             onClick={handleDeleteSelectedRows}
             title="Delete all rows spanned by the current selection"
           >
@@ -460,7 +1428,323 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
         </div>
       </header>
 
-      {showTip && engine.status === "ready" && (
+      <div className="formatbar" role="toolbar" aria-label="Cell formatting and freeze panes">
+        <select
+          className="fmt-select"
+          data-testid="number-format-select"
+          aria-label="Number format"
+          disabled={!hasSelection}
+          value={
+            NUMBER_FORMAT_OPTIONS.some((o) => o.code === activeFormatCode)
+              ? activeFormatCode
+              : "General"
+          }
+          onChange={(e) => {
+            const code = e.target.value;
+            applyFormat({
+              numberFormat: code === "General" ? { kind: "clear" } : { kind: "set", code },
+            });
+          }}
+        >
+          {NUMBER_FORMAT_OPTIONS.map((opt) => (
+            <option key={opt.code} value={opt.code}>
+              {opt.label}
+            </option>
+          ))}
+        </select>
+
+        <span className="fmt-divider" aria-hidden="true" />
+
+        <button
+          type="button"
+          className={activeStyle?.bold ? "fmt-btn active" : "fmt-btn"}
+          data-testid="fmt-bold"
+          aria-pressed={activeStyle?.bold ?? false}
+          disabled={!hasSelection}
+          title="Bold"
+          onClick={() => applyFormat({ style: { bold: !(activeStyle?.bold ?? false) } })}
+        >
+          <strong>B</strong>
+        </button>
+        <button
+          type="button"
+          className={activeStyle?.italic ? "fmt-btn active" : "fmt-btn"}
+          data-testid="fmt-italic"
+          aria-pressed={activeStyle?.italic ?? false}
+          disabled={!hasSelection}
+          title="Italic"
+          onClick={() => applyFormat({ style: { italic: !(activeStyle?.italic ?? false) } })}
+        >
+          <em>I</em>
+        </button>
+        <button
+          type="button"
+          className={activeStyle?.strikethrough ? "fmt-btn active" : "fmt-btn"}
+          data-testid="fmt-strike"
+          aria-pressed={activeStyle?.strikethrough ?? false}
+          disabled={!hasSelection}
+          title="Strikethrough"
+          onClick={() =>
+            applyFormat({ style: { strikethrough: !(activeStyle?.strikethrough ?? false) } })
+          }
+        >
+          <span style={{ textDecoration: "line-through" }}>S</span>
+        </button>
+
+        <span className="fmt-divider" aria-hidden="true" />
+
+        {(["left", "center", "right"] as const satisfies readonly WireHorizontalAlign[]).map(
+          (align) => {
+            const isPressed = activeStyle?.align === align;
+            const label = align === "left" ? "⫷" : align === "center" ? "≡" : "⫸";
+            return (
+              <button
+                key={align}
+                type="button"
+                className={isPressed ? "fmt-btn active" : "fmt-btn"}
+                data-testid={`align-${align}`}
+                aria-pressed={isPressed}
+                disabled={!hasSelection}
+                title={`Align ${align}`}
+                onClick={() => applyFormat({ style: { align: isPressed ? "auto" : align } })}
+              >
+                {label}
+              </button>
+            );
+          },
+        )}
+
+        <span className="fmt-divider" aria-hidden="true" />
+
+        <div className="color-popover-wrap">
+          <button
+            type="button"
+            className="fmt-btn"
+            data-testid="text-color-btn"
+            disabled={!hasSelection}
+            title="Text color"
+            onClick={() => setColorPopover((cur) => (cur === "text" ? null : "text"))}
+          >
+            <span className="color-glyph">A</span>
+            <span
+              className="color-swatch-bar"
+              style={{
+                background:
+                  activeStyle?.textColor?.kind === "palette"
+                    ? (textPalette[activeStyle.textColor.slot & 7] ?? "currentColor")
+                    : "currentColor",
+              }}
+            />
+          </button>
+          {colorPopover === "text" && (
+            <div className="color-popover" data-testid="text-color-popover">
+              <button
+                type="button"
+                className="color-clear-btn"
+                data-testid="text-color-clear"
+                onClick={() => {
+                  setColorPopover(null);
+                  applyFormat({ style: { textColor: { kind: "clear" } } });
+                }}
+              >
+                Default text color
+              </button>
+              <div className="color-grid">
+                {textPalette.map((hex, slot) => (
+                  <button
+                    key={hex}
+                    type="button"
+                    className="color-swatch"
+                    data-testid={`text-color-slot-${slot}`}
+                    style={{ background: hex }}
+                    aria-label={`Text palette slot ${slot + 1}`}
+                    onClick={() => {
+                      setColorPopover(null);
+                      applyFormat({
+                        style: { textColor: { kind: "set", color: { kind: "palette", slot } } },
+                      });
+                    }}
+                  />
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+
+        <div className="color-popover-wrap">
+          <button
+            type="button"
+            className="fmt-btn"
+            data-testid="fill-color-btn"
+            disabled={!hasSelection}
+            title="Fill color"
+            onClick={() => setColorPopover((cur) => (cur === "fill" ? null : "fill"))}
+          >
+            <span className="color-glyph">▨</span>
+            <span
+              className="color-swatch-bar"
+              style={{
+                background:
+                  activeStyle?.fillColor?.kind === "palette"
+                    ? (fillPalette[activeStyle.fillColor.slot & 7] ?? "transparent")
+                    : "var(--shell-line)",
+              }}
+            />
+          </button>
+          {colorPopover === "fill" && (
+            <div className="color-popover" data-testid="fill-color-popover">
+              <button
+                type="button"
+                className="color-clear-btn"
+                data-testid="fill-color-clear"
+                onClick={() => {
+                  setColorPopover(null);
+                  applyFormat({ style: { fillColor: { kind: "clear" } } });
+                }}
+              >
+                No fill
+              </button>
+              <div className="color-grid">
+                {fillPalette.map((hex, slot) => (
+                  <button
+                    key={hex}
+                    type="button"
+                    className="color-swatch"
+                    data-testid={`fill-color-slot-${slot}`}
+                    style={{ background: hex }}
+                    aria-label={`Fill palette slot ${slot + 1}`}
+                    onClick={() => {
+                      setColorPopover(null);
+                      applyFormat({
+                        style: { fillColor: { kind: "set", color: { kind: "palette", slot } } },
+                      });
+                    }}
+                  />
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+
+        <span className="fmt-divider" aria-hidden="true" />
+
+        <button
+          type="button"
+          className="fmt-btn"
+          data-testid="border-thin"
+          disabled={!hasSelection}
+          title="Thin borders"
+          onClick={() =>
+            applyFormat({
+              style: {
+                borderTop: "thin",
+                borderRight: "thin",
+                borderBottom: "thin",
+                borderLeft: "thin",
+              },
+            })
+          }
+        >
+          ⊞ Thin
+        </button>
+        <button
+          type="button"
+          className="fmt-btn"
+          data-testid="border-medium"
+          disabled={!hasSelection}
+          title="Medium borders"
+          onClick={() =>
+            applyFormat({
+              style: {
+                borderTop: "medium",
+                borderRight: "medium",
+                borderBottom: "medium",
+                borderLeft: "medium",
+              },
+            })
+          }
+        >
+          ⊞ Med
+        </button>
+        <button
+          type="button"
+          className="fmt-btn"
+          data-testid="border-none"
+          disabled={!hasSelection}
+          title="Clear borders"
+          onClick={() =>
+            applyFormat({
+              style: {
+                borderTop: "none",
+                borderRight: "none",
+                borderBottom: "none",
+                borderLeft: "none",
+              },
+            })
+          }
+        >
+          ⊟ Clear
+        </button>
+
+        <span className="fmt-divider" aria-hidden="true" />
+
+        <select
+          className="fmt-select"
+          data-testid="freeze-select"
+          aria-label="Freeze panes"
+          disabled={!readySheet}
+          value={currentFreezeValue}
+          onChange={(e) => handleFreezeChange(e.target.value)}
+        >
+          <option value="none">No Freeze</option>
+          <option value="row1">Freeze Top Row</option>
+          <option value="col1">Freeze First Column</option>
+          <option value="row1col1">Freeze Row 1 &amp; Col A</option>
+          <option value="active">Freeze to Active Cell</option>
+        </select>
+
+        <span className="fmt-divider" aria-hidden="true" />
+
+        <button
+          type="button"
+          className="fmt-btn"
+          data-testid="insert-col-left"
+          disabled={!readySheet}
+          title="Insert 1 column to the left of selection"
+          onClick={() => handleInsertCol(false)}
+        >
+          + Col
+        </button>
+        <button
+          type="button"
+          className="fmt-btn"
+          data-testid="delete-cols"
+          disabled={!readySheet || !canDeleteCols}
+          title="Delete selected columns"
+          onClick={handleDeleteSelectedCols}
+        >
+          − Col
+        </button>
+      </div>
+
+      {readySheet?.recalcFrozen && (
+        <div className="frozen-recalc-banner" role="status" data-testid="recalc-frozen-banner">
+          <span>
+            Safe Mode opened this workbook with automatic recalculation paused so you can inspect or
+            edit formulas safely.
+          </span>
+          <button
+            type="button"
+            className="tip-action"
+            data-testid="resume-recalc-btn"
+            onClick={() => clientRef.current?.send({ kind: "resumeRecalc" })}
+          >
+            Resume Recalculation
+          </button>
+        </div>
+      )}
+
+      {showTip && readySheet && readySheet.seed !== 0 && readySheet.sheet === 0 && (
         <div className="demo-tip" data-testid="demo-tip">
           <span>
             Try live recalculation: edit parameter cell <code>V1</code> (e.g. type <code>5%</code>{" "}
@@ -485,39 +1769,26 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
         </div>
       )}
 
-      <div className="formulabar">
-        <output className="name-box" data-testid="name-box" aria-label="Selected cell or range">
-          {selection ? selection.name : "—"}
-        </output>
-        <span className="fx-badge" aria-hidden="true">
-          fx
-        </span>
-        <input
-          type="text"
-          className="formula-input"
-          data-testid="formula-input"
-          aria-label="Formula bar"
-          placeholder={selection ? "Enter a value or =formula" : "Select a cell to edit"}
-          disabled={engine.status !== "ready" || selection === null}
-          value={formulaBarValue}
-          onChange={(event) => {
-            const next = event.target.value;
-            setEditingText(next);
-            editorRef.current?.setTextExternal(next);
-          }}
-          onKeyDown={(event) => {
-            if (event.key === "Enter") {
-              event.preventDefault();
-              setEditingText(null);
-              editorRef.current?.commitExternal(true);
-            } else if (event.key === "Escape") {
-              event.preventDefault();
-              setEditingText(null);
-              editorRef.current?.cancelExternal();
-            }
-          }}
-        />
-      </div>
+      <FormulaBar
+        ref={formulaBarRef}
+        nameBoxText={nameBoxText}
+        value={formulaBarValue}
+        placeholder={
+          selection || editSessionRef.current
+            ? "Enter a value or =formula (Tab to autocomplete, F4 to toggle $)"
+            : "Select a cell to edit"
+        }
+        disabled={engine.status !== "ready" || (selection === null && !editSessionRef.current)}
+        isEditing={editingText !== null}
+        analysis={formulaAnalysis}
+        onChange={handleFormulaBarChange}
+        onCommit={handleFormulaBarCommit}
+        onCancel={handleFormulaBarCancel}
+        onToggleDollar={(text, cursorUtf16) => {
+          clientRef.current?.send({ kind: "toggleFormulaDollar", source: text, cursorUtf16 });
+        }}
+        onAcceptCompletion={handleAcceptCompletion}
+      />
 
       {rejectedReason && (
         <div className="rejected-banner" role="alert" data-testid="rejected-banner">
@@ -545,10 +1816,107 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
         )}
       </div>
 
+      {readySheet && (
+        <div className="sheetbar" role="tablist" aria-label="Worksheets" data-testid="sheet-tabs">
+          {readySheet.sheets.map((tab) => {
+            const isActive = tab.id === readySheet.sheet;
+            const isRenaming = renamingSheet?.id === tab.id;
+            if (isRenaming) {
+              return (
+                <input
+                  key={tab.id}
+                  type="text"
+                  className="sheet-rename-input"
+                  data-testid="rename-sheet-input"
+                  value={renamingSheet.draft}
+                  maxLength={31}
+                  // biome-ignore lint/a11y/noAutofocus: inline tab rename requires immediate focus
+                  autoFocus
+                  onChange={(e) => setRenamingSheet({ id: tab.id, draft: e.target.value })}
+                  onBlur={() => {
+                    const trimmed = renamingSheet.draft.trim();
+                    setRenamingSheet(null);
+                    if (trimmed && trimmed !== tab.name) {
+                      pendingActionVerbRef.current = "renamed sheet";
+                      clientRef.current?.send({
+                        kind: "renameSheet",
+                        sheet: tab.id,
+                        name: trimmed,
+                      });
+                    }
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") {
+                      e.preventDefault();
+                      const trimmed = renamingSheet.draft.trim();
+                      setRenamingSheet(null);
+                      if (trimmed && trimmed !== tab.name) {
+                        pendingActionVerbRef.current = "renamed sheet";
+                        clientRef.current?.send({
+                          kind: "renameSheet",
+                          sheet: tab.id,
+                          name: trimmed,
+                        });
+                      }
+                      editorRef.current?.focus();
+                    } else if (e.key === "Escape") {
+                      e.preventDefault();
+                      setRenamingSheet(null);
+                      editorRef.current?.focus();
+                    }
+                  }}
+                />
+              );
+            }
+            return (
+              <button
+                key={tab.id}
+                type="button"
+                role="tab"
+                aria-selected={isActive}
+                className={isActive ? "sheet-tab active" : "sheet-tab"}
+                data-testid={`sheet-tab-${tab.id}`}
+                onClick={() => handleSwitchSheet(tab.id)}
+                onDoubleClick={() => setRenamingSheet({ id: tab.id, draft: tab.name })}
+                onContextMenu={(e) => {
+                  e.preventDefault();
+                  setColorPopover(null);
+                  setContextMenu({
+                    kind: "tab",
+                    clientX: e.clientX,
+                    clientY: e.clientY,
+                    tab,
+                  });
+                }}
+              >
+                {tab.name}
+              </button>
+            );
+          })}
+          <button
+            type="button"
+            className="sheet-add-btn"
+            data-testid="add-sheet-btn"
+            title="Add worksheet"
+            aria-label="Add worksheet"
+            onClick={() => {
+              pendingActionVerbRef.current = "added sheet";
+              clientRef.current?.send({
+                kind: "addSheet",
+                afterSheet: readySheet.sheet,
+              });
+              editorRef.current?.focus();
+            }}
+          >
+            +
+          </button>
+        </div>
+      )}
+
       <footer className="statusbar">
         <span data-testid="engine-status">{engine.status}</span>
         {engine.status === "starting" && <span>Generating the sample…</span>}
-        {engine.status === "ready" && (
+        {readySheet && engine.status === "ready" && (
           <>
             {(selection ?? stats?.selection) && (
               <span data-testid="selection">
@@ -564,11 +1932,13 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
               </span>
             )}
             <span className="spacer" />
-            <span title="The sample is computed from this seed, not downloaded">
-              seed {engine.sheet.seed}
-            </span>
-            <span data-testid="generation" title="Time the engine took to generate the sample">
-              generated in {milliseconds.format(engine.sheet.generationMs)} ms
+            {readySheet.seed !== 0 && (
+              <span title="The sample is computed from this seed, not downloaded">
+                seed {readySheet.seed}
+              </span>
+            )}
+            <span data-testid="generation" title="Time the engine took to generate or open">
+              generated in {milliseconds.format(readySheet.generationMs)} ms
             </span>
             {stats && stats.frameWork.samples > 0 && (
               <span
@@ -583,6 +1953,235 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
           </>
         )}
       </footer>
+
+      {contextMenu && (
+        <div
+          className="context-menu"
+          role="menu"
+          data-testid="context-menu"
+          style={{
+            left: `${Math.min(window.innerWidth - 208, Math.max(8, contextMenu.kind === "grid" ? contextMenu.target.clientX : contextMenu.clientX))}px`,
+            top: `${Math.min(window.innerHeight - 260, Math.max(8, contextMenu.kind === "grid" ? contextMenu.target.clientY : contextMenu.clientY))}px`,
+          }}
+        >
+          {contextMenu.kind === "grid" ? (
+            <>
+              <button
+                type="button"
+                role="menuitem"
+                className="ctx-item"
+                data-testid="ctx-cut"
+                onClick={() => void handleContextClipboard("cut")}
+              >
+                Cut <kbd>Ctrl+X</kbd>
+              </button>
+              <button
+                type="button"
+                role="menuitem"
+                className="ctx-item"
+                data-testid="ctx-copy"
+                onClick={() => void handleContextClipboard("copy")}
+              >
+                Copy <kbd>Ctrl+C</kbd>
+              </button>
+              <button
+                type="button"
+                role="menuitem"
+                className="ctx-item"
+                data-testid="ctx-paste"
+                onClick={() => void handleContextClipboard("paste")}
+              >
+                Paste <kbd>Ctrl+V</kbd>
+              </button>
+              <button
+                type="button"
+                role="menuitem"
+                className="ctx-item"
+                data-testid="ctx-clear"
+                onClick={() => {
+                  setContextMenu(null);
+                  const runs = gridRef.current?.selectedCellRuns();
+                  if (runs) {
+                    pendingActionVerbRef.current = "cleared cells";
+                    clientRef.current?.send({
+                      kind: "clearCells",
+                      sheet: activeSheetRef.current,
+                      rows: runs.rows,
+                      cols: runs.cols,
+                    });
+                  }
+                  editorRef.current?.focus();
+                }}
+              >
+                Clear Contents <kbd>Del</kbd>
+              </button>
+              <div className="ctx-sep" />
+              <button
+                type="button"
+                role="menuitem"
+                className="ctx-item"
+                data-testid="ctx-insert-row-above"
+                onClick={() => {
+                  setContextMenu(null);
+                  handleInsertRow(false);
+                }}
+              >
+                Insert Row Above
+              </button>
+              <button
+                type="button"
+                role="menuitem"
+                className="ctx-item"
+                data-testid="ctx-insert-row-below"
+                onClick={() => {
+                  setContextMenu(null);
+                  handleInsertRow(true);
+                }}
+              >
+                Insert Row Below
+              </button>
+              <button
+                type="button"
+                role="menuitem"
+                className="ctx-item"
+                data-testid="ctx-delete-rows"
+                disabled={!canDeleteRows}
+                onClick={() => {
+                  setContextMenu(null);
+                  handleDeleteSelectedRows();
+                }}
+              >
+                Delete Selected Rows
+              </button>
+              <div className="ctx-sep" />
+              <button
+                type="button"
+                role="menuitem"
+                className="ctx-item"
+                data-testid="ctx-insert-col-left"
+                onClick={() => {
+                  setContextMenu(null);
+                  handleInsertCol(false);
+                }}
+              >
+                Insert Column Left
+              </button>
+              <button
+                type="button"
+                role="menuitem"
+                className="ctx-item"
+                data-testid="ctx-insert-col-right"
+                onClick={() => {
+                  setContextMenu(null);
+                  handleInsertCol(true);
+                }}
+              >
+                Insert Column Right
+              </button>
+              <button
+                type="button"
+                role="menuitem"
+                className="ctx-item"
+                data-testid="ctx-delete-cols"
+                disabled={!canDeleteCols}
+                onClick={() => {
+                  setContextMenu(null);
+                  handleDeleteSelectedCols();
+                }}
+              >
+                Delete Selected Columns
+              </button>
+            </>
+          ) : (
+            <>
+              <button
+                type="button"
+                role="menuitem"
+                className="ctx-item"
+                data-testid="ctx-rename-sheet"
+                onClick={() => {
+                  const { tab } = contextMenu;
+                  setContextMenu(null);
+                  setRenamingSheet({ id: tab.id, draft: tab.name });
+                }}
+              >
+                Rename Sheet…
+              </button>
+              {readySheet &&
+                (() => {
+                  const idx = readySheet.sheets.findIndex((s) => s.id === contextMenu.tab.id);
+                  const canLeft = idx > 0;
+                  const canRight = idx >= 0 && idx < readySheet.sheets.length - 1;
+                  return (
+                    <>
+                      <button
+                        type="button"
+                        role="menuitem"
+                        className="ctx-item"
+                        data-testid="ctx-move-sheet-left"
+                        disabled={!canLeft}
+                        onClick={() => {
+                          const targetTab = contextMenu.tab;
+                          setContextMenu(null);
+                          const afterSheet = idx >= 2 ? readySheet.sheets[idx - 2]?.id : undefined;
+                          pendingActionVerbRef.current = "reordered sheets";
+                          clientRef.current?.send({
+                            kind: "moveSheet",
+                            sheet: targetTab.id,
+                            afterSheet,
+                          });
+                        }}
+                      >
+                        Move Left
+                      </button>
+                      <button
+                        type="button"
+                        role="menuitem"
+                        className="ctx-item"
+                        data-testid="ctx-move-sheet-right"
+                        disabled={!canRight}
+                        onClick={() => {
+                          const targetTab = contextMenu.tab;
+                          setContextMenu(null);
+                          const nextTab = readySheet.sheets[idx + 1];
+                          if (nextTab) {
+                            pendingActionVerbRef.current = "reordered sheets";
+                            clientRef.current?.send({
+                              kind: "moveSheet",
+                              sheet: targetTab.id,
+                              afterSheet: nextTab.id,
+                            });
+                          }
+                        }}
+                      >
+                        Move Right
+                      </button>
+                      <div className="ctx-sep" />
+                      <button
+                        type="button"
+                        role="menuitem"
+                        className="ctx-item danger"
+                        data-testid="ctx-delete-sheet"
+                        disabled={readySheet.sheets.length <= 1}
+                        onClick={() => {
+                          const targetTab = contextMenu.tab;
+                          setContextMenu(null);
+                          pendingActionVerbRef.current = "deleted sheet";
+                          clientRef.current?.send({
+                            kind: "deleteSheet",
+                            sheet: targetTab.id,
+                          });
+                        }}
+                      >
+                        Delete Sheet
+                      </button>
+                    </>
+                  );
+                })()}
+            </>
+          )}
+        </div>
+      )}
     </div>
   );
 }

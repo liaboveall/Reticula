@@ -36,7 +36,7 @@ test("editing V1 recalculates 100,001 dependent formulas and updates V2", async 
   });
   await settled(page);
   await expect(page.getByTestId("name-box")).toHaveText("V2");
-  await expect(page.getByTestId("formula-input")).toHaveValue("=SUM(M2:M100001)");
+  await expect(page.getByTestId("formula-input")).toHaveText("=SUM(M2:M100001)");
   const initialSum = await page.evaluate(() => window.__reticula?.textAt(1, 21));
   expect(initialSum).toMatch(/^\d+\.\d\d$/);
 
@@ -76,7 +76,7 @@ test("inserting and deleting rows updates row count and shifts bound formula add
   });
   await settled(page);
   await expect(page.getByTestId("name-box")).toHaveText("V3");
-  await expect(page.getByTestId("formula-input")).toHaveValue("=SUM(M3:M100002)");
+  await expect(page.getByTestId("formula-input")).toHaveText("=SUM(M3:M100002)");
 
   // Delete the newly inserted top row (`row = 0`).
   await page.evaluate(() => {

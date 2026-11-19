@@ -8,6 +8,12 @@ export {
   type EditorEvent,
 } from "./editor.ts";
 export {
+  FormulaBarEditor,
+  type FormulaBarEditorOptions,
+  formulaDecorationExtension,
+  setFormulaAnalysisEffect,
+} from "./formula-input.ts";
+export {
   coalesceIdRuns,
   type FrameReport,
   Grid,
@@ -36,4 +42,11 @@ export type {
   FormulaReferenceOverlay,
   GridCellStyle,
 } from "./renderer.ts";
-export { REF_COLORS_DARK, REF_COLORS_LIGHT } from "./theme.ts";
+export {
+  DARK_PALETTE_FILL,
+  DARK_PALETTE_TEXT,
+  LIGHT_PALETTE_FILL,
+  LIGHT_PALETTE_TEXT,
+  REF_COLORS_DARK,
+  REF_COLORS_LIGHT,
+} from "./theme.ts";
