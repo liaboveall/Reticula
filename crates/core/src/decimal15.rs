@@ -13,6 +13,7 @@ use alloc::string::String;
 use core::fmt::Write as _;
 
 use crate::num;
+use crate::value::CalcError;
 
 ///Smallest positive normal IEEE 754 `f64` (`2^-1022`).
 const MIN_NORMAL: f64 = 2.225_073_858_507_201_4e-308;
@@ -192,6 +193,69 @@ pub fn excel_int(x: f64) -> Option<f64> {
         RoundingMode::TowardZero
     };
     round_decimal(x, 0, mode)
+}
+
+/// Excel's `FLOOR(x, significance)` under D-027 15-significant-digit rules.
+pub fn excel_floor(x: f64, significance: f64) -> Result<f64, CalcError> {
+    if !x.is_finite() || !significance.is_finite() {
+        return Err(CalcError::Num);
+    }
+    if x == 0.0 {
+        return Ok(0.0);
+    }
+    if significance == 0.0 {
+        return Err(CalcError::Div0);
+    }
+    if x > 0.0 && significance < 0.0 {
+        return Err(CalcError::Num);
+    }
+    if significance == 1.0 && x.abs() < 1.0e15 {
+        let mode = if x < 0.0 {
+            RoundingMode::AwayFromZero
+        } else {
+            RoundingMode::TowardZero
+        };
+        return round_decimal(x, 0, mode).ok_or(CalcError::Num);
+    }
+    let rx = round_to_15_sig_figs(x);
+    let rsig = round_to_15_sig_figs(significance);
+    let ratio = round_to_15_sig_figs(rx / rsig);
+    let res = num::floor(ratio) * significance;
+    if res.is_finite() {
+        Ok(canonical_zero(res))
+    } else {
+        Err(CalcError::Num)
+    }
+}
+
+/// Excel's `CEILING(x, significance)` under D-027 15-significant-digit rules.
+pub fn excel_ceiling(x: f64, significance: f64) -> Result<f64, CalcError> {
+    if !x.is_finite() || !significance.is_finite() {
+        return Err(CalcError::Num);
+    }
+    if x == 0.0 || significance == 0.0 {
+        return Ok(0.0);
+    }
+    if x > 0.0 && significance < 0.0 {
+        return Err(CalcError::Num);
+    }
+    if significance == 1.0 && x.abs() < 1.0e15 {
+        let mode = if x > 0.0 {
+            RoundingMode::AwayFromZero
+        } else {
+            RoundingMode::TowardZero
+        };
+        return round_decimal(x, 0, mode).ok_or(CalcError::Num);
+    }
+    let rx = round_to_15_sig_figs(x);
+    let rsig = round_to_15_sig_figs(significance);
+    let ratio = round_to_15_sig_figs(rx / rsig);
+    let res = num::ceil(ratio) * significance;
+    if res.is_finite() {
+        Ok(canonical_zero(res))
+    } else {
+        Err(CalcError::Num)
+    }
 }
 
 /// Excel's `MOD(a, b)`: exact IEEE remainder with the sign of `b` (`None` when

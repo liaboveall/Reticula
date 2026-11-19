@@ -441,6 +441,13 @@ impl BoundFormula {
         expr_is_structure_sensitive(&self.root)
     }
 
+    /// Whether this formula invokes volatile functions (`TODAY`, `NOW`, `RAND`,
+    /// or `RANDBETWEEN`; `14-m1b.md` 5.3).
+    #[must_use]
+    pub fn is_volatile(&self) -> bool {
+        expr_is_volatile(&self.root)
+    }
+
     /// Reconstructs the formula string (beginning with `'='`) from current live
     /// axis positions in `workbook` for a cell on `host_sheet`.
     #[must_use]
@@ -1242,6 +1249,21 @@ fn expr_is_structure_sensitive(expr: &BoundExpr) -> bool {
         }
         BoundExpr::Call { name, args } => {
             name == "ROW" || name == "COLUMN" || args.iter().any(expr_is_structure_sensitive)
+        }
+    }
+}
+
+fn expr_is_volatile(expr: &BoundExpr) -> bool {
+    match expr {
+        BoundExpr::Literal(_)
+        | BoundExpr::ArrayLiteral { .. }
+        | BoundExpr::Reference(_)
+        | BoundExpr::Name(_) => false,
+        BoundExpr::Paren(inner) | BoundExpr::Unary { expr: inner, .. } => expr_is_volatile(inner),
+        BoundExpr::Binary { left, right, .. } => expr_is_volatile(left) || expr_is_volatile(right),
+        BoundExpr::Call { name, args } => {
+            crate::functions::catalog::is_volatile_function(name)
+                || args.iter().any(expr_is_volatile)
         }
     }
 }

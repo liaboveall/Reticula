@@ -1,0 +1,21 @@
+# Reticula Layer-1 Conformance: Conditional Aggregation
+# Reference oracle: Microsoft Excel 16.0 (build 20711) & S3b 15-digit / tail-zeroing study
+
+COUNTBLANK	=COUNTBLANK(E1:E4)	NUM	3
+COUNTBLANK	=COUNTBLANK(C5:C6)	NUM	1
+COUNTIF	=COUNTIF(B1:B6, ">10")	NUM	2
+COUNTIF	=COUNTIF(C1:C5, "*e*")	NUM	3
+COUNTIF	=COUNTIF(F1:F3, "item~*1")	NUM	1
+COUNTIF	=COUNTIF(E1:E4, "")	NUM	3
+COUNTIF	=COUNTIF(E1:E4, "<>")	NUM	1
+# S3b verified: `COUNTIF` uses 15-digit equality, so `1.0 + eps` matches `1.0`!
+COUNTIF	=COUNTIF(F5:F5, F4)	NUM	1
+SUMIF	=SUMIF(B1:B6, ">=10")	NUM	135.5
+SUMIF	=SUMIF(C1:C5, "abc", B1:B5)	NUM	-4
+# `sum_range` given as single top-left cell expands to shape of `range`!
+SUMIF	=SUMIF(G1:G5, ">=20", B1)	NUM	124.5
+# S3b verified: `SUM(0.1, 0.2, -0.3)` snaps to `0`, whereas `SUMIF` does NOT snap (~5.55e-17 > 0)!
+SUMIF	=SUMIF(L1:L3, "<>")>0	BOOL	TRUE
+AVERAGEIF	=AVERAGEIF(G1:G5, ">=20")	NUM	35
+AVERAGEIF	=AVERAGEIF(G1:G5, ">999")	ERR	#DIV/0!
+AVERAGEIF	=AVERAGEIF(C1:C4, "*grid*", B1:B4)	NUM	25.5

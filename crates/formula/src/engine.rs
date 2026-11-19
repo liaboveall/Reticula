@@ -13,6 +13,7 @@
 //!   without losing work already completed in earlier slices.
 
 use alloc::boxed::Box;
+use alloc::collections::BTreeSet;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -40,7 +41,7 @@ use crate::address::CellAddr;
 use crate::ast::{BinaryOp, Literal, MAX_NESTING_DEPTH};
 use crate::binder::{BoundExpr, BoundFormula, BoundRef, live_span_positions};
 use crate::dep_graph::{DepGraph, FormulaRegistration};
-use crate::functions::{combine_if, combine_iferror, eval_eager_function};
+use crate::functions::{EvalEnv, combine_choose, combine_if, combine_iferror, eval_eager_function};
 use crate::parser::ParseError;
 use crate::value_eval::{
     Array2D, CallerContext, EvalScalar, EvalValue, ResolvedRef, coerce_for_scalar_op, eval_binary,
@@ -155,6 +156,8 @@ pub struct FormulaEngine {
     call_stack: Vec<u32>,
     wave_done: u32,
     changes: DirtyChanges,
+    volatile_set: BTreeSet<u32>,
+    env: EvalEnv,
 }
 
 impl Default for FormulaEngine {
@@ -189,6 +192,8 @@ impl FormulaEngine {
             call_stack: Vec::new(),
             wave_done: 0,
             changes: DirtyChanges::default(),
+            volatile_set: BTreeSet::new(),
+            env: EvalEnv::default(),
         };
         let keys_and_formulas: Vec<(WorkbookCellKey, BoundFormula)> = engine
             .workbook
@@ -371,6 +376,26 @@ impl FormulaEngine {
             call_stack: Vec::new(),
             wave_done: 0,
             changes: DirtyChanges::default(),
+            volatile_set: BTreeSet::new(),
+            env: EvalEnv::default(),
+        }
+    }
+
+    /// Current host-injected volatile evaluation environment.
+    #[must_use]
+    pub const fn eval_env(&self) -> &EvalEnv {
+        &self.env
+    }
+
+    /// Injects a fresh volatile evaluation environment (`now_serial` in the
+    /// Excel 1900 date system and a 64-bit PRNG seed) and marks all volatile
+    /// formulas (`TODAY`, `NOW`, `RAND`, `RANDBETWEEN`) and their dependents
+    /// dirty (`14-m1b.md` 5.3).
+    pub fn set_eval_env(&mut self, now_serial: f64, seed: u64) {
+        self.env = EvalEnv::new(now_serial, seed);
+        if !self.volatile_set.is_empty() {
+            let roots: Vec<u32> = self.volatile_set.iter().copied().collect();
+            self.propagate_dirty(roots);
         }
     }
 
@@ -567,6 +592,11 @@ impl FormulaEngine {
                 format,
             }],
         })?;
+        if !self.volatile_set.is_empty() {
+            let vol_roots: Vec<u32> = self.volatile_set.iter().copied().collect();
+            self.propagate_dirty(vol_roots);
+        }
+
         Ok(inv)
     }
 
@@ -688,6 +718,11 @@ impl FormulaEngine {
             InverseOp::UndeleteSheet { sheet } | InverseOp::RedeleteSheet { sheet, .. } => {
                 self.on_sheet_visibility_changed(*sheet);
             }
+        }
+
+        if !self.volatile_set.is_empty() {
+            let vol_roots: Vec<u32> = self.volatile_set.iter().copied().collect();
+            self.propagate_dirty(vol_roots);
         }
 
         Ok(inv)
@@ -1151,6 +1186,9 @@ impl FormulaEngine {
             fresh
         };
         let reg = self.dep_graph.register(fid, key.0, formula);
+        if formula.is_volatile() {
+            self.volatile_set.insert(fid);
+        }
         if let Some(slot_ref) = self.slots.get_mut(fid as usize) {
             *slot_ref = Some(FormulaSlot { key, reg });
         }
@@ -1165,6 +1203,7 @@ impl FormulaEngine {
         let Some(fid) = self.cell_to_fid.remove(&key) else {
             return;
         };
+        self.volatile_set.remove(&fid);
         self.set_state(fid, STATE_CLEAN);
         if let Some(slot_opt) = self.slots.get_mut(fid as usize)
             && let Some(old_slot) = slot_opt.take()
@@ -1309,7 +1348,7 @@ impl FormulaEngine {
         }
     }
 
-    fn eval_root_formula(&self, root: &BoundExpr, caller: CallerContext) -> ExprOutcome {
+    fn eval_root_formula(&mut self, root: &BoundExpr, caller: CallerContext) -> ExprOutcome {
         // Outermost `Add`/`Sub` (not wrapped in `Paren`) gets D-027 tail-zeroing!
         let out = self.eval_expr(root, caller, true, 0);
         match out {
@@ -1322,7 +1361,7 @@ impl FormulaEngine {
     }
 
     fn eval_expr(
-        &self,
+        &mut self,
         expr: &BoundExpr,
         caller: CallerContext,
         is_outermost: bool,
@@ -1391,7 +1430,7 @@ impl FormulaEngine {
     }
 
     fn eval_call(
-        &self,
+        &mut self,
         name: &str,
         args: &[BoundExpr],
         caller: CallerContext,
@@ -1527,9 +1566,95 @@ impl FormulaEngine {
             ));
         }
 
-        // 2. Coordinate-only functions (`ROW`, `COLUMN`) do NOT dereference
-        // cell values inside their reference argument!
-        let deref_args = !matches!(name, "ROW" | "COLUMN");
+        if name == "CHOOSE" {
+            if args.len() < 2 {
+                return ExprOutcome::Ready(EvalValue::Scalar(EvalScalar::Error(CalcError::Value)));
+            }
+            let Some(idx_expr) = args.first() else {
+                return ExprOutcome::Ready(EvalValue::Scalar(EvalScalar::Error(CalcError::Value)));
+            };
+            let idx_raw = match self.eval_expr(idx_expr, caller, false, depth) {
+                ExprOutcome::Ready(v) => v,
+                other => return other,
+            };
+            if let Err(wait) = self.ensure_value_ready(&idx_raw) {
+                return wait;
+            }
+            let idx_sa = match coerce_for_scalar_op(idx_raw, &self.workbook, caller) {
+                Ok(sa) => sa,
+                Err(e) => return ExprOutcome::Ready(EvalValue::Scalar(EvalScalar::Error(e))),
+            };
+
+            let choice_exprs = args.get(1..).unwrap_or(&[]);
+            let mut needed_mask = vec![false; choice_exprs.len()];
+            let mut mark_index = |s: &EvalScalar| {
+                if let Ok(idx_1based) = s.to_number().and_then(crate::functions::trunc_to_isize)
+                    && idx_1based >= 1
+                    && let Ok(i) = usize::try_from(idx_1based)
+                    && let Some(flag) = needed_mask.get_mut(i.saturating_sub(1))
+                {
+                    *flag = true;
+                }
+            };
+            match &idx_sa {
+                crate::value_eval::ScalarOrArray::Scalar(s) => mark_index(s),
+                crate::value_eval::ScalarOrArray::Array(arr) => {
+                    for s in &arr.values {
+                        mark_index(s);
+                    }
+                }
+            }
+
+            let mut evaluated_choices: Vec<Option<EvalValue>> =
+                Vec::with_capacity(choice_exprs.len());
+            let mut blocked: SmallVec<[u32; 4]> = SmallVec::new();
+            for (i, c_expr) in choice_exprs.iter().enumerate() {
+                if !needed_mask.get(i).copied().unwrap_or(false) {
+                    evaluated_choices.push(None);
+                    continue;
+                }
+                let val = match self.eval_expr(c_expr, caller, false, depth) {
+                    ExprOutcome::Ready(v) => v,
+                    ExprOutcome::Cycle(c) => return ExprOutcome::Cycle(c),
+                    ExprOutcome::Blocked(b) => {
+                        for f in b {
+                            if !blocked.contains(&f) {
+                                blocked.push(f);
+                            }
+                        }
+                        evaluated_choices.push(None);
+                        continue;
+                    }
+                };
+                if let Err(wait) = self.ensure_value_ready(&val) {
+                    match wait {
+                        ExprOutcome::Cycle(c) => return ExprOutcome::Cycle(c),
+                        ExprOutcome::Blocked(b) => {
+                            for f in b {
+                                if !blocked.contains(&f) {
+                                    blocked.push(f);
+                                }
+                            }
+                        }
+                        ExprOutcome::Ready(_) => {}
+                    }
+                }
+                evaluated_choices.push(Some(val));
+            }
+            if !blocked.is_empty() {
+                return ExprOutcome::Blocked(blocked);
+            }
+            return ExprOutcome::Ready(combine_choose(
+                idx_sa,
+                evaluated_choices,
+                &self.workbook,
+                caller,
+            ));
+        }
+
+        // 2. Coordinate/shape-only functions (`ROW`, `COLUMN`, `ROWS`, `COLUMNS`)
+        // do NOT dereference cell values inside their reference argument!
+        let deref_args = !matches!(name, "ROW" | "COLUMN" | "ROWS" | "COLUMNS");
 
         let mut evaluated_args = Vec::with_capacity(args.len());
         let mut all_blocked: SmallVec<[u32; 4]> = SmallVec::new();
@@ -1570,6 +1695,7 @@ impl FormulaEngine {
             evaluated_args,
             &self.workbook,
             caller,
+            &mut self.env,
         ))
     }
 

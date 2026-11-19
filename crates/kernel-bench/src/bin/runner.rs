@@ -53,7 +53,7 @@ fn main() {
 }
 
 fn run_diff_cmd(args: &[String]) {
-    let mut count = 2_500_usize;
+    let mut count = 10_000_usize;
     let mut seed = 0xD1FF_2026_u64;
     let mut out: Option<PathBuf> = None;
 

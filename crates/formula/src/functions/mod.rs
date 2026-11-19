@@ -1,12 +1,12 @@
-//! Layer-0 built-in spreadsheet functions (`13-m1a.md` 5.5).
-//!
-//! Covers aggregation & statistics (`SUM`, `AVERAGE`, `COUNT`, `COUNTA`, `MIN`,
-//! `MAX`), logic & error handling (`IF`, `AND`, `OR`, `NOT`, `IFERROR`, `IFNA`,
-//! `TRUE`, `FALSE`), math & D-027 rounding (`ABS`, `ROUND`, `ROUNDDOWN`,
-//! `ROUNDUP`, `INT`, `TRUNC`, `MOD`, `SQRT`, `POWER`), text (`LEN`, `LOWER`,
-//! `UPPER`, `TRIM`, `LEFT`, `RIGHT`, `MID`, `CONCAT`), type predicates
-//! (`ISBLANK`, `ISNUMBER`, `ISTEXT`, `ISLOGICAL`, `ISERROR`, `NA`), and
-//! structure-sensitive functions (`ROW`, `COLUMN`).
+//! Built-in Layer-0 (39) and Layer-1 (30) spreadsheet functions (`13-m1a.md`
+//! 5.5 & `14-m1b.md` 5.3 — 69 functions total).
+
+pub mod catalog;
+pub mod criteria;
+pub mod datetime;
+pub mod lookup;
+pub mod text_conv;
+pub mod wildcard;
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -14,9 +14,10 @@ use alloc::vec::Vec;
 use reticula_core::decimal15::{
     RoundingMode, excel_int, excel_mod, round_decimal, snap_cancelled_zero,
 };
-use reticula_core::id::{ColId, IdRun, RowId, SheetId};
+use reticula_core::id::IdRun;
 use reticula_core::num;
 use reticula_core::ops::{MAX_CELL_TEXT_UTF16, Workbook};
+use reticula_core::rng::Rng;
 use reticula_core::sheet::Sheet;
 use reticula_core::store::{BLOCK_ROWS, Block};
 use reticula_core::value::{CalcError, Value};
@@ -27,16 +28,54 @@ use crate::value_eval::{
     coerce_for_scalar_op,
 };
 
-/// Evaluates an eager (non-short-circuiting) Layer-0 function `name` on
-/// already-evaluated `args`. (`IF`, `IFERROR` and `IFNA` are handled directly
-/// in the evaluator so unchosen branches are never evaluated.)
+pub use lookup::combine_choose;
+
+/// Default deterministic date serial (`2026-01-01 00:00:00` = `46_023.0`) used
+/// by [`EvalEnv::default`] when no host clock has been injected (`14-m1b.md` 5.3).
+pub const DEFAULT_NOW_SERIAL: f64 = 46_023.0;
+
+/// Default deterministic PRNG seed used by [`EvalEnv::default`].
+pub const DEFAULT_EVAL_SEED: u64 = 0x2026_0101_5EED_CAFE;
+
+/// Pure host-injected environment for volatile functions (`TODAY`, `NOW`,
+/// `RAND`, `RANDBETWEEN`; `14-m1b.md` 5.3, D-021).
+#[derive(Clone, Debug)]
+pub struct EvalEnv {
+    /// Current local date+time as an Excel 1900-system serial number.
+    pub now_serial: f64,
+    /// Deterministic PRNG stepped by `RAND` and `RANDBETWEEN`.
+    pub rng: Rng,
+}
+
+impl Default for EvalEnv {
+    fn default() -> Self {
+        Self::new(DEFAULT_NOW_SERIAL, DEFAULT_EVAL_SEED)
+    }
+}
+
+impl EvalEnv {
+    /// Constructs an evaluation environment from a 1900 date serial and 64-bit seed.
+    #[must_use]
+    pub fn new(now_serial: f64, seed: u64) -> Self {
+        Self {
+            now_serial,
+            rng: Rng::from_seed(seed),
+        }
+    }
+}
+
+/// Evaluates an eager (non-short-circuiting) Layer-0 or Layer-1 function `name`
+/// on already-evaluated `args`. (`IF`, `IFERROR`, `IFNA`, and `CHOOSE` are
+/// handled directly in `FormulaEngine` so unchosen branches are never evaluated.)
 pub fn eval_eager_function(
     name: &str,
     args: Vec<EvalValue>,
     workbook: &Workbook<BoundFormula>,
     caller: CallerContext,
+    env: &mut EvalEnv,
 ) -> EvalValue {
     match name {
+        // --- Layer 0: Aggregations ---
         "SUM" => EvalValue::Scalar(eval_sum(&args, workbook)),
         "AVERAGE" => EvalValue::Scalar(eval_average(&args, workbook)),
         "COUNT" => EvalValue::Scalar(eval_count(&args, workbook)),
@@ -44,6 +83,7 @@ pub fn eval_eager_function(
         "MIN" => EvalValue::Scalar(eval_min_max(&args, workbook, true)),
         "MAX" => EvalValue::Scalar(eval_min_max(&args, workbook, false)),
 
+        // --- Layer 0: Logic & constants ---
         "AND" => EvalValue::Scalar(eval_and_or(&args, workbook, true)),
         "OR" => EvalValue::Scalar(eval_and_or(&args, workbook, false)),
         "NOT" => lift_unary(args, workbook, caller, |x| {
@@ -72,6 +112,7 @@ pub fn eval_eager_function(
             }
         }
 
+        // --- Layer 0 & Layer 1: Math, Rounding & Volatiles ---
         "ABS" => lift_unary(args, workbook, caller, |x| {
             x.to_number()
                 .map_or_else(EvalScalar::Error, |n| EvalScalar::number(n.abs()))
@@ -95,6 +136,8 @@ pub fn eval_eager_function(
             eval_round_scalar(x, d, RoundingMode::AwayFromZero)
         }),
         "TRUNC" => eval_trunc(args, workbook, caller),
+        "FLOOR" => text_conv::eval_floor_or_ceiling(args, workbook, caller, true),
+        "CEILING" => text_conv::eval_floor_or_ceiling(args, workbook, caller, false),
         "MOD" => lift_binary(args, workbook, caller, |a, b| {
             let x = match a.to_number() {
                 Ok(v) => v,
@@ -126,7 +169,12 @@ pub fn eval_eager_function(
             }
             EvalScalar::number(num::pow(x, y))
         }),
+        "TODAY" => text_conv::eval_today_or_now(&args, env, false),
+        "NOW" => text_conv::eval_today_or_now(&args, env, true),
+        "RAND" => text_conv::eval_rand(&args, env),
+        "RANDBETWEEN" => text_conv::eval_randbetween(args, workbook, caller, env),
 
+        // --- Layer 0 & Layer 1: Text & Conversion ---
         "LEN" => lift_unary(args, workbook, caller, |x| match x.to_text() {
             Ok(s) => {
                 #[expect(
@@ -154,7 +202,14 @@ pub fn eval_eager_function(
         "RIGHT" => eval_left_or_right(args, workbook, caller, false),
         "MID" => eval_mid(args, workbook, caller),
         "CONCAT" => EvalValue::Scalar(eval_concat(&args, workbook)),
+        "FIND" => text_conv::eval_find_or_search(args, workbook, caller, true),
+        "SEARCH" => text_conv::eval_find_or_search(args, workbook, caller, false),
+        "SUBSTITUTE" => text_conv::eval_substitute(args, workbook, caller),
+        "REPLACE" => text_conv::eval_replace(args, workbook, caller),
+        "VALUE" => text_conv::eval_value(args, workbook, caller),
+        "TEXT" => text_conv::eval_text(args, workbook, caller),
 
+        // --- Layer 0: Type predicates ---
         "ISBLANK" => lift_unary(args, workbook, caller, |x| {
             EvalScalar::Bool(matches!(x, EvalScalar::Empty))
         }),
@@ -171,8 +226,30 @@ pub fn eval_eager_function(
             EvalScalar::Bool(matches!(x, EvalScalar::Error(_)))
         }),
 
+        // --- Layer 0 & Layer 1: Structural & Lookup ---
         "ROW" => EvalValue::Scalar(eval_row_or_col(&args, workbook, caller, true)),
         "COLUMN" => EvalValue::Scalar(eval_row_or_col(&args, workbook, caller, false)),
+        "ROWS" => lookup::eval_rows_or_columns(&args, workbook, true),
+        "COLUMNS" => lookup::eval_rows_or_columns(&args, workbook, false),
+        "INDEX" => lookup::eval_index(args, workbook, caller),
+        "MATCH" => lookup::eval_match(args, workbook, caller),
+        "VLOOKUP" => lookup::eval_vlookup_or_hlookup(args, workbook, caller, true),
+        "HLOOKUP" => lookup::eval_vlookup_or_hlookup(args, workbook, caller, false),
+
+        // --- Layer 1: Conditional aggregation ---
+        "COUNTBLANK" => criteria::eval_countblank(&args, workbook),
+        "COUNTIF" => criteria::eval_countif(args, workbook, caller),
+        "SUMIF" => criteria::eval_sumif_or_averageif(args, workbook, caller, false),
+        "AVERAGEIF" => criteria::eval_sumif_or_averageif(args, workbook, caller, true),
+
+        // --- Layer 1: Date basics ---
+        "DATE" => datetime::eval_date(args, workbook, caller),
+        "YEAR" => datetime::eval_date_part(args, workbook, caller, 0),
+        "MONTH" => datetime::eval_date_part(args, workbook, caller, 1),
+        "DAY" => datetime::eval_date_part(args, workbook, caller, 2),
+        "EDATE" => datetime::eval_edate_or_eomonth(args, workbook, caller, false),
+        "EOMONTH" => datetime::eval_edate_or_eomonth(args, workbook, caller, true),
+        "DAYS" => datetime::eval_days(args, workbook, caller),
 
         _ => EvalValue::Scalar(EvalScalar::Error(CalcError::Name)),
     }
@@ -312,21 +389,21 @@ pub fn combine_iferror(
     }
 }
 
-const fn shape_of(sa: &ScalarOrArray) -> (u32, u32) {
+pub(crate) const fn shape_of(sa: &ScalarOrArray) -> (u32, u32) {
     match sa {
         ScalarOrArray::Scalar(_) => (1, 1),
         ScalarOrArray::Array(a) => (a.rows, a.cols),
     }
 }
 
-fn get_sa(sa: &ScalarOrArray, r: u32, c: u32) -> EvalScalar {
+pub(crate) fn get_sa(sa: &ScalarOrArray, r: u32, c: u32) -> EvalScalar {
     match sa {
         ScalarOrArray::Scalar(s) => s.clone(),
         ScalarOrArray::Array(a) => a.get_broadcast(r, c),
     }
 }
 
-fn empty_to_zero(s: EvalScalar) -> EvalScalar {
+pub(crate) fn empty_to_zero(s: EvalScalar) -> EvalScalar {
     match s {
         EvalScalar::Empty => EvalScalar::Number(0.0),
         other => other,
@@ -433,10 +510,6 @@ fn eval_min_max(args: &[EvalValue], workbook: &Workbook<BoundFormula>, is_min: b
     EvalScalar::number(best.unwrap_or(0.0))
 }
 
-/// Visits numbers in `arg` following Excel's distinction between direct scalar
-/// arguments (which coerce strings and booleans) and range/array arguments
-/// (which ignore strings, booleans and blanks, and stream column blocks without
-/// materialising intermediate arrays).
 fn visit_numeric_arg(
     arg: &EvalValue,
     workbook: &Workbook<BoundFormula>,
@@ -475,8 +548,6 @@ fn eval_count(args: &[EvalValue], workbook: &Workbook<BoundFormula>) -> EvalScal
     for arg in args {
         match arg {
             EvalValue::Scalar(s) => {
-                // `COUNT` ignores errors even in direct arguments, while coercing
-                // numeric text and booleans in direct arguments!
                 if !matches!(s, EvalScalar::Empty | EvalScalar::Error(_)) && s.to_number().is_ok() {
                     count = count.saturating_add(1);
                 }
@@ -539,10 +610,7 @@ fn eval_counta(args: &[EvalValue], workbook: &Workbook<BoundFormula>) -> EvalSca
     EvalScalar::Number(count as f64)
 }
 
-/// Streams raw packed 64-bit cell words of `r` in deterministic row-major axis
-/// order without allocating per-cell objects. Single-column base runs scan
-/// contiguous `Dense` block slices directly (`B2` fast path).
-fn visit_reference_words(
+pub(crate) fn visit_reference_words(
     r: &ResolvedRef,
     workbook: &Workbook<BoundFormula>,
     mut visit: impl FnMut(u64) -> Result<(), CalcError>,
@@ -633,13 +701,10 @@ fn stream_spans(
         return Err(CalcError::Ref);
     }
 
-    // Fast path for single-column ranges (e.g. `=SUM(A1:A1000000)` and
-    // `=SUM(M2:M100001)`): scan contiguous base-slot blocks directly.
     if col_ids.len() == 1
         && let Some(&col_id) = col_ids.first()
     {
         let Some(col_slot) = sheet.col_slots().get(col_id) else {
-            // Unwritten column: all slots are Empty.
             for run in &row_runs {
                 for _ in 0..run.len {
                     visit(Value::EMPTY_BITS)?;
@@ -675,7 +740,6 @@ fn stream_spans(
         return Ok(());
     }
 
-    // General multi-column row-major traversal.
     for run in &row_runs {
         for row_id in run.iter() {
             let row_slot = sheet.row_slots().get(row_id);
@@ -839,12 +903,12 @@ fn trunc_to_i32(n: f64) -> Result<i32, CalcError> {
     Ok(t as i32)
 }
 
-fn trunc_to_isize(n: f64) -> Result<isize, CalcError> {
+pub(crate) fn trunc_to_isize(n: f64) -> Result<isize, CalcError> {
     if !n.is_finite() {
         return Err(CalcError::Num);
     }
     let t = num::trunc(n);
-    if t < -1_000_000_000.0 || t > 1_000_000_000.0 {
+    if !(-1_000_000_000.0..=1_000_000_000.0).contains(&t) {
         return Err(CalcError::Value);
     }
     #[expect(clippy::cast_possible_truncation, reason = "bounded to `[-1e9, 1e9]`")]
@@ -853,7 +917,7 @@ fn trunc_to_isize(n: f64) -> Result<isize, CalcError> {
 
 // ------------------------------------------------------------ text & structural
 
-fn checked_text(s: String) -> EvalScalar {
+pub(crate) fn checked_text(s: String) -> EvalScalar {
     if s.encode_utf16().count() > MAX_CELL_TEXT_UTF16 {
         EvalScalar::Error(CalcError::Value)
     } else {
@@ -1104,7 +1168,7 @@ fn first_pos_of_ref(
 
 // ------------------------------------------------------------ array lifting helpers
 
-fn lift_unary(
+pub(crate) fn lift_unary(
     args: Vec<EvalValue>,
     workbook: &Workbook<BoundFormula>,
     caller: CallerContext,
@@ -1133,7 +1197,7 @@ fn lift_unary(
     }
 }
 
-fn lift_binary(
+pub(crate) fn lift_binary(
     args: Vec<EvalValue>,
     workbook: &Workbook<BoundFormula>,
     caller: CallerContext,
@@ -1179,7 +1243,7 @@ fn lift_binary(
     }
 }
 
-fn lift_ternary(
+pub(crate) fn lift_ternary(
     args: Vec<EvalValue>,
     workbook: &Workbook<BoundFormula>,
     caller: CallerContext,
@@ -1235,6 +1299,3 @@ fn lift_ternary(
         Err(e) => EvalValue::Scalar(EvalScalar::Error(e)),
     }
 }
-
-#[allow(dead_code)]
-const _UNUSED_TYPES: Option<(SheetId, RowId, ColId)> = None;

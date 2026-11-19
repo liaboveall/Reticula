@@ -9,7 +9,7 @@ use crate::util::{self, Cmd, Flags, Result, cargo, node, pnpm, tool};
 const WASM_TARGET: &str = "wasm32-unknown-unknown";
 
 pub fn diff(flags: &Flags) -> Result {
-    let count = flags.get("count").unwrap_or("2500");
+    let count = flags.get("count").unwrap_or("10000");
     let out = flags
         .get("out")
         .map_or_else(|| "target/qa/diff-report.json".to_owned(), str::to_owned);

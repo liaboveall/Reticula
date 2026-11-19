@@ -1,9 +1,13 @@
 //! Cross-target determinism self-check for the full kernel (`core` + `formula`).
 //!
-//! Folds [`reticula_core::determinism::digest`] together with all Layer-0
-//! functions, 15-digit comparison/rounding edge cases, dynamic-array
-//! broadcasting, structural (`ROW`/`COLUMN`) recalculation, time-sliced
-//! recalculation on the upgraded seeded sample, and `RTCLSNAP` v0 round-trip.
+//! Folds [`reticula_core::determinism::digest`] together with all 69 Layer-0
+//! and Layer-1 functions, 15-digit comparison/rounding edge cases, dynamic-array
+//! broadcasting, structural (`ROW`/`COLUMN`/`ROWS`/`COLUMNS`) recalculation,
+//! cross-sheet lookup, conditional aggregation, date serial arithmetic, host
+//! `EvalEnv` volatiles, time-sliced recalculation on the upgraded seeded sample,
+//! and snapshot round-trip.
+
+use alloc::string::String;
 
 use reticula_core::determinism as core_det;
 use reticula_core::digest::Digest64;
@@ -20,6 +24,7 @@ pub fn digest() -> u64 {
     let mut d = Digest64::new();
     d.write_u64(core_det::digest());
     layer0_and_numeric_boundaries(&mut d);
+    layer1_functions_and_cross_sheet(&mut d);
     upgraded_sample_and_slicing(&mut d);
     d.finish()
 }
@@ -107,6 +112,90 @@ fn layer0_and_numeric_boundaries(d: &mut Digest64) {
     {
         d.write_u64(decoded.workbook().logical_digest());
     }
+}
+
+fn layer1_functions_and_cross_sheet(d: &mut Digest64) {
+    let mut eng = FormulaEngine::new();
+    let s0 = SheetId(0);
+    let s1 = eng.alloc_sheet_id();
+    let _ = eng.apply_op(Op::AddSheet {
+        sheet: s1,
+        name: String::from("Rates Table"),
+        after: Some(s0),
+    });
+
+    for (r, (sku, rate)) in [("SKU-10", "12.5"), ("SKU-20", "25.0"), ("SKU-30", "37.5")]
+        .iter()
+        .enumerate()
+    {
+        let _ = eng.edit_cell_raw(s1, RowId(r as u64), ColId(0), sku);
+        let _ = eng.edit_cell_raw(s1, RowId(r as u64), ColId(1), rate);
+    }
+
+    let setup: &[(u64, u64, &str)] = &[
+        (0, 0, "10"),
+        (1, 0, "20"),
+        (2, 0, "30"),
+        (3, 0, "40"),
+        (0, 1, "'alpha*1"),
+        (1, 1, "'alpha*2"),
+        (2, 1, "'beta?3"),
+        (3, 1, "=\"\""),
+        (0, 2, "'K1"),
+        (0, 3, "'K2"),
+        (1, 2, "100"),
+        (1, 3, "200"),
+        (0, 4, "0.1"),
+        (1, 4, "0.2"),
+        (2, 4, "-0.3"),
+        // Layer-1 lookup & reference (7)
+        (0, 6, "=VLOOKUP(\"SKU-20\",'Rates Table'!A1:B3,2,FALSE)"),
+        (1, 6, "=HLOOKUP(\"K2\",C1:D2,2,FALSE)"),
+        (2, 6, "=SUM(INDEX(A1:A4,2):INDEX(A1:A4,4))"),
+        (3, 6, "=MATCH(\"alpha~*2\",B1:B4,0)*10+MATCH(25,A1:A4,1)"),
+        (4, 6, "=CHOOSE(2,1/0,42,NA())"),
+        (5, 6, "=ROWS(A1:D4)*100+COLUMNS(A1:D4)"),
+        // Layer-1 criteria (4)
+        (6, 6, "=COUNTBLANK(B1:B6)"),
+        (7, 6, "=COUNTIF(B1:B4,\"alpha~**\")"),
+        (8, 6, "=SUMIF(E1:E3,\"<>0\")"),
+        (9, 6, "=AVERAGEIF(A1:A4,\">=20\")"),
+        // Layer-1 date basics (7)
+        (10, 6, "=DATE(1900,2,29)"),
+        (
+            11,
+            6,
+            "=YEAR(DATE(2024,2,29))*10000+MONTH(DATE(2024,2,29))*100+DAY(DATE(2024,2,29))",
+        ),
+        (12, 6, "=EDATE(DATE(2024,1,31),1)"),
+        (13, 6, "=EOMONTH(DATE(2023,1,15),1)"),
+        (14, 6, "=DAYS(DATE(2026,11,19),DATE(2026,1,1))"),
+        // Layer-1 rounding, text & conversion (8)
+        (15, 6, "=FLOOR(-2.5,1)*10+FLOOR(-2.5,-1)"),
+        (16, 6, "=CEILING(-2.5,1)*10+CEILING(-2.5,-1)"),
+        (17, 6, "=FIND(\"Grid\",\"Reticula Grid\",1)"),
+        (18, 6, "=SEARCH(\"g?id\",\"Reticula Grid\",1)"),
+        (19, 6, "=SUBSTITUTE(\"a-b-a\",\"a\",\"x\",2)"),
+        (20, 6, "=REPLACE(\"abcdef\",3,2,\"XY\")"),
+        (21, 6, "=VALUE(\"$1,234.50\")"),
+        (
+            22,
+            6,
+            "=TEXT(1234.5,\"$#,##0.00\")&\"|\"&TEXT(DATE(2026,11,19),\"yyyy-mm-dd\")",
+        ),
+        // Layer-1 volatiles under deterministic EvalEnv (4)
+        (23, 6, "=TODAY()"),
+        (24, 6, "=NOW()"),
+        (25, 6, "=RAND()"),
+        (26, 6, "=RANDBETWEEN(10,99)"),
+    ];
+
+    for &(r, c, raw) in setup {
+        let _ = eng.edit_cell_raw(s0, RowId(r), ColId(c), raw);
+    }
+    eng.set_eval_env(46_345.25, 0xCAFE_BEEF_2026_1119);
+    eng.recalc_all();
+    d.write_u64(eng.workbook().logical_digest());
 }
 
 fn upgraded_sample_and_slicing(d: &mut Digest64) {
