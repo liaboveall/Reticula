@@ -1,4 +1,31 @@
 import type { Grid, GridStats } from "@reticula/grid";
+import type { SafeModeInfo } from "./engine/client.ts";
+import type { StorageBackendKind } from "./engine/storage.ts";
+
+export interface HookDocStatus {
+  readonly docId: string;
+  readonly title: string;
+  readonly engineStatus:
+    | "starting"
+    | "ready"
+    | "failed"
+    | "blocked"
+    | "takingOver"
+    | "yielded"
+    | "safeMode";
+  readonly storageBackend: StorageBackendKind | null;
+  readonly activeSlot: "a" | "b" | null;
+  readonly walSeq: string;
+  readonly waitingForFile: boolean;
+  readonly safeMode: SafeModeInfo | null;
+}
+
+export interface SnapshotSaveResult {
+  readonly docId: string;
+  readonly slot: "a" | "b";
+  readonly byteLen: number;
+  readonly elapsedMs: number;
+}
 
 /**
  * A window onto the running app for end-to-end tests and measurements, which
@@ -20,6 +47,14 @@ export interface Hooks {
   textAt(row: number, col: number): string | null;
   /** Runs the engine's determinism self-check and resolves to its digest. */
   selfCheck(): Promise<string>;
+  /** Current local persistence, lock, and Safe Mode status. */
+  docStatus(): HookDocStatus;
+  /** Triggers a background CoW snapshot compaction and resolves when flushed. */
+  compactSnapshot(): Promise<SnapshotSaveResult>;
+  /** Flushes and closes open OPFS handles & Web Locks cleanly. */
+  flushAndClose(): Promise<void>;
+  /** Busy-waits the engine worker for `ms` (for testing the 500 ms takeover watchdog). */
+  spinWorker(ms: number): void;
 }
 
 declare global {
@@ -32,14 +67,26 @@ export function hooksRequested(): boolean {
   return new URLSearchParams(window.location.search).has("hooks");
 }
 
-export function installHooks(grid: Grid, selfCheck: () => Promise<string>): () => void {
+export interface HookExtras {
+  readonly selfCheck: () => Promise<string>;
+  readonly docStatus: () => HookDocStatus;
+  readonly compactSnapshot: () => Promise<SnapshotSaveResult>;
+  readonly flushAndClose: () => Promise<void>;
+  readonly spinWorker: (ms: number) => void;
+}
+
+export function installHooks(grid: Grid, extras: HookExtras): () => void {
   const hooks: Hooks = {
     stats: () => grid.stats(),
     scrollTo: (position) => grid.scrollTo(position),
     select: (row, col) => grid.select({ row, col }),
     selectRange: (anchor, focus) => grid.selectRange(anchor, focus),
     textAt: (row, col) => grid.textAt(row, col),
-    selfCheck,
+    selfCheck: extras.selfCheck,
+    docStatus: extras.docStatus,
+    compactSnapshot: extras.compactSnapshot,
+    flushAndClose: extras.flushAndClose,
+    spinWorker: extras.spinWorker,
   };
   window.__reticula = hooks;
   return () => {

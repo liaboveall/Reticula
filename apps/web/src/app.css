@@ -615,6 +615,252 @@ body {
   background: var(--shell-line);
 }
 
+/* Storage badge, lock overlay, Safe Mode & Local Workbooks modals (`14-m1b.md` 7) */
+.storage-badge {
+  color: var(--shell-muted);
+  font-size: 11.5px;
+  white-space: nowrap;
+}
+
+.storage-export-link {
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--shell-accent);
+  font: inherit;
+  font-weight: 600;
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+.storage-export-link:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.banner-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.primary-btn {
+  border-color: var(--shell-accent);
+  background: var(--shell-accent);
+  color: #ffffff;
+  font-weight: 600;
+}
+
+@media (prefers-color-scheme: dark) {
+  .primary-btn {
+    color: #0d1117;
+  }
+}
+
+.lock-overlay,
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 80;
+  display: grid;
+  place-items: center;
+  padding: 20px;
+  background: rgba(15, 23, 42, 0.45);
+}
+
+.lock-card,
+.modal-card {
+  width: min(620px, 100%);
+  max-height: calc(100vh - 48px);
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 18px 20px;
+  border: 1px solid var(--shell-line);
+  border-radius: 10px;
+  background: var(--shell-surface);
+  color: var(--shell-text);
+  box-shadow: 0 20px 48px rgba(0, 0, 0, 0.28);
+  overflow-y: auto;
+}
+
+.lock-card h2,
+.modal-header h2 {
+  margin: 0;
+  font-size: 16px;
+}
+
+.lock-card p {
+  margin: 0;
+  color: var(--shell-muted);
+  line-height: 1.5;
+}
+
+.lock-actions,
+.drawer-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.drawer-storage-note {
+  margin: 0;
+  padding: 6px 10px;
+  border-radius: 6px;
+  background: var(--shell-background);
+  color: var(--shell-muted);
+  font-size: 12px;
+}
+
+.csv-progress-box {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 10px;
+  border: 1px solid var(--shell-accent);
+  border-radius: 6px;
+  background: var(--shell-accent-soft);
+  font-size: 12px;
+}
+
+.csv-progress-box progress {
+  width: 100%;
+}
+
+.drawer-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 300px;
+  overflow-y: auto;
+}
+
+.drawer-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border: 1px solid var(--shell-line);
+  border-radius: 6px;
+}
+
+.drawer-row.current {
+  border-color: var(--shell-accent);
+  background: color-mix(in srgb, var(--shell-accent-soft) 50%, transparent);
+}
+
+.drawer-open-btn {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 2px 4px;
+  border: none;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.drawer-doc-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 600;
+}
+
+.drawer-current-pill {
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: var(--shell-accent);
+  color: #ffffff;
+  font-size: 10px;
+}
+
+.drawer-doc-meta,
+.drawer-empty,
+.safe-muted {
+  color: var(--shell-muted);
+  font-size: 12px;
+}
+
+.safe-detail {
+  margin: 0;
+  padding: 8px 10px;
+  border-left: 3px solid var(--shell-danger);
+  border-radius: 4px;
+  background: var(--shell-danger-soft);
+  color: var(--shell-danger);
+  font-size: 12.5px;
+}
+
+.safe-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.safe-option {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 10px 12px;
+  border: 1px solid var(--shell-line);
+  border-radius: 7px;
+  background: var(--shell-background);
+}
+
+.safe-option p {
+  margin: 4px 0 0;
+  color: var(--shell-muted);
+  font-size: 12px;
+}
+
+.safe-skip-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+  font-size: 12px;
+}
+
+.safe-skip-controls input {
+  width: 56px;
+  padding: 2px 6px;
+  border: 1px solid var(--shell-line);
+  border-radius: 4px;
+  background: var(--shell-surface);
+  color: var(--shell-text);
+  font: inherit;
+}
+
+.safe-txn-list {
+  margin: 8px 0 0;
+  padding-left: 18px;
+  font-size: 11.5px;
+  color: var(--shell-muted);
+}
+
+.safe-export-note {
+  color: var(--shell-accent);
+  font-weight: 600;
+}
+
+.modal-footer {
+  display: flex;
+  justify-content: flex-end;
+}
+
 .rejected-banner {
   display: flex;
   align-items: center;

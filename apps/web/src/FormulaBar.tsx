@@ -1,6 +1,14 @@
 import { FormulaBarEditor } from "@reticula/grid";
 import type { WireCompletionItem, WireFormulaAnalysis } from "@reticula/protocol";
-import { type Ref, useCallback, useEffect, useImperativeHandle, useRef, useState } from "react";
+import {
+  type Ref,
+  useCallback,
+  useEffect,
+  useImperativeHandle,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from "react";
 
 export interface FormulaBarHandle {
   focus(): void;
@@ -210,7 +218,7 @@ export function FormulaBar({
     };
   }, [handleAssistKey]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     editorRef.current?.setDisabled(disabled);
   }, [disabled]);
 

@@ -10,10 +10,12 @@ use crate::wasm::report_sizes;
 const APP: &str = "@reticula/web";
 const DIST: &str = "apps/web/dist";
 
-/// Hard upper bound on brotli-compressed core `.wasm` module (`1.2 MB`, `13-m1a.md` 6.4 & 8.2).
+/// Hard upper bound on brotli-compressed core `.wasm` module (`1.2 MB`, `14-m1b.md` 8.3).
 const MAX_CORE_WASM_BROTLI_BYTES: u64 = 1_200_000;
-/// Upper bound on brotli-compressed first-screen JS (`index` + `worker`, `13-m1a.md` 6.4).
+/// Upper bound on brotli-compressed first-screen critical-path JS (`165 KB`, `14-m1b.md` 8.3).
 const MAX_FIRST_SCREEN_JS_BROTLI_BYTES: u64 = 165_000;
+/// Upper bound on brotli-compressed total JS including lazy chunks & service worker (`220 KB`, `14-m1b.md` 8.3).
+const MAX_TOTAL_JS_BROTLI_BYTES: u64 = 220_000;
 
 /// TypeScript projects, each with its own `tsconfig.json`.
 const TS_PROJECTS: [&str; 4] = [
@@ -138,9 +140,14 @@ fn inject_preloads(dist_dir: &Path) -> Result {
 
 fn check_budgets(dist_dir: &Path) -> Result {
     util::step("bundle size budgets (brotli)");
+    let index_path = dist_dir.join("index.html");
+    let index_html = fs::read_to_string(&index_path)
+        .map_err(|e| format!("cannot read {}: {e}", index_path.display()))?;
+
     let assets_dir = dist_dir.join("assets");
     let mut wasm_br: u64 = 0;
-    let mut js_br: u64 = 0;
+    let mut first_screen_js_br: u64 = 0;
+    let mut total_js_br: u64 = 0;
 
     for entry in fs::read_dir(&assets_dir)
         .map_err(|e| format!("cannot read {}: {e}", assets_dir.display()))?
@@ -156,9 +163,19 @@ fn check_budgets(dist_dir: &Path) -> Result {
             .len();
         if name.ends_with(".wasm.br") {
             wasm_br = wasm_br.saturating_add(len);
-        } else if name.ends_with(".js.br") {
-            js_br = js_br.saturating_add(len);
+        } else if let Some(js_name) = name.strip_suffix(".br")
+            && js_name.ends_with(".js")
+        {
+            total_js_br = total_js_br.saturating_add(len);
+            if index_html.contains(js_name) {
+                first_screen_js_br = first_screen_js_br.saturating_add(len);
+            }
         }
+    }
+
+    let sw_br_path = dist_dir.join("sw.js.br");
+    if let Ok(meta) = fs::metadata(&sw_br_path) {
+        total_js_br = total_js_br.saturating_add(meta.len());
     }
 
     println!(
@@ -169,9 +186,15 @@ fn check_budgets(dist_dir: &Path) -> Result {
     );
     println!(
         "  first-screen JS (brotli):  {:>8} / {:>8} bytes ({:.1}%)",
-        js_br,
+        first_screen_js_br,
         MAX_FIRST_SCREEN_JS_BROTLI_BYTES,
-        (js_br as f64 / MAX_FIRST_SCREEN_JS_BROTLI_BYTES as f64) * 100.0
+        (first_screen_js_br as f64 / MAX_FIRST_SCREEN_JS_BROTLI_BYTES as f64) * 100.0
+    );
+    println!(
+        "  total JS (brotli):         {:>8} / {:>8} bytes ({:.1}%)",
+        total_js_br,
+        MAX_TOTAL_JS_BROTLI_BYTES,
+        (total_js_br as f64 / MAX_TOTAL_JS_BROTLI_BYTES as f64) * 100.0
     );
 
     if wasm_br > MAX_CORE_WASM_BROTLI_BYTES {
@@ -179,9 +202,14 @@ fn check_budgets(dist_dir: &Path) -> Result {
             "core WASM brotli size ({wasm_br} B) exceeds budget ({MAX_CORE_WASM_BROTLI_BYTES} B)"
         ));
     }
-    if js_br > MAX_FIRST_SCREEN_JS_BROTLI_BYTES {
+    if first_screen_js_br > MAX_FIRST_SCREEN_JS_BROTLI_BYTES {
         return Err(format!(
-            "first-screen JS brotli size ({js_br} B) exceeds budget ({MAX_FIRST_SCREEN_JS_BROTLI_BYTES} B)"
+            "first-screen JS brotli size ({first_screen_js_br} B) exceeds budget ({MAX_FIRST_SCREEN_JS_BROTLI_BYTES} B)"
+        ));
+    }
+    if total_js_br > MAX_TOTAL_JS_BROTLI_BYTES {
+        return Err(format!(
+            "total JS brotli size ({total_js_br} B) exceeds budget ({MAX_TOTAL_JS_BROTLI_BYTES} B)"
         ));
     }
     Ok(())

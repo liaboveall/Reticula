@@ -20,16 +20,45 @@ import type {
   WireHorizontalAlign,
   WireStylePatch,
 } from "@reticula/protocol";
-import { useCallback, useEffect, useRef, useState } from "react";
-import { type EngineClient, startEngine } from "./engine/client.ts";
+import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
+import {
+  type EngineClient,
+  type HostCommand,
+  type SafeModeInfo,
+  startEngine,
+} from "./engine/client.ts";
+import type { StorageBackendKind, WorkbookCatalogEntry } from "./engine/storage.ts";
 import { FormulaBar, type FormulaBarHandle } from "./FormulaBar.tsx";
 import { BENCHMARKS } from "./generated/benchmarks.ts";
-import { hooksRequested, installHooks } from "./hooks.ts";
+import {
+  type HookDocStatus,
+  hooksRequested,
+  installHooks,
+  type SnapshotSaveResult,
+} from "./hooks.ts";
+import type { LocalModalMode } from "./LocalModals.tsx";
+
+const LazyLocalModals = lazy(() => import("./LocalModals.tsx"));
 
 type EngineState =
   | { status: "starting" }
   | { status: "ready"; info: EngineInfo; sheet: SheetInfo }
   | { status: "failed"; message: string };
+
+type LockOverlayState =
+  | { readonly kind: "blocked"; readonly docId: string; readonly title: string }
+  | {
+      readonly kind: "takingOver";
+      readonly docId: string;
+      readonly title: string;
+      readonly waitingForFile: boolean;
+    }
+  | {
+      readonly kind: "yielded";
+      readonly docId: string;
+      readonly title: string;
+      readonly evicted: boolean;
+    };
 
 interface InspectedState {
   readonly sheet: number;
@@ -78,8 +107,9 @@ type ContextMenuState =
       readonly tab: SheetTabInfo;
     };
 
-/** How often the status bar refreshes frame-work statistics. */
+const DEFAULT_DOC_ID = "sample-1m";
 const STATUS_INTERVAL_MS = 500;
+const YIELD_WATCHDOG_MS = 500;
 
 const MARKS = {
   shell: "reticula:shell",
@@ -138,6 +168,57 @@ function sendEvalEnv(client: EngineClient): void {
     seed: nextEvalSeed(),
     timestampMs: Date.now(),
   });
+}
+
+function readInitialUrlDoc(): { docId: string; safeRequested: boolean } {
+  if (typeof window === "undefined") {
+    return { docId: DEFAULT_DOC_ID, safeRequested: false };
+  }
+  const params = new URLSearchParams(window.location.search);
+  const rawDoc = params.get("doc")?.trim();
+  const safeDoc = rawDoc && /^[a-zA-Z0-9._-]+$/.test(rawDoc) ? rawDoc : DEFAULT_DOC_ID;
+  return {
+    docId: safeDoc,
+    safeRequested: params.get("safe") === "1",
+  };
+}
+
+function syncUrlForDoc(docId: string): void {
+  if (typeof window === "undefined") {
+    return;
+  }
+  const url = new URL(window.location.href);
+  url.searchParams.delete("safe");
+  if (docId === DEFAULT_DOC_ID) {
+    if (!url.searchParams.has("doc")) {
+      return;
+    }
+    url.searchParams.delete("doc");
+  } else {
+    url.searchParams.set("doc", docId);
+  }
+  const nextRel = `${url.pathname}${url.search}${url.hash}`;
+  const curRel = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+  if (nextRel !== curRel) {
+    window.history.replaceState({}, "", nextRel);
+  }
+}
+
+function downloadArrayBuffer(filename: string, bytes: ArrayBuffer): void {
+  const blob = new Blob([bytes], { type: "application/octet-stream" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  a.style.display = "none";
+  document.body.append(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 2_000);
+}
+
+function makeFreshDocId(): string {
+  return `wb-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
 }
 
 export interface EditorPageProps {
@@ -245,11 +326,30 @@ export function EditorPage({ onNavigateHome }: EditorPageProps) {
 }
 
 function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
+  const initialRoute = useRef(readInitialUrlDoc());
+  const tabIdRef = useRef<string>(Math.random().toString(36).slice(2, 10));
+
   const hostRef = useRef<HTMLDivElement>(null);
   const gridRef = useRef<Grid | null>(null);
   const editorRef = useRef<CellEditor | null>(null);
   const formulaBarRef = useRef<FormulaBarHandle | null>(null);
   const clientRef = useRef<EngineClient | null>(null);
+  const startWorkerFnRef = useRef<((docId: string, initialCmd: HostCommand) => void) | null>(null);
+
+  const activeDocIdRef = useRef<string>(initialRoute.current.docId);
+  const activeDocTitleRef = useRef<string>(
+    initialRoute.current.docId === DEFAULT_DOC_ID
+      ? "Sample sales data"
+      : initialRoute.current.docId,
+  );
+  const docLifecycleRef = useRef<HookDocStatus["engineStatus"]>("starting");
+  const storageBackendRef = useRef<StorageBackendKind | null>(null);
+  const activeSlotRef = useRef<"a" | "b" | null>(null);
+  const walSeqRef = useRef<string>("0");
+  const waitingForFileRef = useRef<boolean>(false);
+  const safeModeRef = useRef<SafeModeInfo | null>(null);
+  const workerTerminatedRef = useRef<boolean>(false);
+  const persistRequestedRef = useRef<boolean>(false);
 
   const activeSheetRef = useRef<number>(0);
   const inspectedRef = useRef<InspectedState | null>(null);
@@ -259,6 +359,18 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
   const pendingActionVerbRef = useRef<string>("updated");
 
   const [engine, setEngine] = useState<EngineState>({ status: "starting" });
+  const [docId, setDocId] = useState<string>(initialRoute.current.docId);
+  const [docTitle, setDocTitle] = useState<string>(activeDocTitleRef.current);
+  const [catalogDocs, setCatalogDocs] = useState<readonly WorkbookCatalogEntry[]>([]);
+  const [lockOverlay, setLockOverlay] = useState<LockOverlayState | null>(null);
+  const [modalMode, setModalMode] = useState<LocalModalMode | null>(null);
+  const [quotaBanner, setQuotaBanner] = useState<string | null>(null);
+  const [csvProgress, setCsvProgress] = useState<{
+    readonly rowsParsed: number;
+    readonly percent: number;
+  } | null>(null);
+  const [storageUsedMb, setStorageUsedMb] = useState<string>("0.0");
+
   const [stats, setStats] = useState<GridStats | null>(null);
   const [selection, setSelection] = useState<Selection | null>(null);
   const [inspected, setInspected] = useState<InspectedState | null>(null);
@@ -275,6 +387,33 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
   const [colorPopover, setColorPopover] = useState<"text" | "fill" | null>(null);
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
   const [renamingSheet, setRenamingSheet] = useState<{ id: number; draft: string } | null>(null);
+
+  const refreshStorageEstimate = useCallback(() => {
+    if (typeof navigator === "undefined" || !navigator.storage?.estimate) {
+      return;
+    }
+    void navigator.storage
+      .estimate()
+      .then((est) => {
+        const used = est.usage ?? 0;
+        setStorageUsedMb((used / (1024 * 1024)).toFixed(1));
+      })
+      .catch(() => {});
+  }, []);
+
+  /**
+   * Requests persistent browser storage lazily AFTER the user's first edit,
+   * creation, or import (`14-m1b.md` 7.3.1 — never on cold start!).
+   */
+  const notePersistenceMutation = useCallback(() => {
+    if (!persistRequestedRef.current) {
+      persistRequestedRef.current = true;
+      if (typeof navigator !== "undefined" && navigator.storage?.persist) {
+        void navigator.storage.persist().catch(() => {});
+      }
+    }
+    refreshStorageEstimate();
+  }, [refreshStorageEstimate]);
 
   useEffect(() => {
     const mq = window.matchMedia("(prefers-color-scheme: dark)");
@@ -402,10 +541,20 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
       return;
     }
     const selfChecks: ((digest: string) => void)[] = [];
+    const compactWaiters: ((res: SnapshotSaveResult) => void)[] = [];
+    const closeWaiters: (() => void)[] = [];
     let lastInspectKey = "";
+    let yieldWatchdog = 0;
 
     const requestInspect = (sel: Selection | null, force = false) => {
-      if (!sel || sel.rowId === null || sel.colId === null) {
+      const client = clientRef.current;
+      if (
+        !client ||
+        workerTerminatedRef.current ||
+        !sel ||
+        sel.rowId === null ||
+        sel.colId === null
+      ) {
         lastInspectKey = "";
         inspectedRef.current = null;
         setInspected(null);
@@ -429,247 +578,6 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
       });
     };
 
-    const client = startEngine({
-      onMessage(message) {
-        switch (message.kind) {
-          case "ready":
-            performance.mark(MARKS.engineReady);
-            activeSheetRef.current = message.sheet.sheet;
-            grid.setSheet(message.sheet);
-            setEngine({ status: "ready", info: message.info, sheet: message.sheet });
-            break;
-          case "sheetChanged": {
-            const switched = message.sheet.sheet !== activeSheetRef.current;
-            activeSheetRef.current = message.sheet.sheet;
-            if (switched) {
-              lastInspectKey = "";
-              inspectedRef.current = null;
-              setInspected(null);
-              grid.setSheet(message.sheet);
-              const cp = lastCopiedRef.current;
-              if (cp && cp.sheet === message.sheet.sheet) {
-                grid.setClipboardRange(
-                  {
-                    firstRow: cp.firstRow,
-                    endRow: cp.firstRow + cp.rowCount,
-                    firstCol: cp.firstCol,
-                    endCol: cp.firstCol + cp.colCount,
-                  },
-                  cp.cut,
-                );
-              }
-            } else {
-              grid.updateSheet(message.sheet);
-            }
-            syncGridFormulaRefs(grid, analysisRef.current, message.sheet.sheet);
-            setEngine((prev) =>
-              prev.status === "ready" ? { ...prev, sheet: message.sheet } : prev,
-            );
-            const verb = pendingActionVerbRef.current;
-            pendingActionVerbRef.current = "updated";
-            const extra =
-              message.recalculated > 0
-                ? `, recalculated ${integer.format(message.recalculated)} cells`
-                : "";
-            setRecalcMessage(`${verb} in ${milliseconds.format(message.actionMs)} ms${extra}`);
-            requestInspect(grid.selectionDetails(), true);
-            break;
-          }
-          case "stylesUpdated": {
-            if (message.sheet === activeSheetRef.current) {
-              grid.setStyles(message.styles);
-            }
-            break;
-          }
-          case "cellInspected": {
-            const cur = grid.selectionDetails();
-            if (
-              !cur ||
-              message.sheet !== activeSheetRef.current ||
-              cur.rowId !== message.rowId ||
-              cur.colId !== message.colId
-            ) {
-              break;
-            }
-            const info: InspectedState = {
-              sheet: message.sheet,
-              rowId: message.rowId,
-              colId: message.colId,
-              address: message.address,
-              raw: message.raw,
-              display: message.display,
-              isFormula: message.isFormula,
-              error: message.error ?? null,
-              formatCode: message.formatCode,
-              style: message.style,
-            };
-            inspectedRef.current = info;
-            setInspected(info);
-            break;
-          }
-          case "formulaAnalyzed": {
-            if (!editSessionRef.current) {
-              break;
-            }
-            analysisRef.current = message.analysis;
-            editSessionRef.current.canInsertRef = message.analysis.canInsertRef;
-            editSessionRef.current.activeRefSpan = message.analysis.activeRefSpan ?? null;
-            setFormulaAnalysis(message.analysis);
-            editor.setFormulaAnalysis(message.analysis);
-            syncGridFormulaRefs(grid, message.analysis, activeSheetRef.current);
-            break;
-          }
-          case "formulaDollarToggled": {
-            const session = editSessionRef.current;
-            if (!session || !message.changed) {
-              break;
-            }
-            session.source = message.source;
-            session.cursorUtf16 = message.endUtf16;
-            session.pointPickedSpan = null;
-            setEditingText(message.source);
-            formulaBarRef.current?.applyTextAndSelection(
-              message.source,
-              message.startUtf16,
-              message.endUtf16,
-            );
-            if (activeSheetRef.current === session.hostSheet) {
-              editor.applyTextAndSelection(message.source, message.startUtf16, message.endUtf16);
-            }
-            requestAnalyze(client, grid, editor);
-            break;
-          }
-          case "rangeRefFormatted": {
-            const session = editSessionRef.current;
-            if (!session) {
-              break;
-            }
-            const span = session.pointPickedSpan ??
-              session.activeRefSpan ?? [session.cursorUtf16, session.cursorUtf16];
-            const repStart = Math.max(0, Math.min(session.source.length, span[0]));
-            const repEnd = Math.max(repStart, Math.min(session.source.length, span[1]));
-            const nextSource =
-              session.source.slice(0, repStart) + message.reference + session.source.slice(repEnd);
-            const nextEnd = repStart + message.reference.length;
-            session.source = nextSource;
-            session.cursorUtf16 = nextEnd;
-            session.pointPickedSpan = [repStart, nextEnd];
-            setEditingText(nextSource);
-            formulaBarRef.current?.applyTextAndSelection(nextSource, nextEnd, nextEnd);
-            if (activeSheetRef.current === session.hostSheet) {
-              editor.setTextExternal(nextSource, nextEnd);
-            }
-            requestAnalyze(client, grid, editor);
-            break;
-          }
-          case "edgeJumped": {
-            if (message.sheet === activeSheetRef.current) {
-              grid.jumpTo(message.row, message.col, message.select);
-            }
-            break;
-          }
-          case "clipboardCopied": {
-            const snap: CopiedSnapshot = {
-              sheet: message.sheet,
-              firstRow: message.firstRow,
-              rowCount: message.rowCount,
-              firstCol: message.firstCol,
-              colCount: message.colCount,
-              cut: message.cut,
-              tsv: message.tsv,
-              html: message.html,
-            };
-            lastCopiedRef.current = snap;
-            if (message.sheet === activeSheetRef.current) {
-              grid.setClipboardRange(
-                {
-                  firstRow: message.firstRow,
-                  endRow: message.firstRow + message.rowCount,
-                  firstCol: message.firstCol,
-                  endCol: message.firstCol + message.colCount,
-                },
-                message.cut,
-              );
-            }
-            if (typeof navigator !== "undefined" && navigator.clipboard) {
-              if (typeof ClipboardItem !== "undefined" && navigator.clipboard.write) {
-                const item = new ClipboardItem({
-                  "text/plain": new Blob([message.tsv], { type: "text/plain" }),
-                  "text/html": new Blob([message.html], { type: "text/html" }),
-                });
-                void navigator.clipboard.write([item]).catch(() => {
-                  void navigator.clipboard.writeText?.(message.tsv).catch(() => {});
-                });
-              } else {
-                void navigator.clipboard.writeText?.(message.tsv).catch(() => {});
-              }
-            }
-            break;
-          }
-          case "clipboardPasted": {
-            activeSheetRef.current = message.sheet.sheet;
-            grid.updateSheet(message.sheet);
-            setEngine((prev) =>
-              prev.status === "ready" ? { ...prev, sheet: message.sheet } : prev,
-            );
-            if (lastCopiedRef.current?.cut) {
-              lastCopiedRef.current = null;
-              grid.setClipboardRange(null);
-            }
-            if (message.destRowCount > 0 && message.destColCount > 0) {
-              grid.selectRange(
-                { row: message.destFirstRow, col: message.destFirstCol },
-                {
-                  row: message.destFirstRow + message.destRowCount - 1,
-                  col: message.destFirstCol + message.destColCount - 1,
-                },
-              );
-            }
-            const extra =
-              message.recalculated > 0
-                ? `, recalculated ${integer.format(message.recalculated)} cells`
-                : "";
-            setRecalcMessage(`pasted in ${milliseconds.format(message.elapsedMs)} ms${extra}`);
-            requestInspect(grid.selectionDetails(), true);
-            break;
-          }
-          case "recalcProgress":
-            setRecalcMessage(
-              `recalculating ${integer.format(message.done)} / ${integer.format(message.total)}…`,
-            );
-            break;
-          case "recalcDone":
-            setRejectedReason(null);
-            grid.updateSheet(message.sheet);
-            setEngine((prev) =>
-              prev.status === "ready" ? { ...prev, sheet: message.sheet } : prev,
-            );
-            if (message.recalculated > 0) {
-              setRecalcMessage(
-                `recalculated ${integer.format(message.recalculated)} cells in ${milliseconds.format(message.elapsedMs)} ms`,
-              );
-            } else {
-              setRecalcMessage(`updated cell in ${milliseconds.format(message.elapsedMs)} ms`);
-            }
-            requestInspect(grid.selectionDetails(), true);
-            break;
-          case "rejected":
-            setRejectedReason(message.reason);
-            break;
-          case "selfChecked":
-            for (const resolve of selfChecks.splice(0)) {
-              resolve(message.digest);
-            }
-            break;
-          case "failed":
-            setEngine({ status: "failed", message: message.message });
-            break;
-        }
-      },
-      onPage: (page) => grid.acceptPage(page),
-    });
-    clientRef.current = client;
-
     const isPointAndClickActive = (): boolean => {
       const session = editSessionRef.current;
       if (!session?.source.startsWith("=")) {
@@ -681,8 +589,15 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
     };
 
     const grid = new Grid(element, {
-      subscribe: (subscription) =>
-        client.send({ kind: "subscribe", sheet: activeSheetRef.current, ...subscription }),
+      subscribe: (subscription) => {
+        if (!workerTerminatedRef.current) {
+          clientRef.current?.send({
+            kind: "subscribe",
+            sheet: activeSheetRef.current,
+            ...subscription,
+          });
+        }
+      },
       onSelectionChange: (sel) => {
         setSelection(sel);
         setContextMenu(null);
@@ -692,6 +607,11 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
         editor.startEdit("doubleClick");
       },
       onResizeRows: (sizes) => {
+        const client = clientRef.current;
+        if (!client || workerTerminatedRef.current) {
+          return;
+        }
+        notePersistenceMutation();
         pendingActionVerbRef.current = "resized rows";
         client.send({
           kind: "resizeRows",
@@ -700,6 +620,11 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
         });
       },
       onResizeCols: (sizes) => {
+        const client = clientRef.current;
+        if (!client || workerTerminatedRef.current) {
+          return;
+        }
+        notePersistenceMutation();
         pendingActionVerbRef.current = "resized columns";
         client.send({
           kind: "resizeCols",
@@ -708,6 +633,11 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
         });
       },
       onMoveRows: (rows, afterRowId) => {
+        const client = clientRef.current;
+        if (!client || workerTerminatedRef.current) {
+          return;
+        }
+        notePersistenceMutation();
         pendingActionVerbRef.current = "moved rows";
         client.send({
           kind: "moveRows",
@@ -717,6 +647,11 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
         });
       },
       onMoveCols: (cols, afterColId) => {
+        const client = clientRef.current;
+        if (!client || workerTerminatedRef.current) {
+          return;
+        }
+        notePersistenceMutation();
         pendingActionVerbRef.current = "moved columns";
         client.send({
           kind: "moveCols",
@@ -726,6 +661,11 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
         });
       },
       onFillRange: (src, dst) => {
+        const client = clientRef.current;
+        if (!client || workerTerminatedRef.current) {
+          return;
+        }
+        notePersistenceMutation();
         pendingActionVerbRef.current = "filled range";
         sendEvalEnv(client);
         client.send({
@@ -746,6 +686,11 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
         );
       },
       onAutoFillDown: (src) => {
+        const client = clientRef.current;
+        if (!client || workerTerminatedRef.current) {
+          return;
+        }
+        notePersistenceMutation();
         pendingActionVerbRef.current = "auto-filled column";
         sendEvalEnv(client);
         client.send({
@@ -758,7 +703,8 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
         });
       },
       onPointAndClickRange: (range) => {
-        if (!isPointAndClickActive()) {
+        const client = clientRef.current;
+        if (!client || workerTerminatedRef.current || !isPointAndClickActive()) {
           return false;
         }
         const session = editSessionRef.current;
@@ -806,8 +752,12 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
         return grid.textAt(cell.row, cell.col) ?? "";
       },
       onCommit: (cell, raw) => {
+        const client = clientRef.current;
         const session = editSessionRef.current;
         clearEditState(grid, editor);
+        if (!client || workerTerminatedRef.current) {
+          return;
+        }
         const sheet = session ? session.hostSheet : activeSheetRef.current;
         const rowId = session ? session.rowId : grid.rowIdAt(cell.row);
         const sel = grid.selectionDetails();
@@ -817,6 +767,7 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
             ? sel.colId
             : (grid.colIdAt(cell.col) ?? String(cell.col));
         if (rowId !== null) {
+          notePersistenceMutation();
           sendEvalEnv(client);
           client.send({
             kind: "editCell",
@@ -831,8 +782,10 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
         }
       },
       onClear: () => {
+        const client = clientRef.current;
         const runs = grid.selectedCellRuns();
-        if (runs) {
+        if (client && !workerTerminatedRef.current && runs) {
+          notePersistenceMutation();
           pendingActionVerbRef.current = "cleared cells";
           client.send({
             kind: "clearCells",
@@ -843,8 +796,8 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
         }
       },
       onTextChange: (text, editingCell, cursorUtf16) => {
+        const client = clientRef.current;
         if (!editingCell) {
-          // If cross-sheet point-and-click cleared the floating overlay silently, keep formula bar session intact.
           if (
             editSessionRef.current &&
             activeSheetRef.current !== editSessionRef.current.hostSheet
@@ -864,10 +817,12 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
           session.canInsertRef = text === "=";
         }
         setEditingText(text);
-        requestAnalyze(client, grid, editor);
+        if (client && !workerTerminatedRef.current) {
+          requestAnalyze(client, grid, editor);
+        }
       },
       onToggleDollar: (text, cursorUtf16) => {
-        client.send({ kind: "toggleFormulaDollar", source: text, cursorUtf16 });
+        clientRef.current?.send({ kind: "toggleFormulaDollar", source: text, cursorUtf16 });
       },
       onFormulaKeyDown: (event, text, cursorUtf16) => {
         return formulaBarRef.current?.handleAssistKeyDown(event, text, cursorUtf16) ?? false;
@@ -875,8 +830,8 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
       isPointAndClickActive,
       onJumpEdge: (dir, select) => {
         const cur = grid.selection;
-        if (cur) {
-          client.send({
+        if (cur && !workerTerminatedRef.current) {
+          clientRef.current?.send({
             kind: "jumpEdge",
             sheet: activeSheetRef.current,
             row: cur.row,
@@ -887,26 +842,33 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
         }
       },
       onJumpUsedEnd: (select) => {
-        client.send({
-          kind: "jumpUsedEnd",
-          sheet: activeSheetRef.current,
-          select,
-        });
+        if (!workerTerminatedRef.current) {
+          clientRef.current?.send({
+            kind: "jumpUsedEnd",
+            sheet: activeSheetRef.current,
+            select,
+          });
+        }
       },
       onUndo: () => {
-        pendingActionVerbRef.current = "undid action";
-        client.send({ kind: "undo" });
+        if (!workerTerminatedRef.current) {
+          notePersistenceMutation();
+          pendingActionVerbRef.current = "undid action";
+          clientRef.current?.send({ kind: "undo" });
+        }
       },
       onRedo: () => {
-        pendingActionVerbRef.current = "redid action";
-        client.send({ kind: "redo" });
+        if (!workerTerminatedRef.current) {
+          notePersistenceMutation();
+          pendingActionVerbRef.current = "redid action";
+          clientRef.current?.send({ kind: "redo" });
+        }
       },
       onCopy: (cut, clipboardData) => {
         const range = grid.selectionRange;
-        if (!range) {
+        if (!range || workerTerminatedRef.current) {
           return;
         }
-        // Seed single-cell display text synchronously when available; Worker follows up with full TSV+HTML.
         if (
           clipboardData &&
           range.endRow - range.firstRow === 1 &&
@@ -917,7 +879,7 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
             clipboardData.setData("text/plain", single);
           }
         }
-        client.send({
+        clientRef.current?.send({
           kind: "copyRange",
           sheet: activeSheetRef.current,
           firstRow: range.firstRow,
@@ -928,8 +890,9 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
         });
       },
       onPaste: (tsv, html) => {
+        const client = clientRef.current;
         const range = grid.selectionRange;
-        if (!range) {
+        if (!client || workerTerminatedRef.current || !range) {
           return;
         }
         let effTsv = tsv;
@@ -941,6 +904,7 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
         if (effTsv.length === 0 && !effHtml) {
           return;
         }
+        notePersistenceMutation();
         sendEvalEnv(client);
         client.send({
           kind: "pasteClipboard",
@@ -956,6 +920,419 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
     });
     editorRef.current = editor;
 
+    const mountWorkerClient = (targetDocId: string, initialCmd: HostCommand) => {
+      clientRef.current?.stop();
+      workerTerminatedRef.current = false;
+      activeDocIdRef.current = targetDocId;
+      docLifecycleRef.current = initialCmd.kind === "takeOverDoc" ? "takingOver" : "starting";
+
+      const client = startEngine({
+        tabId: tabIdRef.current,
+        initialDocId: targetDocId,
+        initialCommand: initialCmd,
+        onMessage(message) {
+          switch (message.kind) {
+            case "docOpened": {
+              window.clearTimeout(yieldWatchdog);
+              activeDocIdRef.current = message.docId;
+              activeDocTitleRef.current = message.title;
+              storageBackendRef.current = message.storageBackend;
+              activeSlotRef.current = message.activeSlot;
+              waitingForFileRef.current = false;
+              safeModeRef.current = null;
+              setDocId(message.docId);
+              setDocTitle(message.title);
+              setLockOverlay(null);
+              setCsvProgress(null);
+              setModalMode(null);
+              syncUrlForDoc(message.docId);
+              refreshStorageEstimate();
+              break;
+            }
+            case "docBlocked": {
+              activeDocIdRef.current = message.docId;
+              activeDocTitleRef.current = message.title;
+              docLifecycleRef.current = "blocked";
+              waitingForFileRef.current = false;
+              setDocId(message.docId);
+              setDocTitle(message.title);
+              setLockOverlay({ kind: "blocked", docId: message.docId, title: message.title });
+              break;
+            }
+            case "docTakingOver": {
+              docLifecycleRef.current = "takingOver";
+              waitingForFileRef.current = message.waitingForFile;
+              setLockOverlay({
+                kind: "takingOver",
+                docId: message.docId,
+                title: activeDocTitleRef.current,
+                waitingForFile: message.waitingForFile,
+              });
+              break;
+            }
+            case "docYielded": {
+              window.clearTimeout(yieldWatchdog);
+              docLifecycleRef.current = "yielded";
+              waitingForFileRef.current = false;
+              clearEditState(grid, editor);
+              setLockOverlay({
+                kind: "yielded",
+                docId: message.docId,
+                title: activeDocTitleRef.current,
+                evicted: message.evicted,
+              });
+              break;
+            }
+            case "safeMode": {
+              docLifecycleRef.current = "safeMode";
+              safeModeRef.current = message.info;
+              activeDocIdRef.current = message.info.docId;
+              activeDocTitleRef.current = message.info.title;
+              setDocId(message.info.docId);
+              setDocTitle(message.info.title);
+              setLockOverlay(null);
+              setModalMode({ kind: "safeMode", info: message.info });
+              break;
+            }
+            case "catalogListed": {
+              setCatalogDocs(message.docs);
+              const activeEntry = message.docs.find((d) => d.id === activeDocIdRef.current);
+              if (activeEntry) {
+                activeDocTitleRef.current = activeEntry.title;
+                setDocTitle(activeEntry.title);
+              }
+              refreshStorageEstimate();
+              break;
+            }
+            case "docSaved": {
+              activeSlotRef.current = message.slot;
+              refreshStorageEstimate();
+              for (const resolve of compactWaiters.splice(0)) {
+                resolve({
+                  docId: message.docId,
+                  slot: message.slot,
+                  byteLen: message.byteLen,
+                  elapsedMs: message.elapsedMs,
+                });
+              }
+              break;
+            }
+            case "quotaExceeded": {
+              setQuotaBanner(message.message);
+              break;
+            }
+            case "csvImportProgress": {
+              setCsvProgress({ rowsParsed: message.rowsParsed, percent: message.percent });
+              break;
+            }
+            case "fileExported": {
+              downloadArrayBuffer(message.filename, message.bytes);
+              break;
+            }
+            case "closedForUpdate": {
+              for (const resolve of closeWaiters.splice(0)) {
+                resolve();
+              }
+              break;
+            }
+            case "ready":
+              performance.mark(MARKS.engineReady);
+              docLifecycleRef.current = "ready";
+              activeSheetRef.current = message.sheet.sheet;
+              walSeqRef.current = message.sheet.walSeq;
+              lastInspectKey = "";
+              inspectedRef.current = null;
+              setInspected(null);
+              grid.setSheet(message.sheet);
+              setEngine({ status: "ready", info: message.info, sheet: message.sheet });
+              break;
+            case "sheetChanged": {
+              const switched = message.sheet.sheet !== activeSheetRef.current;
+              activeSheetRef.current = message.sheet.sheet;
+              walSeqRef.current = message.sheet.walSeq;
+              if (switched) {
+                lastInspectKey = "";
+                inspectedRef.current = null;
+                setInspected(null);
+                grid.setSheet(message.sheet);
+                const cp = lastCopiedRef.current;
+                if (cp && cp.sheet === message.sheet.sheet) {
+                  grid.setClipboardRange(
+                    {
+                      firstRow: cp.firstRow,
+                      endRow: cp.firstRow + cp.rowCount,
+                      firstCol: cp.firstCol,
+                      endCol: cp.firstCol + cp.colCount,
+                    },
+                    cp.cut,
+                  );
+                }
+              } else {
+                grid.updateSheet(message.sheet);
+              }
+              syncGridFormulaRefs(grid, analysisRef.current, message.sheet.sheet);
+              setEngine((prev) =>
+                prev.status === "ready" ? { ...prev, sheet: message.sheet } : prev,
+              );
+              const verb = pendingActionVerbRef.current;
+              pendingActionVerbRef.current = "updated";
+              const extra =
+                message.recalculated > 0
+                  ? `, recalculated ${integer.format(message.recalculated)} cells`
+                  : "";
+              setRecalcMessage(`${verb} in ${milliseconds.format(message.actionMs)} ms${extra}`);
+              requestInspect(grid.selectionDetails(), true);
+              refreshStorageEstimate();
+              break;
+            }
+            case "stylesUpdated": {
+              if (message.sheet === activeSheetRef.current) {
+                grid.setStyles(message.styles);
+              }
+              break;
+            }
+            case "cellInspected": {
+              const cur = grid.selectionDetails();
+              if (
+                !cur ||
+                message.sheet !== activeSheetRef.current ||
+                cur.rowId !== message.rowId ||
+                cur.colId !== message.colId
+              ) {
+                break;
+              }
+              const info: InspectedState = {
+                sheet: message.sheet,
+                rowId: message.rowId,
+                colId: message.colId,
+                address: message.address,
+                raw: message.raw,
+                display: message.display,
+                isFormula: message.isFormula,
+                error: message.error ?? null,
+                formatCode: message.formatCode,
+                style: message.style,
+              };
+              inspectedRef.current = info;
+              setInspected(info);
+              break;
+            }
+            case "formulaAnalyzed": {
+              if (!editSessionRef.current) {
+                break;
+              }
+              analysisRef.current = message.analysis;
+              editSessionRef.current.canInsertRef = message.analysis.canInsertRef;
+              editSessionRef.current.activeRefSpan = message.analysis.activeRefSpan ?? null;
+              setFormulaAnalysis(message.analysis);
+              editor.setFormulaAnalysis(message.analysis);
+              syncGridFormulaRefs(grid, message.analysis, activeSheetRef.current);
+              break;
+            }
+            case "formulaDollarToggled": {
+              const session = editSessionRef.current;
+              if (!session || !message.changed) {
+                break;
+              }
+              session.source = message.source;
+              session.cursorUtf16 = message.endUtf16;
+              session.pointPickedSpan = null;
+              setEditingText(message.source);
+              formulaBarRef.current?.applyTextAndSelection(
+                message.source,
+                message.endUtf16,
+                message.endUtf16,
+              );
+              if (activeSheetRef.current === session.hostSheet) {
+                editor.applyTextAndSelection(message.source, message.endUtf16, message.endUtf16);
+              }
+              requestAnalyze(client, grid, editor);
+              break;
+            }
+            case "rangeRefFormatted": {
+              const session = editSessionRef.current;
+              if (!session) {
+                break;
+              }
+              const span = session.pointPickedSpan ??
+                session.activeRefSpan ?? [session.cursorUtf16, session.cursorUtf16];
+              const repStart = Math.max(0, Math.min(session.source.length, span[0]));
+              const repEnd = Math.max(repStart, Math.min(session.source.length, span[1]));
+              const nextSource =
+                session.source.slice(0, repStart) +
+                message.reference +
+                session.source.slice(repEnd);
+              const nextEnd = repStart + message.reference.length;
+              session.source = nextSource;
+              session.cursorUtf16 = nextEnd;
+              session.pointPickedSpan = [repStart, nextEnd];
+              setEditingText(nextSource);
+              formulaBarRef.current?.applyTextAndSelection(nextSource, nextEnd, nextEnd);
+              if (activeSheetRef.current === session.hostSheet) {
+                editor.setTextExternal(nextSource, nextEnd);
+              }
+              requestAnalyze(client, grid, editor);
+              break;
+            }
+            case "edgeJumped": {
+              if (message.sheet === activeSheetRef.current) {
+                grid.jumpTo(message.row, message.col, message.select);
+              }
+              break;
+            }
+            case "clipboardCopied": {
+              const snap: CopiedSnapshot = {
+                sheet: message.sheet,
+                firstRow: message.firstRow,
+                rowCount: message.rowCount,
+                firstCol: message.firstCol,
+                colCount: message.firstCol === undefined ? 0 : message.colCount,
+                cut: message.cut,
+                tsv: message.tsv,
+                html: message.html,
+              };
+              lastCopiedRef.current = snap;
+              if (message.sheet === activeSheetRef.current) {
+                grid.setClipboardRange(
+                  {
+                    firstRow: message.firstRow,
+                    endRow: message.firstRow + message.rowCount,
+                    firstCol: message.firstCol,
+                    endCol: message.firstCol + message.colCount,
+                  },
+                  message.cut,
+                );
+              }
+              if (typeof navigator !== "undefined" && navigator.clipboard) {
+                if (typeof ClipboardItem !== "undefined" && navigator.clipboard.write) {
+                  const item = new ClipboardItem({
+                    "text/plain": new Blob([message.tsv], { type: "text/plain" }),
+                    "text/html": new Blob([message.html], { type: "text/html" }),
+                  });
+                  void navigator.clipboard.write([item]).catch(() => {
+                    void navigator.clipboard.writeText?.(message.tsv).catch(() => {});
+                  });
+                } else {
+                  void navigator.clipboard.writeText?.(message.tsv).catch(() => {});
+                }
+              }
+              break;
+            }
+            case "clipboardPasted": {
+              activeSheetRef.current = message.sheet.sheet;
+              walSeqRef.current = message.sheet.walSeq;
+              grid.updateSheet(message.sheet);
+              setEngine((prev) =>
+                prev.status === "ready" ? { ...prev, sheet: message.sheet } : prev,
+              );
+              if (lastCopiedRef.current?.cut) {
+                lastCopiedRef.current = null;
+                grid.setClipboardRange(null);
+              }
+              if (message.destRowCount > 0 && message.destColCount > 0) {
+                grid.selectRange(
+                  { row: message.destFirstRow, col: message.destFirstCol },
+                  {
+                    row: message.destFirstRow + message.destRowCount - 1,
+                    col: message.destFirstCol + message.destColCount - 1,
+                  },
+                );
+              }
+              const extra =
+                message.recalculated > 0
+                  ? `, recalculated ${integer.format(message.recalculated)} cells`
+                  : "";
+              setRecalcMessage(`pasted in ${milliseconds.format(message.elapsedMs)} ms${extra}`);
+              requestInspect(grid.selectionDetails(), true);
+              refreshStorageEstimate();
+              break;
+            }
+            case "recalcProgress":
+              setRecalcMessage(
+                `recalculating ${integer.format(message.done)} / ${integer.format(message.total)}…`,
+              );
+              break;
+            case "recalcDone":
+              setRejectedReason(null);
+              walSeqRef.current = message.sheet.walSeq;
+              grid.updateSheet(message.sheet);
+              setEngine((prev) =>
+                prev.status === "ready" ? { ...prev, sheet: message.sheet } : prev,
+              );
+              if (message.recalculated > 0) {
+                setRecalcMessage(
+                  `recalculated ${integer.format(message.recalculated)} cells in ${milliseconds.format(message.elapsedMs)} ms`,
+                );
+              } else {
+                setRecalcMessage(`updated cell in ${milliseconds.format(message.elapsedMs)} ms`);
+              }
+              requestInspect(grid.selectionDetails(), true);
+              refreshStorageEstimate();
+              break;
+            case "rejected":
+              setCsvProgress(null);
+              setRejectedReason(message.reason);
+              break;
+            case "selfChecked":
+              for (const resolve of selfChecks.splice(0)) {
+                resolve(message.digest);
+              }
+              break;
+            case "failed":
+              docLifecycleRef.current = "failed";
+              setEngine({ status: "failed", message: message.message });
+              break;
+          }
+        },
+        onPage: (page) => grid.acceptPage(page),
+      });
+
+      clientRef.current = client;
+    };
+
+    startWorkerFnRef.current = mountWorkerClient;
+    mountWorkerClient(initialRoute.current.docId, {
+      kind: "openDoc",
+      docId: initialRoute.current.docId,
+      safeRequested: initialRoute.current.safeRequested,
+    });
+    refreshStorageEstimate();
+
+    // Main-thread 500 ms takeover watchdog (`14-m1b.md` 7.2 Step 3): terminates a
+    // stuck Worker that fails to yield within 500 ms so its lock & OPFS file release!
+    const locksWatch =
+      typeof BroadcastChannel !== "undefined" ? new BroadcastChannel("reticula:locks") : null;
+    if (locksWatch) {
+      locksWatch.onmessage = (
+        event: MessageEvent<{ kind?: string; docId?: string; fromTabId?: string }>,
+      ) => {
+        const data = event.data;
+        if (
+          data?.kind === "yield" &&
+          data.fromTabId !== tabIdRef.current &&
+          data.docId === activeDocIdRef.current &&
+          docLifecycleRef.current === "ready"
+        ) {
+          window.clearTimeout(yieldWatchdog);
+          yieldWatchdog = window.setTimeout(() => {
+            if (docLifecycleRef.current !== "ready" || activeDocIdRef.current !== data.docId) {
+              return;
+            }
+            clientRef.current?.stop();
+            workerTerminatedRef.current = true;
+            docLifecycleRef.current = "yielded";
+            clearEditState(grid, editor);
+            setLockOverlay({
+              kind: "yielded",
+              docId: activeDocIdRef.current,
+              title: activeDocTitleRef.current,
+              evicted: true,
+            });
+          }, YIELD_WATCHDOG_MS);
+        }
+      };
+    }
+
     let shellMarked = false;
     const stopMarking = grid.watchFrames((frame) => {
       if (!shellMarked) {
@@ -969,25 +1346,61 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
     });
 
     const removeHooks = hooksRequested()
-      ? installHooks(grid, () => {
-          client.send({ kind: "selfCheck" });
-          return new Promise<string>((resolve) => selfChecks.push(resolve));
+      ? installHooks(grid, {
+          selfCheck: () => {
+            clientRef.current?.send({ kind: "selfCheck" });
+            return new Promise<string>((resolve) => selfChecks.push(resolve));
+          },
+          docStatus: () => ({
+            docId: activeDocIdRef.current,
+            title: activeDocTitleRef.current,
+            engineStatus: docLifecycleRef.current,
+            storageBackend: storageBackendRef.current,
+            activeSlot: activeSlotRef.current,
+            walSeq: walSeqRef.current,
+            waitingForFile: waitingForFileRef.current,
+            safeMode: safeModeRef.current,
+          }),
+          compactSnapshot: () => {
+            clientRef.current?.sendHost({ kind: "forceCompactSnapshot" });
+            return new Promise<SnapshotSaveResult>((resolve) => compactWaiters.push(resolve));
+          },
+          flushAndClose: () => {
+            if (workerTerminatedRef.current || !clientRef.current) {
+              return Promise.resolve();
+            }
+            clientRef.current.sendHost({ kind: "flushAndCloseForUpdate" });
+            return new Promise<void>((resolve) => closeWaiters.push(resolve));
+          },
+          spinWorker: (ms) => {
+            clientRef.current?.sendHost({ kind: "debugSpinWorker", ms });
+          },
         })
       : undefined;
     const timer = window.setInterval(() => setStats(grid.stats()), STATUS_INTERVAL_MS);
 
     return () => {
       window.clearInterval(timer);
+      window.clearTimeout(yieldWatchdog);
+      locksWatch?.close();
       stopMarking();
       removeHooks?.();
       editor.destroy();
       grid.destroy();
-      client.stop();
+      clientRef.current?.stop();
       editorRef.current = null;
       gridRef.current = null;
       clientRef.current = null;
+      startWorkerFnRef.current = null;
     };
-  }, [clearEditState, ensureEditSession, requestAnalyze, syncGridFormulaRefs]);
+  }, [
+    clearEditState,
+    ensureEditSession,
+    notePersistenceMutation,
+    refreshStorageEstimate,
+    requestAnalyze,
+    syncGridFormulaRefs,
+  ]);
 
   const activeSheetId = engine.status === "ready" ? engine.sheet.sheet : 0;
   const matchingInspected =
@@ -1014,7 +1427,7 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
     const grid = gridRef.current;
     const editor = editorRef.current;
     const client = clientRef.current;
-    if (!grid || !editor || !client) {
+    if (!grid || !editor || !client || workerTerminatedRef.current) {
       return;
     }
     const session = ensureEditSession(grid, next, cursorUtf16);
@@ -1040,13 +1453,14 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
     const grid = gridRef.current;
     const editor = editorRef.current;
     const client = clientRef.current;
-    if (!grid || !editor || !client) {
+    if (!grid || !editor || !client || workerTerminatedRef.current) {
       return;
     }
     const session = editSessionRef.current;
     if (session && activeSheetRef.current !== session.hostSheet) {
       const { hostSheet, rowId, colId, source } = session;
       clearEditState(grid, editor);
+      notePersistenceMutation();
       sendEvalEnv(client);
       client.send({ kind: "editCell", sheet: hostSheet, rowId, colId, raw: source });
       client.send({ kind: "switchSheet", sheet: hostSheet });
@@ -1066,7 +1480,7 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
     }
     const session = editSessionRef.current;
     clearEditState(grid, editor);
-    if (session && activeSheetRef.current !== session.hostSheet) {
+    if (!workerTerminatedRef.current && session && activeSheetRef.current !== session.hostSheet) {
       client.send({ kind: "switchSheet", sheet: session.hostSheet });
     }
     editor.cancelExternal();
@@ -1080,7 +1494,7 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
     const grid = gridRef.current;
     const editor = editorRef.current;
     const client = clientRef.current;
-    if (!grid || !editor || !client) {
+    if (!grid || !editor || !client || workerTerminatedRef.current) {
       return;
     }
     const start = Math.max(0, Math.min(currentSource.length, item.replaceStartUtf16));
@@ -1110,7 +1524,7 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
   const handleInsertRow = (below: boolean) => {
     const grid = gridRef.current;
     const client = clientRef.current;
-    if (!grid || !client) {
+    if (!grid || !client || workerTerminatedRef.current) {
       return;
     }
     const baseRow = selection ? (below ? selection.range.endRow - 1 : selection.range.firstRow) : 0;
@@ -1119,6 +1533,7 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
     if (afterPos >= 0 && afterRowId === null) {
       return;
     }
+    notePersistenceMutation();
     pendingActionVerbRef.current = "inserted rows";
     client.send({
       kind: "insertRows",
@@ -1132,13 +1547,14 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
   const handleDeleteSelectedRows = () => {
     const grid = gridRef.current;
     const client = clientRef.current;
-    if (!grid || !client) {
+    if (!grid || !client || workerTerminatedRef.current) {
       return;
     }
     const rows = grid.selectedRowRuns();
     if (!rows || rows.length === 0) {
       return;
     }
+    notePersistenceMutation();
     pendingActionVerbRef.current = "deleted rows";
     client.send({
       kind: "deleteRows",
@@ -1151,7 +1567,7 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
   const handleInsertCol = (right: boolean) => {
     const grid = gridRef.current;
     const client = clientRef.current;
-    if (!grid || !client) {
+    if (!grid || !client || workerTerminatedRef.current) {
       return;
     }
     const baseCol = selection ? (right ? selection.range.endCol - 1 : selection.range.firstCol) : 0;
@@ -1160,6 +1576,7 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
     if (afterPos >= 0 && afterColId === null) {
       return;
     }
+    notePersistenceMutation();
     pendingActionVerbRef.current = "inserted columns";
     client.send({
       kind: "insertCols",
@@ -1173,13 +1590,14 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
   const handleDeleteSelectedCols = () => {
     const grid = gridRef.current;
     const client = clientRef.current;
-    if (!grid || !client) {
+    if (!grid || !client || workerTerminatedRef.current) {
       return;
     }
     const cols = grid.selectedColRuns();
     if (!cols || cols.length === 0) {
       return;
     }
+    notePersistenceMutation();
     pendingActionVerbRef.current = "deleted columns";
     client.send({
       kind: "deleteCols",
@@ -1192,13 +1610,14 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
   const applyFormat = (patch: { numberFormat?: WireFormatPatch; style?: WireStylePatch }) => {
     const grid = gridRef.current;
     const client = clientRef.current;
-    if (!grid || !client) {
+    if (!grid || !client || workerTerminatedRef.current) {
       return;
     }
     const target = grid.selectedFormatTarget();
     if (!target) {
       return;
     }
+    notePersistenceMutation();
     pendingActionVerbRef.current = "formatted cells";
     client.send({
       kind: "setFormat",
@@ -1211,7 +1630,7 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
 
   const handleFreezeChange = (value: string) => {
     const client = clientRef.current;
-    if (!client) {
+    if (!client || workerTerminatedRef.current) {
       return;
     }
     let frozenRows = 0;
@@ -1230,6 +1649,7 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
         frozenRows = 1;
       }
     }
+    notePersistenceMutation();
     pendingActionVerbRef.current = "updated freeze panes";
     client.send({
       kind: "setFreeze",
@@ -1244,7 +1664,13 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
     const grid = gridRef.current;
     const editor = editorRef.current;
     const client = clientRef.current;
-    if (!grid || !editor || !client || targetId === activeSheetRef.current) {
+    if (
+      !grid ||
+      !editor ||
+      !client ||
+      workerTerminatedRef.current ||
+      targetId === activeSheetRef.current
+    ) {
       return;
     }
     const session = editSessionRef.current;
@@ -1252,7 +1678,6 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
       session?.source.startsWith("=") &&
       (session.pointPickedSpan !== null || session.canInsertRef || session.activeRefSpan !== null)
     ) {
-      // Cross-sheet point-and-click mode: hide in-cell box on old sheet and keep FormulaBar active!
       editor.clearSilent();
       client.send({ kind: "switchSheet", sheet: targetId });
       formulaBarRef.current?.focus();
@@ -1271,7 +1696,7 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
     const grid = gridRef.current;
     const client = clientRef.current;
     setContextMenu(null);
-    if (!grid || !client) {
+    if (!grid || !client || workerTerminatedRef.current) {
       return;
     }
     const range = grid.selectionRange;
@@ -1305,6 +1730,7 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
       html = lastCopiedRef.current.html;
     }
     if (tsv.length > 0 || html) {
+      notePersistenceMutation();
       sendEvalEnv(client);
       client.send({
         kind: "pasteClipboard",
@@ -1320,6 +1746,34 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
     editorRef.current?.focus();
   };
 
+  const handleTakeOver = (targetDocId: string) => {
+    if (workerTerminatedRef.current || !clientRef.current) {
+      startWorkerFnRef.current?.(targetDocId, { kind: "takeOverDoc", docId: targetDocId });
+    } else {
+      clientRef.current.sendHost({ kind: "takeOverDoc", docId: targetDocId });
+    }
+  };
+
+  const handleCreateNewWorkbook = (title: string, template: "empty" | "sample") => {
+    const newId = makeFreshDocId();
+    notePersistenceMutation();
+    setModalMode(null);
+    setLockOverlay(null);
+    if (workerTerminatedRef.current || !clientRef.current) {
+      startWorkerFnRef.current?.(newId, { kind: "createDoc", docId: newId, title, template });
+    } else {
+      clientRef.current.sendHost({ kind: "createDoc", docId: newId, title, template });
+    }
+  };
+
+  const handleOpenWorkbooksDrawer = () => {
+    if (!workerTerminatedRef.current) {
+      clientRef.current?.sendHost({ kind: "listDocs" });
+    }
+    refreshStorageEstimate();
+    setModalMode({ kind: "workbooks" });
+  };
+
   const handleJumpToV1 = () => {
     const grid = gridRef.current;
     if (!grid) {
@@ -1330,7 +1784,7 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
     editorRef.current?.focus();
   };
 
-  const readySheet = engine.status === "ready" ? engine.sheet : null;
+  const readySheet = engine.status === "ready" && lockOverlay === null ? engine.sheet : null;
   const canDeleteRows = selection !== null && selection.rowId !== null;
   const canDeleteCols = selection !== null && selection.colId !== null;
   const hasSelection = readySheet !== null && selection !== null;
@@ -1364,14 +1818,34 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
         >
           <h1>Reticula</h1>
         </a>
+        <button
+          type="button"
+          className="toolbar-btn"
+          data-testid="workbooks-btn"
+          onClick={handleOpenWorkbooksDrawer}
+          title="Manage local browser workbooks, import or export .rtcl / .csv"
+        >
+          Workbooks
+        </button>
         {readySheet && (
           <span className="document" data-testid="document">
-            {readySheet.seed !== 0 ? "Sample sales data" : readySheet.sheetName} ·{" "}
-            {integer.format(readySheet.rows)} rows × {readySheet.cols} columns ·{" "}
+            {docTitle} · {integer.format(readySheet.rows)} rows × {readySheet.cols} columns ·{" "}
             {integer.format(readySheet.formulaCount)} formulas
           </span>
         )}
         <span className="titlebar-spacer" />
+        <span className="storage-badge" data-testid="storage-badge">
+          Local browser storage only · {storageUsedMb} MB used ·{" "}
+          <button
+            type="button"
+            className="storage-export-link"
+            data-testid="export-rtcl-btn"
+            disabled={!readySheet}
+            onClick={() => clientRef.current?.sendHost({ kind: "exportRtcl" })}
+          >
+            Export .rtcl
+          </button>
+        </span>
         <div className="toolbar">
           <button
             type="button"
@@ -1379,6 +1853,7 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
             data-testid="undo-btn"
             disabled={!readySheet?.canUndo}
             onClick={() => {
+              notePersistenceMutation();
               pendingActionVerbRef.current = "undid action";
               clientRef.current?.send({ kind: "undo" });
               editorRef.current?.focus();
@@ -1395,6 +1870,7 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
             data-testid="redo-btn"
             disabled={!readySheet?.canRedo}
             onClick={() => {
+              notePersistenceMutation();
               pendingActionVerbRef.current = "redid action";
               clientRef.current?.send({ kind: "redo" });
               editorRef.current?.focus();
@@ -1727,6 +2203,32 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
         </button>
       </div>
 
+      {quotaBanner && (
+        <div className="rejected-banner" role="alert" data-testid="quota-banner">
+          <span>{quotaBanner}</span>
+          <div className="banner-actions">
+            <button
+              type="button"
+              className="tip-action"
+              onClick={() => clientRef.current?.sendHost({ kind: "exportRtcl" })}
+            >
+              Export .rtcl
+            </button>
+            <button type="button" className="tip-action" onClick={handleOpenWorkbooksDrawer}>
+              Manage Workbooks
+            </button>
+            <button
+              type="button"
+              className="tip-close"
+              aria-label="Dismiss storage warning"
+              onClick={() => setQuotaBanner(null)}
+            >
+              ×
+            </button>
+          </div>
+        </div>
+      )}
+
       {readySheet?.recalcFrozen && (
         <div className="frozen-recalc-banner" role="status" data-testid="recalc-frozen-banner">
           <span>
@@ -1778,7 +2280,7 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
             ? "Enter a value or =formula (Tab to autocomplete, F4 to toggle $)"
             : "Select a cell to edit"
         }
-        disabled={engine.status !== "ready" || (selection === null && !editSessionRef.current)}
+        disabled={readySheet === null || (selection === null && !editSessionRef.current)}
         isEditing={editingText !== null}
         analysis={formulaAnalysis}
         onChange={handleFormulaBarChange}
@@ -1806,6 +2308,50 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
 
       <div className="sheet">
         <div ref={hostRef} className="grid" data-testid="grid" />
+        {lockOverlay && (
+          <div className="lock-overlay" role="dialog" aria-modal="true" data-testid="lock-overlay">
+            <div className="lock-card">
+              <h2>
+                {lockOverlay.kind === "blocked"
+                  ? "This local workbook is open in another tab"
+                  : lockOverlay.kind === "takingOver"
+                    ? "Moving workbook to this tab…"
+                    : "Workbook moved to another tab"}
+              </h2>
+              <p data-testid="lock-overlay-message">
+                {lockOverlay.kind === "blocked"
+                  ? `“${lockOverlay.title}” is exclusively locked by another browser tab to keep its OPFS edit log consistent.`
+                  : lockOverlay.kind === "takingOver"
+                    ? lockOverlay.waitingForFile
+                      ? "Waiting for the other tab to release the file — if the other tab is unresponsive, please close it."
+                      : "Asking the other tab to flush and release the workbook…"
+                    : lockOverlay.evicted
+                      ? "Another tab took over this workbook because this tab did not release it in time."
+                      : "This tab flushed its changes and handed the workbook over to another tab."}
+              </p>
+              {lockOverlay.kind !== "takingOver" && (
+                <div className="lock-actions">
+                  <button
+                    type="button"
+                    className="toolbar-btn primary-btn"
+                    data-testid="take-over-btn"
+                    onClick={() => handleTakeOver(lockOverlay.docId)}
+                  >
+                    Open here (Take over)
+                  </button>
+                  <button
+                    type="button"
+                    className="toolbar-btn"
+                    data-testid="new-workbook-from-lock-btn"
+                    onClick={() => handleCreateNewWorkbook("Untitled workbook", "empty")}
+                  >
+                    New local workbook
+                  </button>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
         {engine.status === "failed" && (
           <div className="failure" role="alert">
             <p>The engine has stopped. Reload the page to start again.</p>
@@ -1837,6 +2383,7 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
                     const trimmed = renamingSheet.draft.trim();
                     setRenamingSheet(null);
                     if (trimmed && trimmed !== tab.name) {
+                      notePersistenceMutation();
                       pendingActionVerbRef.current = "renamed sheet";
                       clientRef.current?.send({
                         kind: "renameSheet",
@@ -1851,6 +2398,7 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
                       const trimmed = renamingSheet.draft.trim();
                       setRenamingSheet(null);
                       if (trimmed && trimmed !== tab.name) {
+                        notePersistenceMutation();
                         pendingActionVerbRef.current = "renamed sheet";
                         clientRef.current?.send({
                           kind: "renameSheet",
@@ -1900,6 +2448,7 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
             title="Add worksheet"
             aria-label="Add worksheet"
             onClick={() => {
+              notePersistenceMutation();
               pendingActionVerbRef.current = "added sheet";
               clientRef.current?.send({
                 kind: "addSheet",
@@ -1914,8 +2463,16 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
       )}
 
       <footer className="statusbar">
-        <span data-testid="engine-status">{engine.status}</span>
-        {engine.status === "starting" && <span>Generating the sample…</span>}
+        <span data-testid="engine-status">
+          {lockOverlay
+            ? lockOverlay.kind
+            : modalMode?.kind === "safeMode"
+              ? "safeMode"
+              : engine.status}
+        </span>
+        {engine.status === "starting" && !lockOverlay && !modalMode && (
+          <span>Opening local workbook…</span>
+        )}
         {readySheet && engine.status === "ready" && (
           <>
             {(selection ?? stats?.selection) && (
@@ -2002,6 +2559,7 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
                   setContextMenu(null);
                   const runs = gridRef.current?.selectedCellRuns();
                   if (runs) {
+                    notePersistenceMutation();
                     pendingActionVerbRef.current = "cleared cells";
                     clientRef.current?.send({
                       kind: "clearCells",
@@ -2124,6 +2682,7 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
                           const targetTab = contextMenu.tab;
                           setContextMenu(null);
                           const afterSheet = idx >= 2 ? readySheet.sheets[idx - 2]?.id : undefined;
+                          notePersistenceMutation();
                           pendingActionVerbRef.current = "reordered sheets";
                           clientRef.current?.send({
                             kind: "moveSheet",
@@ -2145,6 +2704,7 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
                           setContextMenu(null);
                           const nextTab = readySheet.sheets[idx + 1];
                           if (nextTab) {
+                            notePersistenceMutation();
                             pendingActionVerbRef.current = "reordered sheets";
                             clientRef.current?.send({
                               kind: "moveSheet",
@@ -2166,6 +2726,7 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
                         onClick={() => {
                           const targetTab = contextMenu.tab;
                           setContextMenu(null);
+                          notePersistenceMutation();
                           pendingActionVerbRef.current = "deleted sheet";
                           clientRef.current?.send({
                             kind: "deleteSheet",
@@ -2181,6 +2742,80 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
             </>
           )}
         </div>
+      )}
+
+      {modalMode && (
+        <Suspense fallback={null}>
+          <LazyLocalModals
+            mode={modalMode}
+            activeDocId={docId}
+            docs={catalogDocs}
+            storageUsedMb={storageUsedMb}
+            csvProgress={csvProgress}
+            onClose={() => setModalMode(null)}
+            onOpenDoc={(nextId, nextTitle) => {
+              setModalMode(null);
+              if (workerTerminatedRef.current || !clientRef.current) {
+                startWorkerFnRef.current?.(nextId, {
+                  kind: "openDoc",
+                  docId: nextId,
+                  title: nextTitle,
+                });
+              } else {
+                clientRef.current.sendHost({ kind: "openDoc", docId: nextId, title: nextTitle });
+              }
+            }}
+            onCreateDoc={handleCreateNewWorkbook}
+            onRenameDoc={(id, title) => {
+              notePersistenceMutation();
+              clientRef.current?.sendHost({ kind: "renameDoc", docId: id, title });
+            }}
+            onDeleteDoc={(id) => {
+              notePersistenceMutation();
+              clientRef.current?.sendHost({ kind: "deleteDoc", docId: id });
+            }}
+            onExportRtcl={() => clientRef.current?.sendHost({ kind: "exportRtcl" })}
+            onExportCsv={() =>
+              clientRef.current?.sendHost({ kind: "exportCsv", sheet: activeSheetRef.current })
+            }
+            onImportRtcl={(title, bytes) => {
+              const newId = makeFreshDocId();
+              notePersistenceMutation();
+              setModalMode(null);
+              clientRef.current?.sendHost({ kind: "importRtcl", docId: newId, title, bytes }, [
+                bytes,
+              ]);
+            }}
+            onImportCsv={(title, sheetName, bytes) => {
+              const newId = makeFreshDocId();
+              notePersistenceMutation();
+              clientRef.current?.sendHost(
+                { kind: "importCsv", docId: newId, title, sheetName, bytes },
+                [bytes],
+              );
+            }}
+            onImportRejected={(reason) => {
+              setModalMode(null);
+              setRejectedReason(reason);
+            }}
+            onSafeModeOpenFrozen={(targetId) => {
+              setModalMode(null);
+              clientRef.current?.sendHost({
+                kind: "safeModeRecover",
+                docId: targetId,
+                mode: { type: "openFrozen" },
+              });
+            }}
+            onSafeModeSkipTail={(targetId, skipCount, salvageMid) => {
+              setModalMode(null);
+              clientRef.current?.sendHost({
+                kind: "safeModeRecover",
+                docId: targetId,
+                mode: { type: "skipTail", skipCount, salvageMid },
+              });
+            }}
+          />
+        </Suspense>
       )}
     </div>
   );

@@ -282,7 +282,7 @@ pub fn scan_wal(
         }
     };
 
-    if meta.base_snapshot_seq != expected_base_seq {
+    if meta.base_snapshot_seq > expected_base_seq {
         return Err(WalCorruption::BaseSeqMismatch {
             found: Some(meta.base_snapshot_seq),
             expected: expected_base_seq,
@@ -290,13 +290,19 @@ pub fn scan_wal(
     }
 
     let mut records = Vec::new();
-    let mut last_seq = expected_base_seq;
+    let mut last_seq = meta.base_snapshot_seq;
 
     while cursor < bytes.len() {
         let Some(rem) = bytes.get(cursor..) else {
             break;
         };
         if all_zero(rem) {
+            if last_seq < expected_base_seq {
+                return Err(WalCorruption::BaseSeqMismatch {
+                    found: Some(meta.base_snapshot_seq),
+                    expected: expected_base_seq,
+                });
+            }
             if watermark_ok(last_seq, expected_base_seq, last_flushed_seq) {
                 return Ok(WalScan {
                     base_snapshot_seq: expected_base_seq,
@@ -331,10 +337,18 @@ pub fn scan_wal(
                     });
                 }
                 last_seq = rec.seq;
-                records.push(rec);
+                if rec.seq > expected_base_seq {
+                    records.push(rec);
+                }
                 cursor = next_pos;
             }
             FrameOutcome::TornTail => {
+                if last_seq < expected_base_seq {
+                    return Err(WalCorruption::BaseSeqMismatch {
+                        found: Some(meta.base_snapshot_seq),
+                        expected: expected_base_seq,
+                    });
+                }
                 if watermark_ok(last_seq, expected_base_seq, last_flushed_seq) {
                     return Ok(WalScan {
                         base_snapshot_seq: expected_base_seq,
@@ -359,6 +373,13 @@ pub fn scan_wal(
                 });
             }
         }
+    }
+
+    if last_seq < expected_base_seq {
+        return Err(WalCorruption::BaseSeqMismatch {
+            found: Some(meta.base_snapshot_seq),
+            expected: expected_base_seq,
+        });
     }
 
     if !watermark_ok(last_seq, expected_base_seq, last_flushed_seq) {
@@ -600,5 +621,23 @@ mod tests {
                 "mid-file byte flip at {pos} was not rejected as corruption: {err:?}"
             );
         }
+
+        // 5. Compaction crash window: `state.json` switched to a newer snapshot
+        //    (`expected_base_seq = 12`), while `wal.log` still anchors at `10`
+        //    and covers `11..=13`. Only `seq > 12` (`13`) is returned for replay.
+        let overlap = scan_wal(&clean_bytes, 12, 13).unwrap();
+        assert_eq!(overlap.base_snapshot_seq, 12);
+        assert_eq!(overlap.records.len(), 1);
+        assert_eq!(overlap.records[0].seq, 13);
+
+        // If `wal.log` lags behind `expected_base_seq` (`14`), reject as mismatch.
+        let lag = scan_wal(&clean_bytes, 14, 14).unwrap_err();
+        assert!(matches!(
+            lag,
+            WalCorruption::BaseSeqMismatch {
+                found: Some(10),
+                expected: 14,
+            }
+        ));
     }
 }

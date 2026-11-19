@@ -92,6 +92,7 @@ export class CellEditor {
   #cell: CellPosition | null = null;
   #mode: "input" | "edit" = "input";
   #suppressAutoStart = false;
+  #suppressNotify = false;
   #stopWatching: () => void;
 
   constructor(grid: Grid, host: HTMLElement, options: CellEditorOptions) {
@@ -116,11 +117,13 @@ export class CellEditor {
               if (!this.#suppressAutoStart && !this.#cell && update.state.doc.length > 0) {
                 this.#start("typing", "input");
               }
-              this.#options.onTextChange?.(
-                update.state.doc.toString(),
-                this.#cell,
-                update.state.selection.main.head,
-              );
+              if (!this.#suppressNotify) {
+                this.#options.onTextChange?.(
+                  update.state.doc.toString(),
+                  this.#cell,
+                  update.state.selection.main.head,
+                );
+              }
             }
           }),
           EditorView.domEventHandlers({
@@ -273,7 +276,7 @@ export class CellEditor {
   /** Closes the in-grid overlay without emitting `cancelled` or stealing focus (used when switching tabs mid-formula). */
   clearSilent(): void {
     if (this.#cell) {
-      this.#finish();
+      this.#finish(false);
     }
   }
 
@@ -330,15 +333,19 @@ export class CellEditor {
     this.#note({ kind: "started", cause });
   }
 
-  #finish(): void {
+  #finish(notify = true): void {
     this.#cell = null;
     this.#mode = "input";
     delete this.#box.dataset.editing;
     this.#suppressAutoStart = true;
+    this.#suppressNotify = !notify;
     this.#clear();
+    this.#suppressNotify = false;
     this.#suppressAutoStart = false;
     this.#place();
-    this.#options.onTextChange?.("", null, 0);
+    if (notify) {
+      this.#options.onTextChange?.("", null, 0);
+    }
   }
 
   #clear(): void {
