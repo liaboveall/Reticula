@@ -130,13 +130,17 @@ pub fn bench(flags: &Flags) -> Result {
         "WASM benchmarks in {browser} (affinity {affinity})"
     ));
     let wasm_out = util::root().join("target/bench-wasm/wasm.json");
-    node()
+    let mut wasm_cmd = node();
+    wasm_cmd = wasm_cmd
         .arg("bench/run-wasm-bench.mjs")
         .arg("--pkg")
         .arg(&pkg_dir)
         .args(["--browser", browser, "--affinity", affinity, "--out"])
-        .arg(&wasm_out)
-        .run()?;
+        .arg(&wasm_out);
+    if flags.has("quick") {
+        wasm_cmd = wasm_cmd.arg("--quick");
+    }
+    wasm_cmd.run()?;
 
     // Combine native + WASM results into `bench/results/<date>-<commit>.json`.
     let native_val: serde_json::Value = serde_json::from_str(
@@ -165,7 +169,7 @@ pub fn bench(flags: &Flags) -> Result {
     }
 
     let combined = serde_json::json!({
-        "suite": "m1a-engine",
+        "suite": "m1b-engine",
         "date": today,
         "commit": commit,
         "uncommittedChanges": dirty,
