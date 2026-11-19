@@ -11,11 +11,14 @@
 //! 3. **Structure-sensitive set** (`ROW`, `COLUMN` callers): deterministic
 //!    `BTreeSet<u32>` per sheet marked dirty on structural mutations.
 
+use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::vec;
 use alloc::vec::Vec;
 use core::hash::BuildHasherDefault;
 
 use hashbrown::HashMap;
+use hashbrown::hash_map::Entry;
 use reticula_core::axis::Axis;
 use reticula_core::id::{ColId, IdRun, RowId, SheetId};
 use reticula_core::ops::{Workbook, WorkbookCellKey};
@@ -23,8 +26,55 @@ use rustc_hash::FxHasher;
 use smallvec::SmallVec;
 
 use crate::binder::{BoundExpr, BoundFormula, BoundRef};
+use crate::functions::catalog::is_volatile_function;
 
 type FxMap<K, V> = HashMap<K, V, BuildHasherDefault<FxHasher>>;
+
+/// Inline single-dependent storage avoiding a separate heap `Vec` for cells
+/// referenced by only one formula (the common case in 1M-row sheets).
+#[derive(Clone, Debug)]
+enum DepList {
+    One(u32),
+    Many(Vec<u32>),
+}
+
+impl DepList {
+    #[inline]
+    fn push(&mut self, fid: u32) {
+        match self {
+            Self::One(first) => {
+                let prev = *first;
+                *self = Self::Many(vec![prev, fid]);
+            }
+            Self::Many(vec) => vec.push(fid),
+        }
+    }
+
+    #[inline]
+    fn remove_first(&mut self, target: u32) -> bool {
+        match self {
+            Self::One(first) => *first == target,
+            Self::Many(vec) => {
+                if let Some(idx) = vec.iter().position(|&x| x == target) {
+                    vec.swap_remove(idx);
+                }
+                vec.is_empty()
+            }
+        }
+    }
+
+    #[inline]
+    fn for_each(&self, mut emit: impl FnMut(u32)) {
+        match self {
+            Self::One(fid) => emit(*fid),
+            Self::Many(vec) => {
+                for &fid in vec {
+                    emit(fid);
+                }
+            }
+        }
+    }
+}
 
 /// Single-column row-span subscription (`first_row..=last_row` on one column).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -63,34 +113,49 @@ pub struct ColSpanSub {
     pub last_col: ColId,
 }
 
+#[derive(Clone, Debug, Default)]
+struct RangeRegistrations {
+    col_spans: Vec<(SheetId, ColId, RowId, RowId)>,
+    areas: Vec<(SheetId, AreaSub)>,
+    full_cols: Vec<(SheetId, ColSpanSub)>,
+    full_rows: Vec<(SheetId, RowSpanSub)>,
+}
+
 /// Reverse edges registered by one formula, kept so removal is fast without
 /// scanning the entire graph.
 #[derive(Clone, Debug, Default)]
 pub struct FormulaRegistration {
-    single_cells: SmallVec<[WorkbookCellKey; 4]>,
-    col_spans: SmallVec<[(SheetId, ColId, RowId, RowId); 1]>,
-    areas: SmallVec<[(SheetId, AreaSub); 1]>,
-    full_cols: SmallVec<[(SheetId, ColSpanSub); 1]>,
-    full_rows: SmallVec<[(SheetId, RowSpanSub); 1]>,
+    single_cells: SmallVec<[WorkbookCellKey; 3]>,
+    ranges: Option<Box<RangeRegistrations>>,
     structural_sheet: Option<SheetId>,
 }
 
 impl FormulaRegistration {
+    fn ranges_mut(&mut self) -> &mut RangeRegistrations {
+        self.ranges
+            .get_or_insert_with(|| Box::new(RangeRegistrations::default()))
+    }
+
     /// Whether this formula statically subscribes to any cell or range on `target`.
     #[must_use]
     pub fn references_sheet(&self, target: SheetId) -> bool {
-        self.single_cells.iter().any(|&(s, _, _)| s == target)
-            || self.col_spans.iter().any(|&(s, _, _, _)| s == target)
-            || self.areas.iter().any(|&(s, _)| s == target)
-            || self.full_cols.iter().any(|&(s, _)| s == target)
-            || self.full_rows.iter().any(|&(s, _)| s == target)
+        if self.single_cells.iter().any(|&(s, _, _)| s == target) {
+            return true;
+        }
+        let Some(ranges) = self.ranges.as_deref() else {
+            return false;
+        };
+        ranges.col_spans.iter().any(|&(s, _, _, _)| s == target)
+            || ranges.areas.iter().any(|&(s, _)| s == target)
+            || ranges.full_cols.iter().any(|&(s, _)| s == target)
+            || ranges.full_rows.iter().any(|&(s, _)| s == target)
     }
 }
 
 /// Reverse dependency graph keyed by dense `FormulaId` (`u32`).
 #[derive(Clone, Debug, Default)]
 pub struct DepGraph {
-    single_deps: FxMap<WorkbookCellKey, Vec<u32>>,
+    single_deps: FxMap<WorkbookCellKey, DepList>,
     col_ranges: FxMap<(SheetId, ColId), Vec<RowSpanSub>>,
     sheet_col_range_keys: BTreeMap<SheetId, BTreeSet<ColId>>,
     multi_col_ranges: BTreeMap<SheetId, Vec<AreaSub>>,
@@ -106,10 +171,38 @@ impl DepGraph {
         Self::default()
     }
 
+    /// Creates an empty dependency graph with `single_deps` pre-sized for
+    /// roughly `formula_count` formulas (avoids repeated hash-table rehashing
+    /// when decoding large snapshots).
+    #[must_use]
+    pub fn with_formula_capacity(formula_count: usize) -> Self {
+        let single_cap = formula_count.saturating_mul(2);
+        Self {
+            single_deps: FxMap::with_capacity_and_hasher(single_cap, BuildHasherDefault::default()),
+            ..Self::default()
+        }
+    }
+
     /// Pre-reserves capacity in the single-cell reverse map for a known hot
     /// precedent cell (used by `open_sample` for `$V$1` with 100k dependents).
     pub fn reserve_single_dependents(&mut self, cell: WorkbookCellKey, capacity: usize) {
-        self.single_deps.entry(cell).or_default().reserve(capacity);
+        if capacity <= 1 {
+            return;
+        }
+        match self.single_deps.entry(cell) {
+            Entry::Occupied(mut slot) => match slot.get_mut() {
+                DepList::Many(vec) => vec.reserve(capacity),
+                DepList::One(first) => {
+                    let prev = *first;
+                    let mut vec = Vec::with_capacity(capacity.max(2));
+                    vec.push(prev);
+                    *slot.get_mut() = DepList::Many(vec);
+                }
+            },
+            Entry::Vacant(slot) => {
+                slot.insert(DepList::Many(Vec::with_capacity(capacity)));
+            }
+        }
     }
 
     /// Extracts and registers all static precedents of `formula` (located on
@@ -120,92 +213,115 @@ impl DepGraph {
         host_sheet: SheetId,
         formula: &BoundFormula,
     ) -> FormulaRegistration {
+        self.register_with_flags(fid, host_sheet, formula).0
+    }
+
+    /// Single-pass variant of [`Self::register`] that also reports whether
+    /// `formula` invokes any volatile function (`TODAY`, `NOW`, `RAND`,
+    /// `RANDBETWEEN`), avoiding redundant AST walks during snapshot decode.
+    pub fn register_with_flags(
+        &mut self,
+        fid: u32,
+        host_sheet: SheetId,
+        formula: &BoundFormula,
+    ) -> (FormulaRegistration, bool) {
         let mut reg = FormulaRegistration::default();
-        collect_refs(&formula.root, host_sheet, fid, &mut reg);
+        let mut flags = WalkFlags::default();
+        collect_refs(&formula.root, host_sheet, fid, &mut reg, &mut flags);
 
         for &cell_key in &reg.single_cells {
-            self.single_deps.entry(cell_key).or_default().push(fid);
+            match self.single_deps.entry(cell_key) {
+                Entry::Vacant(slot) => {
+                    slot.insert(DepList::One(fid));
+                }
+                Entry::Occupied(mut slot) => {
+                    slot.get_mut().push(fid);
+                }
+            }
         }
-        for &(sheet, col, r1, r2) in &reg.col_spans {
-            self.col_ranges
-                .entry((sheet, col))
-                .or_default()
-                .push(RowSpanSub {
-                    fid,
-                    first_row: r1,
-                    last_row: r2,
-                });
-            self.sheet_col_range_keys
-                .entry(sheet)
-                .or_default()
-                .insert(col);
+        if let Some(ranges) = reg.ranges.as_deref() {
+            for &(sheet, col, r1, r2) in &ranges.col_spans {
+                self.col_ranges
+                    .entry((sheet, col))
+                    .or_default()
+                    .push(RowSpanSub {
+                        fid,
+                        first_row: r1,
+                        last_row: r2,
+                    });
+                self.sheet_col_range_keys
+                    .entry(sheet)
+                    .or_default()
+                    .insert(col);
+            }
+            for &(sheet, sub) in &ranges.areas {
+                self.multi_col_ranges.entry(sheet).or_default().push(sub);
+            }
+            for &(sheet, sub) in &ranges.full_cols {
+                self.full_col_deps.entry(sheet).or_default().push(sub);
+            }
+            for &(sheet, sub) in &ranges.full_rows {
+                self.full_row_deps.entry(sheet).or_default().push(sub);
+            }
         }
-        for &(sheet, sub) in &reg.areas {
-            self.multi_col_ranges.entry(sheet).or_default().push(sub);
-        }
-        for &(sheet, sub) in &reg.full_cols {
-            self.full_col_deps.entry(sheet).or_default().push(sub);
-        }
-        for &(sheet, sub) in &reg.full_rows {
-            self.full_row_deps.entry(sheet).or_default().push(sub);
-        }
-        if formula.is_structure_sensitive() {
+        if flags.structural {
             reg.structural_sheet = Some(host_sheet);
             self.structural_set
                 .entry(host_sheet)
                 .or_default()
                 .insert(fid);
         }
-        reg
+        (reg, flags.volatile)
     }
 
     /// Removes all reverse edges previously recorded in `reg` for `fid`.
     pub fn unregister(&mut self, fid: u32, reg: &FormulaRegistration) {
         for cell_key in &reg.single_cells {
-            if let Some(list) = self.single_deps.get_mut(cell_key) {
-                remove_first_u32(list, fid);
-                if list.is_empty() {
-                    self.single_deps.remove(cell_key);
-                }
+            if let Some(list) = self.single_deps.get_mut(cell_key)
+                && list.remove_first(fid)
+            {
+                self.single_deps.remove(cell_key);
             }
         }
-        for &(sheet, col, r1, r2) in &reg.col_spans {
-            if let Some(list) = self.col_ranges.get_mut(&(sheet, col)) {
-                let target = RowSpanSub {
-                    fid,
-                    first_row: r1,
-                    last_row: r2,
-                };
-                if let Some(idx) = list.iter().position(|x| *x == target) {
-                    list.swap_remove(idx);
-                }
-                if list.is_empty() {
-                    self.col_ranges.remove(&(sheet, col));
-                    if let Some(cols) = self.sheet_col_range_keys.get_mut(&sheet) {
-                        cols.remove(&col);
+        if let Some(ranges) = reg.ranges.as_deref() {
+            for &(sheet, col, r1, r2) in &ranges.col_spans {
+                if let Some(list) = self.col_ranges.get_mut(&(sheet, col)) {
+                    let target = RowSpanSub {
+                        fid,
+                        first_row: r1,
+                        last_row: r2,
+                    };
+                    if let Some(idx) = list.iter().position(|x| *x == target) {
+                        list.swap_remove(idx);
+                    }
+                    if list.is_empty() {
+                        self.col_ranges.remove(&(sheet, col));
+                        if let Some(cols) = self.sheet_col_range_keys.get_mut(&sheet) {
+                            cols.remove(&col);
+                        }
                     }
                 }
             }
-        }
-        for &(sheet, sub) in &reg.areas {
-            if let Some(list) = self.multi_col_ranges.get_mut(&sheet)
-                && let Some(idx) = list.iter().position(|x| *x == sub)
-            {
-                list.swap_remove(idx);
+            for &(sheet, sub) in &ranges.areas {
+                if let Some(list) = self.multi_col_ranges.get_mut(&sheet)
+                    && let Some(idx) = list.iter().position(|x| *x == sub)
+                {
+                    list.swap_remove(idx);
+                }
             }
-        }
-        for &(sheet, sub) in &reg.full_cols {
-            if let Some(list) = self.full_col_deps.get_mut(&sheet)
-                && let Some(idx) = list.iter().position(|x| *x == sub)
-            {
-                list.swap_remove(idx);
+            for &(sheet, sub) in &ranges.full_cols {
+                if let Some(list) = self.full_col_deps.get_mut(&sheet)
+                    && let Some(idx) = list.iter().position(|x| *x == sub)
+                {
+                    list.swap_remove(idx);
+                }
             }
-        }
-        for &(sheet, sub) in &reg.full_rows {
-            if let Some(list) = self.full_row_deps.get_mut(&sheet)
-                && let Some(idx) = list.iter().position(|x| *x == sub)
-            {
-                list.swap_remove(idx);
+            for &(sheet, sub) in &ranges.full_rows {
+                if let Some(list) = self.full_row_deps.get_mut(&sheet)
+                    && let Some(idx) = list.iter().position(|x| *x == sub)
+                {
+                    list.swap_remove(idx);
+                }
             }
         }
         if let Some(sheet) = reg.structural_sheet
@@ -224,9 +340,7 @@ impl DepGraph {
     ) {
         let (sheet_id, row, col) = key;
         if let Some(list) = self.single_deps.get(&key) {
-            for &fid in list {
-                emit(fid);
-            }
+            list.for_each(&mut emit);
         }
 
         let Some(sheet) = workbook.sheet(sheet_id) else {
@@ -414,9 +528,7 @@ impl DepGraph {
                             self.single_deps
                                 .get(&(sheet_id, RowId(raw_row), ColId(raw_col)))
                         {
-                            for &fid in list {
-                                emit(fid);
-                            }
+                            list.for_each(&mut emit);
                         }
                     }
                 }
@@ -490,9 +602,7 @@ impl DepGraph {
                 for row_run in row_axis.runs() {
                     for raw_row in row_run.ids.iter() {
                         if let Some(list) = self.single_deps.get(&(sheet_id, RowId(raw_row), col)) {
-                            for &fid in list {
-                                emit(fid);
-                            }
+                            list.for_each(&mut emit);
                         }
                     }
                 }
@@ -571,9 +681,7 @@ impl DepGraph {
                         for raw_r in r_run.iter() {
                             if let Some(list) = self.single_deps.get(&(sheet_id, RowId(raw_r), col))
                             {
-                                for &fid in list {
-                                    emit(fid);
-                                }
+                                list.for_each(&mut emit);
                             }
                         }
                     }
@@ -624,7 +732,19 @@ impl DepGraph {
     }
 }
 
-fn collect_refs(expr: &BoundExpr, host_sheet: SheetId, fid: u32, reg: &mut FormulaRegistration) {
+#[derive(Default)]
+struct WalkFlags {
+    structural: bool,
+    volatile: bool,
+}
+
+fn collect_refs(
+    expr: &BoundExpr,
+    host_sheet: SheetId,
+    fid: u32,
+    reg: &mut FormulaRegistration,
+    flags: &mut WalkFlags,
+) {
     match expr {
         BoundExpr::Literal(_) | BoundExpr::ArrayLiteral { .. } | BoundExpr::Name(_) => {}
         BoundExpr::Reference(r) => match r {
@@ -647,10 +767,11 @@ fn collect_refs(expr: &BoundExpr, host_sheet: SheetId, fid: u32, reg: &mut Formu
                 ..
             } => {
                 let s = sheet.unwrap_or(host_sheet);
+                let ranges = reg.ranges_mut();
                 if first_col == last_col {
                     let entry = (s, *first_col, *first_row, *last_row);
-                    if !reg.col_spans.contains(&entry) {
-                        reg.col_spans.push(entry);
+                    if !ranges.col_spans.contains(&entry) {
+                        ranges.col_spans.push(entry);
                     }
                 } else {
                     let sub = AreaSub {
@@ -660,8 +781,8 @@ fn collect_refs(expr: &BoundExpr, host_sheet: SheetId, fid: u32, reg: &mut Formu
                         first_col: *first_col,
                         last_col: *last_col,
                     };
-                    if !reg.areas.contains(&(s, sub)) {
-                        reg.areas.push((s, sub));
+                    if !ranges.areas.contains(&(s, sub)) {
+                        ranges.areas.push((s, sub));
                     }
                 }
             }
@@ -677,8 +798,9 @@ fn collect_refs(expr: &BoundExpr, host_sheet: SheetId, fid: u32, reg: &mut Formu
                     first_col: *first_col,
                     last_col: *last_col,
                 };
-                if !reg.full_cols.contains(&(s, sub)) {
-                    reg.full_cols.push((s, sub));
+                let ranges = reg.ranges_mut();
+                if !ranges.full_cols.contains(&(s, sub)) {
+                    ranges.full_cols.push((s, sub));
                 }
             }
             BoundRef::RowRange {
@@ -693,21 +815,28 @@ fn collect_refs(expr: &BoundExpr, host_sheet: SheetId, fid: u32, reg: &mut Formu
                     first_row: *first_row,
                     last_row: *last_row,
                 };
-                if !reg.full_rows.contains(&(s, sub)) {
-                    reg.full_rows.push((s, sub));
+                let ranges = reg.ranges_mut();
+                if !ranges.full_rows.contains(&(s, sub)) {
+                    ranges.full_rows.push((s, sub));
                 }
             }
         },
         BoundExpr::Paren(inner) | BoundExpr::Unary { expr: inner, .. } => {
-            collect_refs(inner, host_sheet, fid, reg);
+            collect_refs(inner, host_sheet, fid, reg, flags);
         }
         BoundExpr::Binary { left, right, .. } => {
-            collect_refs(left, host_sheet, fid, reg);
-            collect_refs(right, host_sheet, fid, reg);
+            collect_refs(left, host_sheet, fid, reg, flags);
+            collect_refs(right, host_sheet, fid, reg, flags);
         }
-        BoundExpr::Call { args, .. } => {
+        BoundExpr::Call { name, args } => {
+            if name == "ROW" || name == "COLUMN" {
+                flags.structural = true;
+            }
+            if is_volatile_function(name) {
+                flags.volatile = true;
+            }
             for arg in args {
-                collect_refs(arg, host_sheet, fid, reg);
+                collect_refs(arg, host_sheet, fid, reg, flags);
             }
         }
     }
@@ -767,10 +896,4 @@ fn span_overlaps_runs(axis: &Axis, a: u64, b: u64, runs: &[IdRun]) -> bool {
         }
     }
     false
-}
-
-fn remove_first_u32(list: &mut Vec<u32>, target: u32) {
-    if let Some(idx) = list.iter().position(|&x| x == target) {
-        list.swap_remove(idx);
-    }
 }

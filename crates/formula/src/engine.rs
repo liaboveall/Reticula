@@ -178,7 +178,7 @@ impl FormulaEngine {
     #[must_use]
     pub fn from_workbook_clean(workbook: Workbook<BoundFormula>) -> Self {
         let count = workbook.formulas().len();
-        let mut dep_graph = DepGraph::new();
+        let mut dep_graph = DepGraph::with_formula_capacity(count);
         let mut slots = Vec::with_capacity(count);
         let states = vec![STATE_CLEAN; count];
         let mut cell_to_fid = FxMap::with_capacity_and_hasher(count, BuildHasherDefault::default());
@@ -186,8 +186,8 @@ impl FormulaEngine {
 
         for (&key, formula) in workbook.formulas() {
             let fid = u32::try_from(slots.len()).unwrap_or(0);
-            let reg = dep_graph.register(fid, key.0, formula);
-            if formula.is_volatile() {
+            let (reg, is_volatile) = dep_graph.register_with_flags(fid, key.0, formula);
+            if is_volatile {
                 volatile_set.insert(fid);
             }
             slots.push(Some(FormulaSlot { key, reg }));
@@ -1245,8 +1245,8 @@ impl FormulaEngine {
             self.states.push(STATE_CLEAN);
             fresh
         };
-        let reg = self.dep_graph.register(fid, key.0, formula);
-        if formula.is_volatile() {
+        let (reg, is_volatile) = self.dep_graph.register_with_flags(fid, key.0, formula);
+        if is_volatile {
             self.volatile_set.insert(fid);
         }
         if let Some(slot_ref) = self.slots.get_mut(fid as usize) {

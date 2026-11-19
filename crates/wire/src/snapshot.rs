@@ -26,10 +26,11 @@ use reticula_core::store::{BLOCK_ROWS, Block, Column, SlotMap};
 use reticula_core::strings::StringTable;
 use reticula_core::style::{CellStyle, StylePatch, StyleTable};
 use reticula_core::value::Value;
-use reticula_formula::binder::BoundFormula;
+use reticula_formula::ast::{Literal, MAX_FUNCTION_ARGS, MAX_NESTING_DEPTH};
+use reticula_formula::binder::{BoundExpr, BoundFormula};
 use reticula_formula::engine::FormulaEngine;
-use serde::Serialize;
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 
 use crate::v1::{
     WireAxesMetricsSectionV1, WireAxisRunV1, WireBoundFormulaV1, WireCellStyleV1,
@@ -54,11 +55,19 @@ const BLOCK_TAG_EMPTY: u8 = 0;
 const BLOCK_TAG_SPARSE: u8 = 1;
 const BLOCK_TAG_DENSE: u8 = 2;
 
-/// Maximum `4096`-row blocks packed into a single column LZ4 chunk (`2 MiB` raw).
+/// Maximum `4096`-row blocks accepted in a single decoded column LZ4 chunk (`2 MiB` raw).
 pub const BLOCKS_PER_COLUMN_CHUNK: usize = 64;
 
-/// Maximum formula entries packed into a single formula LZ4 chunk.
+/// Number of `4096`-row blocks packed into each newly encoded column LZ4 chunk
+/// (`512 KiB` raw), keeping background CoW snapshot slices well within a `16 ms`
+/// frame budget even during 50M-cell saves (`14-m1b.md` 8.3 B11/B12).
+const ENCODE_BLOCKS_PER_COLUMN_CHUNK: usize = 16;
+
+/// Maximum formula entries packed into a single formula LZ4 chunk on decode.
 const FORMULAS_PER_CHUNK: usize = 4_096;
+
+/// Formula entries packed per newly encoded formula LZ4 chunk.
+const ENCODE_FORMULAS_PER_CHUNK: usize = 2_048;
 
 const MAX_KERNEL_VERSION_LEN: usize = 64;
 const MAX_DIRECTORY_SECTIONS: usize = 16;
@@ -488,7 +497,7 @@ impl SnapshotEncoder {
                         let total_blocks =
                             u32::try_from(blocks.len()).map_err(|_| SnapshotError::Codec)?;
                         let chunk_count =
-                            u32::try_from(blocks.len().div_ceil(BLOCKS_PER_COLUMN_CHUNK))
+                            u32::try_from(blocks.len().div_ceil(ENCODE_BLOCKS_PER_COLUMN_CHUNK))
                                 .map_err(|_| SnapshotError::Codec)?;
                         out.extend_from_slice(&col_len.to_le_bytes());
                         out.extend_from_slice(&total_blocks.to_le_bytes());
@@ -500,10 +509,10 @@ impl SnapshotEncoder {
                         continue;
                     }
 
-                    // Always align chunk boundaries on multiples of `BLOCKS_PER_COLUMN_CHUNK`
+                    // Always align chunk boundaries on multiples of `ENCODE_BLOCKS_PER_COLUMN_CHUNK`
                     // so chunk_count matches exact framing regardless of `max_blocks`!
                     let rem_in_col = blocks.len().saturating_sub(block_idx);
-                    let take = rem_in_col.min(BLOCKS_PER_COLUMN_CHUNK);
+                    let take = rem_in_col.min(ENCODE_BLOCKS_PER_COLUMN_CHUNK);
                     let slice = blocks
                         .get(block_idx..block_idx.saturating_add(take))
                         .ok_or(SnapshotError::Codec)?;
@@ -554,8 +563,8 @@ impl SnapshotEncoder {
             }
 
             EncodePhase::EmitFormulas => {
-                // Collect up to `FORMULAS_PER_CHUNK` point-in-time formulas per step!
-                let batch = self.next_formula_batch(live_workbook, FORMULAS_PER_CHUNK);
+                // Collect up to `ENCODE_FORMULAS_PER_CHUNK` point-in-time formulas per step!
+                let batch = self.next_formula_batch(live_workbook, ENCODE_FORMULAS_PER_CHUNK);
                 if !batch.is_empty() {
                     let count_u32 = u32::try_from(batch.len()).map_err(|_| SnapshotError::Codec)?;
                     self.total_formulas_encoded = self
@@ -895,6 +904,18 @@ pub fn decode_snapshot_any(bytes: &[u8]) -> Result<DecodedSnapshot, SnapshotErro
         Some(raw) => Some(decode_compressed_section::<WireSeedOriginV1>(raw)?.into()),
         None => None,
     };
+
+    // Pre-warm linear memory in one contiguous step so decoding large
+    // snapshots on WebAssembly does not invoke `memory.grow` thousands of times.
+    let formula_count_hint = read_u32_le(formulas_slice, 0).unwrap_or(0) as usize;
+    let reserve_hint = cols_slice
+        .len()
+        .saturating_mul(5)
+        .saturating_add(formula_count_hint.saturating_mul(600))
+        .min(768 * 1024 * 1024);
+    if reserve_hint >= 4 * 1024 * 1024 {
+        let _ = reticula_core::memory::try_reserve_heap(reserve_hint);
+    }
 
     let sheet_count = axes_sec.sheets.len();
     if sheet_count == 0
@@ -1344,13 +1365,13 @@ fn decode_one_column(
                     let end = rc.checked_add(byte_span).ok_or(SnapshotError::Codec)?;
                     let body = scratch.get(rc..end).ok_or(SnapshotError::Codec)?;
                     rc = end;
-                    let mut words = Vec::with_capacity(BLOCK_ROWS as usize);
-                    for src in body.as_chunks::<8>().0 {
+                    let mut words = vec![0_u64; BLOCK_ROWS as usize];
+                    for (dst, src) in words.iter_mut().zip(body.as_chunks::<8>().0) {
                         let bits = u64::from_le_bytes(*src);
                         if !validate_cell_word(bits, string_bound) {
                             return Err(SnapshotError::Validation);
                         }
-                        words.push(bits);
+                        *dst = bits;
                     }
                     blocks.push(Block::Dense(alloc::sync::Arc::new(words)));
                 }
@@ -1366,6 +1387,94 @@ fn decode_one_column(
         return Err(SnapshotError::Validation);
     }
     Column::try_from_blocks(blocks, col_len, |_| true).ok_or(SnapshotError::Validation)
+}
+
+/// Wire-compatible mirror of [`WireFormulaEntryV1`] that deserializes directly
+/// into an in-memory [`BoundFormula`], avoiding allocating and immediately
+/// dropping millions of intermediate `WireBoundExprV1` heap nodes on decode.
+#[derive(Deserialize)]
+struct DirectFormulaEntry {
+    sheet: u32,
+    row: u64,
+    col: u64,
+    formula: BoundFormula,
+}
+
+fn validate_and_normalize_direct_expr(
+    expr: &mut BoundExpr,
+    depth: usize,
+) -> Result<(), SnapshotError> {
+    if depth > MAX_NESTING_DEPTH {
+        return Err(SnapshotError::Validation);
+    }
+    let next = depth.saturating_add(1);
+    match expr {
+        BoundExpr::Literal(lit) => validate_direct_literal(lit),
+        BoundExpr::ArrayLiteral {
+            rows,
+            cols,
+            elements,
+        } => {
+            if *rows == 0 || *cols == 0 {
+                return Err(SnapshotError::Validation);
+            }
+            let expected = (*rows as usize)
+                .checked_mul(*cols as usize)
+                .ok_or(SnapshotError::Validation)?;
+            if expected != elements.len() {
+                return Err(SnapshotError::Validation);
+            }
+            for item in elements.iter_mut() {
+                validate_direct_literal(item)?;
+            }
+            Ok(())
+        }
+        BoundExpr::Reference(_) => Ok(()),
+        BoundExpr::Name(n) => check_direct_text_len(n),
+        BoundExpr::Paren(inner) | BoundExpr::Unary { expr: inner, .. } => {
+            validate_and_normalize_direct_expr(inner, next)
+        }
+        BoundExpr::Binary { left, right, .. } => {
+            validate_and_normalize_direct_expr(left, next)?;
+            validate_and_normalize_direct_expr(right, next)
+        }
+        BoundExpr::Call { name, args } => {
+            if args.len() > MAX_FUNCTION_ARGS {
+                return Err(SnapshotError::Validation);
+            }
+            check_direct_text_len(name)?;
+            if name.bytes().any(|b| b.is_ascii_lowercase()) {
+                name.make_ascii_uppercase();
+            }
+            for arg in args.iter_mut() {
+                validate_and_normalize_direct_expr(arg, next)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn validate_direct_literal(lit: &mut Literal) -> Result<(), SnapshotError> {
+    match lit {
+        Literal::Number(n) => {
+            if !n.is_finite() {
+                return Err(SnapshotError::Validation);
+            }
+            if *n == 0.0 {
+                *n = 0.0;
+            }
+            Ok(())
+        }
+        Literal::Text(s) => check_direct_text_len(s),
+        Literal::Bool(_) | Literal::Error(_) => Ok(()),
+    }
+}
+
+fn check_direct_text_len(s: &str) -> Result<(), SnapshotError> {
+    if s.encode_utf16().count() > MAX_CELL_TEXT_UTF16 {
+        return Err(SnapshotError::Validation);
+    }
+    Ok(())
 }
 
 fn decode_formulas_section(
@@ -1405,22 +1514,24 @@ fn decode_formulas_section(
         cursor = comp_end;
 
         decompress_into_scratch(lz4_slice, raw_len, scratch)?;
-        let entries: Vec<WireFormulaEntryV1> =
+        let entries: Vec<DirectFormulaEntry> =
             postcard::from_bytes(scratch).map_err(|_| SnapshotError::Codec)?;
         if entries.is_empty() || entries.len() > FORMULAS_PER_CHUNK {
             return Err(SnapshotError::Validation);
         }
-        for entry in entries {
-            let bound =
-                BoundFormula::try_from(entry.formula).map_err(|_| SnapshotError::Validation)?;
+        for mut entry in entries {
+            validate_and_normalize_direct_expr(&mut entry.formula.root, 0)?;
             use reticula_core::ops::FormulaPayload as _;
-            bound.validate().map_err(|_| SnapshotError::Validation)?;
-            running_bytes = running_bytes.saturating_add(bound.estimated_bytes());
+            entry
+                .formula
+                .validate()
+                .map_err(|_| SnapshotError::Validation)?;
+            running_bytes = running_bytes.saturating_add(entry.formula.estimated_bytes());
             if running_bytes > MAX_WORKBOOK_BYTES {
                 return Err(SnapshotError::Validation);
             }
             let key = (SheetId(entry.sheet), RowId(entry.row), ColId(entry.col));
-            if formulas.insert(key, bound).is_some() {
+            if formulas.insert(key, entry.formula).is_some() {
                 return Err(SnapshotError::Validation);
             }
         }
@@ -1432,8 +1543,11 @@ fn decode_formulas_section(
     Ok(formulas)
 }
 
+#[inline]
 fn validate_cell_word(bits: u64, string_bound: u32) -> bool {
-    if bits == Value::EMPTY_BITS {
+    // Fast path: any finite IEEE 754 float (non-NaN, non-Inf) is valid in one mask check.
+    const EXP_MASK: u64 = 0x7FF0_0000_0000_0000;
+    if (bits & EXP_MASK) != EXP_MASK || bits == Value::EMPTY_BITS {
         return true;
     }
     let Some(val) = Value::try_unpack(bits) else {
@@ -1686,5 +1800,118 @@ mod tests {
             from_v1.engine.workbook().logical_digest(),
             sample.workbook().logical_digest()
         );
+    }
+
+    #[test]
+    fn direct_formula_entry_matches_frozen_wire_v1_layout() {
+        use alloc::boxed::Box;
+        use alloc::vec::Vec;
+        use reticula_core::ops::FormulaMode;
+        use reticula_core::value::CalcError;
+        use reticula_formula::ast::{BinaryOp, Literal, UnaryOp};
+        use reticula_formula::binder::{BoundExpr, BoundFormula, BoundRef};
+
+        use super::{DirectFormulaEntry, validate_and_normalize_direct_expr};
+        use crate::v1::{WireBoundFormulaV1, WireFormulaEntryV1};
+
+        let samples: Vec<BoundFormula> = vec![
+            BoundFormula {
+                mode: FormulaMode::Dynamic,
+                root: BoundExpr::Call {
+                    name: String::from("SUM"),
+                    args: vec![
+                        BoundExpr::Literal(Literal::Number(12.5)),
+                        BoundExpr::Literal(Literal::Text(String::from("hi"))),
+                        BoundExpr::Literal(Literal::Bool(true)),
+                        BoundExpr::Literal(Literal::Error(CalcError::Cycle)),
+                        BoundExpr::ArrayLiteral {
+                            rows: 1,
+                            cols: 2,
+                            elements: vec![Literal::Number(1.0), Literal::Error(CalcError::Div0)],
+                        },
+                        BoundExpr::Reference(BoundRef::Cell {
+                            sheet: Some(SheetId(2)),
+                            missing_sheet: Some(String::from("Gone")),
+                            row: RowId(5),
+                            col: ColId(3),
+                            abs_col: true,
+                            abs_row: false,
+                        }),
+                        BoundExpr::Reference(BoundRef::Area {
+                            sheet: None,
+                            missing_sheet: None,
+                            first_row: RowId(1),
+                            first_col: ColId(2),
+                            last_row: RowId(9),
+                            last_col: ColId(4),
+                            abs_first_col: true,
+                            abs_first_row: false,
+                            abs_last_col: false,
+                            abs_last_row: true,
+                        }),
+                        BoundExpr::Reference(BoundRef::ColRange {
+                            sheet: None,
+                            missing_sheet: None,
+                            first_col: ColId(0),
+                            last_col: ColId(3),
+                            abs_first: true,
+                            abs_last: false,
+                        }),
+                        BoundExpr::Reference(BoundRef::RowRange {
+                            sheet: Some(SheetId(1)),
+                            missing_sheet: None,
+                            first_row: RowId(2),
+                            last_row: RowId(8),
+                            abs_first: false,
+                            abs_last: true,
+                        }),
+                        BoundExpr::Reference(BoundRef::Invalid {
+                            sheet_name: Some(String::from("Deleted")),
+                        }),
+                        BoundExpr::Name(String::from("MY_NAME")),
+                        BoundExpr::Paren(Box::new(BoundExpr::Unary {
+                            op: UnaryOp::Percent,
+                            expr: Box::new(BoundExpr::Binary {
+                                op: BinaryOp::Ge,
+                                left: Box::new(BoundExpr::Literal(Literal::Number(2.0))),
+                                right: Box::new(BoundExpr::Literal(Literal::Number(1.0))),
+                            }),
+                        })),
+                    ],
+                },
+            },
+            BoundFormula {
+                mode: FormulaMode::Legacy,
+                root: BoundExpr::Unary {
+                    op: UnaryOp::ImplicitIntersection,
+                    expr: Box::new(BoundExpr::Binary {
+                        op: BinaryOp::Pow,
+                        left: Box::new(BoundExpr::Literal(Literal::Error(CalcError::Spill))),
+                        right: Box::new(BoundExpr::Literal(Literal::Bool(false))),
+                    }),
+                },
+            },
+        ];
+
+        let wire_entries: Vec<WireFormulaEntryV1> = samples
+            .iter()
+            .enumerate()
+            .map(|(i, f)| WireFormulaEntryV1 {
+                sheet: u32::try_from(i).unwrap(),
+                row: (i as u64) + 10,
+                col: (i as u64) + 20,
+                formula: WireBoundFormulaV1::from(f),
+            })
+            .collect();
+        let encoded = postcard::to_allocvec(&wire_entries).unwrap();
+        let mut decoded: Vec<DirectFormulaEntry> = postcard::from_bytes(&encoded).unwrap();
+        assert_eq!(decoded.len(), samples.len());
+        for (idx, (direct, expected)) in decoded.iter_mut().zip(samples.iter()).enumerate() {
+            validate_and_normalize_direct_expr(&mut direct.formula.root, 0).unwrap();
+            assert_eq!(direct.sheet, u32::try_from(idx).unwrap());
+            assert_eq!(direct.row, (idx as u64) + 10);
+            assert_eq!(direct.col, (idx as u64) + 20);
+            assert_eq!(&direct.formula, expected);
+        }
     }
 }
