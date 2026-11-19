@@ -424,20 +424,7 @@ where
         axes_sec.next_sheet_id,
         seed_origin,
     )
-    .map_err(|err| match err {
-        OpError::MemoryLimitExceeded
-        | OpError::SheetNotFound
-        | OpError::TooManySheets
-        | OpError::TooManyEdits
-        | OpError::DuplicateCellTarget
-        | OpError::TargetNotFound
-        | OpError::Axis(_)
-        | OpError::NonFiniteNumber
-        | OpError::TextTooLong
-        | OpError::FormulaTooLong
-        | OpError::InvalidFormula
-        | OpError::StringPoolExhausted => SnapshotError::Validation,
-    })?;
+    .map_err(|_: OpError| SnapshotError::Validation)?;
 
     Ok((workbook, kernel_ver))
 }
@@ -646,7 +633,7 @@ mod tests {
         }
 
         // Foreign NaN word (`0x7FF8_0002_0000_0000`) in a Sparse block must be rejected.
-        let bad_blocks = vec![Block::Sparse(vec![(0, 0x7FF8_0002_0000_0000)])];
+        let bad_blocks = vec![Block::Sparse(vec![(0, 0x7FF8_0002_0000_0000)].into())];
         let raw_bad = postcard::to_allocvec(&bad_blocks).unwrap();
         let compressed_bad = compress_bounded(&raw_bad).unwrap();
         assert!(!super::validate_cell_word(0x7FF8_0002_0000_0000, 10));

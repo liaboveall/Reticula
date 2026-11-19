@@ -22,12 +22,12 @@ use hashbrown::HashMap;
 use reticula_core::axis::{Axis, MAX_COL_AXIS_LEN};
 use reticula_core::decimal15::{RoundingMode, round_decimal, snap_cancelled_zero};
 use reticula_core::format::NumberFormat;
-use reticula_core::id::{ColId, RowId, SheetId};
-use reticula_core::input::{InferredInput, infer_input};
+use reticula_core::id::{ColId, IdRun, RowId, SheetId};
+use reticula_core::input::{InferredInput, infer_input, infer_input_for_cell};
 use reticula_core::memory::try_reserve_heap;
 use reticula_core::ops::{
-    CellEdit, CellInput, FormatPatch, FormulaMode, InverseOp, Op, OpError, ScalarValue, SeedOrigin,
-    Workbook, WorkbookCellKey,
+    CellEdit, CellInput, CellSnapshot, FormatBackup, FormatPatch, FormulaMode, InverseOp, Op,
+    OpError, ScalarValue, SeedOrigin, Workbook, WorkbookCellKey,
 };
 use reticula_core::sample;
 use reticula_core::sheet::Sheet;
@@ -380,6 +380,22 @@ impl FormulaEngine {
         &self.workbook
     }
 
+    /// Allocates and returns a fresh [`SheetId`] from the workbook's sheet
+    /// counter for [`Op::AddSheet`].
+    pub fn alloc_sheet_id(&mut self) -> SheetId {
+        self.workbook.alloc_sheet_id()
+    }
+
+    /// Purges tombstoned worksheets, rows, columns and orphaned strings when the
+    /// session undo stack is empty (`14-m1b.md` 5.5), rebuilding the dependency
+    /// graph cleanly over the compacted workbook.
+    pub fn compact_local_garbage(&mut self) {
+        self.recalc_all();
+        let mut wb = core::mem::take(&mut self.workbook);
+        wb.compact_local_garbage();
+        *self = Self::from_workbook_clean(wb);
+    }
+
     /// Mutable access to the workbook's [`IdAllocator`] for allocating fresh
     /// row/column [`IdRun`]s prior to [`Self::apply_op`].
     pub const fn allocator_mut(&mut self) -> &mut reticula_core::id::IdAllocator {
@@ -492,8 +508,9 @@ impl FormulaEngine {
         })
     }
 
-    /// Parses raw user input under E30, binds any `'='` formula, applies the
-    /// single-cell edit atomically, and schedules affected dependents.
+    /// Parses raw user input under E30 (respecting [`NumberFormat::PlainText`]
+    /// `@` on the target cell), binds any `'='` formula, applies the single-cell
+    /// edit atomically, and schedules affected dependents.
     pub fn edit_cell_raw(
         &mut self,
         sheet_id: SheetId,
@@ -501,12 +518,16 @@ impl FormulaEngine {
         col: ColId,
         raw: &str,
     ) -> Result<InverseOp<BoundFormula>, EditError> {
-        let inferred = infer_input(raw)?;
-        let has_explicit_fmt = self
-            .workbook
-            .sheet(sheet_id)
-            .and_then(|s| s.cell_format_by_id(row, col))
-            .is_some();
+        let (has_explicit_fmt, effective_fmt) =
+            self.workbook
+                .sheet(sheet_id)
+                .map_or((false, NumberFormat::General), |s| {
+                    (
+                        s.cell_format_by_id(row, col).is_some(),
+                        s.effective_format_by_id(row, col),
+                    )
+                });
+        let inferred = infer_input_for_cell(raw, effective_fmt)?;
 
         let (input, format) = match inferred {
             InferredInput::Empty => (CellInput::Empty, FormatPatch::Keep),
@@ -549,6 +570,28 @@ impl FormulaEngine {
         Ok(inv)
     }
 
+    /// Applies a multi-operation transaction atomically: if any operation fails,
+    /// all earlier operations in `ops` are rolled back via [`Self::apply_inverse`]
+    /// so the engine remains unchanged.
+    pub fn apply_txn(
+        &mut self,
+        ops: Vec<Op<BoundFormula>>,
+    ) -> Result<Vec<InverseOp<BoundFormula>>, OpError> {
+        let mut inverses = Vec::with_capacity(ops.len());
+        for op in ops {
+            match self.apply_op(op) {
+                Ok(inv) => inverses.push(inv),
+                Err(err) => {
+                    for inv in inverses.into_iter().rev() {
+                        let _ = self.apply_inverse(inv);
+                    }
+                    return Err(err);
+                }
+            }
+        }
+        Ok(inverses)
+    }
+
     /// Validates and applies `op` to the workbook, updating the dependency
     /// graph and queuing affected formulas for recalculation.
     pub fn apply_op(&mut self, op: Op<BoundFormula>) -> Result<InverseOp<BoundFormula>, OpError> {
@@ -558,18 +601,28 @@ impl FormulaEngine {
         match &inv {
             InverseOp::RestoreCells { sheet, cells } => {
                 let mut root_dirty: Vec<u32> = Vec::new();
+                if cells.len() > 256 {
+                    self.changes.structural = true;
+                }
                 for cell in cells {
                     let key = (*sheet, cell.row, cell.col);
-                    self.changes.cells.push(key);
+                    if cells.len() <= 256 {
+                        self.changes.cells.push(key);
+                    }
                     self.remove_slot_by_key(key);
                     if let Some(new_f) = self.workbook.formula(*sheet, cell.row, cell.col).cloned()
                     {
-                        let fid = self.insert_slot(key, &new_f, true);
+                        let fid = self.insert_slot(key, &new_f, false);
                         root_dirty.push(fid);
                     }
                     self.collect_direct_dependents(key, &mut root_dirty);
                 }
                 self.propagate_dirty(root_dirty);
+            }
+            InverseOp::RestoreFilledRange {
+                sheet, rows, cols, ..
+            } => {
+                self.on_filled_range_applied(*sheet, rows, cols);
             }
             InverseOp::RemoveInsertedRows { sheet, ids } => {
                 self.changes.structural = true;
@@ -598,6 +651,42 @@ impl FormulaEngine {
                 self.dep_graph
                     .on_cols_toggled(*sheet, ids, &self.workbook, |fid| root_dirty.push(fid));
                 self.propagate_dirty(root_dirty);
+            }
+            InverseOp::RedeleteRows { sheet, ids } => {
+                self.on_rows_undeleted(*sheet, ids);
+            }
+            InverseOp::RedeleteCols { sheet, ids } => {
+                self.on_cols_undeleted(*sheet, ids);
+            }
+            InverseOp::RestoreMovedRows {
+                sheet, rewritten, ..
+            }
+            | InverseOp::RestoreMovedCols {
+                sheet, rewritten, ..
+            } => {
+                self.on_axis_reordered(*sheet, rewritten);
+            }
+            InverseOp::RestoreRowHeights { .. }
+            | InverseOp::RestoreColWidths { .. }
+            | InverseOp::RestoreFreeze { .. }
+            | InverseOp::RemoveAddedSheet { .. }
+            | InverseOp::RestoreSheetName { .. }
+            | InverseOp::RestoreSheetOrder { .. } => {
+                self.changes.structural = true;
+            }
+            InverseOp::RestoreFormat { sheet, backup } => {
+                if let FormatBackup::Cells(entries) = backup
+                    && entries.len() <= 256
+                {
+                    for &(r, c, _, _) in entries {
+                        self.changes.cells.push((*sheet, r, c));
+                    }
+                } else {
+                    self.changes.structural = true;
+                }
+            }
+            InverseOp::UndeleteSheet { sheet } | InverseOp::RedeleteSheet { sheet, .. } => {
+                self.on_sheet_visibility_changed(*sheet);
             }
         }
 
@@ -636,51 +725,99 @@ impl FormulaEngine {
         match inv {
             InverseOp::RestoreCells { sheet, cells } => {
                 let mut root_dirty = Vec::new();
+                let small_batch = cells.len() <= 256;
+                if !small_batch {
+                    self.changes.structural = true;
+                }
                 for cell in cells {
                     let key = (sheet, cell.row, cell.col);
-                    self.changes.cells.push(key);
+                    if small_batch {
+                        self.changes.cells.push(key);
+                    }
                     self.remove_slot_by_key(key);
                     if let CellInput::Formula { formula, .. } = &cell.input {
-                        // Restored formula already has its prior cached value, yet
-                        // other edits may have happened if out-of-order; mark dirty
-                        // so recalculation verifies or restores exact consistency.
-                        let fid = self.insert_slot(key, formula, true);
+                        let fid = self.insert_slot(key, formula, false);
                         root_dirty.push(fid);
                     }
                     self.collect_direct_dependents(key, &mut root_dirty);
                 }
                 self.propagate_dirty(root_dirty);
             }
+            InverseOp::RestoreFilledRange {
+                sheet,
+                rows,
+                cols,
+                prior_non_empty,
+            } => {
+                self.on_filled_range_restored(sheet, &rows, &cols, &prior_non_empty);
+            }
             InverseOp::RemoveInsertedRows { .. } | InverseOp::RemoveInsertedCols { .. } => {
                 self.changes.structural = true;
                 self.propagate_dirty(pre_dirty);
             }
             InverseOp::UndeleteRows { sheet, ids } => {
+                self.on_rows_undeleted(sheet, &ids);
+            }
+            InverseOp::UndeleteCols { sheet, ids } => {
+                self.on_cols_undeleted(sheet, &ids);
+            }
+            InverseOp::RedeleteRows { sheet, ids } => {
                 self.changes.structural = true;
                 let mut root_dirty = Vec::new();
                 self.dep_graph
                     .on_rows_toggled(sheet, &ids, &self.workbook, |fid| root_dirty.push(fid));
-                // Also re-evaluate formulas located ON the undeleted rows themselves
-                // (e.g. `ROW()` formulas that became `#REF!` while tombstoned).
-                for run in &ids {
-                    for raw_r in run.iter() {
-                        let start = (sheet, RowId(raw_r), ColId(0));
-                        let end = (sheet, RowId(raw_r), ColId(u64::MAX));
-                        for (&k, _) in self.workbook.formulas().range(start..=end) {
-                            if let Some(&fid) = self.cell_to_fid.get(&k) {
-                                root_dirty.push(fid);
-                            }
-                        }
-                    }
-                }
                 self.propagate_dirty(root_dirty);
             }
-            InverseOp::UndeleteCols { sheet, ids } => {
+            InverseOp::RedeleteCols { sheet, ids } => {
                 self.changes.structural = true;
                 let mut root_dirty = Vec::new();
                 self.dep_graph
                     .on_cols_toggled(sheet, &ids, &self.workbook, |fid| root_dirty.push(fid));
                 self.propagate_dirty(root_dirty);
+            }
+            InverseOp::RestoreMovedRows {
+                sheet, rewritten, ..
+            }
+            | InverseOp::RestoreMovedCols {
+                sheet, rewritten, ..
+            } => {
+                self.on_axis_reordered(sheet, &rewritten);
+            }
+            InverseOp::RemoveAddedSheet { sheet, .. } => {
+                self.changes.structural = true;
+                let to_remove: Vec<WorkbookCellKey> = (0..self.slots.len())
+                    .filter_map(|idx| {
+                        self.slots
+                            .get(idx)
+                            .and_then(Option::as_ref)
+                            .and_then(|s| (s.key.0 == sheet).then_some(s.key))
+                    })
+                    .collect();
+                for k in to_remove {
+                    self.remove_slot_by_key(k);
+                }
+                self.on_sheet_visibility_changed(sheet);
+            }
+            InverseOp::RestoreRowHeights { .. }
+            | InverseOp::RestoreColWidths { .. }
+            | InverseOp::RestoreFreeze { .. }
+            | InverseOp::RestoreSheetName { .. }
+            | InverseOp::RestoreSheetOrder { .. } => {
+                self.changes.structural = true;
+            }
+            InverseOp::RestoreFormat { sheet, backup } => {
+                if let FormatBackup::Cells(entries) = &backup
+                    && entries.len() <= 256
+                {
+                    for &(r, c, _, _) in entries {
+                        self.changes.cells.push((sheet, r, c));
+                    }
+                } else {
+                    self.changes.structural = true;
+                }
+            }
+            InverseOp::UndeleteSheet { sheet } | InverseOp::RedeleteSheet { sheet, .. } => {
+                self.on_sheet_visibility_changed(sheet);
             }
         }
 
@@ -811,6 +948,160 @@ impl FormulaEngine {
     }
 
     // -------------------------------------------------------- internal helpers
+
+    fn on_filled_range_applied(&mut self, sheet: SheetId, rows: &[IdRun], cols: &[IdRun]) {
+        let total_r: usize = rows
+            .iter()
+            .fold(0usize, |acc, r| acc.saturating_add(r.len as usize));
+        let total_c: usize = cols
+            .iter()
+            .fold(0usize, |acc, c| acc.saturating_add(c.len as usize));
+        let total_cells = total_r.saturating_mul(total_c);
+        if total_cells > 256 {
+            self.changes.structural = true;
+        }
+
+        let mut root_dirty = Vec::with_capacity(total_cells.saturating_add(8));
+        for c_run in cols {
+            for raw_c in c_run.iter() {
+                let col = ColId(raw_c);
+                for r_run in rows {
+                    for raw_r in r_run.iter() {
+                        let row = RowId(raw_r);
+                        let key = (sheet, row, col);
+                        if total_cells <= 256 {
+                            self.changes.cells.push(key);
+                        }
+                        self.remove_slot_by_key(key);
+                        if let Some(new_f) = self.workbook.formula(sheet, row, col).cloned() {
+                            let fid = self.insert_slot(key, &new_f, false);
+                            root_dirty.push(fid);
+                        }
+                    }
+                }
+            }
+        }
+        self.dep_graph
+            .on_rect_written(sheet, rows, cols, &self.workbook, |fid| {
+                if self.state_of(fid) == STATE_CLEAN {
+                    root_dirty.push(fid);
+                }
+            });
+        self.propagate_dirty(root_dirty);
+    }
+
+    fn on_filled_range_restored(
+        &mut self,
+        sheet: SheetId,
+        rows: &[IdRun],
+        cols: &[IdRun],
+        prior_non_empty: &[CellSnapshot<BoundFormula>],
+    ) {
+        let total_r: usize = rows
+            .iter()
+            .fold(0usize, |acc, r| acc.saturating_add(r.len as usize));
+        let total_c: usize = cols
+            .iter()
+            .fold(0usize, |acc, c| acc.saturating_add(c.len as usize));
+        let total_cells = total_r.saturating_mul(total_c);
+        if total_cells > 256 {
+            self.changes.structural = true;
+        }
+        for c_run in cols {
+            for raw_c in c_run.iter() {
+                let col = ColId(raw_c);
+                for r_run in rows {
+                    for raw_r in r_run.iter() {
+                        let key = (sheet, RowId(raw_r), col);
+                        if total_cells <= 256 {
+                            self.changes.cells.push(key);
+                        }
+                        self.remove_slot_by_key(key);
+                    }
+                }
+            }
+        }
+        let mut root_dirty = Vec::new();
+        for cell in prior_non_empty {
+            if let CellInput::Formula { formula, .. } = &cell.input {
+                let key = (sheet, cell.row, cell.col);
+                let fid = self.insert_slot(key, formula, false);
+                root_dirty.push(fid);
+            }
+        }
+        self.dep_graph
+            .on_rect_written(sheet, rows, cols, &self.workbook, |fid| {
+                if self.state_of(fid) == STATE_CLEAN {
+                    root_dirty.push(fid);
+                }
+            });
+        self.propagate_dirty(root_dirty);
+    }
+
+    fn on_rows_undeleted(&mut self, sheet: SheetId, ids: &[IdRun]) {
+        self.changes.structural = true;
+        let mut root_dirty = Vec::new();
+        self.dep_graph
+            .on_rows_toggled(sheet, ids, &self.workbook, |fid| root_dirty.push(fid));
+        for run in ids {
+            for raw_r in run.iter() {
+                let start = (sheet, RowId(raw_r), ColId(0));
+                let end = (sheet, RowId(raw_r), ColId(u64::MAX));
+                for (&k, _) in self.workbook.formulas().range(start..=end) {
+                    if let Some(&fid) = self.cell_to_fid.get(&k) {
+                        root_dirty.push(fid);
+                    }
+                }
+            }
+        }
+        self.propagate_dirty(root_dirty);
+    }
+
+    fn on_cols_undeleted(&mut self, sheet: SheetId, ids: &[IdRun]) {
+        self.changes.structural = true;
+        let mut root_dirty = Vec::new();
+        self.dep_graph
+            .on_cols_toggled(sheet, ids, &self.workbook, |fid| root_dirty.push(fid));
+        let start = (sheet, RowId(0), ColId(0));
+        let end = (sheet, RowId(u64::MAX), ColId(u64::MAX));
+        for (&k @ (_, _, col), _) in self.workbook.formulas().range(start..=end) {
+            if ids.iter().any(|r| r.contains(col.0))
+                && let Some(&fid) = self.cell_to_fid.get(&k)
+            {
+                root_dirty.push(fid);
+            }
+        }
+        self.propagate_dirty(root_dirty);
+    }
+
+    fn on_axis_reordered(&mut self, sheet: SheetId, rewritten: &[(WorkbookCellKey, BoundFormula)]) {
+        self.changes.structural = true;
+        let mut root_dirty = Vec::new();
+        for &(key, _) in rewritten {
+            self.remove_slot_by_key(key);
+            if let Some(updated_f) = self.workbook.formula(key.0, key.1, key.2).cloned() {
+                let fid = self.insert_slot(key, &updated_f, false);
+                root_dirty.push(fid);
+            }
+        }
+        self.dep_graph
+            .on_sheet_reordered(sheet, |fid| root_dirty.push(fid));
+        self.propagate_dirty(root_dirty);
+    }
+
+    fn on_sheet_visibility_changed(&mut self, sheet: SheetId) {
+        self.changes.structural = true;
+        let mut root_dirty = Vec::new();
+        for idx in 0..self.slots.len() {
+            if let Some(slot) = self.slots.get(idx).and_then(Option::as_ref)
+                && (slot.key.0 == sheet || slot.reg.references_sheet(sheet))
+                && let Ok(fid) = u32::try_from(idx)
+            {
+                root_dirty.push(fid);
+            }
+        }
+        self.propagate_dirty(root_dirty);
+    }
 
     fn slot_of(&self, fid: u32) -> Option<&FormulaSlot> {
         self.slots.get(fid as usize).and_then(Option::as_ref)

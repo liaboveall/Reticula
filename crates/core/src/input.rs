@@ -122,6 +122,68 @@ pub fn infer_input(raw: &str) -> Result<InferredInput, OpError> {
     })
 }
 
+/// Infers the typed cell input for `raw` when the target cell currently carries
+/// `existing_format`. When `existing_format` is [`NumberFormat::PlainText`]
+/// (`"@"`), non-empty inputs that do not begin with `'='` skip boolean/date/
+/// numeric inference and remain literal [`ScalarValue::Text`] (`14-m1b.md` 5.4).
+pub fn infer_input_for_cell(
+    raw: &str,
+    existing_format: NumberFormat,
+) -> Result<InferredInput, OpError> {
+    if existing_format == NumberFormat::PlainText && !raw.is_empty() && !raw.starts_with('=') {
+        let stripped = raw.strip_prefix('\'').unwrap_or(raw);
+        check_utf16_limit(stripped)?;
+        return Ok(InferredInput::Scalar {
+            value: ScalarValue::Text(String::from(stripped)),
+            suggested_format: None,
+        });
+    }
+    infer_input(raw)
+}
+
+/// Scalar-only classification used by CSV/TSV import (`14-m1b.md` 2.6 & 5.6):
+/// empty -> `None`, exact `TRUE`/`FALSE` -> `Bool`, ISO date -> `Number + Date`,
+/// `<decimal>%` -> `Number + Percent`, finite decimal -> `Number`, and everything
+/// else (including strings starting with `'='` or `'\''`) -> verbatim `Text`.
+pub fn infer_input_scalar_only(
+    raw: &str,
+) -> Result<Option<(ScalarValue, Option<NumberFormat>)>, OpError> {
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    if !has_surrounding_whitespace(raw) {
+        if raw.eq_ignore_ascii_case("TRUE") {
+            return Ok(Some((ScalarValue::Bool(true), None)));
+        }
+        if raw.eq_ignore_ascii_case("FALSE") {
+            return Ok(Some((ScalarValue::Bool(false), None)));
+        }
+        if let Some(err) = CalcError::parse_literal(raw) {
+            return Ok(Some((ScalarValue::Error(err), None)));
+        }
+    }
+    let trimmed = raw.trim_matches(' ');
+    if let Some(serial) = parse_iso_date(trimmed) {
+        return Ok(Some((
+            ScalarValue::Number(serial),
+            Some(NumberFormat::Date),
+        )));
+    }
+    if let Some(prefix) = trimmed.strip_suffix('%')
+        && let Some(pct) = parse_decimal_shifted(prefix, -2)
+    {
+        return Ok(Some((
+            ScalarValue::Number(pct),
+            Some(NumberFormat::Percent),
+        )));
+    }
+    if let Some(num) = parse_decimal_shifted(trimmed, 0) {
+        return Ok(Some((ScalarValue::Number(num), None)));
+    }
+    check_utf16_limit(raw)?;
+    Ok(Some((ScalarValue::Text(String::from(raw)), None)))
+}
+
 fn check_utf16_limit(text: &str) -> Result<(), OpError> {
     if text.encode_utf16().count() > MAX_CELL_TEXT_UTF16 {
         Err(OpError::TextTooLong)

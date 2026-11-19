@@ -855,11 +855,20 @@ fn format_edit_error(err: EditError) -> String {
 fn format_op_error(err: OpError) -> String {
     match err {
         OpError::SheetNotFound => String::from("Target sheet does not exist."),
+        OpError::DuplicateSheetId => String::from("Sheet ID already exists in this workbook."),
         OpError::TooManySheets => String::from("Maximum sheet count (256) reached."),
-        OpError::TooManyEdits => String::from("Single operation exceeds 10,000 cell edits."),
+        OpError::InvalidSheetName => {
+            String::from("Sheet name must be 1–31 characters and cannot contain : \\ / ? * [ or ].")
+        }
+        OpError::CannotDeleteLastSheet => String::from("Cannot delete the last visible worksheet."),
+        OpError::InvalidSheetOp => String::from("Invalid worksheet operation."),
+        OpError::TooManyEdits => String::from("Operation exceeds per-transaction cell limit."),
         OpError::DuplicateCellTarget => String::from("Operation contains duplicate target cells."),
         OpError::TargetNotFound => String::from("Target row or column no longer exists."),
         OpError::Axis(axis_err) => format!("Axis limit or target error ({axis_err:?})."),
+        OpError::InvalidDimensionOrFormat => {
+            String::from("Dimension, freeze count, or format is out of bounds.")
+        }
         OpError::NonFiniteNumber => String::from("Numeric value must be finite."),
         OpError::TextTooLong => String::from("Cell text exceeds 32,767 UTF-16 code units."),
         OpError::FormulaTooLong => {

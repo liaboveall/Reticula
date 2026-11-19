@@ -75,6 +75,18 @@ pub struct FormulaRegistration {
     structural_sheet: Option<SheetId>,
 }
 
+impl FormulaRegistration {
+    /// Whether this formula statically subscribes to any cell or range on `target`.
+    #[must_use]
+    pub fn references_sheet(&self, target: SheetId) -> bool {
+        self.single_cells.iter().any(|&(s, _, _)| s == target)
+            || self.col_spans.iter().any(|&(s, _, _, _)| s == target)
+            || self.areas.iter().any(|&(s, _)| s == target)
+            || self.full_cols.iter().any(|&(s, _)| s == target)
+            || self.full_rows.iter().any(|&(s, _)| s == target)
+    }
+}
+
 /// Reverse dependency graph keyed by dense `FormulaId` (`u32`).
 #[derive(Clone, Debug, Default)]
 pub struct DepGraph {
@@ -505,6 +517,111 @@ impl DepGraph {
             }
         }
     }
+
+    /// Marks structure-sensitive formulas and range subscriptions on `sheet_id`
+    /// dirty after rows or columns are reordered (`MoveRows` / `MoveCols`).
+    pub fn on_sheet_reordered(&self, sheet_id: SheetId, mut emit: impl FnMut(u32)) {
+        if let Some(set) = self.structural_set.get(&sheet_id) {
+            for &fid in set {
+                emit(fid);
+            }
+        }
+        if let Some(cols) = self.sheet_col_range_keys.get(&sheet_id) {
+            for &col in cols {
+                if let Some(list) = self.col_ranges.get(&(sheet_id, col)) {
+                    for sub in list {
+                        emit(sub.fid);
+                    }
+                }
+            }
+        }
+        if let Some(list) = self.multi_col_ranges.get(&sheet_id) {
+            for sub in list {
+                emit(sub.fid);
+            }
+        }
+        if let Some(list) = self.full_col_deps.get(&sheet_id) {
+            for sub in list {
+                emit(sub.fid);
+            }
+        }
+        if let Some(list) = self.full_row_deps.get(&sheet_id) {
+            for sub in list {
+                emit(sub.fid);
+            }
+        }
+    }
+
+    /// Emits all formula dependents overlapping the rectangular/run-product
+    /// region `(sheet_id, rows × cols)` (used by [`reticula_core::ops::Op::FillFormula`]
+    /// so range subscriptions are tested once per run rather than once per cell).
+    pub fn on_rect_written(
+        &self,
+        sheet_id: SheetId,
+        rows: &[IdRun],
+        cols: &[IdRun],
+        workbook: &Workbook<BoundFormula>,
+        mut emit: impl FnMut(u32),
+    ) {
+        if !self.single_deps.is_empty() {
+            for c_run in cols {
+                for raw_c in c_run.iter() {
+                    let col = ColId(raw_c);
+                    for r_run in rows {
+                        for raw_r in r_run.iter() {
+                            if let Some(list) = self.single_deps.get(&(sheet_id, RowId(raw_r), col))
+                            {
+                                for &fid in list {
+                                    emit(fid);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let Some(sheet) = workbook.sheet(sheet_id) else {
+            return;
+        };
+        let row_axis = sheet.row_axis();
+        let col_axis = sheet.col_axis();
+
+        for c_run in cols {
+            for raw_c in c_run.iter() {
+                if let Some(list) = self.col_ranges.get(&(sheet_id, ColId(raw_c))) {
+                    for sub in list {
+                        if span_overlaps_runs(row_axis, sub.first_row.0, sub.last_row.0, rows) {
+                            emit(sub.fid);
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(list) = self.multi_col_ranges.get(&sheet_id) {
+            for sub in list {
+                if span_overlaps_runs(col_axis, sub.first_col.0, sub.last_col.0, cols)
+                    && span_overlaps_runs(row_axis, sub.first_row.0, sub.last_row.0, rows)
+                {
+                    emit(sub.fid);
+                }
+            }
+        }
+        if let Some(list) = self.full_col_deps.get(&sheet_id) {
+            for sub in list {
+                if span_overlaps_runs(col_axis, sub.first_col.0, sub.last_col.0, cols) {
+                    emit(sub.fid);
+                }
+            }
+        }
+        if let Some(list) = self.full_row_deps.get(&sheet_id) {
+            for sub in list {
+                if span_overlaps_runs(row_axis, sub.first_row.0, sub.last_row.0, rows) {
+                    emit(sub.fid);
+                }
+            }
+        }
+    }
 }
 
 fn collect_refs(expr: &BoundExpr, host_sheet: SheetId, fid: u32, reg: &mut FormulaRegistration) {
@@ -610,6 +727,46 @@ fn span_strictly_straddles(axis: &Axis, a: u64, b: u64, ins_order: u32) -> bool 
     };
     let (lo, hi) = if oa <= ob { (oa, ob) } else { (ob, oa) };
     lo < ins_order && ins_order < hi
+}
+
+fn span_overlaps_runs(axis: &Axis, a: u64, b: u64, runs: &[IdRun]) -> bool {
+    let (Some(oa), Some(ob)) = (axis.axis_order_of(a), axis.axis_order_of(b)) else {
+        return false;
+    };
+    let (lo, hi) = if oa <= ob { (oa, ob) } else { (ob, oa) };
+    let span_len = hi.saturating_sub(lo).saturating_add(1);
+    for run in runs {
+        if let (Some(o_first), Some(last_id)) = (
+            axis.axis_order_of(run.first_id),
+            run.id_at(run.len.saturating_sub(1)),
+        ) && let Some(o_last) = axis.axis_order_of(last_id)
+            && o_first <= o_last
+            && o_last.saturating_sub(o_first).saturating_add(1) == run.len
+        {
+            if lo <= o_last && o_first <= hi {
+                return true;
+            }
+            continue;
+        }
+        if span_len < run.len {
+            for ord in lo..=hi {
+                if let Some((id, _)) = axis.id_at_axis_order(ord)
+                    && run.contains(id)
+                {
+                    return true;
+                }
+            }
+        } else {
+            for id in run.iter() {
+                if let Some(ord) = axis.axis_order_of(id)
+                    && (lo..=hi).contains(&ord)
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 fn remove_first_u32(list: &mut Vec<u32>, target: u32) {

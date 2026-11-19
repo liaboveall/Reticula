@@ -272,7 +272,7 @@ pub fn resolve_bound_ref(
             sheet, row, col, ..
         } => {
             let target_id = sheet.unwrap_or(host_sheet);
-            let Some(s) = workbook.sheet(target_id) else {
+            let Some(s) = workbook.live_sheet(target_id) else {
                 return ResolvedRef::Invalid(CalcError::Ref);
             };
             if s.row_axis().id_to_pos(row.0).is_none() || s.col_axis().id_to_pos(col.0).is_none() {
@@ -293,7 +293,7 @@ pub fn resolve_bound_ref(
             ..
         } => {
             let target_id = sheet.unwrap_or(host_sheet);
-            let Some(s) = workbook.sheet(target_id) else {
+            let Some(s) = workbook.live_sheet(target_id) else {
                 return ResolvedRef::Invalid(CalcError::Ref);
             };
             if live_span_positions(s.row_axis(), first_row.0, last_row.0).is_none()
@@ -316,7 +316,7 @@ pub fn resolve_bound_ref(
             ..
         } => {
             let target_id = sheet.unwrap_or(host_sheet);
-            let Some(s) = workbook.sheet(target_id) else {
+            let Some(s) = workbook.live_sheet(target_id) else {
                 return ResolvedRef::Invalid(CalcError::Ref);
             };
             if live_span_positions(s.col_axis(), first_col.0, last_col.0).is_none()
@@ -337,7 +337,7 @@ pub fn resolve_bound_ref(
             ..
         } => {
             let target_id = sheet.unwrap_or(host_sheet);
-            let Some(s) = workbook.sheet(target_id) else {
+            let Some(s) = workbook.live_sheet(target_id) else {
                 return ResolvedRef::Invalid(CalcError::Ref);
             };
             if live_span_positions(s.row_axis(), first_row.0, last_row.0).is_none()

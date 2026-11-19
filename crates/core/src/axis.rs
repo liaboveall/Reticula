@@ -43,6 +43,8 @@ pub enum AxisError {
     /// Undeleting an entry whose deletion count is already zero, or removing an
     /// entry that does not match an exact inserted run.
     InvalidInverse,
+    /// Moving entries to a position anchored inside the moved set itself.
+    InvalidMove,
 }
 
 /// One contiguous run of identities in axis order.
@@ -92,6 +94,25 @@ impl AxisRun {
                     Self::from_tombstones(left_ids, left_slice),
                     Self::from_tombstones(right_ids, right_slice),
                 ))
+            }
+        }
+    }
+
+    /// Slices `[start_offset, end_offset)` (`0 <= start_offset < end_offset <= len`)
+    /// out of this run, preserving tombstone counts.
+    #[must_use]
+    pub fn slice(&self, start_offset: u32, end_offset: u32) -> Option<Self> {
+        if start_offset >= end_offset || end_offset > self.ids.len {
+            return None;
+        }
+        let len = end_offset.checked_sub(start_offset)?;
+        let first_id = self.ids.id_at(start_offset)?;
+        let sub_ids = IdRun::new(first_id, len)?;
+        match &self.tombstones {
+            None => Some(Self::live(sub_ids)),
+            Some(counts) => {
+                let slice = counts.get(start_offset as usize..end_offset as usize)?;
+                Some(Self::from_tombstones(sub_ids, slice))
             }
         }
     }
@@ -180,6 +201,8 @@ pub struct Axis {
     runs: Vec<AxisRun>,
     /// Cumulative live count strictly before each run (`len == runs.len()`).
     live_prefix: Vec<u32>,
+    /// Cumulative total entry count (live + tombstones) strictly before each run.
+    order_prefix: Vec<u32>,
     total_live: u32,
     total_entries: u32,
     max_entries: u32,
@@ -200,6 +223,7 @@ impl Axis {
         Self {
             runs: Vec::new(),
             live_prefix: Vec::new(),
+            order_prefix: Vec::new(),
             total_live: 0,
             total_entries: 0,
             max_entries,
@@ -217,6 +241,7 @@ impl Axis {
         let mut axis = Self {
             runs: vec![AxisRun::live(ids)],
             live_prefix: Vec::new(),
+            order_prefix: Vec::new(),
             total_live: 0,
             total_entries: 0,
             max_entries,
@@ -248,6 +273,7 @@ impl Axis {
         let mut axis = Self {
             runs,
             live_prefix: Vec::new(),
+            order_prefix: Vec::new(),
             total_live: 0,
             total_entries: 0,
             max_entries,
@@ -296,7 +322,11 @@ impl Axis {
     #[must_use]
     pub fn estimated_bytes(&self) -> usize {
         let runs_mem = self.runs.capacity().saturating_mul(size_of::<AxisRun>());
-        let prefix_mem = self.live_prefix.capacity().saturating_mul(size_of::<u32>());
+        let prefix_mem = self
+            .live_prefix
+            .capacity()
+            .saturating_add(self.order_prefix.capacity())
+            .saturating_mul(size_of::<u32>());
         let index_mem = self
             .id_index
             .capacity()
@@ -362,6 +392,35 @@ impl Axis {
     #[must_use]
     pub fn axis_order_of(&self, id: u64) -> Option<u32> {
         self.locate_id(id).map(|loc| loc.axis_order)
+    }
+
+    /// Whether `id` exists on the axis and has tombstone count `0`.
+    #[must_use]
+    pub fn is_live(&self, id: u64) -> bool {
+        let Some(loc) = self.locate_id(id) else {
+            return false;
+        };
+        self.runs
+            .get(loc.run_idx as usize)
+            .is_some_and(|run| run.tombstone_at(loc.offset) == 0)
+    }
+
+    /// Resolves a 0-based axis-order index (`0..total_len()`, tombstones
+    /// included) to `(id, is_live)` in `O(log R)`.
+    #[must_use]
+    pub fn id_at_axis_order(&self, order: u32) -> Option<(u64, bool)> {
+        if order >= self.total_entries {
+            return None;
+        }
+        let run_idx = self
+            .order_prefix
+            .partition_point(|&start| start <= order)
+            .checked_sub(1)?;
+        let run = self.runs.get(run_idx)?;
+        let start = self.order_prefix.get(run_idx).copied()?;
+        let offset = order.checked_sub(start)?;
+        let id = run.ids.id_at(offset)?;
+        Some((id, run.tombstone_at(offset) == 0))
     }
 
     /// Calls `visit` with contiguous live [`IdRun`] segments between
@@ -605,6 +664,155 @@ impl Axis {
         Ok(())
     }
 
+    /// Moves all entries in `targets` (preserving their current relative axis
+    /// order and tombstone counts) to sit immediately after `after` (`None`
+    /// places them at the very start of the axis). Returns the prior `runs`
+    /// slice so [`Self::restore_runs`] can invert the move in `O(runs)`.
+    pub fn move_runs(
+        &mut self,
+        targets: &[IdRun],
+        after: Option<u64>,
+    ) -> Result<Vec<AxisRun>, AxisError> {
+        self.validate_existing_runs(targets)?;
+        if let Some(anchor) = after {
+            let _ = self.locate_id(anchor).ok_or(AxisError::AnchorNotFound)?;
+            if targets.iter().any(|t| t.contains(anchor)) {
+                return Err(AxisError::InvalidMove);
+            }
+        }
+
+        let prior = self.runs.clone();
+        let mut staying_runs: Vec<AxisRun> = Vec::with_capacity(self.runs.len().saturating_add(4));
+        let mut moved_runs: Vec<AxisRun> = Vec::with_capacity(targets.len().saturating_add(2));
+
+        for run in &self.runs {
+            // Fast path: untouched runs (e.g. a 1,000,000-row base segment not
+            // intersecting `targets`) are copied in O(1) without per-item work.
+            let mut intervals: Vec<(u32, u32)> = Vec::new();
+            let run_stream = id_stream(run.ids.first_id);
+            let run_c0 = id_counter(run.ids.first_id);
+            let run_c1 = run_c0.saturating_add(run.ids.len);
+            for target in targets {
+                if id_stream(target.first_id) != run_stream {
+                    continue;
+                }
+                let t_c0 = id_counter(target.first_id);
+                let t_c1 = t_c0.saturating_add(target.len);
+                let start_c = run_c0.max(t_c0);
+                let end_c = run_c1.min(t_c1);
+                if start_c < end_c {
+                    intervals.push((start_c.saturating_sub(run_c0), end_c.saturating_sub(run_c0)));
+                }
+            }
+            if intervals.is_empty() {
+                staying_runs.push(run.clone());
+                continue;
+            }
+            intervals.sort_unstable_by_key(|&(s, _)| s);
+            let mut cursor: u32 = 0;
+            for (iv_start, iv_end) in intervals {
+                if cursor < iv_start
+                    && let Some(stay_piece) = run.slice(cursor, iv_start)
+                {
+                    staying_runs.push(stay_piece);
+                }
+                if let Some(moved_piece) = run.slice(iv_start, iv_end) {
+                    moved_runs.push(moved_piece);
+                }
+                cursor = iv_end;
+            }
+            if cursor < run.ids.len
+                && let Some(tail_piece) = run.slice(cursor, run.ids.len)
+            {
+                staying_runs.push(tail_piece);
+            }
+        }
+
+        match after {
+            None => {
+                let mut combined =
+                    Vec::with_capacity(moved_runs.len().saturating_add(staying_runs.len()));
+                combined.extend(moved_runs);
+                combined.extend(staying_runs);
+                self.runs = combined;
+            }
+            Some(anchor) => {
+                let mut anchor_pos: Option<(usize, u32)> = None;
+                for (idx, run) in staying_runs.iter().enumerate() {
+                    if run.ids.contains(anchor) {
+                        let off = id_counter(anchor).saturating_sub(id_counter(run.ids.first_id));
+                        anchor_pos = Some((idx, off));
+                        break;
+                    }
+                }
+                let (idx, off) = anchor_pos.ok_or(AxisError::AnchorNotFound)?;
+                let target_run = staying_runs
+                    .get(idx)
+                    .cloned()
+                    .ok_or(AxisError::AnchorNotFound)?;
+                let left_len = off.saturating_add(1);
+                if left_len == target_run.ids.len {
+                    let insert_at = idx.saturating_add(1);
+                    staying_runs.splice(insert_at..insert_at, moved_runs);
+                } else {
+                    let (left, right) =
+                        target_run.split_at(left_len).ok_or(AxisError::InvalidRun)?;
+                    if let Some(slot) = staying_runs.get_mut(idx) {
+                        *slot = left;
+                    }
+                    let insert_at = idx.saturating_add(1);
+                    moved_runs.push(right);
+                    staying_runs.splice(insert_at..insert_at, moved_runs);
+                }
+                self.runs = staying_runs;
+            }
+        }
+
+        self.coalesce_adjacent_runs();
+        self.rebuild_index();
+        Ok(prior)
+    }
+
+    /// Restores `runs` saved prior to [`Self::move_runs`].
+    pub fn restore_runs(&mut self, runs: Vec<AxisRun>) -> Result<(), AxisError> {
+        let restored = Self::from_runs(runs, self.max_entries)?;
+        *self = restored;
+        Ok(())
+    }
+
+    /// Physically removes all tombstoned entries (`tombstone > 0`) from this
+    /// axis during local snapshot garbage collection (`14-m1b.md` 5.5),
+    /// returning the purged identities in deterministic order.
+    pub fn purge_tombstones(&mut self) -> Vec<u64> {
+        let mut purged = Vec::new();
+        let mut live_runs: Vec<AxisRun> = Vec::with_capacity(self.runs.len());
+        for run in &self.runs {
+            match &run.tombstones {
+                None => live_runs.push(run.clone()),
+                Some(counts) => {
+                    for (idx, &cnt) in counts.iter().enumerate() {
+                        if cnt > 0
+                            && let Ok(off) = u32::try_from(idx)
+                            && let Some(id) = run.ids.id_at(off)
+                        {
+                            purged.push(id);
+                        }
+                    }
+                    if run.live_count > 0 {
+                        let to = run.ids.len.saturating_sub(1);
+                        Self::emit_live_subruns(run, 0, to, &mut |sub| {
+                            live_runs.push(AxisRun::live(sub));
+                        });
+                    }
+                }
+            }
+        }
+        self.runs = live_runs;
+        self.coalesce_adjacent_runs();
+        self.rebuild_index();
+        purged
+    }
+
     fn validate_target_runs(
         &self,
         targets: &[IdRun],
@@ -818,14 +1026,17 @@ impl Axis {
 
     fn rebuild_index(&mut self) {
         self.live_prefix.clear();
+        self.order_prefix.clear();
         self.id_index.clear();
         self.live_prefix.reserve(self.runs.len());
+        self.order_prefix.reserve(self.runs.len());
         self.id_index.reserve(self.runs.len());
 
         let mut live_acc: u32 = 0;
         let mut order_acc: u32 = 0;
         for (idx, run) in self.runs.iter().enumerate() {
             self.live_prefix.push(live_acc);
+            self.order_prefix.push(order_acc);
             let run_idx = u32::try_from(idx).unwrap_or(u32::MAX);
             self.id_index.push(IdIndexEntry {
                 first_id: run.ids.first_id,

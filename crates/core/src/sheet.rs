@@ -1,11 +1,14 @@
-//! A worksheet: identity-addressed axes, slotted columns and formatting.
+//! A worksheet: identity-addressed axes, slotted Copy-on-Write columns, row/col
+//! dimensions, freeze panes, formatting and styles (`14-m1b.md` 5.1 & 5.4).
 //!
 //! Positions (`0..rows()`, `0..cols()`) are derived from `row_axis` and
-//! `col_axis`. Cell values and explicit formats are stored against `(row_slot,
-//! col_slot)` so inserting or deleting rows on the axis never moves cell data.
+//! `col_axis`. Cell values are stored against `(row_slot, col_slot)` while
+//! formats, styles and pixel sizes are keyed by stable `RowId` / `ColId` so
+//! inserting, deleting or moving rows/columns never moves cell data.
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;
+use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::axis::{
@@ -15,22 +18,83 @@ use crate::format::{NumberFormat, write_number};
 use crate::id::{ColId, IdRun, RowId, SheetId};
 use crate::store::{Column, SlotMap};
 use crate::strings::StringTable;
+use crate::style::{CellStyle, StyleId, StylePatch, StyleTable};
 use crate::value::Value;
 
+/// Minimum explicit row height in CSS pixels.
+pub const MIN_ROW_HEIGHT: u16 = 16;
+/// Maximum explicit row height in CSS pixels.
+pub const MAX_ROW_HEIGHT: u16 = 600;
+/// Default row height in CSS pixels.
+pub const DEFAULT_ROW_HEIGHT: u16 = 24;
+
+/// Minimum explicit column width in CSS pixels.
+pub const MIN_COL_WIDTH: u16 = 24;
+/// Maximum explicit column width in CSS pixels.
+pub const MAX_COL_WIDTH: u16 = 1_200;
+/// Default column width in CSS pixels.
+pub const DEFAULT_COL_WIDTH: u16 = 112;
+
+/// Maximum frozen rows or frozen columns on a single sheet.
+pub const MAX_FREEZE_COUNT: u32 = 32;
+
+/// Maximum UTF-16 code units in a worksheet tab name (Excel parity).
+pub const MAX_SHEET_NAME_UTF16: usize = 31;
+
 type CellFormatMap = BTreeMap<(RowId, ColId), NumberFormat>;
+type RowFormatMap = BTreeMap<RowId, NumberFormat>;
+type RowStyleMap = BTreeMap<RowId, StylePatch>;
+type ColStyleMap = BTreeMap<ColId, StylePatch>;
+type CellStyleMap = BTreeMap<(RowId, ColId), StylePatch>;
+
+/// Auxiliary layout, tombstone and style state of a [`Sheet`], grouped for
+/// clean snapshot reconstruction.
+#[derive(Clone, Debug, Default)]
+pub struct SheetExtras {
+    /// Deletion counter (`0` = live sheet; `> 0` = tombstoned per E20).
+    pub deleted_count: u32,
+    /// Number of frozen rows pinned at top (`0..=MAX_FREEZE_COUNT`).
+    pub frozen_rows: u32,
+    /// Number of frozen columns pinned at left (`0..=MAX_FREEZE_COUNT`).
+    pub frozen_cols: u32,
+    /// Explicit custom row heights in CSS pixels.
+    pub row_heights: BTreeMap<RowId, u16>,
+    /// Explicit custom column widths in CSS pixels.
+    pub col_widths: BTreeMap<ColId, u16>,
+    /// Explicit whole-row number formats.
+    pub row_formats: RowFormatMap,
+    /// Whole-column visual style patches.
+    pub col_styles: ColStyleMap,
+    /// Whole-row visual style patches.
+    pub row_styles: RowStyleMap,
+    /// Per-cell visual style patches.
+    pub cell_styles: CellStyleMap,
+    /// Deduplicated resolved style table (`StyleId(0)` = default).
+    pub styles: StyleTable,
+}
 
 /// One worksheet of a workbook.
 #[derive(Clone, Debug)]
 pub struct Sheet {
     id: SheetId,
     name: String,
+    deleted_count: u32,
+    frozen_rows: u32,
+    frozen_cols: u32,
     row_axis: Axis,
     col_axis: Axis,
     row_slots: SlotMap,
     col_slots: SlotMap,
     columns: Vec<Column>,
     col_formats: Vec<NumberFormat>,
+    row_formats: RowFormatMap,
     cell_formats: CellFormatMap,
+    row_heights: BTreeMap<RowId, u16>,
+    col_widths: BTreeMap<ColId, u16>,
+    col_styles: ColStyleMap,
+    row_styles: RowStyleMap,
+    cell_styles: CellStyleMap,
+    styles: StyleTable,
     strings: StringTable,
 }
 
@@ -49,13 +113,23 @@ impl Sheet {
         Self {
             id: SheetId(0),
             name: String::from("Sheet1"),
+            deleted_count: 0,
+            frozen_rows: 0,
+            frozen_cols: 0,
             row_axis: Axis::empty(MAX_ROW_AXIS_LEN),
             col_axis: Axis::with_base(base_cols, MAX_COL_AXIS_LEN),
             row_slots: SlotMap::with_base(MAX_ROW_AXIS_LEN),
             col_slots: SlotMap::with_base(base_cols.max(DEFAULT_BASE_COLS)),
             columns: formats.iter().map(|_| Column::new()).collect(),
-            col_formats: formats.to_vec(),
+            col_formats: formats.iter().map(|f| f.normalize()).collect(),
+            row_formats: RowFormatMap::default(),
             cell_formats: CellFormatMap::default(),
+            row_heights: BTreeMap::new(),
+            col_widths: BTreeMap::new(),
+            col_styles: ColStyleMap::default(),
+            row_styles: RowStyleMap::default(),
+            cell_styles: CellStyleMap::default(),
+            styles: StyleTable::new(),
             strings: StringTable::new(),
         }
     }
@@ -67,13 +141,23 @@ impl Sheet {
         Self {
             id,
             name,
+            deleted_count: 0,
+            frozen_rows: 0,
+            frozen_cols: 0,
             row_axis: Axis::with_base(base_rows, MAX_ROW_AXIS_LEN),
             col_axis: Axis::with_base(base_cols, MAX_COL_AXIS_LEN),
             row_slots: SlotMap::with_base(base_rows.max(DEFAULT_BASE_ROWS)),
             col_slots: SlotMap::with_base(base_cols.max(DEFAULT_BASE_COLS)),
             columns: Vec::new(),
             col_formats: Vec::new(),
+            row_formats: RowFormatMap::default(),
             cell_formats: CellFormatMap::default(),
+            row_heights: BTreeMap::new(),
+            col_widths: BTreeMap::new(),
+            col_styles: ColStyleMap::default(),
+            row_styles: RowStyleMap::default(),
+            cell_styles: CellStyleMap::default(),
+            styles: StyleTable::new(),
             strings: StringTable::new(),
         }
     }
@@ -91,6 +175,9 @@ impl Sheet {
         Self {
             id: SheetId(0),
             name: String::from("Sheet1"),
+            deleted_count: 0,
+            frozen_rows: 0,
+            frozen_cols: 0,
             row_axis: Axis::with_base(rows, MAX_ROW_AXIS_LEN),
             col_axis: Axis::with_base(base_cols, MAX_COL_AXIS_LEN),
             row_slots: SlotMap::with_base(rows.max(DEFAULT_BASE_ROWS)),
@@ -99,10 +186,41 @@ impl Sheet {
                 .iter()
                 .map(|_| Column::with_slot_capacity(rows))
                 .collect(),
-            col_formats: formats.to_vec(),
+            col_formats: formats.iter().map(|f| f.normalize()).collect(),
+            row_formats: RowFormatMap::default(),
             cell_formats: CellFormatMap::default(),
+            row_heights: BTreeMap::new(),
+            col_widths: BTreeMap::new(),
+            col_styles: ColStyleMap::default(),
+            row_styles: RowStyleMap::default(),
+            cell_styles: CellStyleMap::default(),
+            styles: StyleTable::new(),
             strings,
         }
+    }
+
+    /// Extends a fresh base-run sheet up to `target_rows` (`<= MAX_ROW_AXIS_LEN`)
+    /// during CSV import.
+    pub fn extend_base_rows_to(&mut self, target_rows: u32) -> Option<u32> {
+        if target_rows > MAX_ROW_AXIS_LEN {
+            return None;
+        }
+        let cur = self.row_axis.total_len();
+        if target_rows <= cur {
+            return Some(cur);
+        }
+        let grow = target_rows.checked_sub(cur)?;
+        let anchor = if cur == 0 {
+            None
+        } else {
+            self.row_axis
+                .runs()
+                .last()
+                .and_then(|r| r.ids.id_at(r.ids.len.saturating_sub(1)))
+        };
+        let run = IdRun::new(u64::from(cur), grow)?;
+        self.row_axis.insert_after(anchor, run).ok()?;
+        Some(target_rows)
     }
 
     /// Stable identifier of this worksheet.
@@ -120,6 +238,129 @@ impl Sheet {
     /// Sets the display name of this worksheet.
     pub fn set_name(&mut self, name: String) {
         self.name = name;
+    }
+
+    /// Tombstone deletion count (`0` means visible/live; `> 0` means deleted).
+    #[must_use]
+    pub const fn deleted_count(&self) -> u32 {
+        self.deleted_count
+    }
+
+    /// Whether this worksheet is currently tombstoned (E20).
+    #[must_use]
+    pub const fn is_deleted(&self) -> bool {
+        self.deleted_count > 0
+    }
+
+    /// Increments sheet deletion count.
+    pub fn increment_deleted(&mut self) -> bool {
+        if self.deleted_count == u32::MAX {
+            return false;
+        }
+        self.deleted_count = self.deleted_count.saturating_add(1);
+        true
+    }
+
+    /// Decrements sheet deletion count (returns `false` if already `0`).
+    pub fn decrement_deleted(&mut self) -> bool {
+        if self.deleted_count == 0 {
+            return false;
+        }
+        self.deleted_count = self.deleted_count.saturating_sub(1);
+        true
+    }
+
+    /// Frozen row count at the top of the sheet.
+    #[must_use]
+    pub const fn frozen_rows(&self) -> u32 {
+        self.frozen_rows
+    }
+
+    /// Frozen column count at the left of the sheet.
+    #[must_use]
+    pub const fn frozen_cols(&self) -> u32 {
+        self.frozen_cols
+    }
+
+    /// Updates `(frozen_rows, frozen_cols)`.
+    pub fn set_freeze(&mut self, frozen_rows: u32, frozen_cols: u32) {
+        self.frozen_rows = frozen_rows;
+        self.frozen_cols = frozen_cols;
+    }
+
+    /// Explicit custom row heights (`RowId -> px`).
+    #[must_use]
+    pub const fn row_heights(&self) -> &BTreeMap<RowId, u16> {
+        &self.row_heights
+    }
+
+    /// Explicit custom column widths (`ColId -> px`).
+    #[must_use]
+    pub const fn col_widths(&self) -> &BTreeMap<ColId, u16> {
+        &self.col_widths
+    }
+
+    /// Reads custom row height for `row` (`None` means [`DEFAULT_ROW_HEIGHT`]).
+    #[must_use]
+    pub fn row_height_by_id(&self, row: RowId) -> Option<u16> {
+        self.row_heights.get(&row).copied()
+    }
+
+    /// Sets or clears custom row height (`Some(DEFAULT_ROW_HEIGHT)` normalises
+    /// to `None` so default heights cost zero map entries).
+    pub fn set_row_height_by_id(&mut self, row: RowId, height: Option<u16>) {
+        match height {
+            None | Some(DEFAULT_ROW_HEIGHT) => {
+                self.row_heights.remove(&row);
+            }
+            Some(px) => {
+                self.row_heights.insert(row, px);
+            }
+        }
+    }
+
+    /// Reads custom column width for `col` (`None` means [`DEFAULT_COL_WIDTH`]).
+    #[must_use]
+    pub fn col_width_by_id(&self, col: ColId) -> Option<u16> {
+        self.col_widths.get(&col).copied()
+    }
+
+    /// Sets or clears custom column width (`Some(DEFAULT_COL_WIDTH)` normalises
+    /// to `None`).
+    pub fn set_col_width_by_id(&mut self, col: ColId, width: Option<u16>) {
+        match width {
+            None | Some(DEFAULT_COL_WIDTH) => {
+                self.col_widths.remove(&col);
+            }
+            Some(px) => {
+                self.col_widths.insert(col, px);
+            }
+        }
+    }
+
+    /// Sparse `(visible_row_pos, height_px)` list in ascending position order,
+    /// sent to the main thread for `AxisMetrics`.
+    #[must_use]
+    pub fn visible_custom_row_heights(&self) -> Vec<(u32, u16)> {
+        let mut list: Vec<(u32, u16)> = self
+            .row_heights
+            .iter()
+            .filter_map(|(&row_id, &px)| self.row_axis.id_to_pos(row_id.0).map(|pos| (pos, px)))
+            .collect();
+        list.sort_unstable_by_key(|&(pos, _)| pos);
+        list
+    }
+
+    /// Sparse `(visible_col_pos, width_px)` list in ascending position order.
+    #[must_use]
+    pub fn visible_custom_col_widths(&self) -> Vec<(u32, u16)> {
+        let mut list: Vec<(u32, u16)> = self
+            .col_widths
+            .iter()
+            .filter_map(|(&col_id, &px)| self.col_axis.id_to_pos(col_id.0).map(|pos| (pos, px)))
+            .collect();
+        list.sort_unstable_by_key(|&(pos, _)| pos);
+        list
     }
 
     /// Row axis.
@@ -168,13 +409,27 @@ impl Sheet {
         &self.col_formats
     }
 
+    /// Reads the explicit default number format of `col` (`General` if unset).
+    #[must_use]
+    pub fn col_format_by_id(&self, col: ColId) -> NumberFormat {
+        self.col_slots
+            .get(col.0)
+            .and_then(|slot| self.col_formats.get(slot as usize))
+            .copied()
+            .unwrap_or_default()
+    }
+
     /// Sets the default number format of a column by identity.
     pub fn set_col_format_by_id(&mut self, col: ColId, format: NumberFormat) -> bool {
+        let format = format.normalize();
         let Some(col_slot) = self.col_slots.get_or_alloc(col.0) else {
             return false;
         };
         let idx = col_slot as usize;
         if idx >= self.col_formats.len() {
+            if format == NumberFormat::General {
+                return true;
+            }
             self.col_formats
                 .resize(idx.saturating_add(1), NumberFormat::General);
         }
@@ -182,6 +437,160 @@ impl Sheet {
             *slot = format;
         }
         true
+    }
+
+    /// Whole-row number format overrides (`RowId -> NumberFormat`).
+    #[must_use]
+    pub const fn row_formats(&self) -> &RowFormatMap {
+        &self.row_formats
+    }
+
+    /// Reads whole-row number format override for `row`.
+    #[must_use]
+    pub fn row_format_by_id(&self, row: RowId) -> Option<NumberFormat> {
+        self.row_formats.get(&row).copied()
+    }
+
+    /// Sets or clears whole-row number format override.
+    pub fn set_row_format_by_id(&mut self, row: RowId, format: Option<NumberFormat>) {
+        match format {
+            None => {
+                self.row_formats.remove(&row);
+            }
+            Some(fmt) => {
+                self.row_formats.insert(row, fmt.normalize());
+            }
+        }
+    }
+
+    /// Whole-column style overrides.
+    #[must_use]
+    pub const fn col_styles(&self) -> &ColStyleMap {
+        &self.col_styles
+    }
+
+    /// Whole-row style overrides.
+    #[must_use]
+    pub const fn row_styles(&self) -> &RowStyleMap {
+        &self.row_styles
+    }
+
+    /// Per-cell style overrides.
+    #[must_use]
+    pub const fn cell_styles(&self) -> &CellStyleMap {
+        &self.cell_styles
+    }
+
+    /// Interned resolved style table of this sheet.
+    #[must_use]
+    pub const fn styles(&self) -> &StyleTable {
+        &self.styles
+    }
+
+    /// Mutable style table.
+    pub const fn styles_mut(&mut self) -> &mut StyleTable {
+        &mut self.styles
+    }
+
+    /// Reads whole-column style patch for `col` (default empty if unset).
+    #[must_use]
+    pub fn col_style_patch(&self, col: ColId) -> StylePatch {
+        self.col_styles.get(&col).copied().unwrap_or_default()
+    }
+
+    /// Replaces whole-column style patch for `col` (removing map entry if empty),
+    /// and interns the standalone resolved style.
+    pub fn set_col_style_patch(&mut self, col: ColId, patch: StylePatch) {
+        if patch.is_empty() {
+            self.col_styles.remove(&col);
+        } else {
+            self.col_styles.insert(col, patch);
+            let _ = self.styles.intern(patch.apply_to(CellStyle::default()));
+        }
+    }
+
+    /// Reads whole-row style patch for `row`.
+    #[must_use]
+    pub fn row_style_patch(&self, row: RowId) -> StylePatch {
+        self.row_styles.get(&row).copied().unwrap_or_default()
+    }
+
+    /// Replaces whole-row style patch for `row`.
+    pub fn set_row_style_patch(&mut self, row: RowId, patch: StylePatch) {
+        if patch.is_empty() {
+            self.row_styles.remove(&row);
+        } else {
+            self.row_styles.insert(row, patch);
+            let _ = self.styles.intern(patch.apply_to(CellStyle::default()));
+        }
+    }
+
+    /// Reads explicit per-cell style patch at `(row, col)`.
+    #[must_use]
+    pub fn cell_style_patch(&self, row: RowId, col: ColId) -> StylePatch {
+        self.cell_styles
+            .get(&(row, col))
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// Replaces explicit per-cell style patch at `(row, col)` and interns the
+    /// cell's effective resolved [`CellStyle`].
+    pub fn set_cell_style_patch(&mut self, row: RowId, col: ColId, patch: StylePatch) {
+        if patch.is_empty() {
+            self.cell_styles.remove(&(row, col));
+        } else {
+            self.cell_styles.insert((row, col), patch);
+        }
+        let resolved = self.effective_style_by_id(row, col);
+        let _ = self.styles.intern(resolved);
+    }
+
+    /// Resolves `cell > row > col > default` visual style for `(row, col)`.
+    #[must_use]
+    pub fn effective_style_by_id(&self, row: RowId, col: ColId) -> CellStyle {
+        let mut style = CellStyle::default();
+        if let Some(&cp) = self.col_styles.get(&col) {
+            style = cp.apply_to(style);
+        }
+        if let Some(&rp) = self.row_styles.get(&row) {
+            style = rp.apply_to(style);
+        }
+        if let Some(&cell_p) = self.cell_styles.get(&(row, col)) {
+            style = cell_p.apply_to(style);
+        }
+        style
+    }
+
+    /// Ensures every cell in `rows × cols` has its resolved [`CellStyle`]
+    /// interned in [`Self::styles`] prior to immutable viewport page encoding.
+    pub fn prepare_viewport_styles(&mut self, rows: &[RowId], cols: &[ColId]) {
+        if self.col_styles.is_empty() && self.row_styles.is_empty() && self.cell_styles.is_empty() {
+            return;
+        }
+        for &r in rows {
+            let r_patch = self.row_styles.get(&r).copied();
+            for &c in cols {
+                let c_patch = self.col_styles.get(&c).copied();
+                let cell_patch = self.cell_styles.get(&(r, c)).copied();
+                if r_patch.is_none() && c_patch.is_none() && cell_patch.is_none() {
+                    continue;
+                }
+                let resolved = self.effective_style_by_id(r, c);
+                let _ = self.styles.intern(resolved);
+            }
+        }
+    }
+
+    /// Looks up the interned [`StyleId`] of `(row, col)` (`StyleId(0)` if
+    /// unstyled).
+    #[must_use]
+    pub fn effective_style_id(&self, row: RowId, col: ColId) -> StyleId {
+        if self.col_styles.is_empty() && self.row_styles.is_empty() && self.cell_styles.is_empty() {
+            return StyleId(0);
+        }
+        let style = self.effective_style_by_id(row, col);
+        self.styles.lookup(&style).unwrap_or(StyleId(0))
     }
 
     /// Number of visible rows on the row axis.
@@ -223,6 +632,17 @@ impl Sheet {
             .cell_formats
             .len()
             .saturating_mul(size_of::<((RowId, ColId), NumberFormat)>().saturating_mul(2));
+        let style_maps_mem = self
+            .cell_styles
+            .len()
+            .saturating_add(self.row_styles.len())
+            .saturating_add(self.col_styles.len())
+            .saturating_mul(size_of::<((RowId, ColId), StylePatch)>().saturating_mul(2));
+        let size_maps_mem = self
+            .row_heights
+            .len()
+            .saturating_add(self.col_widths.len())
+            .saturating_mul(24);
         self.row_axis
             .estimated_bytes()
             .saturating_add(self.col_axis.estimated_bytes())
@@ -230,6 +650,9 @@ impl Sheet {
             .saturating_add(self.col_slots.estimated_bytes())
             .saturating_add(cols_mem)
             .saturating_add(cell_fmt_mem)
+            .saturating_add(style_maps_mem)
+            .saturating_add(size_maps_mem)
+            .saturating_add(self.styles.estimated_bytes())
             .saturating_add(self.strings.estimated_bytes())
     }
 
@@ -328,24 +751,22 @@ impl Sheet {
                 true
             }
             Some(fmt) => {
-                self.cell_formats.insert((row, col), fmt);
+                self.cell_formats.insert((row, col), fmt.normalize());
                 true
             }
         }
     }
 
-    /// Effective number format at `(row, col)` (cell override, falling back to
-    /// column default, then [`NumberFormat::General`]).
+    /// Effective number format at `(row, col)` (`cell > row > col > General`).
     #[must_use]
     pub fn effective_format_by_id(&self, row: RowId, col: ColId) -> NumberFormat {
         if let Some(fmt) = self.cell_format_by_id(row, col) {
             return fmt;
         }
-        self.col_slots
-            .get(col.0)
-            .and_then(|slot| self.col_formats.get(slot as usize))
-            .copied()
-            .unwrap_or_default()
+        if let Some(fmt) = self.row_format_by_id(row) {
+            return fmt;
+        }
+        self.col_format_by_id(col)
     }
 
     /// Reads the value at visible `(row_pos, col_pos)`; [`Value::Empty`] outside
@@ -419,7 +840,217 @@ impl Sheet {
         self.col_axis.pos_to_id(col_pos).unwrap_or(u64::MAX)
     }
 
-    /// Restores components decoded from a snapshot.
+    /// Computes `(max_visible_row, max_visible_col)` bounding all non-empty
+    /// visible cells on this sheet, returning `None` if every visible cell is
+    /// empty (used by `Ctrl+End` and CSV export).
+    #[must_use]
+    pub fn used_extent(&self) -> Option<(u32, u32)> {
+        let mut max_r: Option<u32> = None;
+        let mut max_c: Option<u32> = None;
+        for (col_slot_idx, column) in self.columns.iter().enumerate() {
+            if column.is_empty() {
+                continue;
+            }
+            let Ok(col_slot) = u32::try_from(col_slot_idx) else {
+                continue;
+            };
+            let Some(col_id) = self.col_slots.slot_to_id(col_slot) else {
+                continue;
+            };
+            let Some(col_pos) = self.col_axis.id_to_pos(col_id) else {
+                continue;
+            };
+            let mut col_has_live = false;
+            column.for_each_non_empty(|row_slot, _| {
+                if let Some(row_id) = self.row_slots.slot_to_id(row_slot)
+                    && let Some(row_pos) = self.row_axis.id_to_pos(row_id)
+                {
+                    col_has_live = true;
+                    max_r = Some(max_r.map_or(row_pos, |cur| cur.max(row_pos)));
+                }
+            });
+            if col_has_live {
+                max_c = Some(max_c.map_or(col_pos, |cur| cur.max(col_pos)));
+            }
+        }
+        match (max_r, max_c) {
+            (Some(r), Some(c)) => Some((r, c)),
+            _ => None,
+        }
+    }
+
+    /// Computes Excel-compatible `Ctrl+Arrow` jump from `(row_pos, col_pos)`.
+    /// `(dr, dc)` is one of `(-1, 0)`, `(1, 0)`, `(0, -1)`, `(0, 1)`.
+    #[must_use]
+    pub fn jump_edge(&self, row_pos: u32, col_pos: u32, dr: i8, dc: i8) -> (u32, u32) {
+        if self.rows() == 0 || self.cols() == 0 {
+            return (0, 0);
+        }
+        let r = row_pos.min(self.rows().saturating_sub(1));
+        let c = col_pos.min(self.cols().saturating_sub(1));
+        if dr != 0 {
+            let forward = dr > 0;
+            let new_r = match self.column(c) {
+                Some(col) => col.jump_vertical(&self.row_axis, &self.row_slots, r, forward),
+                None => {
+                    if forward {
+                        self.rows().saturating_sub(1)
+                    } else {
+                        0
+                    }
+                }
+            };
+            return (new_r, c);
+        }
+        if dc != 0 {
+            let forward = dc > 0;
+            let last_c = self.cols().saturating_sub(1);
+            if (forward && c >= last_c) || (!forward && c == 0) {
+                return (r, c);
+            }
+            let Some(row_id) = self.row_axis.pos_to_id(r) else {
+                return (r, c);
+            };
+            let is_filled = |cp: u32| -> bool {
+                self.value_by_id(RowId(row_id), ColId(self.col_id(cp))) != Value::Empty
+            };
+            let next_c = if forward {
+                c.saturating_add(1)
+            } else {
+                c.saturating_sub(1)
+            };
+            if is_filled(c) && is_filled(next_c) {
+                if forward {
+                    let mut cur = next_c;
+                    while cur < last_c && is_filled(cur.saturating_add(1)) {
+                        cur = cur.saturating_add(1);
+                    }
+                    return (r, cur);
+                }
+                let mut cur = next_c;
+                while cur > 0 && is_filled(cur.saturating_sub(1)) {
+                    cur = cur.saturating_sub(1);
+                }
+                return (r, cur);
+            }
+            if forward {
+                let mut cur = next_c;
+                while cur <= last_c {
+                    if is_filled(cur) {
+                        return (r, cur);
+                    }
+                    if cur == last_c {
+                        break;
+                    }
+                    cur = cur.saturating_add(1);
+                }
+                return (r, last_c);
+            }
+            let mut cur = next_c;
+            loop {
+                if is_filled(cur) {
+                    return (r, cur);
+                }
+                if cur == 0 {
+                    return (r, 0);
+                }
+                cur = cur.saturating_sub(1);
+            }
+        }
+        (r, c)
+    }
+
+    /// Compacts [`Self::strings`] by removing unreferenced entries and
+    /// remapping all [`Value::Text`] indices in deterministic slot order
+    /// (`14-m1b.md` 5.5).
+    pub fn compact_strings(&mut self) {
+        let total = self.strings.len();
+        if total == 0 {
+            return;
+        }
+        let mut used = vec![false; total];
+        let mut used_count = 0usize;
+        for col in &self.columns {
+            col.for_each_non_empty(|_, val| {
+                if let Value::Text(id) = val
+                    && let Some(flag) = used.get_mut(id as usize)
+                    && !*flag
+                {
+                    *flag = true;
+                    used_count = used_count.saturating_add(1);
+                }
+            });
+        }
+        if used_count == total {
+            return;
+        }
+        let mut new_table = StringTable::with_capacity(used_count, self.strings.raw_bytes().len());
+        let mut remap = vec![0_u32; total];
+        for (old_idx, &is_used) in used.iter().enumerate() {
+            if is_used
+                && let Ok(old_id) = u32::try_from(old_idx)
+                && let Some(new_id) = new_table.intern(self.strings.get(old_id))
+                && let Some(slot) = remap.get_mut(old_idx)
+            {
+                *slot = new_id;
+            }
+        }
+        for col in &mut self.columns {
+            col.remap_strings(&remap);
+        }
+        self.strings = new_table;
+    }
+
+    /// Purges tombstoned rows and columns on this sheet, clearing stored cell
+    /// values, formats, styles and custom dimensions on purged identities.
+    pub fn purge_axis_tombstones(&mut self) -> (Vec<RowId>, Vec<ColId>) {
+        let purged_rows: Vec<RowId> = self
+            .row_axis
+            .purge_tombstones()
+            .into_iter()
+            .map(RowId)
+            .collect();
+        let purged_cols: Vec<ColId> = self
+            .col_axis
+            .purge_tombstones()
+            .into_iter()
+            .map(ColId)
+            .collect();
+
+        for &r in &purged_rows {
+            self.row_heights.remove(&r);
+            self.row_formats.remove(&r);
+            self.row_styles.remove(&r);
+            if let Some(r_slot) = self.row_slots.get(r.0) {
+                for col in &mut self.columns {
+                    col.clear_slot(r_slot);
+                }
+            }
+        }
+        for &c in &purged_cols {
+            self.col_widths.remove(&c);
+            self.col_styles.remove(&c);
+            if let Some(c_slot) = self.col_slots.get(c.0) {
+                if let Some(col) = self.columns.get_mut(c_slot as usize) {
+                    *col = Column::new();
+                }
+                if let Some(fmt_slot) = self.col_formats.get_mut(c_slot as usize) {
+                    *fmt_slot = NumberFormat::General;
+                }
+            }
+        }
+        if !purged_rows.is_empty() || !purged_cols.is_empty() {
+            self.cell_formats.retain(|&(r, c), _| {
+                self.row_axis.contains_id(r.0) && self.col_axis.contains_id(c.0)
+            });
+            self.cell_styles.retain(|&(r, c), _| {
+                self.row_axis.contains_id(r.0) && self.col_axis.contains_id(c.0)
+            });
+        }
+        (purged_rows, purged_cols)
+    }
+
+    /// Restores components decoded from an `RTCLSNAP` v0 snapshot.
     #[expect(
         clippy::too_many_arguments,
         reason = "snapshot reconstruction passes each persisted section"
@@ -436,18 +1067,119 @@ impl Sheet {
         cell_formats: CellFormatMap,
         strings: StringTable,
     ) -> Option<Self> {
-        let row_axis = Axis::from_runs(row_runs, MAX_ROW_AXIS_LEN).ok()?;
-        let col_axis = Axis::from_runs(col_runs, MAX_COL_AXIS_LEN).ok()?;
-        Some(Self {
+        Self::from_parts_with_extras(
             id,
             name,
-            row_axis,
-            col_axis,
+            row_runs,
+            col_runs,
             row_slots,
             col_slots,
             columns,
             col_formats,
             cell_formats,
+            strings,
+            SheetExtras::default(),
+        )
+    }
+
+    /// Restores components decoded from an `RTCLSNAP` v1 snapshot, validating
+    /// layout, style and format bounds.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "snapshot reconstruction passes each persisted section"
+    )]
+    pub fn from_parts_with_extras(
+        id: SheetId,
+        name: String,
+        row_runs: Vec<AxisRun>,
+        col_runs: Vec<AxisRun>,
+        row_slots: SlotMap,
+        col_slots: SlotMap,
+        columns: Vec<Column>,
+        col_formats: Vec<NumberFormat>,
+        cell_formats: CellFormatMap,
+        strings: StringTable,
+        extras: SheetExtras,
+    ) -> Option<Self> {
+        if extras.frozen_rows > MAX_FREEZE_COUNT || extras.frozen_cols > MAX_FREEZE_COUNT {
+            return None;
+        }
+        if !col_formats.iter().all(|f| f.is_valid())
+            || !cell_formats.values().all(|f| f.is_valid())
+            || !extras.row_formats.values().all(|f| f.is_valid())
+        {
+            return None;
+        }
+        if !extras
+            .row_heights
+            .values()
+            .all(|&h| (MIN_ROW_HEIGHT..=MAX_ROW_HEIGHT).contains(&h))
+            || !extras
+                .col_widths
+                .values()
+                .all(|&w| (MIN_COL_WIDTH..=MAX_COL_WIDTH).contains(&w))
+        {
+            return None;
+        }
+        if !extras.col_styles.values().all(StylePatch::is_valid)
+            || !extras.row_styles.values().all(StylePatch::is_valid)
+            || !extras.cell_styles.values().all(StylePatch::is_valid)
+        {
+            return None;
+        }
+        let row_axis = Axis::from_runs(row_runs, MAX_ROW_AXIS_LEN).ok()?;
+        let col_axis = Axis::from_runs(col_runs, MAX_COL_AXIS_LEN).ok()?;
+        for &r in extras
+            .row_heights
+            .keys()
+            .chain(extras.row_formats.keys())
+            .chain(extras.row_styles.keys())
+        {
+            if !row_axis.contains_id(r.0) {
+                return None;
+            }
+        }
+        for &c in extras.col_widths.keys().chain(extras.col_styles.keys()) {
+            if !col_axis.contains_id(c.0) {
+                return None;
+            }
+        }
+        for &(r, c) in extras.cell_styles.keys() {
+            if !row_axis.contains_id(r.0) || !col_axis.contains_id(c.0) {
+                return None;
+            }
+        }
+
+        Some(Self {
+            id,
+            name,
+            deleted_count: extras.deleted_count,
+            frozen_rows: extras.frozen_rows,
+            frozen_cols: extras.frozen_cols,
+            row_axis,
+            col_axis,
+            row_slots,
+            col_slots,
+            columns,
+            col_formats: col_formats
+                .into_iter()
+                .map(NumberFormat::normalize)
+                .collect(),
+            row_formats: extras
+                .row_formats
+                .into_iter()
+                .map(|(k, v)| (k, v.normalize()))
+                .collect(),
+            cell_formats: cell_formats
+                .into_iter()
+                .map(|(k, v)| (k, v.normalize()))
+                .collect(),
+            row_heights: extras.row_heights,
+            col_widths: extras.col_widths,
+            col_styles: extras.col_styles,
+            row_styles: extras.row_styles,
+            cell_styles: extras.cell_styles,
+            styles: extras.styles,
             strings,
         })
     }
@@ -458,6 +1190,22 @@ impl Sheet {
     pub const fn cell_formats(&self) -> &BTreeMap<(RowId, ColId), NumberFormat> {
         &self.cell_formats
     }
+}
+
+/// Validates basic worksheet tab name rules (non-empty, `<= 31` UTF-16 units,
+/// no forbidden Excel characters `: \ / ? * [ ]`).
+#[must_use]
+pub fn is_valid_sheet_name(name: &str) -> bool {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if name.encode_utf16().count() > MAX_SHEET_NAME_UTF16 {
+        return false;
+    }
+    !name
+        .chars()
+        .any(|c| matches!(c, ':' | '\\' | '/' | '?' | '*' | '[' | ']'))
 }
 
 #[cfg(test)]
@@ -490,7 +1238,7 @@ mod tests {
         assert!(sheet.push_row(&[
             Value::Number(7.0),
             Value::Bool(true),
-            Value::Error(CalcError::Div0)
+            Value::Error(CalcError::Div0),
         ]));
         assert_eq!((sheet.rows(), sheet.cols()), (2, 3));
 
@@ -525,12 +1273,19 @@ mod tests {
     }
 
     #[test]
-    fn cells_outside_the_sheet_are_empty() {
+    fn string_compaction_reclaims_unreferenced_entries_and_remaps_cells() {
         let mut sheet = Sheet::new(&[NumberFormat::General]);
-        assert!(sheet.push_row(&[Value::Number(1.0)]));
-        assert_eq!(sheet.value(1, 0), Value::Empty);
-        assert_eq!(sheet.value(0, 1), Value::Empty);
-        assert_eq!(sheet.value(u32::MAX, u32::MAX), Value::Empty);
-        assert_eq!(text(&sheet, 5, 5), "");
+        let s0 = sheet.add_string("dropped").unwrap_or(0);
+        let s1 = sheet.add_string("kept-a").unwrap_or(0);
+        let s2 = sheet.add_string("kept-b").unwrap_or(0);
+        let _ = s0;
+        assert!(sheet.push_row(&[Value::Text(s2)]));
+        assert!(sheet.push_row(&[Value::Text(s1)]));
+        assert_eq!(sheet.strings().len(), 3);
+
+        sheet.compact_strings();
+        assert_eq!(sheet.strings().len(), 2);
+        assert_eq!(text(&sheet, 0, 0), "kept-b");
+        assert_eq!(text(&sheet, 1, 0), "kept-a");
     }
 }

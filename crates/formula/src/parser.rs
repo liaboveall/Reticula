@@ -5,6 +5,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use reticula_core::ops::MAX_FORMULA_CHARS;
+use reticula_core::value::CalcError;
 
 use crate::address::{parse_cell_addr, parse_col_only, parse_row_only};
 use crate::ast::{BinaryOp, Expr, Literal, MAX_FUNCTION_ARGS, MAX_NESTING_DEPTH, UnaryOp};
@@ -181,6 +182,19 @@ impl Parser<'_> {
             }
             Token::ErrorLit(err) => {
                 let _ = self.bump();
+                if err == CalcError::Ref {
+                    let has_coord_suffix = match self.peek() {
+                        Some(Token::Ident(_)) => true,
+                        Some(Token::Number {
+                            raw_digits: Some(_),
+                            ..
+                        }) => matches!(self.peek_at(1), Some(Token::Colon)),
+                        _ => false,
+                    };
+                    if has_coord_suffix {
+                        return self.parse_qualified_ref(String::from("#REF!"));
+                    }
+                }
                 Ok(Expr::Literal(Literal::Error(err)))
             }
             Token::Number { value, raw_digits } => {

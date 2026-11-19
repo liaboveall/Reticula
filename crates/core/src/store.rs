@@ -1,20 +1,26 @@
-//! Identity-slotted, block-adaptive column storage.
+//! Identity-slotted, block-adaptive Copy-on-Write column storage (`14-m1b.md` 2.3).
 //!
 //! Each row or column identity maps to a dense storage slot: base-run
 //! identities map directly to `id as u32` with zero table lookup, while newly
 //! inserted identities receive slots appended at the end. Within a column,
 //! slots are partitioned into blocks of [`BLOCK_ROWS`] (`4,096`) entries, each
-//! stored as empty, sorted sparse pairs, or a fixed 32 KiB dense array.
+//! stored as empty, sorted sparse pairs (`Arc<Vec<(u16, u64)>>`), or a fixed
+//! 32 KiB dense array (`Arc<Vec<u64>>`). Wrapping non-empty blocks in [`Arc`]
+//! allows background snapshot encoding (and future draft branches) to fork a
+//! 50,000,000-cell workbook in `< 0.2 ms` with zero block copying while active
+//! edits copy-on-write only touched blocks via [`Arc::make_mut`].
 
-use alloc::boxed::Box;
+use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::hash::BuildHasherDefault;
 
 use hashbrown::HashMap;
 use rustc_hash::FxHasher;
-use serde::{Deserialize, Serialize};
+use serde::de::Error as _;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+use crate::axis::Axis;
 use crate::id::is_base_id;
 use crate::value::Value;
 
@@ -137,18 +143,75 @@ impl SlotMap {
 }
 
 /// Representation of one `4,096`-row block within a [`Column`].
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum Block {
     /// All `4,096` slots hold [`Value::Empty`].
     #[default]
     Empty,
-    /// Sorted `(offset, packed_bits)` entries for non-empty cells.
+    /// Copy-on-write sorted `(offset, packed_bits)` entries for non-empty cells.
+    Sparse(Arc<Vec<(u16, u64)>>),
+    /// Copy-on-write fixed array of `4,096` packed cell words (`32 KiB`).
+    Dense(Arc<Vec<u64>>),
+}
+
+#[derive(Serialize)]
+enum BlockWireRef<'a> {
+    Empty,
+    Sparse(&'a [(u16, u64)]),
+    Dense(&'a [u64]),
+}
+
+#[derive(Deserialize)]
+enum BlockWireOwned {
+    Empty,
     Sparse(Vec<(u16, u64)>),
-    /// Fixed array of `4,096` packed cell words (`32 KiB`).
-    Dense(Box<[u64]>),
+    Dense(Vec<u64>),
+}
+
+impl Serialize for Block {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let wire = match self {
+            Self::Empty => BlockWireRef::Empty,
+            Self::Sparse(entries) => BlockWireRef::Sparse(entries.as_slice()),
+            Self::Dense(words) => BlockWireRef::Dense(words.as_slice()),
+        };
+        wire.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for Block {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = BlockWireOwned::deserialize(deserializer)?;
+        match wire {
+            BlockWireOwned::Empty => Ok(Self::Empty),
+            BlockWireOwned::Sparse(entries) => Ok(Self::Sparse(Arc::new(entries))),
+            BlockWireOwned::Dense(words) => {
+                if words.len() != BLOCK_ROWS as usize {
+                    return Err(D::Error::custom("invalid dense block length"));
+                }
+                Ok(Self::Dense(Arc::new(words)))
+            }
+        }
+    }
 }
 
 impl Block {
+    /// Constructs a [`Block::Sparse`] from owned pairs.
+    #[must_use]
+    pub fn sparse(entries: Vec<(u16, u64)>) -> Self {
+        Self::Sparse(Arc::new(entries))
+    }
+
+    /// Constructs a [`Block::Dense`] from a `4,096`-element word vector.
+    #[must_use]
+    pub fn dense(words: Vec<u64>) -> Option<Self> {
+        if words.len() == BLOCK_ROWS as usize {
+            Some(Self::Dense(Arc::new(words)))
+        } else {
+            None
+        }
+    }
+
     fn get(&self, offset: u16) -> u64 {
         match self {
             Self::Empty => Value::EMPTY_BITS,
@@ -169,41 +232,83 @@ impl Block {
         match self {
             Self::Empty => {
                 if !is_empty {
-                    *self = Self::Sparse(vec![(offset, bits)]);
+                    *self = Self::Sparse(Arc::new(vec![(offset, bits)]));
                 }
             }
-            Self::Sparse(entries) => match entries.binary_search_by_key(&offset, |&(off, _)| off) {
-                Ok(idx) => {
-                    if is_empty {
-                        entries.remove(idx);
-                        if entries.is_empty() {
-                            *self = Self::Empty;
-                        }
-                    } else if let Some(slot) = entries.get_mut(idx) {
-                        slot.1 = bits;
-                    }
-                }
-                Err(idx) if !is_empty => {
-                    if entries.len() >= SPARSE_LIMIT {
-                        let mut dense = vec![Value::EMPTY_BITS; BLOCK_ROWS as usize];
-                        for &(off, word) in entries.iter() {
-                            if let Some(cell) = dense.get_mut(off as usize) {
-                                *cell = word;
+            Self::Sparse(entries_arc) => {
+                let entries = Arc::make_mut(entries_arc);
+                match entries.binary_search_by_key(&offset, |&(off, _)| off) {
+                    Ok(idx) => {
+                        if is_empty {
+                            entries.remove(idx);
+                            if entries.is_empty() {
+                                *self = Self::Empty;
                             }
+                        } else if let Some(slot) = entries.get_mut(idx) {
+                            slot.1 = bits;
                         }
-                        if let Some(cell) = dense.get_mut(offset as usize) {
-                            *cell = bits;
-                        }
-                        *self = Self::Dense(dense.into_boxed_slice());
-                    } else {
-                        entries.insert(idx, (offset, bits));
                     }
+                    Err(idx) if !is_empty => {
+                        if entries.len() >= SPARSE_LIMIT {
+                            let mut dense = vec![Value::EMPTY_BITS; BLOCK_ROWS as usize];
+                            for &(off, word) in entries.iter() {
+                                if let Some(cell) = dense.get_mut(off as usize) {
+                                    *cell = word;
+                                }
+                            }
+                            if let Some(cell) = dense.get_mut(offset as usize) {
+                                *cell = bits;
+                            }
+                            *self = Self::Dense(Arc::new(dense));
+                        } else {
+                            entries.insert(idx, (offset, bits));
+                        }
+                    }
+                    Err(_) => {}
                 }
-                Err(_) => {}
-            },
-            Self::Dense(words) => {
+            }
+            Self::Dense(words_arc) => {
+                let words = Arc::make_mut(words_arc);
                 if let Some(cell) = words.get_mut(offset as usize) {
                     *cell = bits;
+                }
+            }
+        }
+    }
+
+    fn remap_strings(&mut self, remap: &[u32]) {
+        match self {
+            Self::Empty => {}
+            Self::Sparse(entries_arc) => {
+                let has_text = entries_arc
+                    .iter()
+                    .any(|&(_, bits)| matches!(Value::unpack(bits), Value::Text(_)));
+                if !has_text {
+                    return;
+                }
+                let entries = Arc::make_mut(entries_arc);
+                for (_, bits) in entries.iter_mut() {
+                    if let Value::Text(old_id) = Value::unpack(*bits)
+                        && let Some(&new_id) = remap.get(old_id as usize)
+                    {
+                        *bits = Value::Text(new_id).pack();
+                    }
+                }
+            }
+            Self::Dense(words_arc) => {
+                let has_text = words_arc
+                    .iter()
+                    .any(|&bits| matches!(Value::unpack(bits), Value::Text(_)));
+                if !has_text {
+                    return;
+                }
+                let words = Arc::make_mut(words_arc);
+                for bits in words.iter_mut() {
+                    if let Value::Text(old_id) = Value::unpack(*bits)
+                        && let Some(&new_id) = remap.get(old_id as usize)
+                    {
+                        *bits = Value::Text(new_id).pack();
+                    }
                 }
             }
         }
@@ -324,6 +429,18 @@ impl Column {
         true
     }
 
+    /// Clears `slot` back to [`Value::Empty`] (used during tombstone GC).
+    pub fn clear_slot(&mut self, slot: u32) {
+        let _ = self.set(slot, Value::Empty);
+    }
+
+    /// Remaps [`Value::Text`] indices across all blocks using `remap[old_id]`.
+    pub fn remap_strings(&mut self, remap: &[u32]) {
+        for block in &mut self.blocks {
+            block.remap_strings(remap);
+        }
+    }
+
     /// Reads the value at `slot`; [`Value::Empty`] past the end.
     #[must_use]
     pub fn get(&self, slot: u32) -> Value {
@@ -358,7 +475,7 @@ impl Column {
                         return None;
                     }
                     let mut prev_offset: Option<u16> = None;
-                    for &(offset, bits) in entries {
+                    for &(offset, bits) in entries.iter() {
                         if u32::from(offset) >= BLOCK_ROWS || bits == Value::EMPTY_BITS {
                             return None;
                         }
@@ -377,7 +494,7 @@ impl Column {
                     if words.len() != BLOCK_ROWS as usize {
                         return None;
                     }
-                    for &bits in words {
+                    for &bits in words.iter() {
                         if !check_word(bits) {
                             return None;
                         }
@@ -400,7 +517,7 @@ impl Column {
             match block {
                 Block::Empty => {}
                 Block::Sparse(entries) => {
-                    for &(offset, bits) in entries {
+                    for &(offset, bits) in entries.iter() {
                         if let Some(slot) = base_slot.checked_add(u32::from(offset)) {
                             visit(slot, Value::unpack(bits));
                         }
@@ -415,6 +532,89 @@ impl Column {
                             visit(slot, Value::unpack(bits));
                         }
                     }
+                }
+            }
+        }
+    }
+
+    /// Computes Excel-compatible `Ctrl+Down` (`forward = true`) or `Ctrl+Up`
+    /// (`forward = false`) target visible row position along `row_axis`.
+    #[must_use]
+    pub fn jump_vertical(
+        &self,
+        row_axis: &Axis,
+        row_slots: &SlotMap,
+        start_pos: u32,
+        forward: bool,
+    ) -> u32 {
+        let total = row_axis.live_len();
+        if total == 0 {
+            return 0;
+        }
+        let cur = start_pos.min(total.saturating_sub(1));
+        let last = total.saturating_sub(1);
+        if (forward && cur >= last) || (!forward && cur == 0) {
+            return cur;
+        }
+
+        let is_non_empty = |pos: u32| -> bool {
+            row_axis
+                .pos_to_id(pos)
+                .and_then(|id| row_slots.get(id))
+                .is_some_and(|slot| self.get_packed(slot) != Value::EMPTY_BITS)
+        };
+
+        let next_pos = if forward {
+            cur.saturating_add(1)
+        } else {
+            cur.saturating_sub(1)
+        };
+        let cur_filled = is_non_empty(cur);
+        let next_filled = is_non_empty(next_pos);
+
+        if cur_filled && next_filled {
+            // Walk to the last consecutive non-empty cell in the current run.
+            if forward {
+                let mut p = next_pos;
+                while p < last && is_non_empty(p.saturating_add(1)) {
+                    p = p.saturating_add(1);
+                }
+                p
+            } else {
+                let mut p = next_pos;
+                while p > 0 && is_non_empty(p.saturating_sub(1)) {
+                    p = p.saturating_sub(1);
+                }
+                p
+            }
+        } else {
+            // Walk across empty cells to the first non-empty cell, or sheet edge.
+            // Fast-skip when the column has no non-empty blocks at all!
+            if self.is_empty() {
+                return if forward { last } else { 0 };
+            }
+            if forward {
+                let mut p = next_pos;
+                while p <= last {
+                    if is_non_empty(p) {
+                        return p;
+                    }
+                    if p == last {
+                        break;
+                    }
+                    p = p.saturating_add(1);
+                }
+                last
+            } else {
+                let mut p = next_pos;
+                loop {
+                    if is_non_empty(p) {
+                        return p;
+                    }
+                    if p == 0 {
+                        return 0;
+                    }
+                    p = p.saturating_sub(1);
                 }
             }
         }
@@ -437,11 +637,12 @@ mod tests {
     use wasm_bindgen_test::wasm_bindgen_test as test;
 
     use super::{BLOCK_ROWS, Block, Column, SPARSE_LIMIT, SlotMap};
+    use crate::axis::Axis;
     use crate::id::pack_id;
     use crate::value::Value;
 
     #[test]
-    fn rows_are_read_back_across_blocks() {
+    fn rows_are_read_back_across_blocks_and_cow_isolates_clones() {
         let mut column = Column::new();
         assert!(column.is_empty());
         let rows = BLOCK_ROWS * 2 + 3;
@@ -449,8 +650,15 @@ mod tests {
             assert!(column.push(Value::Number(f64::from(row))));
         }
         assert_eq!(column.len(), rows);
+
+        // Clone shares Arc blocks; mutating `column` leaves `forked` untouched!
+        let forked = column.clone();
+        assert!(column.set(5, Value::Number(9999.0)));
+        assert_eq!(column.get(5), Value::Number(9999.0));
+        assert_eq!(forked.get(5), Value::Number(5.0));
+
         for row in [0, 1, BLOCK_ROWS - 1, BLOCK_ROWS, BLOCK_ROWS * 2, rows - 1] {
-            assert_eq!(column.get(row), Value::Number(f64::from(row)));
+            assert_eq!(forked.get(row), Value::Number(f64::from(row)));
         }
         assert_eq!(column.get(rows), Value::Empty);
         assert_eq!(column.get(u32::MAX), Value::Empty);
@@ -463,14 +671,11 @@ mod tests {
         assert!(column.set(999_999, Value::Bool(true)));
         assert_eq!(column.get(999_999), Value::Bool(true));
         assert_eq!(column.get(500_000), Value::Empty);
-        // Only one tiny sparse block allocated even at slot 999,999.
         assert!(column.estimated_bytes() < 8192);
 
-        // Clearing returns the block to Empty.
         assert!(column.set(999_999, Value::Empty));
         assert_eq!(column.get(999_999), Value::Empty);
 
-        // Writing > SPARSE_LIMIT entries in block 0 promotes it to Dense.
         let limit = u32::try_from(SPARSE_LIMIT).unwrap_or(256);
         for offset in 0..=limit {
             assert!(column.set(offset, Value::Number(f64::from(offset))));
@@ -482,7 +687,7 @@ mod tests {
     }
 
     #[test]
-    fn slot_map_uses_identity_arithmetic_for_base_and_table_for_inserted() {
+    fn slot_map_and_ctrl_arrow_jump_behave_like_excel() {
         let mut map = SlotMap::with_base(1_048_576);
         assert_eq!(map.get(0), Some(0));
         assert_eq!(map.get(999_999), Some(999_999));
@@ -492,5 +697,22 @@ mod tests {
         assert_eq!(map.get(inserted), None);
         assert_eq!(map.get_or_alloc(inserted), Some(1_048_576));
         assert_eq!(map.get(inserted), Some(1_048_576));
+
+        let axis = Axis::with_base(20, 100);
+        let slots = SlotMap::with_base(100);
+        let mut col = Column::new();
+        for r in [2_u32, 3, 4, 10, 11] {
+            assert!(col.set(r, Value::Number(1.0)));
+        }
+        assert_eq!(col.jump_vertical(&axis, &slots, 0, true), 2);
+        assert_eq!(col.jump_vertical(&axis, &slots, 2, true), 4);
+        assert_eq!(col.jump_vertical(&axis, &slots, 4, true), 10);
+        assert_eq!(col.jump_vertical(&axis, &slots, 10, true), 11);
+        assert_eq!(col.jump_vertical(&axis, &slots, 11, true), 19);
+        assert_eq!(col.jump_vertical(&axis, &slots, 19, false), 11);
+        assert_eq!(col.jump_vertical(&axis, &slots, 11, false), 10);
+        assert_eq!(col.jump_vertical(&axis, &slots, 10, false), 4);
+        assert_eq!(col.jump_vertical(&axis, &slots, 4, false), 2);
+        assert_eq!(col.jump_vertical(&axis, &slots, 2, false), 0);
     }
 }

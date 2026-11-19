@@ -34,6 +34,7 @@ extern crate alloc;
 extern crate std;
 
 pub mod axis;
+pub mod csv;
 pub mod decimal15;
 pub mod determinism;
 pub mod digest;
@@ -49,6 +50,7 @@ pub mod sheet;
 pub mod snapshot;
 pub mod store;
 pub mod strings;
+pub mod style;
 pub mod value;
 pub mod viewport;
 

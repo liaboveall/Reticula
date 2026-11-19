@@ -18,5 +18,8 @@ rustc-hash = { workspace = true }
 serde = { workspace = true }
 smallvec = { workspace = true }
 
+[dev-dependencies]
+postcard = { workspace = true }
+
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
 wasm-bindgen-test = { workspace = true }
