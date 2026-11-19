@@ -10,9 +10,6 @@ pub fn run(name: &str, options: &[String]) -> Result {
     if matches!(name, "s1" | "s2") {
         return grid(name, options);
     }
-    if name == "s4" {
-        return storage(options);
-    }
     if name == "s9" {
         return first_visit(options);
     }
@@ -28,7 +25,7 @@ pub fn run(name: &str, options: &[String]) -> Result {
     match name {
         "determinism" => determinism(),
         other => Err(format!(
-            "unknown spike `{other}`; available: determinism, s1, s2, s4, s9, s9-builds, s10"
+            "unknown spike `{other}`; available: determinism, s1, s2, s9, s9-builds, s10"
         )),
     }
 }
@@ -44,12 +41,6 @@ fn grid(name: &str, options: &[String]) -> Result {
         .arg(name)
         .args(options)
         .run()
-}
-
-/// Runs the experiments on local storage and tabs in a browser.
-fn storage(options: &[String]) -> Result {
-    util::step("s4");
-    node().arg("spikes/opfs/run.mjs").args(options).run()
 }
 
 /// Measures a first visit: the production build, served compressed over a

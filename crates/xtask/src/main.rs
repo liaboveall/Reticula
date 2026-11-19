@@ -42,7 +42,7 @@ Commands:
   fuzz [--cpu-seconds <s>] [--threads <n>] [--affinity <mask>]
                           Multi-threaded mutation & structured fuzzing campaign.
   bench [--affinity <mask>] [--browser <name>] [--quick] [--out <file>]
-                          Run native and Chrome WASM engine benchmarks (B2-B5, B7a, B7b).
+                          Run native and Chrome WASM engine benchmarks (B1-B8, B11, B12).
   dev                     Build a debug module and start the development server.
   build [--skip-wasm] [--check-budget]
                           Production build with preloads, precompressed assets and size budget check.
@@ -51,12 +51,11 @@ Commands:
   ci                      Everything CI runs on a push. Run it before pushing.
   spike <name> [options]  Run one of the experiments under spikes/ and print its report.
                           `s1` and `s2` measure the grid in a browser and pass their
-                          options on: see spikes/grid/measure.mjs. `s4` tries local
-                          storage and locks between tabs: see spikes/opfs/run.mjs.
-                          `s9` measures a first visit of the production build: see
-                          spikes/startup/measure.mjs; `s9-builds [--affinity <mask>]`
-                          compares the engine at several optimisation levels. `s10` serves the
-                          page for checking input methods: see spikes/grid/ime.mjs.
+                          options on: see spikes/grid/measure.mjs. `s9` measures a first
+                          visit of the production build: see spikes/startup/measure.mjs;
+                          `s9-builds [--affinity <mask>]` compares the engine at several
+                          optimisation levels. `s10` serves the page for checking input
+                          methods: see spikes/grid/ime.mjs.
 ";
 
 fn main() -> ExitCode {
