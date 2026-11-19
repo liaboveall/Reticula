@@ -183,6 +183,13 @@ impl DepGraph {
         }
     }
 
+    /// Pre-reserves space in `single_deps` for `additional_formulas` newly added
+    /// formulas (used by `Op::FillFormula` to avoid repeated rehashing on 1M-row fills).
+    pub fn reserve_for_formulas(&mut self, additional_formulas: usize) {
+        self.single_deps
+            .reserve(additional_formulas.saturating_mul(2));
+    }
+
     /// Pre-reserves capacity in the single-cell reverse map for a known hot
     /// precedent cell (used by `open_sample` for `$V$1` with 100k dependents).
     pub fn reserve_single_dependents(&mut self, cell: WorkbookCellKey, capacity: usize) {
@@ -343,6 +350,18 @@ impl DepGraph {
             list.for_each(&mut emit);
         }
 
+        let col_range_list = self.col_ranges.get(&(sheet_id, col));
+        let multi_list = self.multi_col_ranges.get(&sheet_id);
+        let full_col_list = self.full_col_deps.get(&sheet_id);
+        let full_row_list = self.full_row_deps.get(&sheet_id);
+        if col_range_list.is_none()
+            && multi_list.is_none_or(Vec::is_empty)
+            && full_col_list.is_none_or(Vec::is_empty)
+            && full_row_list.is_none_or(Vec::is_empty)
+        {
+            return;
+        }
+
         let Some(sheet) = workbook.sheet(sheet_id) else {
             return;
         };
@@ -354,14 +373,14 @@ impl DepGraph {
             return;
         };
 
-        if let Some(list) = self.col_ranges.get(&(sheet_id, col)) {
+        if let Some(list) = col_range_list {
             for sub in list {
                 if span_contains_order(row_axis, sub.first_row.0, sub.last_row.0, r_ord) {
                     emit(sub.fid);
                 }
             }
         }
-        if let Some(list) = self.multi_col_ranges.get(&sheet_id) {
+        if let Some(list) = multi_list {
             for sub in list {
                 if span_contains_order(col_axis, sub.first_col.0, sub.last_col.0, c_ord)
                     && span_contains_order(row_axis, sub.first_row.0, sub.last_row.0, r_ord)

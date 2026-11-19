@@ -238,15 +238,21 @@ export class FormulaBarEditor {
     this.#view.dispatch({
       changes: { from: 0, to: this.#view.state.doc.length, insert: text },
       selection: { anchor: clampedAnchor, head: clampedHead },
+      effects: setFormulaAnalysisEffect.of(null),
+      scrollIntoView: true,
     });
     this.#suppressChange = false;
     this.#options.onChange?.(text, clampedHead);
   }
 
   setAnalysis(analysis: WireFormulaAnalysis | null): void {
+    const prevSel = this.#view.state.selection;
+    this.#suppressChange = true;
     this.#view.dispatch({
       effects: setFormulaAnalysisEffect.of(analysis),
+      selection: prevSel,
     });
+    this.#suppressChange = false;
   }
 
   destroy(): void {

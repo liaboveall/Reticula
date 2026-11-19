@@ -518,6 +518,8 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
     [],
   );
 
+  const pendingAnalyzeSourcesRef = useRef<string[]>([]);
+
   const requestAnalyze = useCallback((client: EngineClient, grid: Grid, editor: CellEditor) => {
     const session = editSessionRef.current;
     if (!session?.source.startsWith("=")) {
@@ -531,6 +533,7 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
       }
       return;
     }
+    pendingAnalyzeSourcesRef.current.push(session.source);
     client.send({
       kind: "analyzeFormula",
       sheet: session.hostSheet,
@@ -1122,12 +1125,14 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
               break;
             }
             case "formulaAnalyzed": {
-              if (!editSessionRef.current) {
+              const analyzedSource = pendingAnalyzeSourcesRef.current.shift();
+              const session = editSessionRef.current;
+              if (!session || (analyzedSource !== undefined && analyzedSource !== session.source)) {
                 break;
               }
               analysisRef.current = message.analysis;
-              editSessionRef.current.canInsertRef = message.analysis.canInsertRef;
-              editSessionRef.current.activeRefSpan = message.analysis.activeRefSpan ?? null;
+              session.canInsertRef = message.analysis.canInsertRef;
+              session.activeRefSpan = message.analysis.activeRefSpan ?? null;
               setFormulaAnalysis(message.analysis);
               editor.setFormulaAnalysis(message.analysis);
               syncGridFormulaRefs(grid, message.analysis, activeSheetRef.current);
@@ -1141,6 +1146,8 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
               session.source = message.source;
               session.cursorUtf16 = message.endUtf16;
               session.pointPickedSpan = null;
+              analysisRef.current = null;
+              setFormulaAnalysis(null);
               setEditingText(message.source);
               formulaBarRef.current?.applyTextAndSelection(
                 message.source,
@@ -1170,6 +1177,8 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
               session.source = nextSource;
               session.cursorUtf16 = nextEnd;
               session.pointPickedSpan = [repStart, nextEnd];
+              analysisRef.current = null;
+              setFormulaAnalysis(null);
               setEditingText(nextSource);
               formulaBarRef.current?.applyTextAndSelection(nextSource, nextEnd, nextEnd);
               if (activeSheetRef.current === session.hostSheet) {

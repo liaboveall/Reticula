@@ -1055,6 +1055,13 @@ impl FormulaEngine {
         if total_cells > 256 {
             self.changes.structural = true;
         }
+        if total_cells > 64 {
+            let extra = total_cells.saturating_sub(self.free_slots.len());
+            self.slots.reserve(extra);
+            self.states.reserve(extra);
+            self.cell_to_fid.reserve(total_cells);
+            self.dep_graph.reserve_for_formulas(total_cells);
+        }
 
         let mut root_dirty = Vec::with_capacity(total_cells.saturating_add(8));
         for c_run in cols {
@@ -1067,9 +1074,27 @@ impl FormulaEngine {
                         if total_cells <= 256 {
                             self.changes.cells.push(key);
                         }
-                        self.remove_slot_by_key(key);
-                        if let Some(new_f) = self.workbook.formula(sheet, row, col).cloned() {
-                            let fid = self.insert_slot(key, &new_f, false);
+                        if self.cell_to_fid.contains_key(&key) {
+                            self.remove_slot_by_key(key);
+                        }
+                        if let Some(new_f) = self.workbook.formula(sheet, row, col) {
+                            let fid = if let Some(reused) = self.free_slots.pop() {
+                                reused
+                            } else {
+                                let fresh = u32::try_from(self.slots.len()).unwrap_or(0);
+                                self.slots.push(None);
+                                self.states.push(STATE_CLEAN);
+                                fresh
+                            };
+                            let (reg, is_volatile) =
+                                self.dep_graph.register_with_flags(fid, key.0, new_f);
+                            if is_volatile {
+                                self.volatile_set.insert(fid);
+                            }
+                            if let Some(slot_ref) = self.slots.get_mut(fid as usize) {
+                                *slot_ref = Some(FormulaSlot { key, reg });
+                            }
+                            self.cell_to_fid.insert(key, fid);
                             root_dirty.push(fid);
                         }
                     }
@@ -1294,7 +1319,8 @@ impl FormulaEngine {
         if roots.is_empty() {
             return;
         }
-        let mut bfs: Vec<u32> = Vec::new();
+        self.dirty_queue.reserve(roots.len());
+        let mut bfs: Vec<u32> = Vec::with_capacity(roots.len());
         for fid in roots {
             if self.state_of(fid) == STATE_CLEAN && self.slot_of(fid).is_some() {
                 self.set_state(fid, STATE_DIRTY);

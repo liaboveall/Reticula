@@ -2056,6 +2056,12 @@ impl<F: FormulaPayload> Workbook<F> {
         if self.estimated_bytes().saturating_add(added_bytes) > MAX_WORKBOOK_BYTES {
             return Err(OpError::MemoryLimitExceeded);
         }
+        if total_cells >= 4_096 {
+            let reserve = added_bytes
+                .saturating_add(total_cells.saturating_mul(256))
+                .min(768 * 1024 * 1024);
+            let _ = crate::memory::try_reserve_heap(reserve);
+        }
 
         let row_ids: Vec<RowId> = rows.iter().flat_map(|r| r.iter().map(RowId)).collect();
         let mut prior = Vec::with_capacity(total_cells);
@@ -2104,6 +2110,12 @@ impl<F: FormulaPayload> Workbook<F> {
         );
         if self.estimated_bytes().saturating_add(added_bytes) > MAX_WORKBOOK_BYTES {
             return Err(OpError::MemoryLimitExceeded);
+        }
+        if total_cells >= 4_096 {
+            let reserve = added_bytes
+                .saturating_add(total_cells.saturating_mul(256))
+                .min(768 * 1024 * 1024);
+            let _ = crate::memory::try_reserve_heap(reserve);
         }
 
         // Capture only previously non-empty/formatted cells in `rows × cols` so
