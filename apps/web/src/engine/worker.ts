@@ -851,7 +851,12 @@ async function handleTakeOverDoc(docId: string): Promise<void> {
   try {
     gotLock = await acquireExclusiveLock(lockName, { patienceMs: TAKEOVER_LOCK_PATIENCE_MS });
   } catch (err) {
-    if (!(err instanceof Error && err.name === "AbortError")) {
+    const isAbort =
+      err !== null &&
+      typeof err === "object" &&
+      "name" in err &&
+      (err as { name: unknown }).name === "AbortError";
+    if (!isAbort) {
       throw err;
     }
   }

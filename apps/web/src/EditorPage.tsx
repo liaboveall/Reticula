@@ -1428,7 +1428,28 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
       : undefined;
     const timer = window.setInterval(() => setStats(grid.stats()), STATUS_INTERVAL_MS);
 
+    // Release the dedicated worker (and thus its Web Lock and OPFS
+    // SyncAccessHandle) on navigation or BFCache freeze, and transparently
+    // reopen if restored from BFCache.
+    const onPageHide = () => {
+      window.clearTimeout(yieldWatchdog);
+      clientRef.current?.stop();
+      workerTerminatedRef.current = true;
+    };
+    const onPageShow = (event: PageTransitionEvent) => {
+      if (event.persisted && workerTerminatedRef.current) {
+        mountWorkerClient(activeDocIdRef.current, {
+          kind: "openDoc",
+          docId: activeDocIdRef.current,
+        });
+      }
+    };
+    window.addEventListener("pagehide", onPageHide);
+    window.addEventListener("pageshow", onPageShow);
+
     return () => {
+      window.removeEventListener("pagehide", onPageHide);
+      window.removeEventListener("pageshow", onPageShow);
       window.clearInterval(timer);
       window.clearTimeout(yieldWatchdog);
       window.clearTimeout(swStartTimer);

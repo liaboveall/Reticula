@@ -46,15 +46,28 @@ export const FILE_IN_USE_ERRORS: ReadonlySet<string> = new Set([
   "InvalidStateError",
 ]);
 
+function errorName(err: unknown): string {
+  return err !== null &&
+    typeof err === "object" &&
+    "name" in err &&
+    typeof (err as { name: unknown }).name === "string"
+    ? (err as { name: string }).name
+    : "";
+}
+
+function errorMessage(err: unknown): string {
+  return err !== null &&
+    typeof err === "object" &&
+    "message" in err &&
+    typeof (err as { message: unknown }).message === "string"
+    ? (err as { message: string }).message
+    : "";
+}
+
 export function isQuotaExceededError(err: unknown): boolean {
-  if (!(err instanceof Error)) {
-    return false;
-  }
-  return (
-    err.name === "QuotaExceededError" ||
-    err.message.toLowerCase().includes("quota") ||
-    err.message.toLowerCase().includes("disk full")
-  );
+  const name = errorName(err);
+  const msg = errorMessage(err).toLowerCase();
+  return name === "QuotaExceededError" || msg.includes("quota") || msg.includes("disk full");
 }
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
@@ -178,7 +191,7 @@ async function readOpfsFileBytes(
     const file = await fh.getFile();
     return new Uint8Array(await file.arrayBuffer());
   } catch (err) {
-    if (err instanceof Error && err.name === "NotFoundError") {
+    if (errorName(err) === "NotFoundError") {
       return null;
     }
     throw err;
@@ -283,7 +296,7 @@ export async function removeDocStorage(
       const local = await root.getDirectoryHandle(LOCAL_DIR, { create: true });
       await local.removeEntry(docId, { recursive: true });
     } catch (err) {
-      if (!(err instanceof Error && err.name === "NotFoundError")) {
+      if (errorName(err) !== "NotFoundError") {
         throw err;
       }
     }
@@ -305,7 +318,7 @@ export async function readDocState(
       const dir = await getDocDir(docId, false);
       bytes = await readOpfsFileBytes(dir, "state.json");
     } catch (err) {
-      if (err instanceof Error && err.name === "NotFoundError") {
+      if (errorName(err) === "NotFoundError") {
         return null;
       }
       throw err;
@@ -433,7 +446,7 @@ export async function openWalHandle(
         sync = await fh.createSyncAccessHandle();
         break;
       } catch (err) {
-        const errName = err instanceof Error ? err.name : "";
+        const errName = errorName(err);
         if (!FILE_IN_USE_ERRORS.has(errName) || performance.now() - started >= patienceMs) {
           throw err;
         }

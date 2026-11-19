@@ -80,7 +80,10 @@ function startStaticServer() {
       const { port } = server.address();
       ready({
         origin: `http://localhost:${port}`,
-        stop: () => new Promise((done) => server.close(() => done())),
+        stop: () => {
+          server.closeAllConnections();
+          return new Promise((done) => server.close(() => done()));
+        },
       });
     });
   });
@@ -179,47 +182,80 @@ try {
 
   async function openTab(url) {
     const win = await wdRequest(driver.baseUrl, "POST", `${sess}/window/new`, { type: "tab" });
-    activeWindow = win.handle;
     await switchTo(win.handle);
     await wdRequest(driver.baseUrl, "POST", `${sess}/url`, { url });
     return win.handle;
   }
 
+  async function describeTab(handle) {
+    try {
+      return await execSync(
+        handle,
+        `
+        const h = window.__reticula;
+        return {
+          href: location.href,
+          docStatus: h ? h.docStatus() : null,
+          stats: h ? { pagesHeld: h.stats().pagesHeld, missingCells: h.stats().missingCells } : null,
+          error: document.querySelector('[data-testid="engine-error"]')?.textContent ?? null,
+          overlay: document.querySelector('[data-testid="lock-overlay-message"]')?.textContent ?? null,
+        };
+        `,
+      );
+    } catch (err) {
+      return { inspectError: err instanceof Error ? err.message : String(err) };
+    }
+  }
+
   async function waitReady(handle, timeoutMs = 20_000) {
-    return waitUntil(
-      "engine ready & settled",
-      () =>
-        execSync(
-          handle,
-          `
-          const h = window.__reticula;
-          if (!h) return null;
-          const st = h.docStatus();
-          const gs = h.stats();
-          if (st.engineStatus === "ready" && gs.pagesHeld > 0 && gs.missingCells === 0) {
-            return st;
-          }
-          return null;
-          `,
-        ),
-      timeoutMs,
-    );
+    try {
+      return await waitUntil(
+        "engine ready & settled",
+        () =>
+          execSync(
+            handle,
+            `
+            const h = window.__reticula;
+            if (!h) return null;
+            const st = h.docStatus();
+            const gs = h.stats();
+            if (st.engineStatus === "ready" && gs.pagesHeld > 0 && gs.missingCells === 0) {
+              return st;
+            }
+            return null;
+            `,
+          ),
+        timeoutMs,
+      );
+    } catch (err) {
+      const diag = await describeTab(handle);
+      throw new Error(
+        `${err instanceof Error ? err.message : String(err)} — tab state: ${JSON.stringify(diag)}`,
+      );
+    }
   }
 
   async function waitStatus(handle, expected, timeoutMs = 15_000) {
-    return waitUntil(
-      `engineStatus === "${expected}"`,
-      () =>
-        execSync(
-          handle,
-          `
-          const st = window.__reticula?.docStatus();
-          return st && st.engineStatus === arguments[0] ? st : null;
-          `,
-          [expected],
-        ),
-      timeoutMs,
-    );
+    try {
+      return await waitUntil(
+        `engineStatus === "${expected}"`,
+        () =>
+          execSync(
+            handle,
+            `
+            const st = window.__reticula?.docStatus();
+            return st && st.engineStatus === arguments[0] ? st : null;
+            `,
+            [expected],
+          ),
+        timeoutMs,
+      );
+    } catch (err) {
+      const diag = await describeTab(handle);
+      throw new Error(
+        `${err instanceof Error ? err.message : String(err)} — tab state: ${JSON.stringify(diag)}`,
+      );
+    }
   }
 
   async function editCell(handle, row, col, address, raw, expectedText) {
@@ -284,6 +320,7 @@ try {
     st1.storageBackend === "opfs-sync",
     `expected opfs-sync backend on Safari, got ${st1.storageBackend}`,
   );
+  console.log(`[safari-smoke] step 1 ok: backend=${st1.storageBackend}`);
 
   // 2. Edit values & formula, compact CoW RTCLSNAP v1 snapshot, edit WAL on top, reload & verify.
   await editCell(tab1, 0, 0, "A1", "15", "15");
@@ -322,9 +359,13 @@ try {
     JSON.stringify(persisted) === JSON.stringify(["15", "27", "42", "84"]),
     `unexpected persisted cells after reload: ${JSON.stringify(persisted)}`,
   );
+  console.log(
+    `[safari-smoke] step 2 ok: slot=${afterReload.activeSlot} bytes=${snapResult.res.byteLen}`,
+  );
 
   // 3. Open Tab 2 on the same docId -> blocked by Web Lock -> graceful takeover!
   const tab2 = await openTab(docUrl);
+  assert(tab2 !== tab1, "expected distinct WebDriver tab handles for tab1 and tab2");
   await waitStatus(tab2, "blocked");
   const overlayText = await execSync(
     tab2,
@@ -340,6 +381,7 @@ try {
   await waitStatus(tab1, "yielded");
   const tab2A4 = await execSync(tab2, `return window.__reticula.textAt(3, 0);`);
   assert(tab2A4 === "84", `expected Tab 2 A4 === "84" after takeover, got ${tab2A4}`);
+  console.log("[safari-smoke] step 3 ok: dual-tab lock & graceful takeover verified");
 
   // 4. Hung-worker takeover (500 ms watchdog + Safari InvalidStateError / steal path).
   await editCell(tab2, 0, 1, "B1", "BeforeHang", "BeforeHang");
@@ -360,6 +402,7 @@ try {
     JSON.stringify(recoveredCells) === JSON.stringify(["84", "BeforeHang"]),
     `unexpected cells after hung takeover: ${JSON.stringify(recoveredCells)}`,
   );
+  console.log("[safari-smoke] step 4 ok: hung-worker takeover verified");
 
   // 5. Determinism self-check on Safari WebKit WASM.
   const digestRes = await execAsync(
