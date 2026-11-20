@@ -32,6 +32,7 @@ import {
   FILL_HANDLE_SIZE,
   type FormulaReferenceOverlay,
   type GridCellStyle,
+  type RemotePresenceOverlay,
   Renderer,
   type ReorderGuide,
 } from "./renderer.ts";
@@ -209,6 +210,7 @@ export class Grid {
   #layout: SheetLayout;
   #styles: readonly GridCellStyle[] = [];
   #formulaRefs: readonly FormulaReferenceOverlay[] = [];
+  #remotePresences: readonly RemotePresenceOverlay[] = [];
   #clipboardRange: { readonly span: Span; readonly cut: boolean } | null = null;
   #fillPreview: Span | null = null;
   #reorderGuide: ReorderGuide | null = null;
@@ -303,6 +305,7 @@ export class Grid {
     this.#anchor = null;
     this.#focus = null;
     this.#extraRanges = [];
+    this.#remotePresences = [];
     this.#scope = "cells";
     this.#clipboardRange = null;
     this.#fillPreview = null;
@@ -361,6 +364,12 @@ export class Grid {
   /** Sets colored formula reference highlights (`0..7`) drawn on the active sheet. */
   setFormulaReferences(refs: readonly FormulaReferenceOverlay[]): void {
     this.#formulaRefs = refs;
+    this.#invalidate();
+  }
+
+  /** Replaces the visible remote collaborators on the active sheet. */
+  setRemotePresences(presences: readonly RemotePresenceOverlay[]): void {
+    this.#remotePresences = presences;
     this.#invalidate();
   }
 
@@ -892,6 +901,7 @@ export class Grid {
       layout: this.#layout,
       styles: this.#styles,
       formulaReferences: this.#formulaRefs,
+      remotePresences: this.#remotePresences,
       fillPreview: this.#fillPreview,
       clipboardRange: this.#clipboardRange,
       reorderGuide: this.#reorderGuide,

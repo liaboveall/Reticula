@@ -41,6 +41,7 @@ export {
 export type {
   FormulaReferenceOverlay,
   GridCellStyle,
+  RemotePresenceOverlay,
 } from "./renderer.ts";
 export {
   DARK_PALETTE_FILL,

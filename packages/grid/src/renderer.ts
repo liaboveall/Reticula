@@ -28,6 +28,16 @@ export interface FormulaReferenceOverlay {
   readonly lastCol: number;
 }
 
+/** A collaborator's cursor and selection in displayed positions on the active sheet. */
+export interface RemotePresenceOverlay {
+  readonly replica: number;
+  readonly displayName: string;
+  readonly colorSlot: number;
+  readonly cursorRow: number;
+  readonly cursorCol: number;
+  readonly selection?: Span | null;
+}
+
 /** Active row or column drag-reorder drop indicator. */
 export type ReorderGuide =
   | { readonly axis: "row"; readonly beforeRow: number }
@@ -59,6 +69,8 @@ export interface Frame {
   readonly styles?: readonly GridCellStyle[];
   /** Colored formula reference rectangles on the active sheet. */
   readonly formulaReferences?: readonly FormulaReferenceOverlay[];
+  /** Remote collaborators on the active sheet. */
+  readonly remotePresences?: readonly RemotePresenceOverlay[];
   /** Dashed preview span while dragging the fill handle. */
   readonly fillPreview?: Span | null;
   /** Copied/cut source span (drawn with dashed border when active). */
@@ -287,6 +299,9 @@ export class Renderer {
       this.#formulaRefs(frame, layout, q, originX, originY);
       this.#clipboardOutline(frame, layout, q, originX, originY);
       this.#selectionOutlines(frame, layout, q, originX, originY);
+      if (frame.remotePresences?.length) {
+        this.#remotePresence(frame.remotePresences, theme, layout, q, originX, originY);
+      }
       this.#fillPreviewOutline(frame, layout, q, originX, originY);
 
       if (needOuterClip) {
@@ -298,6 +313,97 @@ export class Renderer {
     this.#freezeDividers(frame, fz, right, bottom);
     this.#reorderGuide(frame, layout, sheet, fz, right, bottom);
     return counts;
+  }
+
+  #remotePresence(
+    overlays: readonly RemotePresenceOverlay[],
+    theme: Theme,
+    layout: SheetLayout,
+    quadrant: Quadrant,
+    originX: number,
+    originY: number,
+  ): void {
+    const { clip, span } = quadrant;
+    const { rowAxis, colAxis } = layout;
+    const context = this.#context;
+    context.save();
+    context.beginPath();
+    context.rect(clip.left, clip.top, clip.width, clip.height);
+    context.clip();
+
+    for (const overlay of overlays) {
+      const slot = overlay.colorSlot & 7;
+      const color = theme.refStrokes[slot] ?? theme.selection;
+      const range = overlay.selection;
+      if (
+        range &&
+        !isEmpty(range) &&
+        range.endRow > span.firstRow &&
+        range.firstRow < span.endRow &&
+        range.endCol > span.firstCol &&
+        range.firstCol < span.endCol
+      ) {
+        const x = originX + colAxis.offsetOf(range.firstCol);
+        const y = originY + rowAxis.offsetOf(range.firstRow);
+        const width = originX + colAxis.offsetOf(range.endCol) - x;
+        const height = originY + rowAxis.offsetOf(range.endRow) - y;
+        context.fillStyle = theme.refFills[slot] ?? theme.selectionFill;
+        context.fillRect(x, y, width, height);
+        context.strokeStyle = color;
+        context.lineWidth = 1;
+        context.strokeRect(x + 0.5, y + 0.5, Math.max(0, width - 1), Math.max(0, height - 1));
+      }
+      const { cursorRow: row, cursorCol: col } = overlay;
+      if (row < span.firstRow || row >= span.endRow || col < span.firstCol || col >= span.endCol) {
+        continue;
+      }
+      const x = originX + colAxis.offsetOf(col);
+      const y = originY + rowAxis.offsetOf(row);
+      const width = colAxis.sizeOf(col);
+      const height = rowAxis.sizeOf(row);
+      context.strokeStyle = color;
+      context.lineWidth = 2;
+      context.strokeRect(x + 1, y + 1, Math.max(0, width - 2), Math.max(0, height - 2));
+      this.#drawPresenceName(theme, clip, x, y, height, overlay.displayName);
+    }
+    context.restore();
+  }
+
+  #drawPresenceName(
+    theme: Theme,
+    clip: Box,
+    cursorX: number,
+    cursorY: number,
+    cursorHeight: number,
+    displayName: string,
+  ): void {
+    const height = 18;
+    const pad = 6;
+    const name = displayName.trim();
+    if (!name || clip.width < 2 * pad + 8 || clip.height < height + 2) {
+      return;
+    }
+    const context = this.#context;
+    context.font = `600 11px ${theme.fontFamily}`;
+    context.textAlign = "left";
+    context.textBaseline = "middle";
+    const width = Math.min(
+      140,
+      clip.width - 2,
+      Math.ceil(context.measureText(name).width) + 2 * pad,
+    );
+    const left = Math.max(clip.left + 1, Math.min(cursorX, clip.left + clip.width - width - 1));
+    const above = cursorY - height;
+    const preferredY = above > clip.top ? above : cursorY + cursorHeight;
+    const top = Math.max(clip.top + 1, Math.min(preferredY, clip.top + clip.height - height - 1));
+    context.beginPath();
+    context.roundRect(left, top, width, height, 5);
+    context.fillStyle = theme.background;
+    context.fill();
+    context.lineWidth = 1;
+    context.stroke();
+    context.fillStyle = theme.text;
+    context.fillText(name, left + pad, top + height / 2, width - 2 * pad);
   }
 
   #placeholders(
