@@ -1,0 +1,21 @@
+[package]
+name = "reticula-sync"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+postcard = { workspace = true }
+reticula-core = { workspace = true }
+reticula-formula = { workspace = true }
+reticula-wire = { workspace = true }
+serde = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = { workspace = true }

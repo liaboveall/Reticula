@@ -5,6 +5,7 @@ members = [
     "crates/formula",
     "crates/kernel-bench",
     "crates/server",
+    "crates/sync",
     "crates/wasm",
     "crates/wire",
     "crates/xtask",

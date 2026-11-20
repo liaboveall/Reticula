@@ -8,7 +8,7 @@
 //! or columns.
 
 use alloc::boxed::Box;
-use alloc::collections::BTreeSet;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -463,6 +463,218 @@ impl BoundFormula {
         let mut out = String::from("=");
         unparse_expr_single_sheet(&self.root, sheet, &mut out, None);
         out
+    }
+
+    /// Rewrites any bound sheet/row/column identity present in `sheets`/`rows`/`cols`
+    /// (used when remapping offline-created formulas after a sync epoch or tail-loss bump).
+    pub fn remap_ids(
+        &mut self,
+        sheets: &BTreeMap<SheetId, SheetId>,
+        rows: &BTreeMap<RowId, RowId>,
+        cols: &BTreeMap<ColId, ColId>,
+    ) {
+        if sheets.is_empty() && rows.is_empty() && cols.is_empty() {
+            return;
+        }
+        remap_bound_expr(&mut self.root, sheets, rows, cols);
+    }
+}
+
+impl TemplateFormula {
+    /// Rewrites any bound sheet or fixed row/column identity present in
+    /// `sheets`/`rows`/`cols` (`IdDelta` offsets stay unchanged).
+    pub fn remap_ids(
+        &mut self,
+        sheets: &BTreeMap<SheetId, SheetId>,
+        rows: &BTreeMap<RowId, RowId>,
+        cols: &BTreeMap<ColId, ColId>,
+    ) {
+        if sheets.is_empty() && rows.is_empty() && cols.is_empty() {
+            return;
+        }
+        remap_template_expr(&mut self.root, sheets, rows, cols);
+    }
+}
+
+fn remap_opt_sheet(sheet: &mut Option<SheetId>, sheets: &BTreeMap<SheetId, SheetId>) {
+    if let Some(s) = sheet
+        && let Some(&mapped) = sheets.get(s)
+    {
+        *s = mapped;
+    }
+}
+
+fn remap_row(row: &mut RowId, rows: &BTreeMap<RowId, RowId>) {
+    if let Some(&mapped) = rows.get(row) {
+        *row = mapped;
+    }
+}
+
+fn remap_col(col: &mut ColId, cols: &BTreeMap<ColId, ColId>) {
+    if let Some(&mapped) = cols.get(col) {
+        *col = mapped;
+    }
+}
+
+fn remap_bound_expr(
+    expr: &mut BoundExpr,
+    sheets: &BTreeMap<SheetId, SheetId>,
+    rows: &BTreeMap<RowId, RowId>,
+    cols: &BTreeMap<ColId, ColId>,
+) {
+    match expr {
+        BoundExpr::Literal(_) | BoundExpr::ArrayLiteral { .. } | BoundExpr::Name(_) => {}
+        BoundExpr::Reference(r) => match r {
+            BoundRef::Cell {
+                sheet, row, col, ..
+            } => {
+                remap_opt_sheet(sheet, sheets);
+                remap_row(row, rows);
+                remap_col(col, cols);
+            }
+            BoundRef::Area {
+                sheet,
+                first_row,
+                first_col,
+                last_row,
+                last_col,
+                ..
+            } => {
+                remap_opt_sheet(sheet, sheets);
+                remap_row(first_row, rows);
+                remap_col(first_col, cols);
+                remap_row(last_row, rows);
+                remap_col(last_col, cols);
+            }
+            BoundRef::ColRange {
+                sheet,
+                first_col,
+                last_col,
+                ..
+            } => {
+                remap_opt_sheet(sheet, sheets);
+                remap_col(first_col, cols);
+                remap_col(last_col, cols);
+            }
+            BoundRef::RowRange {
+                sheet,
+                first_row,
+                last_row,
+                ..
+            } => {
+                remap_opt_sheet(sheet, sheets);
+                remap_row(first_row, rows);
+                remap_row(last_row, rows);
+            }
+            BoundRef::Invalid { .. } => {}
+        },
+        BoundExpr::Paren(inner) | BoundExpr::Unary { expr: inner, .. } => {
+            remap_bound_expr(inner, sheets, rows, cols);
+        }
+        BoundExpr::Binary { left, right, .. } => {
+            remap_bound_expr(left, sheets, rows, cols);
+            remap_bound_expr(right, sheets, rows, cols);
+        }
+        BoundExpr::Call { args, .. } => {
+            for arg in args {
+                remap_bound_expr(arg, sheets, rows, cols);
+            }
+        }
+    }
+}
+
+fn remap_template_expr(
+    expr: &mut TemplateExpr,
+    sheets: &BTreeMap<SheetId, SheetId>,
+    rows: &BTreeMap<RowId, RowId>,
+    cols: &BTreeMap<ColId, ColId>,
+) {
+    match expr {
+        TemplateExpr::Literal(_) | TemplateExpr::ArrayLiteral { .. } | TemplateExpr::Name(_) => {}
+        TemplateExpr::Reference(r) => match r {
+            TemplateRef::Cell {
+                sheet, row, col, ..
+            } => {
+                remap_opt_sheet(sheet, sheets);
+                if let AxisTarget::Fixed(id) = row
+                    && let Some(&mapped) = rows.get(&RowId(*id))
+                {
+                    *id = mapped.0;
+                }
+                if let AxisTarget::Fixed(id) = col
+                    && let Some(&mapped) = cols.get(&ColId(*id))
+                {
+                    *id = mapped.0;
+                }
+            }
+            TemplateRef::Area {
+                sheet,
+                first_row,
+                first_col,
+                last_row,
+                last_col,
+                ..
+            } => {
+                remap_opt_sheet(sheet, sheets);
+                for fr in [first_row, last_row] {
+                    if let AxisTarget::Fixed(id) = fr
+                        && let Some(&mapped) = rows.get(&RowId(*id))
+                    {
+                        *id = mapped.0;
+                    }
+                }
+                for fc in [first_col, last_col] {
+                    if let AxisTarget::Fixed(id) = fc
+                        && let Some(&mapped) = cols.get(&ColId(*id))
+                    {
+                        *id = mapped.0;
+                    }
+                }
+            }
+            TemplateRef::ColRange {
+                sheet,
+                first_col,
+                last_col,
+                ..
+            } => {
+                remap_opt_sheet(sheet, sheets);
+                for fc in [first_col, last_col] {
+                    if let AxisTarget::Fixed(id) = fc
+                        && let Some(&mapped) = cols.get(&ColId(*id))
+                    {
+                        *id = mapped.0;
+                    }
+                }
+            }
+            TemplateRef::RowRange {
+                sheet,
+                first_row,
+                last_row,
+                ..
+            } => {
+                remap_opt_sheet(sheet, sheets);
+                for fr in [first_row, last_row] {
+                    if let AxisTarget::Fixed(id) = fr
+                        && let Some(&mapped) = rows.get(&RowId(*id))
+                    {
+                        *id = mapped.0;
+                    }
+                }
+            }
+            TemplateRef::Invalid { .. } => {}
+        },
+        TemplateExpr::Paren(inner) | TemplateExpr::Unary { expr: inner, .. } => {
+            remap_template_expr(inner, sheets, rows, cols);
+        }
+        TemplateExpr::Binary { left, right, .. } => {
+            remap_template_expr(left, sheets, rows, cols);
+            remap_template_expr(right, sheets, rows, cols);
+        }
+        TemplateExpr::Call { args, .. } => {
+            for arg in args {
+                remap_template_expr(arg, sheets, rows, cols);
+            }
+        }
     }
 }
 
@@ -3484,5 +3696,39 @@ mod tests {
             eng.inspect_cell(s0, RowId(2), ColId(1)).unwrap().raw,
             "=#REF!"
         );
+    }
+
+    #[test]
+    fn remap_ids_rewrites_bound_and_template_references() {
+        use alloc::collections::BTreeMap;
+        use reticula_core::id::pack_id;
+
+        use super::{BoundExpr, BoundRef};
+
+        let mut wb = Workbook::new();
+        let s0 = SheetId(0);
+        let old_r = wb.allocator_mut().alloc_run(1).unwrap();
+        let new_r = RowId(pack_id(1, 5, 1).unwrap());
+        let new_s = SheetId(99);
+        wb.apply(Op::InsertRows {
+            sheet: s0,
+            after: None,
+            ids: old_r,
+        })
+        .unwrap();
+        let mut bound =
+            BoundFormula::parse_and_bind("=SUM(A1:A2)", FormulaMode::Dynamic, &wb, s0).unwrap();
+        let mut rows = BTreeMap::new();
+        rows.insert(RowId(old_r.first_id), new_r);
+        let mut sheets = BTreeMap::new();
+        sheets.insert(s0, new_s);
+        bound.remap_ids(&sheets, &rows, &BTreeMap::new());
+        if let BoundExpr::Call { args, .. } = &bound.root
+            && let BoundExpr::Reference(BoundRef::Area { first_row, .. }) = &args[0]
+        {
+            assert_eq!(*first_row, new_r);
+        } else {
+            panic!("expected BoundRef::Area");
+        }
     }
 }

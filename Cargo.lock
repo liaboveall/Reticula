@@ -1625,6 +1625,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "reticula-sync"
+version = "0.0.0"
+dependencies = [
+ "postcard",
+ "reticula-core",
+ "reticula-formula",
+ "reticula-wire",
+ "serde",
+ "wasm-bindgen-test",
+]
+
+[[package]]
 name = "reticula-wasm"
 version = "0.0.0"
 dependencies = [
