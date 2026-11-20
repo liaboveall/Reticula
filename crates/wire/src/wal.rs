@@ -20,12 +20,25 @@ use serde::de::DeserializeOwned;
 use crate::convert_v1::WireConvertError;
 use crate::crc32::{crc32, crc32_pair};
 use crate::v1::{WireWalMetaV1, WireWalRecordV1};
+use crate::v2::{WirePendingTxnV2, WireWalRecordV2};
 
-/// 8-byte file magic at the start of every write-ahead log.
+/// 8-byte file magic at the start of every `wal.log` v1 write-ahead log.
 pub const WAL_MAGIC: &[u8; 8] = b"RTCLWAL1";
+
+/// 8-byte file magic at the start of every `wal.log` v2 write-ahead log.
+pub const WAL_MAGIC_V2: &[u8; 8] = b"RTCLWAL2";
+
+/// 8-byte file magic at the start of every collaborative `pending.wal` log.
+pub const PENDING_WAL_MAGIC: &[u8; 8] = b"RTCLPWAL";
 
 /// `RTCLWAL1` container format version introduced in M1b.
 pub const WAL_VERSION_V1: u32 = 1;
+
+/// `RTCLWAL2` container format version introduced in M2a.
+pub const WAL_VERSION_V2: u32 = 2;
+
+/// `RTCLPWAL` pending-queue container format version introduced in M2a.
+pub const PENDING_WAL_VERSION_V1: u32 = 1;
 
 /// Byte length of the fixed `RTCLWAL1` file header.
 pub const WAL_HEADER_LEN: usize = 16;
@@ -122,18 +135,170 @@ pub enum WalCorruption {
     },
 }
 
+/// Result of scanning and validating `wal.log` v2 bytes up to a crash/clean boundary.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WalScanV2 {
+    /// Base snapshot sequence anchored by frame `0`.
+    pub base_snapshot_seq: u64,
+    /// Validated contiguous transaction records (`base_snapshot_seq + 1 ..= last_seq`).
+    pub records: Vec<WireWalRecordV2>,
+    /// Byte length of the valid prefix (`<= input.len()`).
+    pub valid_bytes: usize,
+    /// Classification of any trailing bytes beyond `valid_bytes`.
+    pub tail: WalTailDisposition,
+}
+
+impl WalScanV2 {
+    /// Highest contiguous sequence number present (`base_snapshot_seq` if no
+    /// transaction records were present).
+    #[must_use]
+    pub fn last_seq(&self) -> u64 {
+        self.records
+            .last()
+            .map_or(self.base_snapshot_seq, |r| r.seq)
+    }
+}
+
+/// Unrecoverable corruption in a scanned `RTCLWAL2` (or upgraded) WAL file.
+#[derive(Clone, Debug, PartialEq)]
+pub enum WalCorruptionV2 {
+    /// Magic mismatch, unsupported version, or corrupted 16-byte header CRC.
+    InvalidHeader,
+    /// Metadata frame missing, corrupted, or anchored to a different snapshot sequence.
+    BaseSeqMismatch {
+        /// Decoded `base_snapshot_seq` if readable.
+        found: Option<u64>,
+        /// Expected `base_snapshot_seq` from `state.json`.
+        expected: u64,
+    },
+    /// Record sequence jumped or repeated instead of incrementing by `+1`.
+    NonContiguousSeq {
+        /// Byte offset of the out-of-sequence frame.
+        offset: usize,
+        /// Expected `seq`.
+        expected_seq: u64,
+        /// Found `seq`.
+        found_seq: u64,
+    },
+    /// CRC mismatch or malformed payload followed by non-zero trailing bytes.
+    MidFileCorruption {
+        /// Byte offset of the corrupted frame.
+        offset: usize,
+        /// Highest valid sequence number before `offset`.
+        last_valid_seq: u64,
+        /// Already-validated records preceding `offset`.
+        salvageable_records: Vec<WireWalRecordV2>,
+    },
+}
+
+impl From<WalScan> for WalScanV2 {
+    fn from(s: WalScan) -> Self {
+        Self {
+            base_snapshot_seq: s.base_snapshot_seq,
+            records: s.records.into_iter().map(WireWalRecordV2::from).collect(),
+            valid_bytes: s.valid_bytes,
+            tail: s.tail,
+        }
+    }
+}
+
+impl From<WalCorruption> for WalCorruptionV2 {
+    fn from(c: WalCorruption) -> Self {
+        match c {
+            WalCorruption::InvalidHeader => Self::InvalidHeader,
+            WalCorruption::BaseSeqMismatch { found, expected } => {
+                Self::BaseSeqMismatch { found, expected }
+            }
+            WalCorruption::NonContiguousSeq {
+                offset,
+                expected_seq,
+                found_seq,
+            } => Self::NonContiguousSeq {
+                offset,
+                expected_seq,
+                found_seq,
+            },
+            WalCorruption::MidFileCorruption {
+                offset,
+                last_valid_seq,
+                salvageable_records,
+            } => Self::MidFileCorruption {
+                offset,
+                last_valid_seq,
+                salvageable_records: salvageable_records
+                    .into_iter()
+                    .map(WireWalRecordV2::from)
+                    .collect(),
+            },
+        }
+    }
+}
+
+/// Result of scanning collaborative offline `pending.wal` (`RTCLPWAL`) bytes.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PendingWalScan {
+    /// Validated strictly increasing pending transactions.
+    pub records: Vec<WirePendingTxnV2>,
+    /// Byte length of the valid prefix (`<= input.len()`).
+    pub valid_bytes: usize,
+    /// Tail classification beyond `valid_bytes`.
+    pub tail: WalTailDisposition,
+}
+
+/// Unrecoverable corruption in a scanned `pending.wal` (`RTCLPWAL`) file.
+#[derive(Clone, Debug, PartialEq)]
+pub enum PendingWalCorruption {
+    /// Magic mismatch, unsupported version, or corrupted 16-byte header CRC.
+    InvalidHeader,
+    /// Pending records did not strictly increase in `client_seq`.
+    NonMonotonicClientSeq {
+        /// Byte offset of the out-of-order frame.
+        offset: usize,
+        /// Previous valid `client_seq`.
+        prev_client_seq: u64,
+        /// Observed `client_seq` (`<= prev_client_seq`).
+        found_client_seq: u64,
+    },
+    /// CRC mismatch or malformed payload followed by non-zero trailing bytes.
+    MidFileCorruption {
+        /// Byte offset of the corrupted frame.
+        offset: usize,
+        /// Already-validated records preceding `offset`.
+        salvageable_records: Vec<WirePendingTxnV2>,
+    },
+}
+
 /// Encodes the 16-byte `RTCLWAL1` header followed by the initial
 /// [`WireWalMetaV1`] anchor frame.
 pub fn encode_wal_init(base_snapshot_seq: u64) -> Result<Vec<u8>, WalError> {
+    encode_sequenced_wal_init(WAL_MAGIC, WAL_VERSION_V1, base_snapshot_seq)
+}
+
+/// Encodes the 16-byte `RTCLWAL2` header followed by the initial
+/// [`WireWalMetaV1`] anchor frame.
+pub fn encode_wal_init_v2(base_snapshot_seq: u64) -> Result<Vec<u8>, WalError> {
+    encode_sequenced_wal_init(WAL_MAGIC_V2, WAL_VERSION_V2, base_snapshot_seq)
+}
+
+fn encode_sequenced_wal_init(
+    magic: &[u8; 8],
+    version: u32,
+    base_snapshot_seq: u64,
+) -> Result<Vec<u8>, WalError> {
     let meta = WireWalMetaV1 { base_snapshot_seq };
     let meta_frame = encode_frame(&meta)?;
     let mut out = Vec::with_capacity(WAL_HEADER_LEN.saturating_add(meta_frame.len()));
-    out.extend_from_slice(WAL_MAGIC);
-    out.extend_from_slice(&WAL_VERSION_V1.to_le_bytes());
-    let head_crc = crc32(&out);
-    out.extend_from_slice(&head_crc.to_le_bytes());
+    append_log_header(&mut out, magic, version);
     out.extend_from_slice(&meta_frame);
     Ok(out)
+}
+
+fn append_log_header(out: &mut Vec<u8>, magic: &[u8; 8], version: u32) {
+    let start = out.len();
+    out.extend_from_slice(magic);
+    out.extend_from_slice(&version.to_le_bytes());
+    let head_crc = crc32(out.get(start..).unwrap_or(&[]));
+    out.extend_from_slice(&head_crc.to_le_bytes());
 }
 
 /// Encodes a single [`WireWalRecordV1`] transaction into an 8-byte-prefixed
@@ -142,7 +307,12 @@ pub fn encode_wal_record(record: &WireWalRecordV1) -> Result<Vec<u8>, WalError> 
     encode_frame(record)
 }
 
-/// Convenience helper encoding a complete standalone WAL file (`header + meta + records`).
+/// Encodes a single [`WireWalRecordV2`] transaction frame ready to append.
+pub fn encode_wal_record_v2(record: &WireWalRecordV2) -> Result<Vec<u8>, WalError> {
+    encode_frame(record)
+}
+
+/// Convenience helper encoding a complete standalone WAL v1 file (`header + meta + records`).
 pub fn encode_wal_complete(
     base_snapshot_seq: u64,
     records: &[WireWalRecordV1],
@@ -155,24 +325,219 @@ pub fn encode_wal_complete(
     Ok(out)
 }
 
-/// Scans `bytes` from byte `0`, strictly distinguishing recoverable crash
-/// tails (`TornFinalRecord` / `ZeroPaddedTail`) from mid-file corruption
-/// (`WalCorruption::MidFileCorruption`) per `14-m1b.md` 2.4.
+/// Convenience helper encoding a complete standalone WAL v2 file (`header + meta + records`).
+pub fn encode_wal_complete_v2(
+    base_snapshot_seq: u64,
+    records: &[WireWalRecordV2],
+) -> Result<Vec<u8>, WalError> {
+    let mut out = encode_wal_init_v2(base_snapshot_seq)?;
+    for rec in records {
+        let frame = encode_wal_record_v2(rec)?;
+        out.extend_from_slice(&frame);
+    }
+    Ok(out)
+}
+
+/// Encodes the initial 16-byte `pending.wal` (`RTCLPWAL`) header.
+#[must_use]
+pub fn encode_pending_wal_init() -> Vec<u8> {
+    let mut out = Vec::with_capacity(WAL_HEADER_LEN);
+    append_log_header(&mut out, PENDING_WAL_MAGIC, PENDING_WAL_VERSION_V1);
+    out
+}
+
+/// Encodes one [`WirePendingTxnV2`] frame for appending to `pending.wal`.
+pub fn encode_pending_wal_record(record: &WirePendingTxnV2) -> Result<Vec<u8>, WalError> {
+    encode_frame(record)
+}
+
+/// Encodes a complete standalone `pending.wal` (`header + records`).
+pub fn encode_pending_wal_complete(records: &[WirePendingTxnV2]) -> Result<Vec<u8>, WalError> {
+    let mut out = encode_pending_wal_init();
+    for rec in records {
+        let frame = encode_pending_wal_record(rec)?;
+        out.extend_from_slice(&frame);
+    }
+    Ok(out)
+}
+
+/// Scans `RTCLWAL1` bytes from byte `0`, strictly distinguishing recoverable
+/// crash tails from mid-file corruption per `14-m1b.md` 2.4.
 pub fn scan_wal(
     bytes: &[u8],
     expected_base_seq: u64,
     last_flushed_seq: u64,
 ) -> Result<WalScan, WalCorruption> {
+    let raw = scan_sequenced_wal_generic(
+        bytes,
+        WAL_MAGIC,
+        WAL_VERSION_V1,
+        expected_base_seq,
+        last_flushed_seq,
+        |r: &WireWalRecordV1| r.seq,
+    )?;
+    Ok(WalScan {
+        base_snapshot_seq: raw.base_snapshot_seq,
+        records: raw.records,
+        valid_bytes: raw.valid_bytes,
+        tail: raw.tail,
+    })
+}
+
+/// Scans `RTCLWAL2` bytes from byte `0`, distinguishing recoverable crash tails
+/// from mid-file corruption.
+pub fn scan_wal_v2(
+    bytes: &[u8],
+    expected_base_seq: u64,
+    last_flushed_seq: u64,
+) -> Result<WalScanV2, WalCorruptionV2> {
+    let raw = scan_sequenced_wal_generic(
+        bytes,
+        WAL_MAGIC_V2,
+        WAL_VERSION_V2,
+        expected_base_seq,
+        last_flushed_seq,
+        |r: &WireWalRecordV2| r.seq,
+    )
+    .map_err(map_raw_corruption_v2)?;
+    Ok(WalScanV2 {
+        base_snapshot_seq: raw.base_snapshot_seq,
+        records: raw.records,
+        valid_bytes: raw.valid_bytes,
+        tail: raw.tail,
+    })
+}
+
+/// Scans either `RTCLWAL1` (transparently upgraded to [`WireWalRecordV2`]) or
+/// `RTCLWAL2` bytes cleanly. Empty / prefix bytes default cleanly via [`scan_wal`].
+pub fn scan_wal_any(
+    bytes: &[u8],
+    expected_base_seq: u64,
+    last_flushed_seq: u64,
+) -> Result<WalScanV2, WalCorruptionV2> {
+    if bytes.get(0..8) == Some(WAL_MAGIC_V2.as_slice())
+        || (bytes.len() < WAL_HEADER_LEN
+            && bytes
+                .get(..bytes.len().min(WAL_MAGIC_V2.len()))
+                .zip(WAL_MAGIC_V2.get(..bytes.len().min(WAL_MAGIC_V2.len())))
+                .is_some_and(|(a, b)| a == b)
+            && bytes.len() == WAL_MAGIC_V2.len())
+    {
+        return scan_wal_v2(bytes, expected_base_seq, last_flushed_seq);
+    }
+    if bytes.get(0..8) == Some(WAL_MAGIC.as_slice()) {
+        return scan_wal(bytes, expected_base_seq, last_flushed_seq)
+            .map(WalScanV2::from)
+            .map_err(WalCorruptionV2::from);
+    }
+    scan_wal_v2(bytes, expected_base_seq, last_flushed_seq).or_else(|_| {
+        scan_wal(bytes, expected_base_seq, last_flushed_seq)
+            .map(WalScanV2::from)
+            .map_err(WalCorruptionV2::from)
+    })
+}
+
+fn map_raw_corruption_v2(c: WalCorruptionGeneric<WireWalRecordV2>) -> WalCorruptionV2 {
+    match c {
+        WalCorruptionGeneric::InvalidHeader => WalCorruptionV2::InvalidHeader,
+        WalCorruptionGeneric::BaseSeqMismatch { found, expected } => {
+            WalCorruptionV2::BaseSeqMismatch { found, expected }
+        }
+        WalCorruptionGeneric::NonContiguousSeq {
+            offset,
+            expected_seq,
+            found_seq,
+        } => WalCorruptionV2::NonContiguousSeq {
+            offset,
+            expected_seq,
+            found_seq,
+        },
+        WalCorruptionGeneric::MidFileCorruption {
+            offset,
+            last_valid_seq,
+            salvageable_records,
+        } => WalCorruptionV2::MidFileCorruption {
+            offset,
+            last_valid_seq,
+            salvageable_records,
+        },
+    }
+}
+
+type WalCorruptionGeneric<R> = RawWalCorruption<R>;
+
+struct RawWalScan<R> {
+    base_snapshot_seq: u64,
+    records: Vec<R>,
+    valid_bytes: usize,
+    tail: WalTailDisposition,
+}
+
+enum RawWalCorruption<R> {
+    InvalidHeader,
+    BaseSeqMismatch {
+        found: Option<u64>,
+        expected: u64,
+    },
+    NonContiguousSeq {
+        offset: usize,
+        expected_seq: u64,
+        found_seq: u64,
+    },
+    MidFileCorruption {
+        offset: usize,
+        last_valid_seq: u64,
+        salvageable_records: Vec<R>,
+    },
+}
+
+impl From<RawWalCorruption<WireWalRecordV1>> for WalCorruption {
+    fn from(c: RawWalCorruption<WireWalRecordV1>) -> Self {
+        match c {
+            RawWalCorruption::InvalidHeader => Self::InvalidHeader,
+            RawWalCorruption::BaseSeqMismatch { found, expected } => {
+                Self::BaseSeqMismatch { found, expected }
+            }
+            RawWalCorruption::NonContiguousSeq {
+                offset,
+                expected_seq,
+                found_seq,
+            } => Self::NonContiguousSeq {
+                offset,
+                expected_seq,
+                found_seq,
+            },
+            RawWalCorruption::MidFileCorruption {
+                offset,
+                last_valid_seq,
+                salvageable_records,
+            } => Self::MidFileCorruption {
+                offset,
+                last_valid_seq,
+                salvageable_records,
+            },
+        }
+    }
+}
+
+fn scan_sequenced_wal_generic<R: DeserializeOwned>(
+    bytes: &[u8],
+    magic: &[u8; 8],
+    version: u32,
+    expected_base_seq: u64,
+    last_flushed_seq: u64,
+    seq_of: fn(&R) -> u64,
+) -> Result<RawWalScan<R>, RawWalCorruption<R>> {
     if bytes.is_empty() {
         if watermark_ok(expected_base_seq, expected_base_seq, last_flushed_seq) {
-            return Ok(WalScan {
+            return Ok(RawWalScan {
                 base_snapshot_seq: expected_base_seq,
                 records: Vec::new(),
                 valid_bytes: 0,
                 tail: WalTailDisposition::Clean,
             });
         }
-        return Err(WalCorruption::MidFileCorruption {
+        return Err(RawWalCorruption::MidFileCorruption {
             offset: 0,
             last_valid_seq: expected_base_seq,
             salvageable_records: Vec::new(),
@@ -181,78 +546,62 @@ pub fn scan_wal(
 
     if all_zero(bytes) {
         if watermark_ok(expected_base_seq, expected_base_seq, last_flushed_seq) {
-            return Ok(WalScan {
+            return Ok(RawWalScan {
                 base_snapshot_seq: expected_base_seq,
                 records: Vec::new(),
                 valid_bytes: 0,
                 tail: WalTailDisposition::ZeroPaddedTail { valid_bytes: 0 },
             });
         }
-        return Err(WalCorruption::InvalidHeader);
+        return Err(RawWalCorruption::InvalidHeader);
     }
 
     if bytes.len() < WAL_HEADER_LEN {
-        let magic_check_len = bytes.len().min(WAL_MAGIC.len());
+        let magic_check_len = bytes.len().min(magic.len());
         let prefix_matches = bytes
             .get(..magic_check_len)
-            .zip(WAL_MAGIC.get(..magic_check_len))
+            .zip(magic.get(..magic_check_len))
             .is_some_and(|(a, b)| a == b);
         if prefix_matches && watermark_ok(expected_base_seq, expected_base_seq, last_flushed_seq) {
-            return Ok(WalScan {
+            return Ok(RawWalScan {
                 base_snapshot_seq: expected_base_seq,
                 records: Vec::new(),
                 valid_bytes: 0,
                 tail: WalTailDisposition::TornFinalRecord { valid_bytes: 0 },
             });
         }
-        return Err(WalCorruption::InvalidHeader);
+        return Err(RawWalCorruption::InvalidHeader);
     }
 
-    if bytes.get(0..8) != Some(WAL_MAGIC.as_slice()) {
-        return Err(WalCorruption::InvalidHeader);
-    }
-    let Some(version) = read_u32_le(bytes, 8) else {
-        return Err(WalCorruption::InvalidHeader);
-    };
-    if version != WAL_VERSION_V1 {
-        return Err(WalCorruption::InvalidHeader);
-    }
-    let Some(head_crc) = read_u32_le(bytes, 12) else {
-        return Err(WalCorruption::InvalidHeader);
-    };
-    let Some(head_prefix) = bytes.get(0..12) else {
-        return Err(WalCorruption::InvalidHeader);
-    };
-    if head_crc != crc32(head_prefix) {
-        return Err(WalCorruption::InvalidHeader);
+    if !header_valid(bytes, magic, version) {
+        return Err(RawWalCorruption::InvalidHeader);
     }
 
-    // Frame 0 at offset 16: metadata anchor `WireWalMetaV1`.
     let meta_offset = WAL_HEADER_LEN;
     if meta_offset == bytes.len() {
         if watermark_ok(expected_base_seq, expected_base_seq, last_flushed_seq) {
-            return Ok(WalScan {
+            return Ok(RawWalScan {
                 base_snapshot_seq: expected_base_seq,
                 records: Vec::new(),
                 valid_bytes: 0,
                 tail: WalTailDisposition::TornFinalRecord { valid_bytes: 0 },
             });
         }
-        return Err(WalCorruption::BaseSeqMismatch {
+        return Err(RawWalCorruption::BaseSeqMismatch {
             found: None,
             expected: expected_base_seq,
         });
     }
     if bytes.get(meta_offset..).is_some_and(all_zero) {
         if watermark_ok(expected_base_seq, expected_base_seq, last_flushed_seq) {
-            return Ok(WalScan {
+            return Ok(RawWalScan {
                 base_snapshot_seq: expected_base_seq,
                 records: Vec::new(),
                 valid_bytes: 0,
                 tail: WalTailDisposition::ZeroPaddedTail { valid_bytes: 0 },
             });
         }
-        return Err(WalCorruption::BaseSeqMismatch {
+        return Err(RawWalCorruption::BaseSeqMismatch {
             found: None,
             expected: expected_base_seq,
         });
@@ -262,20 +611,20 @@ pub fn scan_wal(
         FrameOutcome::Valid(m, next_pos) => (m, next_pos),
         FrameOutcome::TornTail => {
             if watermark_ok(expected_base_seq, expected_base_seq, last_flushed_seq) {
-                return Ok(WalScan {
+                return Ok(RawWalScan {
                     base_snapshot_seq: expected_base_seq,
                     records: Vec::new(),
                     valid_bytes: 0,
                     tail: WalTailDisposition::TornFinalRecord { valid_bytes: 0 },
                 });
             }
-            return Err(WalCorruption::BaseSeqMismatch {
+            return Err(RawWalCorruption::BaseSeqMismatch {
                 found: None,
                 expected: expected_base_seq,
             });
         }
         FrameOutcome::MidCorrupt => {
-            return Err(WalCorruption::BaseSeqMismatch {
+            return Err(RawWalCorruption::BaseSeqMismatch {
                 found: None,
                 expected: expected_base_seq,
             });
@@ -283,7 +632,7 @@ pub fn scan_wal(
     };
 
     if meta.base_snapshot_seq > expected_base_seq {
-        return Err(WalCorruption::BaseSeqMismatch {
+        return Err(RawWalCorruption::BaseSeqMismatch {
             found: Some(meta.base_snapshot_seq),
             expected: expected_base_seq,
         });
@@ -298,13 +647,13 @@ pub fn scan_wal(
         };
         if all_zero(rem) {
             if last_seq < expected_base_seq {
-                return Err(WalCorruption::BaseSeqMismatch {
+                return Err(RawWalCorruption::BaseSeqMismatch {
                     found: Some(meta.base_snapshot_seq),
                     expected: expected_base_seq,
                 });
             }
             if watermark_ok(last_seq, expected_base_seq, last_flushed_seq) {
-                return Ok(WalScan {
+                return Ok(RawWalScan {
                     base_snapshot_seq: expected_base_seq,
                     records,
                     valid_bytes: cursor,
@@ -313,44 +662,45 @@ pub fn scan_wal(
                     },
                 });
             }
-            return Err(WalCorruption::MidFileCorruption {
+            return Err(RawWalCorruption::MidFileCorruption {
                 offset: cursor,
                 last_valid_seq: last_seq,
                 salvageable_records: records,
             });
         }
 
-        match decode_frame_at::<WireWalRecordV1>(bytes, cursor) {
+        match decode_frame_at::<R>(bytes, cursor) {
             FrameOutcome::Valid(rec, next_pos) => {
+                let rec_seq = seq_of(&rec);
                 let Some(expected_seq) = last_seq.checked_add(1) else {
-                    return Err(WalCorruption::MidFileCorruption {
+                    return Err(RawWalCorruption::MidFileCorruption {
                         offset: cursor,
                         last_valid_seq: last_seq,
                         salvageable_records: records,
                     });
                 };
-                if rec.seq != expected_seq {
-                    return Err(WalCorruption::NonContiguousSeq {
+                if rec_seq != expected_seq {
+                    return Err(RawWalCorruption::NonContiguousSeq {
                         offset: cursor,
                         expected_seq,
-                        found_seq: rec.seq,
+                        found_seq: rec_seq,
                     });
                 }
-                last_seq = rec.seq;
-                if rec.seq > expected_base_seq {
+                last_seq = rec_seq;
+                if rec_seq > expected_base_seq {
                     records.push(rec);
                 }
                 cursor = next_pos;
             }
             FrameOutcome::TornTail => {
                 if last_seq < expected_base_seq {
-                    return Err(WalCorruption::BaseSeqMismatch {
+                    return Err(RawWalCorruption::BaseSeqMismatch {
                         found: Some(meta.base_snapshot_seq),
                         expected: expected_base_seq,
                     });
                 }
                 if watermark_ok(last_seq, expected_base_seq, last_flushed_seq) {
-                    return Ok(WalScan {
+                    return Ok(RawWalScan {
                         base_snapshot_seq: expected_base_seq,
                         records,
                         valid_bytes: cursor,
@@ -359,14 +709,14 @@ pub fn scan_wal(
                         },
                     });
                 }
-                return Err(WalCorruption::MidFileCorruption {
+                return Err(RawWalCorruption::MidFileCorruption {
                     offset: cursor,
                     last_valid_seq: last_seq,
                     salvageable_records: records,
                 });
             }
             FrameOutcome::MidCorrupt => {
-                return Err(WalCorruption::MidFileCorruption {
+                return Err(RawWalCorruption::MidFileCorruption {
                     offset: cursor,
                     last_valid_seq: last_seq,
                     salvageable_records: records,
@@ -376,26 +726,164 @@ pub fn scan_wal(
     }
 
     if last_seq < expected_base_seq {
-        return Err(WalCorruption::BaseSeqMismatch {
+        return Err(RawWalCorruption::BaseSeqMismatch {
             found: Some(meta.base_snapshot_seq),
             expected: expected_base_seq,
         });
     }
 
     if !watermark_ok(last_seq, expected_base_seq, last_flushed_seq) {
-        return Err(WalCorruption::MidFileCorruption {
+        return Err(RawWalCorruption::MidFileCorruption {
             offset: cursor,
             last_valid_seq: last_seq,
             salvageable_records: records,
         });
     }
 
-    Ok(WalScan {
+    Ok(RawWalScan {
         base_snapshot_seq: expected_base_seq,
         records,
         valid_bytes: cursor,
         tail: WalTailDisposition::Clean,
     })
+}
+
+/// Scans `RTCLPWAL` (`pending.wal`) bytes from offset `0`, distinguishing
+/// recoverable crash tails (`ZeroPaddedTail` / `TornFinalRecord`) from mid-file
+/// corruption or non-monotonic `client_seq`.
+pub fn scan_pending_wal(bytes: &[u8]) -> Result<PendingWalScan, PendingWalCorruption> {
+    if bytes.is_empty() {
+        return Ok(PendingWalScan {
+            records: Vec::new(),
+            valid_bytes: 0,
+            tail: WalTailDisposition::Clean,
+        });
+    }
+    if all_zero(bytes) {
+        return Ok(PendingWalScan {
+            records: Vec::new(),
+            valid_bytes: 0,
+            tail: WalTailDisposition::ZeroPaddedTail { valid_bytes: 0 },
+        });
+    }
+    if bytes.len() < WAL_HEADER_LEN {
+        let magic_check_len = bytes.len().min(PENDING_WAL_MAGIC.len());
+        let prefix_matches = bytes
+            .get(..magic_check_len)
+            .zip(PENDING_WAL_MAGIC.get(..magic_check_len))
+            .is_some_and(|(a, b)| a == b);
+        if prefix_matches {
+            return Ok(PendingWalScan {
+                records: Vec::new(),
+                valid_bytes: 0,
+                tail: WalTailDisposition::TornFinalRecord { valid_bytes: 0 },
+            });
+        }
+        return Err(PendingWalCorruption::InvalidHeader);
+    }
+    if !header_valid(bytes, PENDING_WAL_MAGIC, PENDING_WAL_VERSION_V1) {
+        return Err(PendingWalCorruption::InvalidHeader);
+    }
+
+    let mut records = Vec::new();
+    let mut prev_seq: Option<u64> = None;
+    let mut cursor = WAL_HEADER_LEN;
+
+    while cursor < bytes.len() {
+        let Some(rem) = bytes.get(cursor..) else {
+            break;
+        };
+        if all_zero(rem) {
+            return Ok(PendingWalScan {
+                records,
+                valid_bytes: cursor,
+                tail: WalTailDisposition::ZeroPaddedTail {
+                    valid_bytes: cursor,
+                },
+            });
+        }
+        match decode_frame_at::<WirePendingTxnV2>(bytes, cursor) {
+            FrameOutcome::Valid(rec, next_pos) => {
+                if let Some(prev) = prev_seq
+                    && rec.client_seq <= prev
+                {
+                    return Err(PendingWalCorruption::NonMonotonicClientSeq {
+                        offset: cursor,
+                        prev_client_seq: prev,
+                        found_client_seq: rec.client_seq,
+                    });
+                }
+                prev_seq = Some(rec.client_seq);
+                records.push(rec);
+                cursor = next_pos;
+            }
+            FrameOutcome::TornTail => {
+                return Ok(PendingWalScan {
+                    records,
+                    valid_bytes: cursor,
+                    tail: WalTailDisposition::TornFinalRecord {
+                        valid_bytes: cursor,
+                    },
+                });
+            }
+            FrameOutcome::MidCorrupt => {
+                return Err(PendingWalCorruption::MidFileCorruption {
+                    offset: cursor,
+                    salvageable_records: records,
+                });
+            }
+        }
+    }
+
+    Ok(PendingWalScan {
+        records,
+        valid_bytes: cursor,
+        tail: WalTailDisposition::Clean,
+    })
+}
+
+fn header_valid(bytes: &[u8], magic: &[u8; 8], expected_version: u32) -> bool {
+    if bytes.get(0..8) != Some(magic.as_slice()) {
+        return false;
+    }
+    let Some(version) = read_u32_le(bytes, 8) else {
+        return false;
+    };
+    if version != expected_version {
+        return false;
+    }
+    let Some(head_crc) = read_u32_le(bytes, 12) else {
+        return false;
+    };
+    let Some(head_prefix) = bytes.get(0..12) else {
+        return false;
+    };
+    head_crc == crc32(head_prefix)
+}
+
+/// Applies `RTCLWAL2` `records` (optionally skipping the last `skip_tail`
+/// records) onto `engine`, optionally running recalculation at the end.
+pub fn replay_wal_records_v2(
+    engine: &mut FormulaEngine,
+    records: &[WireWalRecordV2],
+    skip_tail: usize,
+    recalculate: bool,
+) -> Result<usize, WalError> {
+    let keep = records.len().saturating_sub(skip_tail);
+    let slice = records.get(..keep).unwrap_or(&[]);
+    for rec in slice {
+        for wire_op in &rec.ops {
+            let op =
+                Op::<BoundFormula>::try_from(wire_op.clone()).map_err(WalError::InvalidWireOp)?;
+            engine
+                .apply_op(op)
+                .map_err(|_| WalError::ApplyFailed { seq: rec.seq })?;
+        }
+    }
+    if recalculate {
+        engine.recalc_all();
+    }
+    Ok(slice.len())
 }
 
 /// Applies `records` (optionally skipping the last `skip_tail` records for Safe
@@ -638,6 +1126,132 @@ mod tests {
                 found: Some(10),
                 expected: 14,
             }
+        ));
+    }
+
+    #[test]
+    fn wal_v2_any_and_pending_wal_round_trip_with_torn_and_corrupt_detection() {
+        use super::{
+            PendingWalCorruption, encode_pending_wal_complete, encode_pending_wal_record,
+            encode_wal_complete_v2, encode_wal_record_v2, replay_wal_records_v2, scan_pending_wal,
+            scan_wal_any, scan_wal_v2,
+        };
+        use crate::v2::{WireOpV2, WirePendingTxnV2, WireTxnV2, WireWalRecordV2};
+        use reticula_core::ops::ConditionalCellEdit;
+
+        // 1. RTCLWAL1 transparently upgraded through `scan_wal_any`.
+        let v1_bytes = encode_wal_complete(0, &[make_record(1, 0, 55.0)]).unwrap();
+        let upgraded = scan_wal_any(&v1_bytes, 0, 1).unwrap();
+        assert_eq!(upgraded.records.len(), 1);
+        let mut eng = FormulaEngine::new();
+        replay_wal_records_v2(&mut eng, &upgraded.records, 0, true).unwrap();
+        assert_eq!(
+            eng.workbook()
+                .sheet(SheetId(0))
+                .unwrap()
+                .value_by_id(RowId(0), ColId(0)),
+            reticula_core::value::Value::Number(55.0)
+        );
+
+        // 2. RTCLWAL2 with `SetCellsIf` + torn tail.
+        let cond_op = Op::SetCellsIf {
+            sheet: SheetId(0),
+            edits: vec![ConditionalCellEdit {
+                row: RowId(0),
+                col: ColId(0),
+                expected_input: CellInput::Scalar(ScalarValue::Number(55.0)),
+                expected_format: None,
+                new_input: CellInput::Scalar(ScalarValue::Number(77.0)),
+                new_format: FormatPatch::Keep,
+            }],
+        };
+        let rec1 = WireWalRecordV2 {
+            seq: 1,
+            timestamp_ms: 100,
+            label: String::from("Undo conditional"),
+            ops: vec![WireOpV2::from(&cond_op)],
+        };
+        let wal2 = encode_wal_complete_v2(0, core::slice::from_ref(&rec1)).unwrap();
+        let scan2 = scan_wal_v2(&wal2, 0, 1).unwrap();
+        assert_eq!(scan2.records, vec![rec1]);
+        let scan2_any = scan_wal_any(&wal2, 0, 1).unwrap();
+        assert_eq!(scan2_any, scan2);
+        replay_wal_records_v2(&mut eng, &scan2.records, 0, true).unwrap();
+        assert_eq!(
+            eng.workbook()
+                .sheet(SheetId(0))
+                .unwrap()
+                .value_by_id(RowId(0), ColId(0)),
+            reticula_core::value::Value::Number(77.0)
+        );
+
+        // Torn tail on record 2
+        let extra = encode_wal_record_v2(&WireWalRecordV2 {
+            seq: 2,
+            timestamp_ms: 200,
+            label: String::from("Torn"),
+            ops: vec![WireOpV2::from(&cond_op)],
+        })
+        .unwrap();
+        let mut torn_wal2 = wal2.clone();
+        torn_wal2.extend_from_slice(&extra[..extra.len() / 2]);
+        let torn_scan = scan_wal_v2(&torn_wal2, 0, 1).unwrap();
+        assert!(matches!(
+            torn_scan.tail,
+            WalTailDisposition::TornFinalRecord { .. }
+        ));
+        assert_eq!(torn_scan.records.len(), 1);
+
+        // 3. `pending.wal` (`RTCLPWAL`) round-trip, torn tail, zero pad & non-monotonic reject.
+        let p1 = WirePendingTxnV2 {
+            replica: 1,
+            client_seq: 1,
+            base_server_seq: 0,
+            timestamp_ms: 1000,
+            txn: WireTxnV2 {
+                label: String::from("Pending 1"),
+                ops: vec![WireOpV2::from(&cond_op)],
+            },
+        };
+        let p2 = WirePendingTxnV2 {
+            replica: 1,
+            client_seq: 2,
+            base_server_seq: 0,
+            timestamp_ms: 1001,
+            txn: WireTxnV2 {
+                label: String::from("Pending 2"),
+                ops: vec![],
+            },
+        };
+        let pending_bytes = encode_pending_wal_complete(&[p1.clone(), p2.clone()]).unwrap();
+        let pscan = scan_pending_wal(&pending_bytes).unwrap();
+        assert_eq!(pscan.tail, WalTailDisposition::Clean);
+        assert_eq!(pscan.records, vec![p1.clone(), p2.clone()]);
+
+        let p3_frame = encode_pending_wal_record(&WirePendingTxnV2 {
+            replica: 1,
+            client_seq: 3,
+            base_server_seq: 0,
+            timestamp_ms: 1002,
+            txn: WireTxnV2 {
+                label: String::from("Torn pending"),
+                ops: vec![],
+            },
+        })
+        .unwrap();
+        let mut torn_pending = pending_bytes.clone();
+        torn_pending.extend_from_slice(&p3_frame[..5]);
+        let p_torn_scan = scan_pending_wal(&torn_pending).unwrap();
+        assert_eq!(p_torn_scan.records.len(), 2);
+        assert!(matches!(
+            p_torn_scan.tail,
+            WalTailDisposition::TornFinalRecord { .. }
+        ));
+
+        let non_mono = encode_pending_wal_complete(&[p2, p1]).unwrap();
+        assert!(matches!(
+            scan_pending_wal(&non_mono),
+            Err(PendingWalCorruption::NonMonotonicClientSeq { .. })
         ));
     }
 }

@@ -33,7 +33,10 @@ extern crate alloc;
 extern crate std;
 
 pub mod convert_v1;
+pub mod convert_v2;
 pub mod crc32;
 pub mod snapshot;
+pub mod sync_frame;
 pub mod v1;
+pub mod v2;
 pub mod wal;

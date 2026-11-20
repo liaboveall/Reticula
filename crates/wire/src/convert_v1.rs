@@ -48,16 +48,18 @@ pub enum WireConvertError {
     InvalidArrayLiteral,
     /// Operation variant introduced in wire v2+ cannot be encoded as [`WireOpV1`].
     UnsupportedInV1,
+    /// State digest version is unsupported.
+    UnsupportedDigestVersion,
 }
 
-fn canon_f64(n: f64) -> Result<f64, WireConvertError> {
+pub(crate) fn canon_f64(n: f64) -> Result<f64, WireConvertError> {
     if !n.is_finite() {
         return Err(WireConvertError::NonFiniteFloat);
     }
     Ok(if n == 0.0 { 0.0 } else { n })
 }
 
-fn check_text_len(s: &str) -> Result<(), WireConvertError> {
+pub(crate) fn check_text_len(s: &str) -> Result<(), WireConvertError> {
     if s.encode_utf16().count() > MAX_CELL_TEXT_UTF16 {
         return Err(WireConvertError::TextTooLong);
     }
@@ -132,11 +134,11 @@ impl TryFrom<WireAxisRunV1> for AxisRun {
     }
 }
 
-fn runs_to_wire(runs: &[IdRun]) -> Vec<WireIdRunV1> {
+pub(crate) fn runs_to_wire(runs: &[IdRun]) -> Vec<WireIdRunV1> {
     runs.iter().copied().map(WireIdRunV1::from).collect()
 }
 
-fn runs_from_wire(runs: Vec<WireIdRunV1>) -> Result<Vec<IdRun>, WireConvertError> {
+pub(crate) fn runs_from_wire(runs: Vec<WireIdRunV1>) -> Result<Vec<IdRun>, WireConvertError> {
     runs.into_iter().map(IdRun::try_from).collect()
 }
 

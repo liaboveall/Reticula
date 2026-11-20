@@ -11,17 +11,27 @@ use std::path::Path;
 
 use reticula_core::determinism::to_hex;
 use reticula_core::format::{CurrencySymbol, NumberFormat};
-use reticula_core::id::{ColId, IdRun, RowId, SheetId};
+use reticula_core::id::{ColId, IdRun, RowId, SheetId, pack_replica_id, pack_sheet_id};
 use reticula_core::ops::{
-    CellEdit, CellInput, FormatPatch, FormatTarget, FormulaMode, Op, ScalarValue, Workbook,
+    CellEdit, CellInput, ConditionalCellEdit, FormatPatch, FormatTarget, FormulaMode, Op,
+    ScalarValue, Workbook,
 };
 use reticula_core::sheet::Sheet;
 use reticula_core::style::{BorderWeight, ColorPatch, ColorValue, HorizontalAlign, StylePatch};
 use reticula_formula::binder::{BoundFormula, templatize_formula};
 use reticula_formula::engine::FormulaEngine;
 use reticula_wire::snapshot::{decode_snapshot_any, encode_snapshot_v1};
+use reticula_wire::sync_frame::{decode_sync_frame, encode_sync_frame};
 use reticula_wire::v1::{WireOpV1, WireReplicaWatermarkV1, WireWalRecordV1};
-use reticula_wire::wal::{encode_wal_complete, replay_wal_records, scan_wal};
+use reticula_wire::v2::{
+    SYNC_PROTOCOL_VERSION, WireCatchupV1, WireCommittedTxnV2, WireOpV2, WirePendingTxnV2,
+    WirePresenceRangeV1, WirePresenceV1, WireRejectReasonV1, WireStateDigestV1, WireSyncFrameV1,
+    WireTxnV2, WireWalRecordV2,
+};
+use reticula_wire::wal::{
+    encode_wal_complete, encode_wal_complete_v2, replay_wal_records, replay_wal_records_v2,
+    scan_wal, scan_wal_any,
+};
 
 use crate::util::{self, Flags, Result};
 
@@ -34,18 +44,29 @@ const FROZEN_V1_FILES: [&str; 4] = [
     "tests/compat/v1/replay.rtclwal",
 ];
 
+const FROZEN_V2_FILES: [&str; 5] = [
+    "crates/wire/src/v2.rs",
+    "tests/compat/v2/base.rtclsnap",
+    "tests/compat/v2/expected_digest.txt",
+    "tests/compat/v2/replay.rtclwal",
+    "tests/compat/v2/sync_frames.bin",
+];
+
 pub fn run(flags: &Flags) -> Result {
     if let Some(ver) = flags.get("freeze") {
-        if ver != "v1" {
-            return Err(format!("unknown wire version `{ver}` (supported: `v1`)"));
-        }
-        return freeze_v1();
+        return match ver {
+            "v1" => freeze_v1(),
+            "v2" => freeze_v2(),
+            other => Err(format!(
+                "unknown wire version `{other}` (supported: `v1`, `v2`)"
+            )),
+        };
     }
     check()
 }
 
 pub fn check() -> Result {
-    util::step("frozen wire compatibility hashes (v1)");
+    util::step("frozen wire compatibility hashes (v1 + v2)");
     let root = util::root();
     let hashes_path = root.join(HASHES_FILE);
     let content = fs::read_to_string(&hashes_path).map_err(|e| {
@@ -71,7 +92,7 @@ pub fn check() -> Result {
         entries.push((hex.trim().to_owned(), rel_path.trim().to_owned()));
     }
 
-    for required in FROZEN_V1_FILES {
+    for required in FROZEN_V1_FILES.iter().chain(FROZEN_V2_FILES.iter()) {
         if !entries.iter().any(|(_, p)| p == required) {
             return Err(format!(
                 "{HASHES_FILE} is missing required frozen file `{required}`"
@@ -89,7 +110,7 @@ pub fn check() -> Result {
         }
     }
 
-    println!("{} frozen v1 file(s) verified", entries.len());
+    println!("{} frozen wire file(s) verified", entries.len());
     Ok(())
 }
 
@@ -298,6 +319,302 @@ fn freeze_v1() -> Result {
         "wrote tests/compat/v1/ (base={}B, wal={}B, expected_digest={digest_hex})",
         snap_bytes.len(),
         wal_bytes.len()
+    );
+    Ok(())
+}
+
+fn freeze_v2() -> Result {
+    util::step("generating tests/compat/v2 fixtures and updating hashes.txt");
+    let root = util::root();
+    let hashes_path = root.join(HASHES_FILE);
+    let existing_hashes = fs::read_to_string(&hashes_path).map_err(|e| {
+        format!(
+            "cannot read {}: {e} (v1 must be frozen before freezing v2)",
+            hashes_path.display()
+        )
+    })?;
+
+    // Collect existing v1 block untouched and verify every v1 SHA-256 still matches.
+    let mut v1_section = String::new();
+    for line in existing_hashes.lines() {
+        let trimmed = line.trim();
+        if trimmed.contains("wire v2") || FROZEN_V2_FILES.iter().any(|p| trimmed.ends_with(p)) {
+            continue;
+        }
+        if let Some((hex, rel)) = trimmed.split_once("  ")
+            && FROZEN_V1_FILES.contains(&rel.trim())
+        {
+            let actual = hash_repo_file(&root.join(rel.trim()))?;
+            if actual != hex.trim() {
+                return Err(format!(
+                    "v1 frozen file `{}` hash drifted before freeze v2 (expected {}, got {actual})",
+                    rel.trim(),
+                    hex.trim()
+                ));
+            }
+        }
+        v1_section.push_str(line);
+        v1_section.push('\n');
+    }
+
+    let dir = root.join("tests/compat/v2");
+    fs::create_dir_all(&dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
+
+    let s0 = SheetId(0);
+    let replica1 = pack_replica_id(0, 1).ok_or_else(|| "pack_replica_id failed".to_owned())?;
+    let base_sheet = Sheet::with_axes(s0, String::from("Sheet1"), 32, 8);
+    let mut eng = FormulaEngine::from_workbook_clean(Workbook::from_sheet(base_sheet, None));
+    eng.edit_cell_raw(s0, RowId(0), ColId(0), "100")
+        .map_err(|e| format!("seed A1: {e:?}"))?;
+    eng.edit_cell_raw(s0, RowId(1), ColId(0), "25")
+        .map_err(|e| format!("seed A2: {e:?}"))?;
+    eng.edit_cell_raw(s0, RowId(2), ColId(0), "=A1+A2")
+        .map_err(|e| format!("seed A3: {e:?}"))?;
+    eng.recalc_all();
+
+    let watermarks = [WireReplicaWatermarkV1 {
+        replica: replica1,
+        last_client_seq: 5,
+        max_id_counter: 1,
+    }];
+    let snap_bytes = encode_snapshot_v1(eng.workbook(), &watermarks)
+        .map_err(|e| format!("encode_snapshot_v1: {e:?}"))?;
+
+    let collab_sheet =
+        pack_sheet_id(0, replica1, 1).ok_or_else(|| "pack_sheet_id failed".to_owned())?;
+    let f_a3 = eng
+        .workbook()
+        .formula(s0, RowId(2), ColId(0))
+        .cloned()
+        .ok_or_else(|| "missing formula A3".to_owned())?;
+
+    let peer_edit_a2 = Op::SetCells {
+        sheet: s0,
+        edits: vec![CellEdit {
+            row: RowId(1),
+            col: ColId(0),
+            input: CellInput::Scalar(ScalarValue::Number(50.0)),
+            format: FormatPatch::Set(NumberFormat::Fixed2),
+        }],
+    };
+    // Undo expects A2=25 (stale -> skipped!) and A3=A1+A2 with stale cached: None (matches!).
+    let cond_undo = Op::SetCellsIf {
+        sheet: s0,
+        edits: vec![
+            ConditionalCellEdit {
+                row: RowId(1),
+                col: ColId(0),
+                expected_input: CellInput::Scalar(ScalarValue::Number(25.0)),
+                expected_format: None,
+                new_input: CellInput::Empty,
+                new_format: FormatPatch::Keep,
+            },
+            ConditionalCellEdit {
+                row: RowId(2),
+                col: ColId(0),
+                expected_input: CellInput::Formula {
+                    formula: f_a3,
+                    cached: None,
+                },
+                expected_format: None,
+                new_input: CellInput::Scalar(ScalarValue::Number(999.0)),
+                new_format: FormatPatch::Set(NumberFormat::Integer),
+            },
+        ],
+    };
+    let add_collab_sheet = Op::AddSheet {
+        sheet: collab_sheet,
+        name: String::from("Collab"),
+        after: Some(s0),
+    };
+    let set_collab_cell = Op::SetCells {
+        sheet: collab_sheet,
+        edits: vec![CellEdit {
+            row: RowId(0),
+            col: ColId(0),
+            input: CellInput::Scalar(ScalarValue::Text(String::from("synced"))),
+            format: FormatPatch::Keep,
+        }],
+    };
+
+    let wal_records = vec![
+        WireWalRecordV2 {
+            seq: 6,
+            timestamp_ms: 1_763_600_000_006,
+            label: String::from("Peer update A2"),
+            ops: vec![WireOpV2::from(&peer_edit_a2)],
+        },
+        WireWalRecordV2 {
+            seq: 7,
+            timestamp_ms: 1_763_600_000_007,
+            label: String::from("Conditional undo"),
+            ops: vec![WireOpV2::from(&cond_undo)],
+        },
+        WireWalRecordV2 {
+            seq: 8,
+            timestamp_ms: 1_763_600_000_008,
+            label: String::from("Add collaborative sheet"),
+            ops: vec![
+                WireOpV2::from(&add_collab_sheet),
+                WireOpV2::from(&set_collab_cell),
+            ],
+        },
+    ];
+    let wal_bytes = encode_wal_complete_v2(5, &wal_records)
+        .map_err(|e| format!("encode_wal_complete_v2: {e:?}"))?;
+
+    let mut verify_eng = decode_snapshot_any(&snap_bytes)
+        .map_err(|e| format!("verify decode: {e:?}"))?
+        .engine;
+    let scan = scan_wal_any(&wal_bytes, 5, 8).map_err(|e| format!("verify scan_wal_any: {e:?}"))?;
+    replay_wal_records_v2(&mut verify_eng, &scan.records, 0, true)
+        .map_err(|e| format!("verify replay v2: {e:?}"))?;
+
+    let logical_hex =
+        String::from_utf8_lossy(&to_hex(verify_eng.workbook().logical_digest())).into_owned();
+    let sd = verify_eng.workbook().state_digest();
+    let lo_hex = String::from_utf8_lossy(&to_hex(sd.content_lo)).into_owned();
+    let hi_hex = String::from_utf8_lossy(&to_hex(sd.content_hi)).into_owned();
+    let ord_hex = String::from_utf8_lossy(&to_hex(sd.order)).into_owned();
+    let expected_txt = format!(
+        "{logical_hex}\nv{}:{lo_hex}:{hi_hex}:{ord_hex}\n",
+        sd.version
+    );
+
+    let frames = vec![
+        WireSyncFrameV1::Hello {
+            protocol_version: SYNC_PROTOCOL_VERSION,
+            doc_id: [0x11; 16],
+            branch_id: [0_u8; 16],
+            replica: Some(replica1),
+            last_applied_seq: 5,
+            known_epoch: 0,
+        },
+        WireSyncFrameV1::Welcome {
+            epoch: 0,
+            head_seq: 8,
+            replica: replica1,
+            last_client_seq: 5,
+            max_id_counter: 1,
+            catchup: WireCatchupV1::Txns {
+                from_seq: 6,
+                txns: vec![WireCommittedTxnV2 {
+                    seq: 6,
+                    replica: replica1,
+                    client_seq: 6,
+                    user_id: [0x22; 16],
+                    timestamp_ms: 1_763_600_000_006,
+                    txn: WireTxnV2 {
+                        label: String::from("Peer"),
+                        ops: vec![WireOpV2::from(&peer_edit_a2)],
+                    },
+                }],
+            },
+        },
+        WireSyncFrameV1::Welcome {
+            epoch: 1,
+            head_seq: 8,
+            replica: pack_replica_id(1, 2).unwrap_or(1),
+            last_client_seq: 0,
+            max_id_counter: 0,
+            catchup: WireCatchupV1::SnapshotRequired {
+                snapshot_seq: 5,
+                url: String::from("/api/workbooks/11111111/snapshots/5"),
+            },
+        },
+        WireSyncFrameV1::Push {
+            txns: vec![WirePendingTxnV2 {
+                replica: replica1,
+                client_seq: 6,
+                base_server_seq: 5,
+                timestamp_ms: 1_763_600_000_007,
+                txn: WireTxnV2 {
+                    label: String::from("Conditional undo"),
+                    ops: vec![WireOpV2::from(&cond_undo)],
+                },
+            }],
+        },
+        WireSyncFrameV1::Ack {
+            replica: replica1,
+            client_seq: 6,
+            seq: 7,
+            timestamp_ms: 1_763_600_000_007,
+        },
+        WireSyncFrameV1::Reject {
+            client_seq: 7,
+            reason: WireRejectReasonV1::NonContiguousClientSeq { expected: 6 },
+        },
+        WireSyncFrameV1::Commit {
+            seq: 8,
+            replica: replica1,
+            client_seq: 7,
+            user_id: [0x22; 16],
+            timestamp_ms: 1_763_600_000_008,
+            txn: WireTxnV2 {
+                label: String::from("Add collaborative sheet"),
+                ops: vec![WireOpV2::from(&add_collab_sheet)],
+            },
+        },
+        WireSyncFrameV1::Digest {
+            seq: 8,
+            state_digest: WireStateDigestV1::from(sd),
+        },
+        WireSyncFrameV1::Presence(WirePresenceV1 {
+            replica: replica1,
+            user_id: [0x22; 16],
+            display_name: String::from("Alice"),
+            color_slot: 2,
+            sheet_id: s0.0,
+            cursor_row: 1,
+            cursor_col: 0,
+            selection: Some(WirePresenceRangeV1 {
+                start_row: 0,
+                start_col: 0,
+                end_row: 2,
+                end_col: 0,
+            }),
+        }),
+        WireSyncFrameV1::Ping(12345),
+        WireSyncFrameV1::Pong(12345),
+    ];
+
+    let mut sync_bin = Vec::new();
+    for frame in &frames {
+        let packet = encode_sync_frame(frame).map_err(|e| format!("encode_sync_frame: {e:?}"))?;
+        let roundtrip =
+            decode_sync_frame(&packet).map_err(|e| format!("decode_sync_frame: {e:?}"))?;
+        if &roundtrip != frame {
+            return Err("sync frame round-trip mismatch".to_owned());
+        }
+        let len_u32 = u32::try_from(packet.len()).map_err(|_| "frame len overflow".to_owned())?;
+        sync_bin.extend_from_slice(&len_u32.to_le_bytes());
+        sync_bin.extend_from_slice(&packet);
+    }
+
+    fs::write(dir.join("base.rtclsnap"), &snap_bytes)
+        .map_err(|e| format!("write v2 base.rtclsnap: {e}"))?;
+    fs::write(dir.join("replay.rtclwal"), &wal_bytes)
+        .map_err(|e| format!("write v2 replay.rtclwal: {e}"))?;
+    fs::write(dir.join("expected_digest.txt"), &expected_txt)
+        .map_err(|e| format!("write v2 expected_digest.txt: {e}"))?;
+    fs::write(dir.join("sync_frames.bin"), &sync_bin)
+        .map_err(|e| format!("write v2 sync_frames.bin: {e}"))?;
+
+    let mut out_hashes = v1_section;
+    out_hashes.push_str(
+        "# Frozen SHA-256 manifest for wire v2 schema, sync protocol v1 frames and fixtures (D-020).\n",
+    );
+    for rel in FROZEN_V2_FILES {
+        let h = hash_repo_file(&root.join(rel))?;
+        out_hashes.push_str(&format!("{h}  {rel}\n"));
+    }
+    fs::write(&hashes_path, out_hashes).map_err(|e| format!("write {HASHES_FILE}: {e}"))?;
+
+    println!(
+        "wrote tests/compat/v2/ (base={}B, wal={}B, sync_frames={}B, digest={logical_hex})",
+        snap_bytes.len(),
+        wal_bytes.len(),
+        sync_bin.len()
     );
     Ok(())
 }
