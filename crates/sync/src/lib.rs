@@ -672,9 +672,11 @@ mod tests {
             if i == 2 {
                 assert!(server.needs_snapshot());
                 snap_wb_at_2 = Some(server.workbook().clone());
-                server.mark_snapshot_written(2);
             }
         }
+        // Seq 3 committed while the snapshot at seq 2 was being written.
+        server.mark_snapshot_written(2);
+        assert!(!server.needs_snapshot());
         let snap_wb_at_2 = snap_wb_at_2.unwrap();
 
         // Bob connects late -> gets SnapshotRequired(snapshot_seq = 2), while commit 4 arrives live!
@@ -723,6 +725,7 @@ mod tests {
             t4[0].clone(),
             4,
         );
+        assert!(server.needs_snapshot());
         bob.on_commit(c4);
 
         let wms: Vec<ReplicaWatermark> = server.watermarks();

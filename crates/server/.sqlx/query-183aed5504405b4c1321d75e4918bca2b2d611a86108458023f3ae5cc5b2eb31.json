@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO replicas (workbook_id, replica, user_id) VALUES ($1, 1, $2)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "183aed5504405b4c1321d75e4918bca2b2d611a86108458023f3ae5cc5b2eb31"
+}

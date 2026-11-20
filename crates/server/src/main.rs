@@ -1,5 +1,6 @@
-//! Minimal M1a HTTP server (`13-m1a.md` 8.1 & D-030):
+//! Reticula HTTP server:
 //! - `GET /healthz` -> `200 OK`;
+//! - `GET /readyz` checks configured collaboration storage;
 //! - serves precompressed `.br` and `.gz` static assets from `RETICULA_STATIC_DIR`
 //!   (default `apps/web/dist`);
 //! - sets `Cache-Control: public, max-age=31536000, immutable` on `/assets/*` and
@@ -13,11 +14,13 @@ use std::path::{Path, PathBuf};
 
 use axum::Router;
 use axum::extract::Request;
-use axum::http::HeaderValue;
-use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE};
+use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE, REFERRER_POLICY};
+use axum::http::{HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::Response;
 use axum::routing::get;
+use reticula_server::http::{self, ApiState, AuthConfig};
+use reticula_server::store::Store;
 use tokio::net::TcpListener;
 use tower_http::services::{ServeDir, ServeFile};
 
@@ -26,8 +29,8 @@ const IMMUTABLE_CACHE: HeaderValue =
 const NO_CACHE: HeaderValue = HeaderValue::from_static("no-cache");
 const WASM_MIME: HeaderValue = HeaderValue::from_static("application/wasm");
 
-/// Builds the Axum router serving `static_dir` and `/healthz`.
-pub fn build_app(static_dir: &Path) -> Router {
+/// Builds the Axum router serving precompressed assets and health endpoints.
+pub fn build_app(static_dir: &Path, api: Option<ApiState>) -> Router {
     let index_fallback = ServeFile::new(static_dir.join("index.html"))
         .precompressed_br()
         .precompressed_gzip();
@@ -36,8 +39,26 @@ pub fn build_app(static_dir: &Path) -> Router {
         .precompressed_gzip()
         .fallback(index_fallback);
 
+    let store = api.as_ref().map(|api| api.store().clone());
+    let routes = match api {
+        Some(api) => http::router(api),
+        None => Router::new().fallback(|| async { StatusCode::SERVICE_UNAVAILABLE }),
+    };
     Router::new()
         .route("/healthz", get(healthz))
+        .nest("/api", routes)
+        .route(
+            "/readyz",
+            get(move || async move {
+                match store {
+                    Some(store) if store.ready().await.is_ok() => (StatusCode::OK, "ok\n"),
+                    _ => (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "collaboration storage unavailable\n",
+                    ),
+                }
+            }),
+        )
         .fallback_service(static_service)
         .layer(middleware::from_fn(apply_asset_headers))
 }
@@ -65,7 +86,15 @@ async fn apply_asset_headers(req: Request, next: Next) -> Response {
             response.headers_mut().insert(CONTENT_TYPE, WASM_MIME);
         }
     } else {
-        response.headers_mut().insert(CACHE_CONTROL, NO_CACHE);
+        response
+            .headers_mut()
+            .entry(CACHE_CONTROL)
+            .or_insert(NO_CACHE);
+        if uri_path.starts_with("/join/") {
+            response
+                .headers_mut()
+                .insert(REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
+        }
     }
     response
 }
@@ -103,7 +132,26 @@ async fn main() {
         env::var("RETICULA_STATIC_DIR").unwrap_or_else(|_| String::from("apps/web/dist")),
     );
 
-    let app = build_app(&static_dir);
+    let api = match env::var("RETICULA_DATABASE_URL") {
+        Ok(database_url) => {
+            let data_dir = env::var_os("RETICULA_DATA_DIR")
+                .expect("RETICULA_DATA_DIR is required when collaboration storage is enabled");
+            let auth = AuthConfig::from_env(bind_addr.ip()).unwrap_or_else(|error| {
+                eprintln!("could not configure collaboration authentication: {error}");
+                std::process::exit(1);
+            });
+            match Store::connect(&database_url, PathBuf::from(data_dir)).await {
+                Ok(store) => Some(ApiState::new(store, auth)),
+                Err(error) => {
+                    eprintln!("could not initialize collaboration storage: {error}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        Err(env::VarError::NotPresent) => None,
+        Err(error) => panic!("invalid RETICULA_DATABASE_URL: {error}"),
+    };
+    let app = build_app(&static_dir, api);
     let listener = TcpListener::bind(bind_addr)
         .await
         .unwrap_or_else(|e| panic!("failed to bind {bind_addr}: {e}"));
@@ -166,11 +214,41 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires an isolated PostgreSQL database in RETICULA_TEST_DATABASE_URL"]
+    async fn readiness_checks_configured_postgres_and_snapshot_directory() {
+        let url = env::var("RETICULA_TEST_DATABASE_URL").unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let dir = data.path().join("workbooks");
+        let store = Store::connect(&url, dir.clone()).await.unwrap();
+        let auth =
+            AuthConfig::github("http://127.0.0.1", "client".into(), "secret".into()).unwrap();
+        let app = build_app(data.path(), Some(ApiState::new(store, auth)));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let request = "GET /readyz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+        assert!(
+            send_raw_http(addr, request)
+                .await
+                .starts_with("HTTP/1.1 200 OK\r\n")
+        );
+
+        fs::remove_dir(&dir).unwrap();
+        fs::write(dir, "not a directory").unwrap();
+        assert!(
+            send_raw_http(addr, request)
+                .await
+                .starts_with("HTTP/1.1 503 Service Unavailable\r\n")
+        );
+        handle.abort();
+    }
+
+    #[tokio::test]
     async fn serves_healthz_precompressed_assets_wasm_mime_cache_headers_and_spa_fallback() {
         let site = make_temp_site();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let app = build_app(&site);
+        let app = build_app(&site, None);
         let handle = tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
@@ -188,6 +266,13 @@ mod tests {
                 .contains("cache-control: no-cache\r\n")
         );
         assert!(health.ends_with("\r\n\r\nok\n"));
+
+        let readiness = send_raw_http(
+            addr,
+            "GET /readyz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(readiness.starts_with("HTTP/1.1 503 Service Unavailable\r\n"));
 
         // 2. /assets/kern-456.wasm with Accept-Encoding: br, gzip -> brotli + wasm MIME + immutable
         let wasm_resp = send_raw_http(

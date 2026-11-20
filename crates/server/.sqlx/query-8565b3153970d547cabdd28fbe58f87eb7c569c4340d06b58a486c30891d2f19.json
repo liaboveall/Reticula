@@ -1,0 +1,61 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT w.title, w.log_epoch, m.role,\n                    COALESCE((SELECT MAX(seq) FROM txns WHERE workbook_id = w.id AND branch_id = $3), 0) AS \"head!\"\n             FROM members m JOIN workbooks w ON w.id = m.workbook_id WHERE m.workbook_id = $1 AND m.user_id = $2",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "title",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "workbooks",
+            "name": "title"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "log_epoch",
+        "type_info": "Int2",
+        "origin": {
+          "Table": {
+            "table": "workbooks",
+            "name": "log_epoch"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "role",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "members",
+            "name": "role"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "head!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      null
+    ]
+  },
+  "hash": "8565b3153970d547cabdd28fbe58f87eb7c569c4340d06b58a486c30891d2f19"
+}

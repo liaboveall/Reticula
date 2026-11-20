@@ -6,6 +6,7 @@
     ".": "./src/index.ts",
     "./viewport": "./src/generated/viewport-layout.ts",
     "./viewport-fixture": "./src/generated/viewport-fixture.ts",
+    "./collab-api": "./src/generated/collab-api.ts",
     "./wasm": "./pkg/reticula_wasm_bg.wasm"
   }
 }

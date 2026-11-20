@@ -1,0 +1,30 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO identities (provider, subject, user_id) VALUES ($1, $2, $3)\n             ON CONFLICT (provider, subject) DO UPDATE SET subject = EXCLUDED.subject RETURNING user_id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "user_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "identities",
+            "name": "user_id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "6147073dc1969bd6dc962d863aa21c44614e8d491550abd9ffdc03bda17c0aff"
+}

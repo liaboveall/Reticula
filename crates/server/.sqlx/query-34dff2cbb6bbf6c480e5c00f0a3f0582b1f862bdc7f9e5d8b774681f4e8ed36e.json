@@ -1,0 +1,40 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT log_epoch, next_per_epoch_replica FROM workbooks WHERE id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "log_epoch",
+        "type_info": "Int2",
+        "origin": {
+          "Table": {
+            "table": "workbooks",
+            "name": "log_epoch"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "next_per_epoch_replica",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "workbooks",
+            "name": "next_per_epoch_replica"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "34dff2cbb6bbf6c480e5c00f0a3f0582b1f862bdc7f9e5d8b774681f4e8ed36e"
+}

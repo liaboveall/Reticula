@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO txns (workbook_id, branch_id, seq, replica, client_seq, base_seq, user_id, created_at, payload)\n             SELECT $1, $2, b.seq, b.replica, b.client_seq, b.base_seq, b.user_id,\n                    to_timestamp(b.timestamp_ms::float8 / 1000), b.payload\n             FROM UNNEST($3::bigint[], $4::integer[], $5::bigint[], $6::bigint[],\n                         $7::uuid[], $8::bigint[], $9::bytea[])\n                  AS b(seq, replica, client_seq, base_seq, user_id, timestamp_ms, payload)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Int8Array",
+        "Int4Array",
+        "Int8Array",
+        "Int8Array",
+        "UuidArray",
+        "Int8Array",
+        "ByteaArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "c67fde322419057c683443f8d5e5009735d6fc65cb4cec4e099084d2409f18df"
+}

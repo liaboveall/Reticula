@@ -1,0 +1,64 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT replica, user_id, last_client_seq, max_id_counter FROM replicas WHERE workbook_id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "replica",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "replicas",
+            "name": "replica"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "user_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "replicas",
+            "name": "user_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "last_client_seq",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "replicas",
+            "name": "last_client_seq"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "max_id_counter",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "replicas",
+            "name": "max_id_counter"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "62e5fa35edd05fab7c735cdbec62d985a87a665ac8cf744f8e7ea28b44faffb8"
+}

@@ -241,8 +241,18 @@ impl ServerDocMachine {
     pub fn mark_snapshot_written(&mut self, seq: u64) {
         if seq > self.last_snapshot_seq && seq <= self.head_seq {
             self.last_snapshot_seq = seq;
-            self.txns_since_snapshot = 0;
-            self.bytes_since_snapshot = 0;
+            let remaining = self.head_seq.saturating_sub(seq);
+            self.txns_since_snapshot = u32::try_from(remaining).unwrap_or(u32::MAX);
+            let tail = self.recent_txns.iter().filter(|txn| txn.seq > seq);
+            let (count, bytes) = tail.fold((0_u64, 0_usize), |(count, bytes), txn| {
+                let len = postcard::to_allocvec(&txn.txn).map_or(64, |encoded| encoded.len());
+                (count.saturating_add(1), bytes.saturating_add(len))
+            });
+            self.bytes_since_snapshot = if count == remaining {
+                bytes
+            } else {
+                bytes.max(self.limits.snapshot_bytes_threshold)
+            };
             self.trim_recent_txns();
         }
     }
