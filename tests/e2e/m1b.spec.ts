@@ -128,8 +128,10 @@ test("formula language service, F4 toggle, cross-sheet point-and-click, sheet de
   const formulaInput = page.getByTestId("formula-input");
   await formulaInput.click();
   await page.keyboard.type("=SU");
+  await expect(formulaInput).toHaveText("=SU");
   await expect(page.getByTestId("formula-completions")).toBeVisible();
   await expect(page.getByTestId("completion-SUM")).toBeVisible();
+  await expect(page.getByTestId("completion-SQRT")).toHaveCount(0);
 
   await page.keyboard.press("ArrowDown");
   await page.keyboard.press("Tab");

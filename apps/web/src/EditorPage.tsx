@@ -379,7 +379,10 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
   const [selection, setSelection] = useState<Selection | null>(null);
   const [inspected, setInspected] = useState<InspectedState | null>(null);
   const [editingText, setEditingText] = useState<string | null>(null);
-  const [formulaAnalysis, setFormulaAnalysis] = useState<WireFormulaAnalysis | null>(null);
+  const [formulaAnalysis, setFormulaAnalysis] = useState<{
+    readonly source: string;
+    readonly analysis: WireFormulaAnalysis;
+  } | null>(null);
   const [recalcMessage, setRecalcMessage] = useState<string | null>(null);
   const [rejectedReason, setRejectedReason] = useState<string | null>(null);
   const [showTip, setShowTip] = useState(true);
@@ -1133,7 +1136,7 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
               analysisRef.current = message.analysis;
               session.canInsertRef = message.analysis.canInsertRef;
               session.activeRefSpan = message.analysis.activeRefSpan ?? null;
-              setFormulaAnalysis(message.analysis);
+              setFormulaAnalysis({ source: session.source, analysis: message.analysis });
               editor.setFormulaAnalysis(message.analysis);
               syncGridFormulaRefs(grid, message.analysis, activeSheetRef.current);
               break;
@@ -2385,7 +2388,8 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
         }
         disabled={readySheet === null || (selection === null && !editSessionRef.current)}
         isEditing={editingText !== null}
-        analysis={formulaAnalysis}
+        analysis={formulaAnalysis?.analysis ?? null}
+        analysisSource={formulaAnalysis?.source ?? null}
         onChange={handleFormulaBarChange}
         onCommit={handleFormulaBarCommit}
         onCancel={handleFormulaBarCancel}

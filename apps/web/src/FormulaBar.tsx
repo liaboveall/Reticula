@@ -28,6 +28,7 @@ export interface FormulaBarProps {
   readonly disabled: boolean;
   readonly isEditing: boolean;
   readonly analysis: WireFormulaAnalysis | null;
+  readonly analysisSource?: string | null;
   readonly onChange: (text: string, cursorUtf16: number) => void;
   readonly onFocus?: () => void;
   readonly onCommit: (moveDown: boolean) => void;
@@ -50,6 +51,7 @@ export function FormulaBar({
   disabled,
   isEditing,
   analysis,
+  analysisSource,
   onChange,
   onFocus,
   onCommit,
@@ -72,8 +74,14 @@ export function FormulaBar({
       ? assistState
       : { forValue: value, selectedIndex: 0, navigated: false, dismissed: false };
 
+  const analysisMatchesValue = analysisSource === undefined || analysisSource === value;
+
   const completions =
-    isEditing && analysis?.isFormula && !currentAssist.dismissed && analysis.completions.length > 0
+    isEditing &&
+    analysisMatchesValue &&
+    analysis?.isFormula &&
+    !currentAssist.dismissed &&
+    analysis.completions.length > 0
       ? analysis.completions.slice(0, MAX_VISIBLE_COMPLETIONS)
       : [];
 
@@ -81,6 +89,7 @@ export function FormulaBar({
   const latestRef = useRef({
     value,
     disabled,
+    analysisSource,
     completions,
     selectedIndex: currentAssist.selectedIndex,
     navigatedList: currentAssist.navigated,
@@ -94,6 +103,7 @@ export function FormulaBar({
   latestRef.current = {
     value,
     disabled,
+    analysisSource,
     completions,
     selectedIndex: currentAssist.selectedIndex,
     navigatedList: currentAssist.navigated,
@@ -113,6 +123,9 @@ export function FormulaBar({
       fromFormulaBar: boolean,
     ): boolean => {
       const cur = latestRef.current;
+      if (cur.analysisSource !== undefined && cur.analysisSource !== text) {
+        return false;
+      }
       const list = cur.completions;
       if (list.length === 0) {
         return false;
@@ -242,9 +255,10 @@ export function FormulaBar({
     },
   }));
 
-  const signature = isEditing && analysis?.isFormula ? analysis.signature : undefined;
+  const signature =
+    isEditing && analysisMatchesValue && analysis?.isFormula ? analysis.signature : undefined;
   const firstDiagnostic =
-    isEditing && analysis?.isFormula && analysis.diagnostics.length > 0
+    isEditing && analysisMatchesValue && analysis?.isFormula && analysis.diagnostics.length > 0
       ? analysis.diagnostics[0]
       : undefined;
   const clampedIndex = Math.min(currentAssist.selectedIndex, Math.max(0, completions.length - 1));
