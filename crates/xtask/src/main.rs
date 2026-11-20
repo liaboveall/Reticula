@@ -41,6 +41,8 @@ Commands:
                           Differential evaluation against ironcalc_base and formualizer-eval.
   fuzz [--cpu-seconds <s>] [--threads <n>] [--affinity <mask>]
                           Multi-threaded mutation & structured fuzzing campaign.
+  sim [--seeds <n>] [--start-seed <n>] [--seed <s>] [--threads <n>] [--fail-fast] [--out <file>]
+                          Deterministic multi-client sync simulation.
   bench [--affinity <mask>] [--browser <name>] [--quick] [--out <file>]
                           Run native and Chrome WASM engine benchmarks (B1-B8, B11, B12).
   dev                     Build a debug module and start the development server.
@@ -98,6 +100,11 @@ fn run(args: &[String]) -> Result {
             rest,
             &[],
             &["cpu-seconds", "threads", "affinity", "out"],
+        )?),
+        "sim" => qa::sim(&Flags::parse(
+            rest,
+            &["fail-fast"],
+            &["seeds", "start-seed", "seed", "threads", "out"],
         )?),
         "bench" => qa::bench(&Flags::parse(
             rest,

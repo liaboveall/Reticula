@@ -642,11 +642,68 @@ impl Axis {
     /// untouched.
     pub fn delete_runs(&mut self, targets: &[IdRun]) -> Result<(), AxisError> {
         self.validate_target_runs(targets, false)?;
-        for target in targets {
-            for id in target.iter() {
-                self.adjust_tombstone(id, true)?;
+        let old_runs = core::mem::take(&mut self.runs);
+        let mut next_runs = Vec::with_capacity(
+            old_runs
+                .len()
+                .saturating_add(targets.len().saturating_mul(2)),
+        );
+        for mut run in old_runs {
+            let intervals = run_target_intervals(&run, targets);
+            if intervals.is_empty() {
+                next_runs.push(run);
+                continue;
+            }
+            if run.tombstones.is_none() && run.ids.len > 64 {
+                let mut cursor: u32 = 0;
+                for (iv_start, iv_end) in intervals {
+                    if cursor < iv_start
+                        && let Some(live_piece) = run.slice(cursor, iv_start)
+                    {
+                        next_runs.push(live_piece);
+                    }
+                    let del_len = iv_end.saturating_sub(iv_start);
+                    if let Some(first_id) = run.ids.id_at(iv_start)
+                        && let Some(del_ids) = IdRun::new(first_id, del_len)
+                        && let Ok(del_usize) = usize::try_from(del_len)
+                    {
+                        next_runs.push(AxisRun {
+                            ids: del_ids,
+                            live_count: 0,
+                            tombstones: Some(vec![1_u32; del_usize].into_boxed_slice()),
+                        });
+                    }
+                    cursor = iv_end;
+                }
+                if cursor < run.ids.len
+                    && let Some(tail_piece) = run.slice(cursor, run.ids.len)
+                {
+                    next_runs.push(tail_piece);
+                }
+            } else {
+                let Ok(len_usize) = usize::try_from(run.ids.len) else {
+                    return Err(AxisError::InvalidRun);
+                };
+                let counts = run
+                    .tombstones
+                    .get_or_insert_with(|| vec![0_u32; len_usize].into_boxed_slice());
+                for (iv_start, iv_end) in intervals {
+                    for off in iv_start..iv_end {
+                        if let Ok(idx) = usize::try_from(off)
+                            && let Some(entry) = counts.get_mut(idx)
+                        {
+                            if *entry == 0 {
+                                run.live_count = run.live_count.saturating_sub(1);
+                            }
+                            *entry = entry.saturating_add(1);
+                        }
+                    }
+                }
+                next_runs.push(run);
             }
         }
+        self.runs = next_runs;
+        self.coalesce_adjacent_runs();
         self.rebuild_index();
         Ok(())
     }
@@ -660,6 +717,7 @@ impl Axis {
                 self.adjust_tombstone(id, false)?;
             }
         }
+        self.coalesce_adjacent_runs();
         self.rebuild_index();
         Ok(())
     }
@@ -688,27 +746,11 @@ impl Axis {
         for run in &self.runs {
             // Fast path: untouched runs (e.g. a 1,000,000-row base segment not
             // intersecting `targets`) are copied in O(1) without per-item work.
-            let mut intervals: Vec<(u32, u32)> = Vec::new();
-            let run_stream = id_stream(run.ids.first_id);
-            let run_c0 = id_counter(run.ids.first_id);
-            let run_c1 = run_c0.saturating_add(run.ids.len);
-            for target in targets {
-                if id_stream(target.first_id) != run_stream {
-                    continue;
-                }
-                let t_c0 = id_counter(target.first_id);
-                let t_c1 = t_c0.saturating_add(target.len);
-                let start_c = run_c0.max(t_c0);
-                let end_c = run_c1.min(t_c1);
-                if start_c < end_c {
-                    intervals.push((start_c.saturating_sub(run_c0), end_c.saturating_sub(run_c0)));
-                }
-            }
+            let intervals = run_target_intervals(run, targets);
             if intervals.is_empty() {
                 staying_runs.push(run.clone());
                 continue;
             }
-            intervals.sort_unstable_by_key(|&(s, _)| s);
             let mut cursor: u32 = 0;
             for (iv_start, iv_end) in intervals {
                 if cursor < iv_start
@@ -1060,6 +1102,37 @@ struct LocatedId {
     axis_order: u32,
 }
 
+fn run_target_intervals(run: &AxisRun, targets: &[IdRun]) -> Vec<(u32, u32)> {
+    let mut intervals: Vec<(u32, u32)> = Vec::new();
+    let run_stream = id_stream(run.ids.first_id);
+    let run_c0 = id_counter(run.ids.first_id);
+    let run_c1 = run_c0.saturating_add(run.ids.len);
+    for target in targets {
+        if id_stream(target.first_id) != run_stream {
+            continue;
+        }
+        let t_c0 = id_counter(target.first_id);
+        let t_c1 = t_c0.saturating_add(target.len);
+        let start_c = run_c0.max(t_c0);
+        let end_c = run_c1.min(t_c1);
+        if start_c < end_c {
+            intervals.push((start_c.saturating_sub(run_c0), end_c.saturating_sub(run_c0)));
+        }
+    }
+    intervals.sort_unstable_by_key(|&(s, _)| s);
+    let mut merged: Vec<(u32, u32)> = Vec::with_capacity(intervals.len());
+    for (s, e) in intervals {
+        if let Some(last) = merged.last_mut()
+            && s <= last.1
+        {
+            last.1 = last.1.max(e);
+        } else {
+            merged.push((s, e));
+        }
+    }
+    merged
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(target_arch = "wasm32")]
@@ -1172,5 +1245,28 @@ mod tests {
         let mut backward = Vec::new();
         assert!(axis.for_each_live_in_range(6, 1, |run| backward.extend(run.iter())));
         assert_eq!(backward, forward);
+    }
+
+    #[test]
+    fn deleting_row_on_1m_base_run_avoids_megabyte_tombstone_allocation() {
+        let mut axis = Axis::with_base(1_048_576, 2_000_000);
+        let Some(del) = IdRun::new(3, 1) else {
+            panic!("run");
+        };
+        assert_eq!(axis.delete_runs(&[del]), Ok(()));
+        assert_eq!(axis.live_len(), 1_048_575);
+        let allocated_tombstones: usize = axis
+            .runs()
+            .iter()
+            .filter_map(|r| r.tombstones.as_ref().map(|t| t.len()))
+            .sum();
+        assert_eq!(allocated_tombstones, 1);
+        assert_eq!(axis.undelete_runs(&[del]), Ok(()));
+        assert_eq!(axis.runs().len(), 1);
+        assert!(
+            axis.runs()
+                .first()
+                .is_some_and(|r| r.tombstones.is_none() && r.live_count == 1_048_576)
+        );
     }
 }

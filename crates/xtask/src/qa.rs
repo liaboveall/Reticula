@@ -69,6 +69,52 @@ pub fn fuzz(flags: &Flags) -> Result {
     cmd.run()
 }
 
+pub fn sim(flags: &Flags) -> Result {
+    let mut pass_args: Vec<String> = Vec::new();
+    if let Some(seed) = flags.get("seed") {
+        util::step(&format!(
+            "deterministic sync simulation (single seed {seed})"
+        ));
+        pass_args.push("--seed".to_owned());
+        pass_args.push(seed.to_owned());
+    } else {
+        let seeds = flags.get("seeds").unwrap_or("5000");
+        util::step(&format!("deterministic sync simulation ({seeds} seeds)"));
+        pass_args.push("--seeds".to_owned());
+        pass_args.push(seeds.to_owned());
+    }
+    if let Some(start) = flags.get("start-seed") {
+        pass_args.push("--start-seed".to_owned());
+        pass_args.push(start.to_owned());
+    }
+    if let Some(threads) = flags.get("threads") {
+        pass_args.push("--threads".to_owned());
+        pass_args.push(threads.to_owned());
+    }
+    if flags.has("fail-fast") {
+        pass_args.push("--fail-fast".to_owned());
+    }
+    if let Some(out) = flags.get("out") {
+        pass_args.push("--out".to_owned());
+        pass_args.push(out.to_owned());
+    }
+
+    let mut cmd = cargo().args([
+        "run",
+        "--locked",
+        "--release",
+        "--package",
+        "reticula-sim",
+        "--bin",
+        "sim",
+        "--",
+    ]);
+    for arg in &pass_args {
+        cmd = cmd.arg(arg);
+    }
+    cmd.run()
+}
+
 pub fn bench(flags: &Flags) -> Result {
     let affinity = flags.get("affinity").unwrap_or("FFFF");
     let browser = flags.get("browser").unwrap_or("chrome");

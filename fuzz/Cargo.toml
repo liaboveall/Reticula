@@ -49,3 +49,10 @@ path = "fuzz_targets/fuzz_eval.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "fuzz_sync"
+path = "fuzz_targets/fuzz_sync.rs"
+test = false
+doc = false
+bench = false

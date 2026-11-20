@@ -1,8 +1,8 @@
 //! Multi-threaded mutation & `arbitrary` fuzz runner (`14-m1b.md` 8.1).
 //!
-//! Runs all five shared harnesses (`fuzz_one_parser`, `fuzz_one_snapshot`,
-//! `fuzz_one_wal`, `fuzz_one_ops`, `fuzz_one_eval`) across `threads` worker
-//! threads until cumulative CPU time exceeds `target_cpu_seconds`.
+//! Runs all six shared harnesses (`fuzz_one_parser`, `fuzz_one_snapshot`,
+//! `fuzz_one_wal`, `fuzz_one_ops`, `fuzz_one_eval`, `fuzz_one_sync`) across
+//! `threads` worker threads until cumulative CPU time exceeds `target_cpu_seconds`.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -13,12 +13,19 @@ use reticula_core::rng::Rng;
 use reticula_formula::binder::BoundFormula;
 use reticula_formula::engine::FormulaEngine;
 use reticula_wire::snapshot::{encode_seed_stub_v1, encode_snapshot_v1};
+use reticula_wire::sync_frame::encode_sync_frame;
 use reticula_wire::v1::{WireOpV1, WireWalRecordV1};
-use reticula_wire::wal::encode_wal_complete;
+use reticula_wire::v2::{
+    SYNC_PROTOCOL_VERSION, WireCatchupV1, WireOpV2, WirePendingTxnV2, WireSyncFrameV1, WireTxnV2,
+    WireWalRecordV2,
+};
+use reticula_wire::wal::{
+    encode_pending_wal_complete, encode_wal_complete, encode_wal_complete_v2,
+};
 use serde::Serialize;
 
 use crate::fuzz_harnesses::{
-    fuzz_one_eval, fuzz_one_ops, fuzz_one_parser, fuzz_one_snapshot, fuzz_one_wal,
+    fuzz_one_eval, fuzz_one_ops, fuzz_one_parser, fuzz_one_snapshot, fuzz_one_sync, fuzz_one_wal,
 };
 
 /// Summary of a completed fuzzing campaign.
@@ -40,11 +47,13 @@ pub struct FuzzReport {
     pub ops_execs: u64,
     /// Total `BoundExpr` evaluator executions.
     pub eval_execs: u64,
+    /// Total collaborative sync frame & state-machine executions.
+    pub sync_execs: u64,
     /// Number of seed corpus entries constructed.
     pub seed_corpus_count: usize,
 }
 
-const DICT_TOKENS: [&[u8]; 20] = [
+const DICT_TOKENS: [&[u8]; 22] = [
     b"=SUM(A1:B10)",
     b"=ROUND(J2*K2*(1-L2-$V$1),2)",
     b"='Sheet 1'!$A$1:$XFD$1048576",
@@ -61,6 +70,8 @@ const DICT_TOKENS: [&[u8]; 20] = [
     b"#CYCLE!",
     b"RTCLSNAP\x01\x00\x00\x00",
     b"RTCLWAL1\x01\x00\x00\x00",
+    b"RTCLWAL2\x01\x00\x00\x00",
+    b"RTCLPWAL\x01\x00\x00\x00",
     b"\xff\xff\xff\xff\x7f\xfc\x00\x04\x00\x00\x00\xff",
     b"((((((((((((((((1))))))))))))))))",
     b"=CONCAT(TRIM(\"  a  b \"),MID(\"hello\",2,3))",
@@ -123,10 +134,60 @@ pub fn build_seed_corpus() -> Vec<Vec<u8>> {
         seeds.push(wal_bytes);
     }
 
+    let wire_op_v2 = WireOpV2::from(&wal_op);
+    let wal_v2 = vec![WireWalRecordV2 {
+        seq: 1,
+        timestamp_ms: 1_760_000_000_001,
+        label: String::from("v2"),
+        ops: vec![wire_op_v2.clone()],
+    }];
+    if let Ok(wal2) = encode_wal_complete_v2(0, &wal_v2) {
+        seeds.push(wal2);
+    }
+    let pending_txns = vec![WirePendingTxnV2 {
+        replica: 1,
+        client_seq: 1,
+        base_server_seq: 0,
+        timestamp_ms: 1_760_000_000_001,
+        txn: WireTxnV2 {
+            label: String::from("pend"),
+            ops: vec![wire_op_v2],
+        },
+    }];
+    if let Ok(pwal) = encode_pending_wal_complete(&pending_txns) {
+        seeds.push(pwal);
+    }
+    if let Ok(f1) = encode_sync_frame(&WireSyncFrameV1::Hello {
+        protocol_version: SYNC_PROTOCOL_VERSION,
+        doc_id: [0x11; 16],
+        branch_id: [0x22; 16],
+        replica: None,
+        last_applied_seq: 0,
+        known_epoch: 0,
+    }) {
+        seeds.push(f1);
+    }
+    if let Ok(f2) = encode_sync_frame(&WireSyncFrameV1::Welcome {
+        epoch: 0,
+        head_seq: 0,
+        replica: 1,
+        last_client_seq: 0,
+        max_id_counter: 0,
+        catchup: WireCatchupV1::Txns {
+            from_seq: 1,
+            txns: Vec::new(),
+        },
+    }) {
+        seeds.push(f2);
+    }
+    if let Ok(f3) = encode_sync_frame(&WireSyncFrameV1::Push { txns: pending_txns }) {
+        seeds.push(f3);
+    }
+
     seeds
 }
 
-/// Runs all five fuzz targets in parallel across `threads` threads until
+/// Runs all six fuzz targets in parallel across `threads` threads until
 /// `threads * wall_elapsed >= target_cpu_seconds`.
 pub fn run_fuzz_campaign(target_cpu_seconds: u64, threads: usize) -> FuzzReport {
     let worker_count = threads.max(1);
@@ -140,6 +201,7 @@ pub fn run_fuzz_campaign(target_cpu_seconds: u64, threads: usize) -> FuzzReport 
     let wal_execs = AtomicU64::new(0);
     let ops_execs = AtomicU64::new(0);
     let eval_execs = AtomicU64::new(0);
+    let sync_execs = AtomicU64::new(0);
 
     let started = Instant::now();
     std::thread::scope(|scope| {
@@ -150,6 +212,7 @@ pub fn run_fuzz_campaign(target_cpu_seconds: u64, threads: usize) -> FuzzReport 
             let w_cnt = &wal_execs;
             let o_cnt = &ops_execs;
             let e_cnt = &eval_execs;
+            let y_cnt = &sync_execs;
 
             scope.spawn(move || {
                 let mut rng =
@@ -160,11 +223,12 @@ pub fn run_fuzz_campaign(target_cpu_seconds: u64, threads: usize) -> FuzzReport 
                 let mut local_w = 0_u64;
                 let mut local_o = 0_u64;
                 let mut local_e = 0_u64;
+                let mut local_y = 0_u64;
                 let mut iter = 0_u64;
 
                 while started.elapsed() < wall_budget {
                     mutate_input(&mut rng, seeds_ref, &mut buf);
-                    match iter % 5 {
+                    match iter % 6 {
                         0 => {
                             fuzz_one_parser(&buf);
                             local_p += 1;
@@ -181,9 +245,13 @@ pub fn run_fuzz_campaign(target_cpu_seconds: u64, threads: usize) -> FuzzReport 
                             fuzz_one_ops(&buf);
                             local_o += 1;
                         }
-                        _ => {
+                        4 => {
                             fuzz_one_eval(&buf);
                             local_e += 1;
+                        }
+                        _ => {
+                            fuzz_one_sync(&buf);
+                            local_y += 1;
                         }
                     }
                     iter += 1;
@@ -198,6 +266,7 @@ pub fn run_fuzz_campaign(target_cpu_seconds: u64, threads: usize) -> FuzzReport 
                 w_cnt.fetch_add(local_w, Ordering::Relaxed);
                 o_cnt.fetch_add(local_o, Ordering::Relaxed);
                 e_cnt.fetch_add(local_e, Ordering::Relaxed);
+                y_cnt.fetch_add(local_y, Ordering::Relaxed);
             });
         }
     });
@@ -212,6 +281,7 @@ pub fn run_fuzz_campaign(target_cpu_seconds: u64, threads: usize) -> FuzzReport 
         wal_execs: wal_execs.load(Ordering::Relaxed),
         ops_execs: ops_execs.load(Ordering::Relaxed),
         eval_execs: eval_execs.load(Ordering::Relaxed),
+        sync_execs: sync_execs.load(Ordering::Relaxed),
         seed_corpus_count,
     }
 }

@@ -429,7 +429,12 @@ impl ServerDocMachine {
                     timestamp_ms: orig.timestamp_ms,
                 });
             }
-            return Err(WireRejectReasonV1::InvalidOp);
+            return Ok(TryApplyOutcome::DuplicateAck {
+                replica: session_replica,
+                client_seq: pending.client_seq,
+                seq: self.last_snapshot_seq,
+                timestamp_ms: 0,
+            });
         }
 
         let expected = wm.last_client_seq.saturating_add(1);

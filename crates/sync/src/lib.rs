@@ -36,7 +36,7 @@ pub mod types;
 pub mod validate;
 
 pub use client::{ClientSyncMachine, replay_pending_onto};
-pub use server::ServerDocMachine;
+pub use server::{ApplyResult, ServerDocMachine};
 pub use types::{
     ClientAction, ConnectionState, MemberRole, ReplicaWatermark, ServerLimits, StagedTxn,
     TryApplyOutcome,
@@ -733,6 +733,550 @@ mod tests {
         assert_eq!(
             bob.confirmed().state_digest(),
             server.workbook().state_digest()
+        );
+    }
+
+    #[test]
+    fn reject_reuses_client_seq_and_reloaded_server_deduplicates_snapshotted_seq() {
+        use reticula_wire::v2::WireRejectReasonV1;
+
+        use crate::server::ApplyResult;
+
+        let mut server = ServerDocMachine::new(
+            DOC_ID,
+            BRANCH_ID,
+            String::from("/api/w"),
+            ServerLimits {
+                max_populated_cells: 1,
+                ..ServerLimits::default()
+            },
+        );
+        let mut alice = ClientSyncMachine::new(DOC_ID, BRANCH_ID);
+        connect_client(&mut server, &mut alice, USER_A, Some(MemberRole::Owner));
+
+        // 1. Push and commit txn 1 (populated cell count = 1, hits cap).
+        let act1 = alice
+            .push_local(
+                String::from("cell1"),
+                vec![Op::SetCells {
+                    sheet: SheetId(0),
+                    edits: vec![CellEdit {
+                        row: RowId(0),
+                        col: ColId(0),
+                        input: CellInput::Scalar(ScalarValue::Number(10.0)),
+                        format: FormatPatch::Keep,
+                    }],
+                }],
+                1,
+            )
+            .unwrap();
+        let ClientAction::SendFrame(WireSyncFrameV1::Push { txns: t1 }) = act1.last().unwrap()
+        else {
+            panic!();
+        };
+        let p1 = t1[0].clone();
+        let c1 = commit_ok(
+            &mut server,
+            USER_A,
+            Some(MemberRole::Owner),
+            alice.replica().unwrap(),
+            p1.clone(),
+            1,
+        );
+        alice.on_ack(c1.replica, c1.client_seq);
+        alice.on_commit(c1);
+        assert_eq!(alice.last_acked_client_seq(), 1);
+        assert_eq!(alice.next_client_seq(), 2);
+
+        // 2. Push txn 2 exceeding quota -> server rejects -> client archives and reuses seq 2.
+        let act2 = alice
+            .push_local(
+                String::from("cell2"),
+                vec![Op::SetCells {
+                    sheet: SheetId(0),
+                    edits: vec![CellEdit {
+                        row: RowId(1),
+                        col: ColId(0),
+                        input: CellInput::Scalar(ScalarValue::Number(20.0)),
+                        format: FormatPatch::Keep,
+                    }],
+                }],
+                2,
+            )
+            .unwrap();
+        let ClientAction::SendFrame(WireSyncFrameV1::Push { txns: t2 }) = act2.last().unwrap()
+        else {
+            panic!();
+        };
+        assert_eq!(t2[0].client_seq, 2);
+        let rej_err = server
+            .apply_and_commit(
+                USER_A,
+                Some(MemberRole::Owner),
+                alice.replica().unwrap(),
+                t2[0].clone(),
+                2,
+            )
+            .unwrap_err();
+        assert_eq!(rej_err, WireRejectReasonV1::QuotaExceeded);
+
+        let rej_actions = alice.on_reject(2, rej_err);
+        assert!(matches!(
+            rej_actions.as_slice(),
+            [
+                ClientAction::PersistTruncatedPending(rem),
+                ClientAction::SaveUnsyncedLocal { from_client_seq: 2, txns },
+                ClientAction::PruneUndoFrom(2),
+                ClientAction::NotifyVisibleChanged,
+            ] if rem.is_empty() && txns.len() == 1
+        ));
+        assert_eq!(alice.next_client_seq(), 2);
+
+        // 3. Subsequent local edit overwrites existing cell (count stays 1) with client_seq = 2.
+        let act3 = alice
+            .push_local(
+                String::from("cell1_update"),
+                vec![Op::SetCells {
+                    sheet: SheetId(0),
+                    edits: vec![CellEdit {
+                        row: RowId(0),
+                        col: ColId(0),
+                        input: CellInput::Scalar(ScalarValue::Number(30.0)),
+                        format: FormatPatch::Keep,
+                    }],
+                }],
+                3,
+            )
+            .unwrap();
+        let ClientAction::SendFrame(WireSyncFrameV1::Push { txns: t3 }) = act3.last().unwrap()
+        else {
+            panic!();
+        };
+        assert_eq!(t3[0].client_seq, 2);
+        let c2 = commit_ok(
+            &mut server,
+            USER_A,
+            Some(MemberRole::Owner),
+            alice.replica().unwrap(),
+            t3[0].clone(),
+            3,
+        );
+        alice.on_commit(c2);
+        assert_eq!(alice.last_acked_client_seq(), 2);
+
+        // Stale terminal reject for an already-acked client_seq must be ignored.
+        assert!(
+            alice
+                .on_reject(1, WireRejectReasonV1::QuotaExceeded)
+                .is_empty()
+        );
+
+        // 4. Reload server from snapshot at seq=2 with empty tail and verify resending p1 yields Duplicate.
+        let mut reloaded = ServerDocMachine::from_snapshot_and_log(
+            DOC_ID,
+            BRANCH_ID,
+            String::from("/api/w"),
+            server.epoch(),
+            server.head_seq(),
+            server.workbook().clone(),
+            server.next_per_epoch_replica(),
+            server.watermarks(),
+            Vec::new(),
+            ServerLimits::default(),
+        )
+        .unwrap();
+        let dup = reloaded
+            .apply_and_commit(
+                USER_A,
+                Some(MemberRole::Owner),
+                alice.replica().unwrap(),
+                p1,
+                4,
+            )
+            .unwrap();
+        assert_eq!(
+            dup,
+            ApplyResult::Duplicate {
+                replica: alice.replica().unwrap(),
+                client_seq: 1,
+                seq: 2,
+                timestamp_ms: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn epoch_change_snapshot_required_preserves_visible_pending_invariant() {
+        let mut server = ServerDocMachine::new(
+            DOC_ID,
+            BRANCH_ID,
+            String::from("/api/w"),
+            ServerLimits {
+                catchup_window: 1,
+                snapshot_txn_threshold: 1,
+                ..ServerLimits::default()
+            },
+        );
+        let mut alice = ClientSyncMachine::new(DOC_ID, BRANCH_ID);
+        connect_client(&mut server, &mut alice, USER_A, Some(MemberRole::Owner));
+
+        // Epoch 0 commits seq 1, captures snapshot at 1, then server restores backup bumping epoch to 1.
+        let act1 = alice
+            .push_local(
+                String::from("seed"),
+                vec![Op::SetCells {
+                    sheet: SheetId(0),
+                    edits: vec![CellEdit {
+                        row: RowId(0),
+                        col: ColId(0),
+                        input: CellInput::Scalar(ScalarValue::Number(10.0)),
+                        format: FormatPatch::Keep,
+                    }],
+                }],
+                1,
+            )
+            .unwrap();
+        let ClientAction::SendFrame(WireSyncFrameV1::Push { txns }) = act1.last().unwrap() else {
+            panic!();
+        };
+        let c1 = commit_ok(
+            &mut server,
+            USER_A,
+            Some(MemberRole::Owner),
+            alice.replica().unwrap(),
+            txns[0].clone(),
+            1,
+        );
+        alice.on_commit(c1);
+        let snap1 = server.workbook().clone();
+        let wms1 = server.watermarks();
+
+        // Reload server at epoch=1 with snapshot_seq=1 and head_seq=1 + a second commit so gap > catchup_window.
+        let mut backup_srv = ServerDocMachine::from_snapshot_and_log(
+            DOC_ID,
+            BRANCH_ID,
+            String::from("/api/w"),
+            1,
+            1,
+            snap1.clone(),
+            1,
+            wms1.clone(),
+            Vec::new(),
+            ServerLimits {
+                catchup_window: 1,
+                snapshot_txn_threshold: 1,
+                ..ServerLimits::default()
+            },
+        )
+        .unwrap();
+        let bob_rep = backup_srv.allocate_replica(USER_B).unwrap();
+        backup_srv
+            .apply_and_commit(
+                USER_B,
+                Some(MemberRole::Editor),
+                bob_rep,
+                WirePendingTxnV2 {
+                    replica: bob_rep,
+                    client_seq: 1,
+                    base_server_seq: 1,
+                    timestamp_ms: 2,
+                    txn: ops_to_wire_txn_v2(
+                        String::from("b1"),
+                        &[Op::SetCells {
+                            sheet: SheetId(0),
+                            edits: vec![CellEdit {
+                                row: RowId(1),
+                                col: ColId(0),
+                                input: CellInput::Scalar(ScalarValue::Number(20.0)),
+                                format: FormatPatch::Keep,
+                            }],
+                        }],
+                    ),
+                },
+                2,
+            )
+            .unwrap();
+        backup_srv
+            .apply_and_commit(
+                USER_B,
+                Some(MemberRole::Editor),
+                bob_rep,
+                WirePendingTxnV2 {
+                    replica: bob_rep,
+                    client_seq: 2,
+                    base_server_seq: 1,
+                    timestamp_ms: 3,
+                    txn: ops_to_wire_txn_v2(
+                        String::from("b2"),
+                        &[Op::SetCells {
+                            sheet: SheetId(0),
+                            edits: vec![CellEdit {
+                                row: RowId(2),
+                                col: ColId(0),
+                                input: CellInput::Scalar(ScalarValue::Number(30.0)),
+                                format: FormatPatch::Keep,
+                            }],
+                        }],
+                    ),
+                },
+                3,
+            )
+            .unwrap();
+
+        // Alice disconnects, reconnects (starts Handshaking), pushes a local edit BEFORE Welcome arrives.
+        alice.on_disconnected();
+        let hello_act = alice.on_connected();
+        let ClientAction::SendFrame(hf) = &hello_act[0] else {
+            panic!();
+        };
+        let _ = alice
+            .push_local(
+                String::from("local_offline"),
+                vec![Op::SetCells {
+                    sheet: SheetId(0),
+                    edits: vec![CellEdit {
+                        row: RowId(3),
+                        col: ColId(0),
+                        input: CellInput::Scalar(ScalarValue::Number(40.0)),
+                        format: FormatPatch::Keep,
+                    }],
+                }],
+                4,
+            )
+            .unwrap();
+
+        let welcome = backup_srv
+            .on_hello(USER_A, Some(MemberRole::Owner), hf)
+            .unwrap();
+        let actions = alice.on_welcome(welcome);
+        assert!(matches!(
+            actions.as_slice(),
+            [
+                ClientAction::EpochChanged {
+                    old_epoch: 0,
+                    new_epoch: 1
+                },
+                ClientAction::RequestSnapshot {
+                    snapshot_seq: 1,
+                    ..
+                }
+            ]
+        ));
+        assert_eq!(
+            alice.visible().state_digest(),
+            replay_pending_onto(alice.confirmed(), &alice.pending_wire_txns()).state_digest()
+        );
+
+        let tail = backup_srv.txns_since(1).unwrap();
+        let snap_actions = alice.install_snapshot(1, snap1, &wms1, tail);
+        let ClientAction::SendFrame(WireSyncFrameV1::Push { txns: remapped }) =
+            snap_actions.last().unwrap()
+        else {
+            panic!();
+        };
+        let c_final = commit_ok(
+            &mut backup_srv,
+            USER_A,
+            Some(MemberRole::Owner),
+            alice.replica().unwrap(),
+            remapped[0].clone(),
+            5,
+        );
+        alice.on_commit(c_final);
+        assert_eq!(
+            alice.confirmed().state_digest(),
+            backup_srv.workbook().state_digest()
+        );
+    }
+
+    #[test]
+    fn awaiting_snapshot_after_epoch_change_keeps_pending_wal_monotonic() {
+        use reticula_wire::wal::{encode_pending_wal_complete, scan_pending_wal};
+
+        let mut srv0 = ServerDocMachine::new(
+            DOC_ID,
+            BRANCH_ID,
+            String::from("/api/w"),
+            ServerLimits {
+                catchup_window: 1,
+                snapshot_txn_threshold: 1,
+                ..ServerLimits::default()
+            },
+        );
+        let mut bob = ClientSyncMachine::new(DOC_ID, BRANCH_ID);
+        connect_client(&mut srv0, &mut bob, USER_B, Some(MemberRole::Editor));
+        for i in 1..=2_u64 {
+            let act = bob
+                .push_local(
+                    String::from("b"),
+                    vec![Op::SetCells {
+                        sheet: SheetId(0),
+                        edits: vec![CellEdit {
+                            row: RowId(i),
+                            col: ColId(0),
+                            input: CellInput::Scalar(ScalarValue::Number(i as f64)),
+                            format: FormatPatch::Keep,
+                        }],
+                    }],
+                    i,
+                )
+                .unwrap();
+            let ClientAction::SendFrame(WireSyncFrameV1::Push { txns }) = act.last().unwrap()
+            else {
+                panic!();
+            };
+            let c = commit_ok(
+                &mut srv0,
+                USER_B,
+                Some(MemberRole::Editor),
+                bob.replica().unwrap(),
+                txns[0].clone(),
+                i,
+            );
+            bob.on_commit(c);
+        }
+        let snap1 = srv0.workbook().clone();
+        let tail_after_1 = srv0.txns_since(1).unwrap();
+        let wms = srv0.watermarks();
+
+        // Reload server bumped to epoch=1 at snapshot_seq=1 + 1 tail commit, then push one more
+        // commit so head_seq=3 (gap from 0 = 3 > catchup_window=1).
+        let mut srv1 = ServerDocMachine::from_snapshot_and_log(
+            DOC_ID,
+            BRANCH_ID,
+            String::from("/api/w"),
+            1,
+            1,
+            snap1.clone(),
+            1,
+            wms.clone(),
+            tail_after_1,
+            ServerLimits {
+                catchup_window: 1,
+                snapshot_txn_threshold: 1,
+                ..ServerLimits::default()
+            },
+        )
+        .unwrap();
+        let rep = srv1.allocate_replica(USER_B).unwrap();
+        srv1.apply_and_commit(
+            USER_B,
+            Some(MemberRole::Editor),
+            rep,
+            WirePendingTxnV2 {
+                replica: rep,
+                client_seq: 1,
+                base_server_seq: 2,
+                timestamp_ms: 3,
+                txn: ops_to_wire_txn_v2(
+                    String::from("b3"),
+                    &[Op::SetCells {
+                        sheet: SheetId(0),
+                        edits: vec![CellEdit {
+                            row: RowId(3),
+                            col: ColId(0),
+                            input: CellInput::Scalar(ScalarValue::Number(3.0)),
+                            format: FormatPatch::Keep,
+                        }],
+                    }],
+                ),
+            },
+            3,
+        )
+        .unwrap();
+
+        // Alice authors 2 offline edits (cs=1,2), connects & gets EpochChanged + SnapshotRequired,
+        // then authors a 3rd edit while AwaitingSnapshot -> must write cs=3, NOT cs=1!
+        let mut alice = ClientSyncMachine::new(DOC_ID, BRANCH_ID);
+        for cs_row in 10..=11_u64 {
+            let _ = alice
+                .push_local(
+                    String::from("off"),
+                    vec![Op::SetCells {
+                        sheet: SheetId(0),
+                        edits: vec![CellEdit {
+                            row: RowId(cs_row),
+                            col: ColId(1),
+                            input: CellInput::Scalar(ScalarValue::Number(cs_row as f64)),
+                            format: FormatPatch::Keep,
+                        }],
+                    }],
+                    cs_row,
+                )
+                .unwrap();
+        }
+        let h = alice.on_connected();
+        let ClientAction::SendFrame(hf) = &h[0] else {
+            panic!();
+        };
+        let w = srv1.on_hello(USER_A, Some(MemberRole::Owner), hf).unwrap();
+        let _ = alice.on_welcome(w);
+        assert_eq!(
+            alice.connection_state(),
+            ConnectionState::AwaitingSnapshot { snapshot_seq: 1 }
+        );
+
+        let _ = alice
+            .push_local(
+                String::from("during_snap"),
+                vec![Op::SetCells {
+                    sheet: SheetId(0),
+                    edits: vec![CellEdit {
+                        row: RowId(12),
+                        col: ColId(1),
+                        input: CellInput::Scalar(ScalarValue::Number(12.0)),
+                        format: FormatPatch::Keep,
+                    }],
+                }],
+                12,
+            )
+            .unwrap();
+        let pending = alice.pending_wire_txns();
+        let seqs: Vec<u64> = pending.iter().map(|p| p.client_seq).collect();
+        assert_eq!(seqs, [1, 2, 3]);
+
+        let wal_bytes = encode_pending_wal_complete(&pending).unwrap();
+        let scan = scan_pending_wal(&wal_bytes).unwrap();
+        assert_eq!(scan.records.len(), 3);
+
+        // Reload from persisted OPFS state and complete install_snapshot -> full convergence!
+        let mut reloaded = ClientSyncMachine::from_persisted(
+            DOC_ID,
+            BRANCH_ID,
+            alice.epoch(),
+            alice.replica(),
+            alice.confirmed_seq(),
+            alice.last_acked_client_seq(),
+            alice.confirmed().clone(),
+            scan.records,
+            1,
+        );
+        let h2 = reloaded.on_connected();
+        let ClientAction::SendFrame(hf2) = &h2[0] else {
+            panic!();
+        };
+        let w2 = srv1.on_hello(USER_A, Some(MemberRole::Owner), hf2).unwrap();
+        let _ = reloaded.on_welcome(w2);
+        let tail = srv1.txns_since(1).unwrap();
+        let snap_acts = reloaded.install_snapshot(1, snap1, &wms, tail);
+        for act in snap_acts {
+            if let ClientAction::SendFrame(WireSyncFrameV1::Push { txns }) = act {
+                for p in txns {
+                    let c = commit_ok(
+                        &mut srv1,
+                        USER_A,
+                        Some(MemberRole::Owner),
+                        reloaded.replica().unwrap(),
+                        p,
+                        99,
+                    );
+                    reloaded.on_commit(c);
+                }
+            }
+        }
+        assert_eq!(
+            reloaded.confirmed().state_digest(),
+            srv1.workbook().state_digest()
         );
     }
 }

@@ -364,7 +364,6 @@ impl ClientSyncMachine {
             self.visible = self.confirmed.clone();
             self.confirmed_seq = 0;
             self.last_acked_client_seq = 0;
-            self.next_client_seq = 1;
             self.next_sheet_counter = 1;
         }
 
@@ -374,16 +373,18 @@ impl ClientSyncMachine {
 
         match catchup {
             WireCatchupV1::SnapshotRequired { snapshot_seq, url } => {
+                let pending_max = self.pending.back().map_or(0, |e| e.wire.client_seq);
                 if epoch_changed || replica_changed {
                     self.last_acked_client_seq = last_client_seq;
-                    self.next_client_seq = last_client_seq.saturating_add(1);
+                    self.next_client_seq = last_client_seq.max(pending_max).saturating_add(1);
                     self.id_allocator =
                         IdAllocator::new(epoch, replica, max_id_counter.saturating_add(1))
                             .unwrap_or_else(IdAllocator::local);
                 } else {
                     self.last_acked_client_seq = self.last_acked_client_seq.max(last_client_seq);
-                    self.next_client_seq =
-                        self.next_client_seq.max(last_client_seq.saturating_add(1));
+                    self.next_client_seq = self
+                        .next_client_seq
+                        .max(last_client_seq.max(pending_max).saturating_add(1));
                 }
                 self.pending_welcome = Some(WelcomeProgress {
                     epoch,
@@ -394,12 +395,18 @@ impl ClientSyncMachine {
                 });
                 self.buffered_commits.clear();
                 self.connection_state = ConnectionState::AwaitingSnapshot { snapshot_seq };
+                if epoch_changed {
+                    self.replay_all_pending_fresh();
+                }
                 actions.push(ClientAction::RequestSnapshot { snapshot_seq, url });
                 actions
             }
             WireCatchupV1::Txns { from_seq, txns } => {
                 let expected_from = self.confirmed_seq.saturating_add(1);
                 if from_seq != expected_from {
+                    if epoch_changed {
+                        self.replay_all_pending_fresh();
+                    }
                     actions.push(ClientAction::RequestReconnect);
                     return actions;
                 }
@@ -537,6 +544,12 @@ impl ClientSyncMachine {
 
     /// Processes an incoming live `Commit` frame from the server.
     pub fn on_commit(&mut self, commit: WireCommittedTxnV2) -> Vec<ClientAction> {
+        if matches!(
+            self.connection_state,
+            ConnectionState::Offline | ConnectionState::Handshaking
+        ) {
+            return Vec::new();
+        }
         if let ConnectionState::AwaitingSnapshot { snapshot_seq } = self.connection_state {
             if commit.seq > snapshot_seq {
                 self.buffered_commits.push(commit);
@@ -552,7 +565,9 @@ impl ClientSyncMachine {
 
         let is_own_front = self.replica == Some(commit.replica)
             && self.pending.front().is_some_and(|front| {
-                front.wire.client_seq == commit.client_seq && front.wire.txn == commit.txn
+                !front.unverified_offline_edit
+                    && front.wire.client_seq == commit.client_seq
+                    && front.wire.txn == commit.txn
             });
 
         if is_own_front {
@@ -613,6 +628,9 @@ impl ClientSyncMachine {
             | WireRejectReasonV1::InvalidOp
             | WireRejectReasonV1::QuotaExceeded
             | WireRejectReasonV1::PayloadTooLarge => {
+                if rejected_client_seq <= self.last_acked_client_seq {
+                    return Vec::new();
+                }
                 self.rewind_all_pending();
 
                 let mut retained = VecDeque::new();
@@ -632,9 +650,7 @@ impl ClientSyncMachine {
                     .pending
                     .back()
                     .map_or(self.last_acked_client_seq, |e| e.wire.client_seq);
-                self.next_client_seq = self
-                    .next_client_seq
-                    .max(self.last_acked_client_seq.saturating_add(1));
+                self.next_client_seq = self.last_pushed_client_seq.saturating_add(1);
 
                 let mut actions = vec![ClientAction::PersistTruncatedPending(
                     self.pending_wire_txns(),
@@ -697,7 +713,9 @@ impl ClientSyncMachine {
 
         let is_own_front = self.replica == Some(commit.replica)
             && self.pending.front().is_some_and(|front| {
-                front.wire.client_seq == commit.client_seq && front.wire.txn == commit.txn
+                !front.unverified_offline_edit
+                    && front.wire.client_seq == commit.client_seq
+                    && front.wire.txn == commit.txn
             });
         if is_own_front {
             let _ = self.pending.pop_front();
@@ -739,7 +757,11 @@ impl ClientSyncMachine {
             self.next_sheet_counter = self.next_sheet_counter.max(wb_sheet_max.saturating_add(1));
         }
 
+        let non_contiguous = self.pending.iter().enumerate().any(|(i, e)| {
+            e.wire.client_seq != server_last_cs.saturating_add(1).saturating_add(i as u64)
+        });
         let needs_remap = force_remap_all
+            || non_contiguous
             || self.pending.iter().any(|e| {
                 e.wire.replica != replica
                     || e.wire.client_seq <= server_last_cs
