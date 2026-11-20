@@ -85,8 +85,8 @@ pub fn test() -> Result {
 pub fn test_wasm() -> Result {
     util::step("kernel tests (wasm32)");
     let mut test = cargo().args(["test", "--locked", "--target", WASM_TARGET]);
-    for name in KERNEL_CRATES {
-        test = test.args(["--package", &format!("reticula-{name}")]);
+    for package in WASM_PACKAGES {
+        test = test.args(["--package", package]);
     }
     test.env(
         "CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER",

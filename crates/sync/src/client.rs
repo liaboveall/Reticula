@@ -28,6 +28,9 @@ use crate::types::{
 };
 use crate::validate::{RemapState, max_id_counter_in_ops};
 
+// Version byte, Push variant tag and the length of a batch of at most 64 entries.
+const PUSH_FRAME_OVERHEAD: usize = 3;
+
 #[derive(Clone, Debug)]
 struct PendingEntry {
     wire: WirePendingTxnV2,
@@ -213,6 +216,24 @@ impl ClientSyncMachine {
         self.next_client_seq
     }
 
+    /// Own client sequence already represented in an aligned confirmed workbook.
+    /// An Ack arriving before its Commit must not advance durable checkpoints.
+    #[must_use]
+    pub fn confirmed_client_seq(&self) -> u64 {
+        self.pending
+            .front()
+            .map_or(self.last_acked_client_seq, |entry| {
+                self.last_acked_client_seq
+                    .min(entry.wire.client_seq.saturating_sub(1))
+            })
+    }
+
+    /// Next identifier counter for persistence alongside a collaborative checkpoint.
+    #[must_use]
+    pub const fn next_id_counter(&self) -> u32 {
+        self.id_allocator.next_counter()
+    }
+
     /// Number of unconfirmed pending transactions in the queue.
     #[must_use]
     pub fn pending_len(&self) -> usize {
@@ -291,6 +312,15 @@ impl ClientSyncMachine {
         self.connection_state = ConnectionState::Offline;
         self.pending_welcome = None;
         self.buffered_commits.clear();
+    }
+
+    /// Discards a divergent confirmed revision while retaining all optimistic transactions.
+    /// The next Hello replays the server log or installs a fresh snapshot from sequence zero.
+    pub fn reset_confirmed_for_resync(&mut self) {
+        self.on_disconnected();
+        self.confirmed = Workbook::new();
+        self.confirmed_seq = 0;
+        self.replay_all_pending_fresh();
     }
 
     /// Applies a local transaction optimistically to `visible`, enqueues it for
@@ -652,9 +682,7 @@ impl ClientSyncMachine {
                     .map_or(self.last_acked_client_seq, |e| e.wire.client_seq);
                 self.next_client_seq = self.last_pushed_client_seq.saturating_add(1);
 
-                let mut actions = vec![ClientAction::PersistTruncatedPending(
-                    self.pending_wire_txns(),
-                )];
+                let mut actions = Vec::new();
                 if !archived.is_empty() {
                     actions.push(ClientAction::SaveUnsyncedLocal {
                         from_client_seq: rejected_client_seq,
@@ -662,6 +690,9 @@ impl ClientSyncMachine {
                     });
                     actions.push(ClientAction::PruneUndoFrom(rejected_client_seq));
                 }
+                actions.push(ClientAction::PersistTruncatedPending(
+                    self.pending_wire_txns(),
+                ));
                 actions.push(ClientAction::NotifyVisibleChanged);
                 actions
             }
@@ -877,7 +908,8 @@ impl ClientSyncMachine {
             let entry_bytes = postcard::to_allocvec(&entry.wire).map_or(64, |v| v.len());
             if !batch.is_empty()
                 && (batch.len() >= DEFAULT_MAX_PUSH_BATCH
-                    || batch_bytes.saturating_add(entry_bytes) > DEFAULT_MAX_PUSH_BYTES)
+                    || batch_bytes.saturating_add(entry_bytes)
+                        > DEFAULT_MAX_PUSH_BYTES.saturating_sub(PUSH_FRAME_OVERHEAD))
             {
                 actions.push(ClientAction::SendFrame(WireSyncFrameV1::Push {
                     txns: core::mem::take(&mut batch),

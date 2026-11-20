@@ -48,12 +48,13 @@ use wasm_bindgen::prelude::*;
 #[cfg(feature = "bench")]
 pub mod bench;
 pub mod clipboard;
+pub mod collab;
 pub mod undo;
 
 use crate::clipboard::{
     InternalClipboard, RectPos, build_fill_ops, build_paste_ops, copy_range, find_autofill_end_row,
 };
-use crate::undo::UndoStack;
+use crate::undo::{UndoStack, collab_compensations};
 
 /// Maximum raw CSV/TSV file size accepted for import (`256 MiB`, `14-m1b.md` 5.6).
 pub const MAX_CSV_IMPORT_BYTES: usize = 256 * 1024 * 1024;
@@ -1270,6 +1271,7 @@ fn summarize_tail_records(records: &[WireWalRecordV1], max_tail: usize) -> Vec<W
 #[wasm_bindgen]
 pub struct Engine {
     engine: FormulaEngine,
+    collab: Option<collab::CollabSession>,
     undo_stack: UndoStack,
     clipboard: Option<InternalClipboard>,
     wal_seq: u64,
@@ -1317,6 +1319,7 @@ impl Default for Engine {
     fn default() -> Self {
         Self {
             engine: FormulaEngine::default(),
+            collab: None,
             undo_stack: UndoStack::new(),
             clipboard: None,
             wal_seq: 0,
@@ -1737,7 +1740,7 @@ impl Engine {
 impl Engine {
     /// Pure Rust command handler used both by WASM bindings and unit tests.
     pub fn handle_command(&mut self, command: EngineCommand) -> Option<EngineEvent> {
-        match command {
+        let event = match command {
             EngineCommand::OpenSample { seed, rows } => Some(self.open_sample(seed, rows)),
             EngineCommand::OpenEmpty => Some(self.open_empty()),
             EngineCommand::Subscribe {
@@ -1993,7 +1996,13 @@ impl Engine {
                     digest: String::from_utf8_lossy(&digest).into_owned(),
                 })
             }
+        };
+        if matches!(event, Some(EngineEvent::SheetChanged { .. }))
+            && let Some(session) = &mut self.collab
+        {
+            session.presence(self.subscribed_sheet);
         }
+        event
     }
 
     fn reset_subscription(&mut self, sheet_id: SheetId) {
@@ -2009,6 +2018,7 @@ impl Engine {
     }
 
     fn open_sample(&mut self, seed: u32, rows: u32) -> EngineEvent {
+        self.collab = None;
         let started = now_ms();
         self.engine = FormulaEngine::open_sample(u64::from(seed), rows);
         let generation_ms = now_ms() - started;
@@ -2035,6 +2045,7 @@ impl Engine {
     }
 
     fn open_empty(&mut self) -> EngineEvent {
+        self.collab = None;
         let started = now_ms();
         self.engine = FormulaEngine::new();
         let generation_ms = now_ms() - started;
@@ -2298,17 +2309,44 @@ impl Engine {
         }
     }
 
-    fn execute_user_txn(
-        &mut self,
-        label: String,
-        ops: Vec<Op<BoundFormula>>,
-    ) -> Result<(), OpError> {
-        let saved = ops.clone();
-        let inverses = self.engine.apply_txn(ops)?;
-        self.record_wal_and_mvcc(&label, &saved, &inverses);
-        self.undo_stack
-            .record_txn(label, &saved, inverses, self.engine.workbook());
+    fn execute_user_txn(&mut self, label: String, ops: &[Op<BoundFormula>]) -> Result<(), String> {
+        let (inverses, seq) = self.apply_user_ops(&label, ops)?;
+        if let Some(seq) = seq {
+            self.undo_stack
+                .record_collab_txn(label, ops, inverses, self.engine.workbook(), seq);
+        } else {
+            self.undo_stack
+                .record_txn(label, ops, inverses, self.engine.workbook());
+        }
         Ok(())
+    }
+
+    fn apply_user_ops(
+        &mut self,
+        label: &str,
+        ops: &[Op<BoundFormula>],
+    ) -> Result<(Vec<InverseOp<BoundFormula>>, Option<u64>), String> {
+        if let Some(session) = &self.collab {
+            session.preflight(label, ops, self.last_timestamp_ms)?;
+        }
+        let inverses = self
+            .engine
+            .apply_txn(ops.to_vec())
+            .map_err(format_op_error)?;
+        if let Some(session) = &mut self.collab {
+            match session.queue(label, ops.to_vec(), self.last_timestamp_ms) {
+                Ok(seq) => Ok((inverses, Some(seq))),
+                Err(error) => {
+                    for inverse in inverses.into_iter().rev() {
+                        let _ = self.engine.apply_inverse(inverse);
+                    }
+                    Err(format_op_error(error))
+                }
+            }
+        } else {
+            self.record_wal_and_mvcc(label, ops, &inverses);
+            Ok((inverses, None))
+        }
     }
 
     fn run_initial_recalc_slice(&mut self) -> u32 {
@@ -2376,38 +2414,19 @@ impl Engine {
     ) -> EngineEvent {
         let started = now_ms();
         let addr_label = cell_label(self.engine.workbook(), sheet_id, row_id, col_id);
-        let inv = match self.engine.edit_cell_raw(sheet_id, row_id, col_id, raw) {
-            Ok(inv) => inv,
-            Err(err) => {
-                return EngineEvent::Rejected {
-                    reason: format_edit_error(err),
-                };
-            }
-        };
-
-        // Reconstruct the applied single-cell `Op::SetCells` from post-state for WAL & Redo.
-        let post_snap = self
-            .engine
-            .workbook()
-            .cell_snapshot(sheet_id, row_id, col_id);
-        let fwd_op = Op::SetCells {
-            sheet: sheet_id,
-            edits: vec![reticula_core::ops::CellEdit {
-                row: row_id,
-                col: col_id,
-                input: post_snap
-                    .as_ref()
-                    .map_or(CellInput::Empty, |s| s.input.clone()),
-                format: post_snap
-                    .and_then(|s| s.explicit_format)
-                    .map_or(FormatPatch::Keep, FormatPatch::Set),
-            }],
-        };
         let label = format!("Edit {addr_label}");
-        let ops = vec![fwd_op];
-        self.record_wal_and_mvcc(&label, &ops, core::slice::from_ref(&inv));
-        self.undo_stack
-            .record_txn(label, &ops, vec![inv], self.engine.workbook());
+        let result = if self.collab.is_some() {
+            self.engine
+                .build_cell_edit(sheet_id, row_id, col_id, raw)
+                .map_err(format_edit_error)
+                .and_then(|op| self.execute_user_txn(label, &[op]))
+                .map(|()| self.engine.invalidate_volatile_after_edit())
+        } else {
+            self.edit_local_cell(sheet_id, row_id, col_id, raw, label)
+        };
+        if let Err(reason) = result {
+            return EngineEvent::Rejected { reason };
+        }
 
         let apply_ms = now_ms() - started;
         self.recalc_elapsed_ms += apply_ms;
@@ -2425,6 +2444,42 @@ impl Engine {
         self.step_recalc_slice()
     }
 
+    fn edit_local_cell(
+        &mut self,
+        sheet_id: SheetId,
+        row_id: RowId,
+        col_id: ColId,
+        raw: &str,
+        label: String,
+    ) -> Result<(), String> {
+        let inv = self
+            .engine
+            .edit_cell_raw(sheet_id, row_id, col_id, raw)
+            .map_err(format_edit_error)?;
+        // Preserve the v1 WAL and redo representation of a local cell edit.
+        let post = self
+            .engine
+            .workbook()
+            .cell_snapshot(sheet_id, row_id, col_id);
+        let ops = [Op::SetCells {
+            sheet: sheet_id,
+            edits: vec![reticula_core::ops::CellEdit {
+                row: row_id,
+                col: col_id,
+                input: post
+                    .as_ref()
+                    .map_or(CellInput::Empty, |cell| cell.input.clone()),
+                format: post
+                    .and_then(|cell| cell.explicit_format)
+                    .map_or(FormatPatch::Keep, FormatPatch::Set),
+            }],
+        }];
+        self.record_wal_and_mvcc(&label, &ops, core::slice::from_ref(&inv));
+        self.undo_stack
+            .record_txn(label, &ops, vec![inv], self.engine.workbook());
+        Ok(())
+    }
+
     fn clear_cells(
         &mut self,
         sheet_id: SheetId,
@@ -2437,10 +2492,8 @@ impl Engine {
             rows: rows.into_iter().map(IdRun::from).collect(),
             cols: cols.into_iter().map(IdRun::from).collect(),
         };
-        if let Err(err) = self.execute_user_txn(String::from("Clear cells"), vec![op]) {
-            return EngineEvent::Rejected {
-                reason: format_op_error(err),
-            };
+        if let Err(err) = self.execute_user_txn(String::from("Clear cells"), &[op]) {
+            return EngineEvent::Rejected { reason: err };
         }
         self.recalc_elapsed_ms += now_ms() - started;
         self.flush_dirty_pages();
@@ -2469,7 +2522,11 @@ impl Engine {
             };
         }
         let started = now_ms();
-        let Some(ids) = self.engine.allocator_mut().alloc_run(count) else {
+        let ids = match self.collab.as_mut() {
+            Some(session) => session.machine.alloc_row_run(count),
+            None => self.engine.allocator_mut().alloc_run(count),
+        };
+        let Some(ids) = ids else {
             return EngineEvent::Rejected {
                 reason: String::from("Identifier counter exhausted."),
             };
@@ -2484,10 +2541,8 @@ impl Engine {
         } else {
             format!("Insert {count} rows")
         };
-        if let Err(err) = self.execute_user_txn(label, vec![op]) {
-            return EngineEvent::Rejected {
-                reason: format_op_error(err),
-            };
+        if let Err(err) = self.execute_user_txn(label, &[op]) {
+            return EngineEvent::Rejected { reason: err };
         }
         let recalculated = self.run_initial_recalc_slice();
         let action_ms = now_ms() - started;
@@ -2511,10 +2566,8 @@ impl Engine {
             sheet: sheet_id,
             ids: rows.into_iter().map(IdRun::from).collect(),
         };
-        if let Err(err) = self.execute_user_txn(String::from("Delete rows"), vec![op]) {
-            return EngineEvent::Rejected {
-                reason: format_op_error(err),
-            };
+        if let Err(err) = self.execute_user_txn(String::from("Delete rows"), &[op]) {
+            return EngineEvent::Rejected { reason: err };
         }
         let recalculated = self.run_initial_recalc_slice();
         let action_ms = now_ms() - started;
@@ -2539,7 +2592,11 @@ impl Engine {
             };
         }
         let started = now_ms();
-        let Some(ids) = self.engine.allocator_mut().alloc_run(count) else {
+        let ids = match self.collab.as_mut() {
+            Some(session) => session.machine.alloc_col_run(count),
+            None => self.engine.allocator_mut().alloc_run(count),
+        };
+        let Some(ids) = ids else {
             return EngineEvent::Rejected {
                 reason: String::from("Identifier counter exhausted."),
             };
@@ -2554,10 +2611,8 @@ impl Engine {
         } else {
             format!("Insert {count} columns")
         };
-        if let Err(err) = self.execute_user_txn(label, vec![op]) {
-            return EngineEvent::Rejected {
-                reason: format_op_error(err),
-            };
+        if let Err(err) = self.execute_user_txn(label, &[op]) {
+            return EngineEvent::Rejected { reason: err };
         }
         let recalculated = self.run_initial_recalc_slice();
         let action_ms = now_ms() - started;
@@ -2581,10 +2636,8 @@ impl Engine {
             sheet: sheet_id,
             ids: cols.into_iter().map(IdRun::from).collect(),
         };
-        if let Err(err) = self.execute_user_txn(String::from("Delete columns"), vec![op]) {
-            return EngineEvent::Rejected {
-                reason: format_op_error(err),
-            };
+        if let Err(err) = self.execute_user_txn(String::from("Delete columns"), &[op]) {
+            return EngineEvent::Rejected { reason: err };
         }
         let recalculated = self.run_initial_recalc_slice();
         let action_ms = now_ms() - started;
@@ -2614,10 +2667,8 @@ impl Engine {
             ids: rows.into_iter().map(IdRun::from).collect(),
             after: after_row_id.map(RowId),
         };
-        if let Err(err) = self.execute_user_txn(String::from("Move rows"), vec![op]) {
-            return EngineEvent::Rejected {
-                reason: format_op_error(err),
-            };
+        if let Err(err) = self.execute_user_txn(String::from("Move rows"), &[op]) {
+            return EngineEvent::Rejected { reason: err };
         }
         let recalculated = self.run_initial_recalc_slice();
         let action_ms = now_ms() - started;
@@ -2647,10 +2698,8 @@ impl Engine {
             ids: cols.into_iter().map(IdRun::from).collect(),
             after: after_col_id.map(ColId),
         };
-        if let Err(err) = self.execute_user_txn(String::from("Move columns"), vec![op]) {
-            return EngineEvent::Rejected {
-                reason: format_op_error(err),
-            };
+        if let Err(err) = self.execute_user_txn(String::from("Move columns"), &[op]) {
+            return EngineEvent::Rejected { reason: err };
         }
         let recalculated = self.run_initial_recalc_slice();
         let action_ms = now_ms() - started;
@@ -2672,10 +2721,8 @@ impl Engine {
                 .map(|s| (IdRun::from(s.run), s.size_px))
                 .collect(),
         };
-        if let Err(err) = self.execute_user_txn(String::from("Resize rows"), vec![op]) {
-            return EngineEvent::Rejected {
-                reason: format_op_error(err),
-            };
+        if let Err(err) = self.execute_user_txn(String::from("Resize rows"), &[op]) {
+            return EngineEvent::Rejected { reason: err };
         }
         let action_ms = now_ms() - started;
         let _ = self.engine.take_dirty_changes();
@@ -2695,10 +2742,8 @@ impl Engine {
                 .map(|s| (IdRun::from(s.run), s.size_px))
                 .collect(),
         };
-        if let Err(err) = self.execute_user_txn(String::from("Resize columns"), vec![op]) {
-            return EngineEvent::Rejected {
-                reason: format_op_error(err),
-            };
+        if let Err(err) = self.execute_user_txn(String::from("Resize columns"), &[op]) {
+            return EngineEvent::Rejected { reason: err };
         }
         let action_ms = now_ms() - started;
         let _ = self.engine.take_dirty_changes();
@@ -2716,10 +2761,8 @@ impl Engine {
             frozen_rows,
             frozen_cols,
         };
-        if let Err(err) = self.execute_user_txn(String::from("Freeze panes"), vec![op]) {
-            return EngineEvent::Rejected {
-                reason: format_op_error(err),
-            };
+        if let Err(err) = self.execute_user_txn(String::from("Freeze panes"), &[op]) {
+            return EngineEvent::Rejected { reason: err };
         }
         let action_ms = now_ms() - started;
         let _ = self.engine.take_dirty_changes();
@@ -2757,10 +2800,8 @@ impl Engine {
             number_format: nf_patch,
             style: style.into(),
         };
-        if let Err(err) = self.execute_user_txn(String::from("Format cells"), vec![op]) {
-            return EngineEvent::Rejected {
-                reason: format_op_error(err),
-            };
+        if let Err(err) = self.execute_user_txn(String::from("Format cells"), &[op]) {
+            return EngineEvent::Rejected { reason: err };
         }
         // Pre-intern styles BEFORE encoding dirty pages so `style_id` in pages matches `SheetInfo.styles`!
         let sheet_meta = self.sheet_info(sheet_id);
@@ -2785,10 +2826,8 @@ impl Engine {
                 recalculated: 0,
             };
         }
-        if let Err(err) = self.execute_user_txn(String::from("Auto-fill"), ops) {
-            return EngineEvent::Rejected {
-                reason: format_op_error(err),
-            };
+        if let Err(err) = self.execute_user_txn(String::from("Auto-fill"), &ops) {
+            return EngineEvent::Rejected { reason: err };
         }
         let recalculated = self.run_initial_recalc_slice();
         let sheet_meta = self.sheet_info(sheet_id);
@@ -2859,10 +2898,8 @@ impl Engine {
             Err(reason) => return EngineEvent::Rejected { reason },
         };
         if !ops.is_empty() {
-            if let Err(err) = self.execute_user_txn(String::from("Paste"), ops) {
-                return EngineEvent::Rejected {
-                    reason: format_op_error(err),
-                };
+            if let Err(err) = self.execute_user_txn(String::from("Paste"), &ops) {
+                return EngineEvent::Rejected { reason: err };
             }
             self.clipboard = clip_clone;
         }
@@ -2882,7 +2919,15 @@ impl Engine {
 
     fn add_sheet(&mut self, name: Option<String>, after_sheet: Option<SheetId>) -> EngineEvent {
         let started = now_ms();
-        let new_id = self.engine.alloc_sheet_id();
+        let new_id = match self.collab.as_mut() {
+            Some(session) => session.machine.alloc_sheet_id(),
+            None => Some(self.engine.alloc_sheet_id()),
+        };
+        let Some(new_id) = new_id else {
+            return EngineEvent::Rejected {
+                reason: "Collaborative worksheet identifier limit reached.".into(),
+            };
+        };
         let default_num = self
             .engine
             .workbook()
@@ -2897,10 +2942,8 @@ impl Engine {
             name: req_name,
             after,
         };
-        if let Err(err) = self.execute_user_txn(String::from("Add sheet"), vec![op]) {
-            return EngineEvent::Rejected {
-                reason: format_op_error(err),
-            };
+        if let Err(err) = self.execute_user_txn(String::from("Add sheet"), &[op]) {
+            return EngineEvent::Rejected { reason: err };
         }
         let _ = self.engine.take_dirty_changes();
         self.subscribed_sheet = new_id;
@@ -2921,10 +2964,8 @@ impl Engine {
             sheet: sheet_id,
             name,
         };
-        if let Err(err) = self.execute_user_txn(String::from("Rename sheet"), vec![op]) {
-            return EngineEvent::Rejected {
-                reason: format_op_error(err),
-            };
+        if let Err(err) = self.execute_user_txn(String::from("Rename sheet"), &[op]) {
+            return EngineEvent::Rejected { reason: err };
         }
         self.flush_dirty_pages();
         EngineEvent::SheetChanged {
@@ -2937,10 +2978,8 @@ impl Engine {
     fn delete_sheet(&mut self, sheet_id: SheetId) -> EngineEvent {
         let started = now_ms();
         let op = Op::DeleteSheet { sheet: sheet_id };
-        if let Err(err) = self.execute_user_txn(String::from("Delete sheet"), vec![op]) {
-            return EngineEvent::Rejected {
-                reason: format_op_error(err),
-            };
+        if let Err(err) = self.execute_user_txn(String::from("Delete sheet"), &[op]) {
+            return EngineEvent::Rejected { reason: err };
         }
         let recalculated = self.run_initial_recalc_slice();
         if self.subscribed_sheet == sheet_id
@@ -2966,10 +3005,8 @@ impl Engine {
             sheet: sheet_id,
             after: after_sheet,
         };
-        if let Err(err) = self.execute_user_txn(String::from("Move sheet"), vec![op]) {
-            return EngineEvent::Rejected {
-                reason: format_op_error(err),
-            };
+        if let Err(err) = self.execute_user_txn(String::from("Move sheet"), &[op]) {
+            return EngineEvent::Rejected { reason: err };
         }
         let _ = self.engine.take_dirty_changes();
         EngineEvent::SheetChanged {
@@ -2981,7 +3018,7 @@ impl Engine {
 
     fn undo_txn(&mut self) -> EngineEvent {
         let started = now_ms();
-        let Some(entry) = self.undo_stack.pop_undo() else {
+        let Some(mut entry) = self.undo_stack.pop_undo() else {
             return EngineEvent::SheetChanged {
                 sheet: self.sheet_info(self.subscribed_sheet),
                 action_ms: 0.0,
@@ -2989,17 +3026,20 @@ impl Engine {
             };
         };
         let ops = entry.undo_ops.clone();
-        match self.engine.apply_txn(ops.clone()) {
-            Ok(inverses) => {
-                let wal_label = format!("Undo: {}", entry.label);
-                self.record_wal_and_mvcc(&wal_label, &ops, &inverses);
-                self.undo_stack.push_redo(entry);
+        match self.apply_user_ops(&format!("Undo: {}", entry.label), &ops) {
+            Ok((inverses, seq)) => {
+                if let Some(seq) = seq {
+                    entry.collab_seq = Some(seq);
+                    entry.redo_ops = collab_compensations(&ops, inverses, self.engine.workbook())
+                        .unwrap_or_default();
+                }
+                if !entry.redo_ops.is_empty() {
+                    self.undo_stack.push_redo(entry);
+                }
             }
             Err(err) => {
                 self.undo_stack.push_undo_back(entry);
-                return EngineEvent::Rejected {
-                    reason: format_op_error(err),
-                };
+                return EngineEvent::Rejected { reason: err };
             }
         }
         let recalculated = self.run_initial_recalc_slice();
@@ -3016,7 +3056,7 @@ impl Engine {
 
     fn redo_txn(&mut self) -> EngineEvent {
         let started = now_ms();
-        let Some(entry) = self.undo_stack.pop_redo() else {
+        let Some(mut entry) = self.undo_stack.pop_redo() else {
             return EngineEvent::SheetChanged {
                 sheet: self.sheet_info(self.subscribed_sheet),
                 action_ms: 0.0,
@@ -3024,17 +3064,20 @@ impl Engine {
             };
         };
         let ops = entry.redo_ops.clone();
-        match self.engine.apply_txn(ops.clone()) {
-            Ok(inverses) => {
-                let wal_label = format!("Redo: {}", entry.label);
-                self.record_wal_and_mvcc(&wal_label, &ops, &inverses);
-                self.undo_stack.push_undo_back(entry);
+        match self.apply_user_ops(&format!("Redo: {}", entry.label), &ops) {
+            Ok((inverses, seq)) => {
+                if let Some(seq) = seq {
+                    entry.collab_seq = Some(seq);
+                    entry.undo_ops = collab_compensations(&ops, inverses, self.engine.workbook())
+                        .unwrap_or_default();
+                }
+                if !entry.undo_ops.is_empty() {
+                    self.undo_stack.push_undo_back(entry);
+                }
             }
             Err(err) => {
                 self.undo_stack.push_redo(entry);
-                return EngineEvent::Rejected {
-                    reason: format_op_error(err),
-                };
+                return EngineEvent::Rejected { reason: err };
             }
         }
         let recalculated = self.run_initial_recalc_slice();

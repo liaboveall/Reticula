@@ -227,6 +227,17 @@ impl FormulaEngine {
         engine
     }
 
+    /// Installs a reconciled workbook and queues full recalculation for later slices.
+    pub fn replace_reconciled_workbook(&mut self, workbook: Workbook<BoundFormula>) {
+        let mut engine = Self::from_workbook_clean(workbook);
+        engine.env = self.env.clone();
+        let count = u32::try_from(engine.slots.len()).unwrap_or(0);
+        for fid in 0..count {
+            engine.mark_fid_dirty_only(fid);
+        }
+        *self = engine;
+    }
+
     /// Generates the upgraded seeded sample (`13-m1a.md` 5.8):
     /// - `rows × 22` columns (`A..T` sales columns + `U1:V2` parameter panel);
     /// - `U1 = "促销立减率"`, `V1 = 0%` (`Percent`), `U2 = "前10万单实收合计"`,
@@ -603,6 +614,20 @@ impl FormulaEngine {
         col: ColId,
         raw: &str,
     ) -> Result<InverseOp<BoundFormula>, EditError> {
+        let op = self.build_cell_edit(sheet_id, row, col, raw)?;
+        let inverse = self.apply_op(op)?;
+        self.invalidate_volatile_after_edit();
+        Ok(inverse)
+    }
+
+    /// Binds a raw cell edit without applying it so another workbook can apply the same operation.
+    pub fn build_cell_edit(
+        &self,
+        sheet_id: SheetId,
+        row: RowId,
+        col: ColId,
+        raw: &str,
+    ) -> Result<Op<BoundFormula>, EditError> {
         let (has_explicit_fmt, effective_fmt) =
             self.workbook
                 .sheet(sheet_id)
@@ -643,7 +668,7 @@ impl FormulaEngine {
             }
         };
 
-        let inv = self.apply_op(Op::SetCells {
+        Ok(Op::SetCells {
             sheet: sheet_id,
             edits: vec![CellEdit {
                 row,
@@ -651,13 +676,15 @@ impl FormulaEngine {
                 input,
                 format,
             }],
-        })?;
+        })
+    }
+
+    /// Invalidates volatile formulas following direct cell input.
+    pub fn invalidate_volatile_after_edit(&mut self) {
         if !self.volatile_set.is_empty() {
             let vol_roots: Vec<u32> = self.volatile_set.iter().copied().collect();
             self.propagate_dirty(vol_roots);
         }
-
-        Ok(inv)
     }
 
     /// Applies a multi-operation transaction atomically: if any operation fails,

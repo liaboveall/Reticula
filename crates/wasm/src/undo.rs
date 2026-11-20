@@ -19,8 +19,9 @@ use reticula_core::axis::AxisRun;
 use reticula_core::format::NumberFormat;
 use reticula_core::id::{ColId, IdRun, RowId, SheetId};
 use reticula_core::ops::{
-    CellEdit, CellInput, CellSnapshot, FormatBackup, FormatPatch, FormatTarget, FormulaPayload,
-    InverseOp, MAX_EDITS_PER_OP, Op, ScalarValue, Workbook, WorkbookCellKey,
+    CellEdit, CellInput, CellSnapshot, ConditionalCellEdit, FormatBackup, FormatPatch,
+    FormatTarget, FormulaPayload, InverseOp, MAX_EDITS_PER_OP, Op, ScalarValue, Workbook,
+    WorkbookCellKey,
 };
 use reticula_core::sheet::Sheet;
 use reticula_core::style::{BorderWeight, ColorPatch, HorizontalAlign, StylePatch};
@@ -44,6 +45,17 @@ pub struct UndoEntry {
     pub redo_ops: Vec<Op<BoundFormula>>,
     /// Estimated heap footprint of this entry.
     pub approx_bytes: usize,
+    /// Sequence of the latest collaborative action that produced this entry.
+    pub collab_seq: Option<u64>,
+}
+
+impl UndoEntry {
+    fn measure(&mut self) {
+        self.approx_bytes = size_of::<Self>()
+            .saturating_add(self.label.capacity())
+            .saturating_add(estimate_ops_bytes(&self.undo_ops))
+            .saturating_add(estimate_ops_bytes(&self.redo_ops));
+    }
 }
 
 /// Bounded session undo/redo stack (`<= 100` entries and `<= 64 MiB`).
@@ -114,45 +126,73 @@ impl UndoStack {
         inverses: Vec<InverseOp<BoundFormula>>,
         post_workbook: &Workbook<BoundFormula>,
     ) {
-        // Drop redo branch first.
-        for dropped in self.redo.drain(..) {
-            self.total_bytes = self.total_bytes.saturating_sub(dropped.approx_bytes);
-        }
-
+        self.clear_redo();
         let mut undo_ops = Vec::new();
         for (fwd, inv) in forward_ops.iter().zip(inverses).rev() {
             synthesize_compensating_ops(fwd, inv, post_workbook, &mut undo_ops);
         }
         let redo_ops: Vec<Op<BoundFormula>> = forward_ops.iter().map(to_redo_op).collect();
+        self.record_entry(label, undo_ops, redo_ops, None);
+    }
 
-        let approx_bytes = size_of::<UndoEntry>()
-            .saturating_add(label.capacity())
-            .saturating_add(estimate_ops_bytes(&undo_ops))
-            .saturating_add(estimate_ops_bytes(&redo_ops));
-
-        if approx_bytes > MAX_UNDO_TOTAL_BYTES {
-            // Single transaction exceeds entire 64 MiB undo budget: clear older
-            // history so the user never undoes an earlier step across an
-            // un-recorded gap.
+    pub(crate) fn record_collab_txn(
+        &mut self,
+        label: String,
+        forward: &[Op<BoundFormula>],
+        inverses: Vec<InverseOp<BoundFormula>>,
+        workbook: &Workbook<BoundFormula>,
+        seq: u64,
+    ) {
+        self.clear_redo();
+        if let Some(undo) = collab_compensations(forward, inverses, workbook) {
+            self.record_entry(label, undo, Vec::new(), Some(seq));
+        } else {
             self.clear();
-            return;
         }
+    }
 
-        self.total_bytes = self.total_bytes.saturating_add(approx_bytes);
-        self.undo.push_back(UndoEntry {
+    fn record_entry(
+        &mut self,
+        label: String,
+        undo_ops: Vec<Op<BoundFormula>>,
+        redo_ops: Vec<Op<BoundFormula>>,
+        collab_seq: Option<u64>,
+    ) {
+        self.push_undo_back(UndoEntry {
             label,
             undo_ops,
             redo_ops,
-            approx_bytes,
+            approx_bytes: 0,
+            collab_seq,
         });
+    }
 
+    fn trim(&mut self) {
         while self.undo.len() > MAX_UNDO_ENTRIES || self.total_bytes > MAX_UNDO_TOTAL_BYTES {
             if let Some(oldest) = self.undo.pop_front() {
                 self.total_bytes = self.total_bytes.saturating_sub(oldest.approx_bytes);
             } else {
+                self.clear_redo();
                 break;
             }
         }
+    }
+
+    fn clear_redo(&mut self) {
+        for dropped in self.redo.drain(..) {
+            self.total_bytes = self.total_bytes.saturating_sub(dropped.approx_bytes);
+        }
+    }
+
+    pub(crate) fn prune_collab(&mut self, from: u64) {
+        self.clear_redo();
+        self.undo.retain(|entry| {
+            let keep = entry.collab_seq.is_none_or(|seq| seq < from);
+            if !keep {
+                self.total_bytes = self.total_bytes.saturating_sub(entry.approx_bytes);
+            }
+            keep
+        });
     }
 
     /// Pops the most recent undo entry for execution; call [`Self::push_redo`]
@@ -164,9 +204,15 @@ impl UndoStack {
     }
 
     /// Moves an executed undo entry onto the redo stack.
-    pub fn push_redo(&mut self, entry: UndoEntry) {
+    pub fn push_redo(&mut self, mut entry: UndoEntry) {
+        entry.measure();
+        if entry.approx_bytes > MAX_UNDO_TOTAL_BYTES {
+            self.clear();
+            return;
+        }
         self.total_bytes = self.total_bytes.saturating_add(entry.approx_bytes);
         self.redo.push(entry);
+        self.trim();
     }
 
     /// Pops the most recent redo entry for re-execution; call
@@ -178,9 +224,135 @@ impl UndoStack {
     }
 
     /// Returns an executed redo entry back onto the undo stack.
-    pub fn push_undo_back(&mut self, entry: UndoEntry) {
+    pub fn push_undo_back(&mut self, mut entry: UndoEntry) {
+        entry.measure();
+        if entry.approx_bytes > MAX_UNDO_TOTAL_BYTES {
+            self.clear();
+            return;
+        }
         self.total_bytes = self.total_bytes.saturating_add(entry.approx_bytes);
         self.undo.push_back(entry);
+        self.trim();
+    }
+}
+
+/// Compensates only logical cells that were changed. A shadow rewind supplies
+/// the expected value immediately after each operation in a compound edit.
+pub(crate) fn collab_compensations(
+    forward: &[Op<BoundFormula>],
+    inverses: Vec<InverseOp<BoundFormula>>,
+    workbook: &Workbook<BoundFormula>,
+) -> Option<Vec<Op<BoundFormula>>> {
+    let mut out = Vec::new();
+    let mut shadow = (inverses.len() > 1).then(|| workbook.clone());
+    let mut remaining = MAX_UNDO_TOTAL_BYTES;
+    for (op, inv) in forward.iter().zip(inverses).rev() {
+        let post = shadow.as_ref().unwrap_or(workbook);
+        let begin = out.len();
+        let rewind = shadow.as_ref().map(|_| inv.clone());
+        match inv {
+            InverseOp::RestoreCells { sheet, cells } => {
+                emit_conditional_restores(post, sheet, cells, remaining, &mut out)?;
+            }
+            InverseOp::RestoreFilledRange {
+                sheet,
+                rows,
+                cols,
+                prior_non_empty,
+            } => {
+                let row_count = rows.iter().map(|run| run.len as usize).sum::<usize>();
+                let col_count = cols.iter().map(|run| run.len as usize).sum::<usize>();
+                if row_count
+                    .saturating_mul(col_count)
+                    .saturating_mul(size_of::<ConditionalCellEdit<BoundFormula>>())
+                    > remaining
+                {
+                    return None;
+                }
+                let mut prior: BTreeMap<_, _> = prior_non_empty
+                    .into_iter()
+                    .map(|cell| ((cell.row, cell.col), cell))
+                    .collect();
+                let cells = rows
+                    .into_iter()
+                    .flat_map(IdRun::iter)
+                    .flat_map(|row| {
+                        cols.iter()
+                            .copied()
+                            .flat_map(IdRun::iter)
+                            .map(move |col| (RowId(row), ColId(col)))
+                    })
+                    .map(|(row, col)| {
+                        prior.remove(&(row, col)).unwrap_or(CellSnapshot {
+                            row,
+                            col,
+                            input: CellInput::Empty,
+                            explicit_format: None,
+                        })
+                    });
+                emit_conditional_restores(post, sheet, cells, remaining, &mut out)?;
+            }
+            other => synthesize_compensating_ops(op, other, post, &mut out),
+        }
+        remaining = remaining.checked_sub(estimate_ops_bytes(&out[begin..]))?;
+        if let (Some(shadow), Some(inverse)) = (shadow.as_mut(), rewind) {
+            shadow.apply_inverse(inverse).ok()?;
+        }
+    }
+    Some(out)
+}
+
+fn emit_conditional_restores(
+    post: &Workbook<BoundFormula>,
+    sheet: SheetId,
+    prior: impl IntoIterator<Item = CellSnapshot<BoundFormula>>,
+    mut remaining: usize,
+    out: &mut Vec<Op<BoundFormula>>,
+) -> Option<()> {
+    let mut edits = Vec::new();
+    for cell in prior {
+        let current = post.cell_snapshot(sheet, cell.row, cell.col)?;
+        let expected_input = discard_cache(current.input);
+        let new_input = discard_cache(cell.input);
+        if expected_input == new_input && current.explicit_format == cell.explicit_format {
+            continue;
+        }
+        remaining = remaining.checked_sub(
+            size_of::<ConditionalCellEdit<BoundFormula>>()
+                .saturating_add(estimate_cell_input_bytes(&expected_input))
+                .saturating_add(estimate_cell_input_bytes(&new_input)),
+        )?;
+        edits.push(ConditionalCellEdit {
+            row: cell.row,
+            col: cell.col,
+            expected_input,
+            expected_format: current.explicit_format,
+            new_input,
+            new_format: cell
+                .explicit_format
+                .map_or(FormatPatch::Clear, FormatPatch::Set),
+        });
+        if edits.len() == MAX_EDITS_PER_OP {
+            out.push(Op::SetCellsIf {
+                sheet,
+                edits: core::mem::take(&mut edits),
+            });
+        }
+    }
+    if !edits.is_empty() {
+        out.push(Op::SetCellsIf { sheet, edits });
+    }
+    Some(())
+}
+
+fn discard_cache(input: CellInput<BoundFormula>) -> CellInput<BoundFormula> {
+    if let CellInput::Formula { formula, .. } = input {
+        CellInput::Formula {
+            formula,
+            cached: None,
+        }
+    } else {
+        input
     }
 }
 

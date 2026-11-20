@@ -1,4 +1,4 @@
-import type { WireCellStyle } from "@reticula/protocol";
+import type { RemotePresence, WireCellStyle } from "@reticula/protocol";
 import { PAGE_COLS, PAGE_ROWS } from "@reticula/protocol/viewport";
 import type { PageCache } from "./cache.ts";
 import {
@@ -29,14 +29,9 @@ export interface FormulaReferenceOverlay {
 }
 
 /** A collaborator's cursor and selection in displayed positions on the active sheet. */
-export interface RemotePresenceOverlay {
-  readonly replica: number;
-  readonly displayName: string;
-  readonly colorSlot: number;
-  readonly cursorRow: number;
-  readonly cursorCol: number;
-  readonly selection?: Span | null;
-}
+export type RemotePresenceOverlay = Readonly<Omit<RemotePresence, "selection">> & {
+  readonly selection?: RemotePresence["selection"] | null;
+};
 
 /** Active row or column drag-reorder drop indicator. */
 export type ReorderGuide =

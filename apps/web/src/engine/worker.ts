@@ -1,4 +1,5 @@
 import {
+  type CollabEvent,
   Engine,
   type EngineCommand,
   encodeWalInit,
@@ -6,9 +7,16 @@ import {
   init,
   inspectWal,
   type SheetInfo,
+  type SyncCommand,
 } from "@reticula/protocol";
 import wasmUrl from "@reticula/protocol/wasm?url";
-import type { EngineMessage, HostCommand, SafeModeInfo, WorkerEnvelope } from "./client.ts";
+import type {
+  EngineMessage,
+  HostCommand,
+  SafeModeInfo,
+  WorkerEnvelope,
+  WorkerOutput,
+} from "./client.ts";
 import {
   detectStorageBackend,
   isQuotaExceededError,
@@ -30,7 +38,7 @@ import {
 interface WorkerScope {
   readonly name: string;
   onmessage: ((event: MessageEvent<WorkerEnvelope | EngineCommand>) => void) | null;
-  postMessage(message: EngineMessage | ArrayBuffer, transfer?: Transferable[]): void;
+  postMessage(message: WorkerOutput, transfer?: Transferable[]): void;
   __reticulaOnWasmPanic?: (message: string) => void;
 }
 
@@ -73,6 +81,7 @@ let backend: StorageBackendKind = "memory";
 let stopped = false;
 let activeDoc: ActiveDoc | null = null;
 let activeSnap: ActiveSnapshotJob | null = null;
+let collaborative = false;
 
 // Web Locks held by this worker (`lockName -> release callback`).
 const heldLocks = new Map<string, () => void>();
@@ -307,6 +316,24 @@ function flushDuePagesAndAux(eng: Engine): void {
   }
 }
 
+function collabTransfers(event: CollabEvent): ArrayBuffer[] {
+  const buffers =
+    event.kind === "checkpoint"
+      ? [event.checkpoint.snapshot.buffer]
+      : event.kind === "saveUnsynced"
+        ? [event.snapshot.buffer, event.pendingWal.buffer]
+        : "bytes" in event
+          ? [event.bytes.buffer]
+          : [];
+  return buffers.filter((buffer): buffer is ArrayBuffer => buffer instanceof ArrayBuffer);
+}
+
+function flushCollabEvents(eng: Engine): void {
+  for (let event = eng.takeCollabEvent(); event; event = eng.takeCollabEvent()) {
+    scope.postMessage({ channel: "collab", event }, collabTransfers(event));
+  }
+}
+
 async function drainWalFrames(eng: Engine, latestSheet?: SheetInfo): Promise<void> {
   const doc = activeDoc;
   if (!doc) {
@@ -513,14 +540,36 @@ async function runEngineCommand(command: EngineCommand): Promise<void> {
   if (stopped || !engine) {
     return;
   }
+  if (collaborative && (command.kind === "openEmpty" || command.kind === "openSample")) {
+    scope.postMessage({ kind: "rejected", reason: "Open a local workbook in a separate worker." });
+    return;
+  }
   const event = engine.handle(command);
   if (event) {
     scope.postMessage(event);
   }
   const updatedSheet = sheetFromEvent(event);
   await drainWalFrames(engine, updatedSheet);
+  if (collaborative) flushCollabEvents(engine);
   flushDuePagesAndAux(engine);
   await settleOpeningSentinelIfReady(engine);
+  scheduleWorkSlice();
+}
+
+function runSyncCommand(command: SyncCommand): void {
+  if (stopped || !engine) return;
+  if (command.kind === "open" && (activeDoc || collaborative)) {
+    scope.postMessage({
+      kind: "rejected",
+      reason: "Open a collaborative workbook in a fresh worker.",
+    });
+    return;
+  }
+  const event = engine.handleSync(command);
+  if (event?.kind === "ready") collaborative = true;
+  if (event) scope.postMessage(event);
+  flushCollabEvents(engine);
+  flushDuePagesAndAux(engine);
   scheduleWorkSlice();
 }
 
@@ -1254,7 +1303,16 @@ const startupQueue: (WorkerEnvelope | EngineCommand)[] = [];
 function dispatchEnvelope(item: WorkerEnvelope | EngineCommand): void {
   enqueueTask(async () => {
     if ("channel" in item) {
-      if (item.channel === "host") {
+      if (item.channel === "collab") {
+        runSyncCommand(item.command);
+      } else if (item.channel === "host") {
+        if (collaborative && item.command.kind !== "flushAndCloseForUpdate") {
+          scope.postMessage({
+            kind: "rejected",
+            reason: "This worker holds a collaborative workbook.",
+          });
+          return;
+        }
         await handleHostCommand(item.command);
       } else {
         await runEngineCommand(item.command);

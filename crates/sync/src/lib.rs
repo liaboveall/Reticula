@@ -827,9 +827,9 @@ mod tests {
         assert!(matches!(
             rej_actions.as_slice(),
             [
-                ClientAction::PersistTruncatedPending(rem),
                 ClientAction::SaveUnsyncedLocal { from_client_seq: 2, txns },
                 ClientAction::PruneUndoFrom(2),
+                ClientAction::PersistTruncatedPending(rem),
                 ClientAction::NotifyVisibleChanged,
             ] if rem.is_empty() && txns.len() == 1
         ));
