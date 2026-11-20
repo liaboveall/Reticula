@@ -246,13 +246,11 @@ export class FormulaBarEditor {
   }
 
   setAnalysis(analysis: WireFormulaAnalysis | null): void {
-    const prevSel = this.#view.state.selection;
-    this.#suppressChange = true;
-    this.#view.dispatch({
-      effects: setFormulaAnalysisEffect.of(analysis),
-      selection: prevSel,
-    });
-    this.#suppressChange = false;
+    const view = this.#view;
+    // Let CodeMirror ingest pending native input before redrawing decorations.
+    if (!view.composing && view.contentDOM.textContent === this.value) {
+      view.dispatch({ effects: setFormulaAnalysisEffect.of(analysis) });
+    }
   }
 
   destroy(): void {

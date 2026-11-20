@@ -1491,6 +1491,8 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
   const formulaBarValue =
     editingText !== null ? editingText : (matchingInspected?.raw ?? selection?.text ?? "");
 
+  const getEditSource = useCallback(() => editSessionRef.current?.source ?? null, []);
+
   const nameBoxText = editSessionRef.current
     ? editSessionRef.current.hostSheet !== activeSheetId
       ? `${engine.status === "ready" ? (engine.sheet.sheets.find((s) => s.id === editSessionRef.current?.hostSheet)?.name ?? "Sheet") : "Sheet"}!${editSessionRef.current.address}`
@@ -2390,6 +2392,7 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
         isEditing={editingText !== null}
         analysis={formulaAnalysis?.analysis ?? null}
         analysisSource={formulaAnalysis?.source ?? null}
+        getEditSource={getEditSource}
         onChange={handleFormulaBarChange}
         onCommit={handleFormulaBarCommit}
         onCancel={handleFormulaBarCancel}

@@ -29,6 +29,7 @@ export interface FormulaBarProps {
   readonly isEditing: boolean;
   readonly analysis: WireFormulaAnalysis | null;
   readonly analysisSource?: string | null;
+  readonly getEditSource: () => string | null;
   readonly onChange: (text: string, cursorUtf16: number) => void;
   readonly onFocus?: () => void;
   readonly onCommit: (moveDown: boolean) => void;
@@ -52,6 +53,7 @@ export function FormulaBar({
   isEditing,
   analysis,
   analysisSource,
+  getEditSource,
   onChange,
   onFocus,
   onCommit,
@@ -235,13 +237,20 @@ export function FormulaBar({
     editorRef.current?.setDisabled(disabled);
   }, [disabled]);
 
-  useEffect(() => {
-    editorRef.current?.setValue(value);
-  }, [value]);
+  useLayoutEffect(() => {
+    // A React render can lag behind the current CodeMirror edit.
+    if (getEditSource() === (isEditing ? value : null)) {
+      editorRef.current?.setValue(value);
+    }
+  }, [getEditSource, isEditing, value]);
 
   useEffect(() => {
-    editorRef.current?.setAnalysis(isEditing ? analysis : null);
-  }, [analysis, isEditing]);
+    const editor = editorRef.current;
+    const source = getEditSource();
+    if (editor && source === (isEditing ? editor.value : null)) {
+      editor.setAnalysis(isEditing && analysisSource === source ? analysis : null);
+    }
+  }, [analysis, analysisSource, getEditSource, isEditing]);
 
   useImperativeHandle(ref, () => ({
     focus() {
