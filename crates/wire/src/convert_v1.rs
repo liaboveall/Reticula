@@ -46,6 +46,8 @@ pub enum WireConvertError {
     FormulaLimitExceeded,
     /// Array literal dimensions do not match element count or equal zero.
     InvalidArrayLiteral,
+    /// Operation variant introduced in wire v2+ cannot be encoded as [`WireOpV1`].
+    UnsupportedInV1,
 }
 
 fn canon_f64(n: f64) -> Result<f64, WireConvertError> {
@@ -1278,13 +1280,16 @@ impl TryFrom<WireCellEditV1> for CellEdit<BoundFormula> {
     }
 }
 
-impl From<&Op<BoundFormula>> for WireOpV1 {
-    fn from(op: &Op<BoundFormula>) -> Self {
-        match op {
+impl TryFrom<&Op<BoundFormula>> for WireOpV1 {
+    type Error = WireConvertError;
+
+    fn try_from(op: &Op<BoundFormula>) -> Result<Self, Self::Error> {
+        let converted = match op {
             Op::SetCells { sheet, edits } => Self::SetCells {
                 sheet: sheet.0,
                 edits: edits.iter().map(WireCellEditV1::from).collect(),
             },
+            Op::SetCellsIf { .. } => return Err(WireConvertError::UnsupportedInV1),
             Op::ClearRange { sheet, rows, cols } => Self::ClearRange {
                 sheet: sheet.0,
                 rows: runs_to_wire(rows),
@@ -1394,7 +1399,8 @@ impl From<&Op<BoundFormula>> for WireOpV1 {
                 sheet: sheet.0,
                 after: after.map(|s| s.0),
             },
-        }
+        };
+        Ok(converted)
     }
 }
 
@@ -1552,12 +1558,16 @@ impl TryFrom<WireOpV1> for Op<BoundFormula> {
 }
 
 /// Converts a slice of in-memory operations into a [`WireTxnV1`].
-#[must_use]
-pub fn ops_to_wire_txn(label: alloc::string::String, ops: &[Op<BoundFormula>]) -> WireTxnV1 {
-    WireTxnV1 {
+pub fn ops_to_wire_txn(
+    label: alloc::string::String,
+    ops: &[Op<BoundFormula>],
+) -> Result<WireTxnV1, WireConvertError> {
+    let converted: Result<Vec<WireOpV1>, WireConvertError> =
+        ops.iter().map(WireOpV1::try_from).collect();
+    Ok(WireTxnV1 {
         label,
-        ops: ops.iter().map(WireOpV1::from).collect(),
-    }
+        ops: converted?,
+    })
 }
 
 /// Validates and converts a [`WireTxnV1`] back into `(label, Vec<Op<BoundFormula>>)`.

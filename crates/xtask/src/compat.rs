@@ -252,7 +252,10 @@ fn freeze_v1() -> Result {
 
     for (idx, (label, ops)) in txns.into_iter().enumerate() {
         let seq = 11 + (idx as u64);
-        let wire_ops: Vec<WireOpV1> = ops.iter().map(WireOpV1::from).collect();
+        let wire_ops: Vec<WireOpV1> = ops
+            .iter()
+            .map(|op| WireOpV1::try_from(op).map_err(|e| format!("WireOpV1::try_from: {e:?}")))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
         wal_records.push(WireWalRecordV1 {
             seq,
             timestamp_ms: 1_763_500_000_000 + seq,

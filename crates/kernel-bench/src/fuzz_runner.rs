@@ -104,18 +104,19 @@ pub fn build_seed_corpus() -> Vec<Vec<u8>> {
             format: FormatPatch::Keep,
         }],
     };
+    let wire_op = WireOpV1::try_from(&wal_op).expect("wal_op fits WireOpV1");
     let wal_records = vec![
         WireWalRecordV1 {
             seq: 1,
             timestamp_ms: 1_760_000_000_001,
             label: String::from("Edit A1"),
-            ops: vec![WireOpV1::from(&wal_op)],
+            ops: vec![wire_op.clone()],
         },
         WireWalRecordV1 {
             seq: 2,
             timestamp_ms: 1_760_000_000_002,
             label: String::from("Edit A1 again"),
-            ops: vec![WireOpV1::from(&wal_op)],
+            ops: vec![wire_op],
         },
     ];
     if let Ok(wal_bytes) = encode_wal_complete(0, &wal_records) {

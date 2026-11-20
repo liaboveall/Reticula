@@ -18,10 +18,17 @@ use serde::{Deserialize, Serialize};
 use crate::axis::{Axis, AxisError, AxisRun, MAX_COL_AXIS_LEN, MAX_ROW_AXIS_LEN};
 use crate::digest::Digest64;
 use crate::format::NumberFormat;
-use crate::id::{ColId, IdAllocator, IdRun, RowId, SheetId};
+use crate::id::{ColId, IdAllocator, IdRun, RowId, SheetId, id_counter, id_stream, pack_sheet_id};
 use crate::sheet::{
     MAX_COL_WIDTH, MAX_FREEZE_COUNT, MAX_ROW_HEIGHT, MAX_SHEET_NAME_UTF16, MIN_COL_WIDTH,
     MIN_ROW_HEIGHT, Sheet, is_valid_sheet_name,
+};
+use crate::state_digest::{
+    AXIS_KIND_COL, AXIS_KIND_ROW, CanonicalScalar, StateDigest, axis_content_hash,
+    compute_order_digest as compute_sheets_order_digest, hash_cell_format, hash_cell_style,
+    hash_col_format, hash_col_style, hash_col_width, hash_formula_cell, hash_row_format,
+    hash_row_height, hash_row_style, hash_scalar_cell, hash_sheet_meta,
+    sheet_content_and_scalar_count,
 };
 use crate::style::StylePatch;
 use crate::value::{CalcError, Value};
@@ -181,6 +188,20 @@ pub enum ScalarValue {
     Error(CalcError),
 }
 
+impl ScalarValue {
+    /// Logical equality where `-0.0` equals `+0.0` and all other scalars compare
+    /// canonically.
+    #[must_use]
+    pub fn logical_eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Number(a), Self::Number(b)) => {
+                (*a == 0.0 && *b == 0.0) || a.to_bits() == b.to_bits()
+            }
+            _ => self == other,
+        }
+    }
+}
+
 /// Authored content of a single cell.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub enum CellInput<F = RawFormula> {
@@ -197,6 +218,21 @@ pub enum CellInput<F = RawFormula> {
         /// until recalculation runs).
         cached: Option<ScalarValue>,
     },
+}
+
+impl<F: PartialEq> CellInput<F> {
+    /// Logical equality used by [`Op::SetCellsIf`]: compares scalar values
+    /// canonically (`-0.0 == +0.0`) and compares formula payloads while
+    /// **ignoring volatile cached evaluation values**.
+    #[must_use]
+    pub fn logical_eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Empty, Self::Empty) => true,
+            (Self::Scalar(a), Self::Scalar(b)) => a.logical_eq(b),
+            (Self::Formula { formula: fa, .. }, Self::Formula { formula: fb, .. }) => fa == fb,
+            _ => false,
+        }
+    }
 }
 
 /// Change to a cell, row or column's explicit [`NumberFormat`].
@@ -249,6 +285,26 @@ pub struct CellEdit<F = RawFormula> {
     pub format: FormatPatch,
 }
 
+/// Conditional cell mutation within [`Op::SetCellsIf`] (`06-sync.md`, E19):
+/// applies `(new_input, new_format)` iff the cell's current logical input
+/// (`cached` ignored for formulas) and explicit number format match
+/// `(expected_input, expected_format)` at application time.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ConditionalCellEdit<F = RawFormula> {
+    /// Target row identity.
+    pub row: RowId,
+    /// Target column identity.
+    pub col: ColId,
+    /// Expected current logical input (`Formula { cached }` ignored).
+    pub expected_input: CellInput<F>,
+    /// Expected current explicit per-cell format (`None` for inherited).
+    pub expected_format: Option<NumberFormat>,
+    /// Replacement input written if preconditions hold.
+    pub new_input: CellInput<F>,
+    /// Number format patch applied if preconditions hold.
+    pub new_format: FormatPatch,
+}
+
 /// Exact prior state of one cell, recorded so [`InverseOp::RestoreCells`]
 /// restores values, bound formulas and explicit formats bit-for-bit.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -288,6 +344,14 @@ pub enum Op<F: FormulaPayload = RawFormula> {
         sheet: SheetId,
         /// Pairwise-distinct cell edits.
         edits: Vec<CellEdit<F>>,
+    },
+    /// Conditionally writes up to [`MAX_EDITS_PER_OP`] cells on one worksheet
+    /// (used for collaborative cell undo per E19, `15-m2a.md` 5.1).
+    SetCellsIf {
+        /// Target worksheet.
+        sheet: SheetId,
+        /// Pairwise-distinct conditional cell edits.
+        edits: Vec<ConditionalCellEdit<F>>,
     },
     /// Clears values and formulas across `rows × cols` (preserving formats and
     /// styles, matching spreadsheet `Delete` key behaviour).
@@ -462,6 +526,30 @@ pub enum Op<F: FormulaPayload = RawFormula> {
         /// Preceding worksheet (`None` moves to first tab).
         after: Option<SheetId>,
     },
+}
+
+impl<F: FormulaPayload> Op<F> {
+    /// Whether this operation mutates axis identity order/membership or sheet
+    /// tab structure (meaning clients with pending structural ops skip the
+    /// `order` component when verifying intermediate `Digest` frames).
+    #[must_use]
+    pub const fn is_structural(&self) -> bool {
+        matches!(
+            self,
+            Self::InsertRows { .. }
+                | Self::InsertCols { .. }
+                | Self::DeleteRows { .. }
+                | Self::DeleteCols { .. }
+                | Self::UndeleteRows { .. }
+                | Self::UndeleteCols { .. }
+                | Self::MoveRows { .. }
+                | Self::MoveCols { .. }
+                | Self::AddSheet { .. }
+                | Self::DeleteSheet { .. }
+                | Self::UndeleteSheet { .. }
+                | Self::MoveSheet { .. }
+        )
+    }
 }
 
 /// Exact in-memory inverse produced by [`Workbook::apply`].
@@ -690,6 +778,10 @@ pub struct Workbook<F = RawFormula> {
     allocator: IdAllocator,
     next_sheet_id: u32,
     seed_origin: Option<SeedOrigin>,
+    /// Incrementally maintained 128-bit collaborative content/membership digest.
+    content_digest: u128,
+    /// Incrementally maintained populated cell count (formulas + non-empty scalars).
+    populated_cells: u64,
 }
 
 impl<F: FormulaPayload> Default for Workbook<F> {
@@ -703,6 +795,8 @@ impl<F: FormulaPayload> Workbook<F> {
     #[must_use]
     pub fn new() -> Self {
         let sheet = Sheet::standard(SheetId(0), String::from("Sheet1"));
+        let (content_digest, populated_cells) =
+            sheet_content_and_scalar_count(&sheet, |_, _| false);
         Self {
             sheets: vec![sheet],
             formulas: BTreeMap::new(),
@@ -712,6 +806,8 @@ impl<F: FormulaPayload> Workbook<F> {
             allocator: IdAllocator::local(),
             next_sheet_id: 1,
             seed_origin: None,
+            content_digest,
+            populated_cells,
         }
     }
 
@@ -719,7 +815,13 @@ impl<F: FormulaPayload> Workbook<F> {
     /// workbook.
     #[must_use]
     pub fn from_sheet(sheet: Sheet, seed_origin: Option<SeedOrigin>) -> Self {
-        let next_id = sheet.id().0.saturating_add(1);
+        let next_id = if sheet.id().0 < 0x0001_0000 {
+            sheet.id().0.saturating_add(1)
+        } else {
+            1
+        };
+        let (content_digest, populated_cells) =
+            sheet_content_and_scalar_count(&sheet, |_, _| false);
         Self {
             sheets: vec![sheet],
             formulas: BTreeMap::new(),
@@ -729,6 +831,8 @@ impl<F: FormulaPayload> Workbook<F> {
             allocator: IdAllocator::local(),
             next_sheet_id: next_id,
             seed_origin,
+            content_digest,
+            populated_cells,
         }
     }
 
@@ -791,7 +895,7 @@ impl<F: FormulaPayload> Workbook<F> {
             }
         }
 
-        let wb = Self {
+        let mut wb = Self {
             sheets,
             formulas,
             formulas_bytes,
@@ -800,10 +904,13 @@ impl<F: FormulaPayload> Workbook<F> {
             allocator,
             next_sheet_id,
             seed_origin,
+            content_digest: 0,
+            populated_cells: 0,
         };
         if wb.estimated_bytes() > MAX_WORKBOOK_BYTES {
             return Err(OpError::MemoryLimitExceeded);
         }
+        wb.recompute_content_and_population();
         Ok(wb)
     }
 
@@ -860,6 +967,85 @@ impl<F: FormulaPayload> Workbook<F> {
         id
     }
 
+    /// Allocates the next collision-free collaborative [`SheetId`] for
+    /// `(epoch, replica)` starting from `*next_counter`, advancing
+    /// `*next_counter` past any ID already present in this workbook.
+    pub fn alloc_collab_sheet_id(
+        &self,
+        epoch: u8,
+        replica: u32,
+        next_counter: &mut u8,
+    ) -> Option<SheetId> {
+        let mut c = (*next_counter).max(1);
+        loop {
+            let candidate = pack_sheet_id(epoch, replica, c)?;
+            if self.sheet(candidate).is_none() {
+                *next_counter = c.saturating_add(1);
+                return Some(candidate);
+            }
+            if c == u8::MAX {
+                return None;
+            }
+            c = c.saturating_add(1);
+        }
+    }
+
+    /// Returns the incrementally maintained 128-bit collaborative content/membership digest.
+    #[must_use]
+    pub const fn content_digest(&self) -> u128 {
+        self.content_digest
+    }
+
+    /// Returns the incrementally maintained populated cell count (formulas plus
+    /// non-empty scalar cells).
+    #[must_use]
+    pub const fn populated_cell_count(&self) -> u64 {
+        self.populated_cells
+    }
+
+    /// Recomputes `(content_digest, populated_cells)` cleanly from full workbook state.
+    #[must_use]
+    pub fn compute_content_digest_from_scratch(&self) -> u128 {
+        self.compute_content_and_population_from_scratch().0
+    }
+
+    fn compute_content_and_population_from_scratch(&self) -> (u128, u64) {
+        let mut digest = 0_u128;
+        let mut count = 0_u64;
+        for sheet in &self.sheets {
+            let sid = sheet.id();
+            let (sd, sc) = sheet_content_and_scalar_count(sheet, |r, c| {
+                self.formulas.contains_key(&(sid, r, c))
+            });
+            digest = digest.wrapping_add(sd);
+            count = count.saturating_add(sc);
+        }
+        for (&(sid, row, col), formula) in &self.formulas {
+            digest = digest.wrapping_add(hash_formula_cell(sid, row, col, formula));
+            count = count.saturating_add(1);
+        }
+        (digest, count)
+    }
+
+    fn recompute_content_and_population(&mut self) {
+        let (digest, count) = self.compute_content_and_population_from_scratch();
+        self.content_digest = digest;
+        self.populated_cells = count;
+    }
+
+    /// Computes the 64-bit order digest covering sheet tab sequence and axis order.
+    #[must_use]
+    pub fn compute_order_digest(&self) -> u64 {
+        compute_sheets_order_digest(&self.sheets)
+    }
+
+    /// Returns the versioned 192-bit [`StateDigest`] (`content` from incremental
+    /// state + `order` from tab/axis sequences, excluding cached formula eval).
+    #[must_use]
+    pub fn state_digest(&self) -> StateDigest {
+        StateDigest::from_parts(self.content_digest, self.compute_order_digest())
+    }
+
     /// Stored formula map across the workbook.
     #[must_use]
     pub const fn formulas(&self) -> &BTreeMap<WorkbookCellKey, F> {
@@ -882,13 +1068,30 @@ impl<F: FormulaPayload> Workbook<F> {
         formula: F,
         cached: Value,
     ) -> bool {
+        let (old_h, old_pop) = {
+            let Some(target) = self.sheet(sheet) else {
+                return false;
+            };
+            if let Some(old_f) = self.formulas.get(&(sheet, row, col)) {
+                (hash_formula_cell(sheet, row, col, old_f), 1_u64)
+            } else {
+                let val = target.value_by_id(row, col);
+                scalar_cell_digest_and_pop(sheet, row, col, target, val)
+            }
+        };
         let Some(target) = self.sheet_mut(sheet) else {
             return false;
         };
         if !target.set_value_by_id(row, col, cached) {
             return false;
         }
+        let new_h = hash_formula_cell(sheet, row, col, &formula);
         self.put_formula((sheet, row, col), formula);
+        self.content_digest = self.content_digest.wrapping_sub(old_h).wrapping_add(new_h);
+        self.populated_cells = self
+            .populated_cells
+            .saturating_sub(old_pop)
+            .saturating_add(1);
         true
     }
 
@@ -1022,8 +1225,10 @@ impl<F: FormulaPayload> Workbook<F> {
             }
         }
 
-        // 4. Compact string pools.
+        // 4. Compact string pools and recompute content/populated baseline
+        // after tombstones/purged cells have been stripped.
         self.compact_strings();
+        self.recompute_content_and_population();
     }
 
     /// Reads the complete logical [`CellSnapshot`] of `(sheet, row, col)`.
@@ -1060,6 +1265,7 @@ impl<F: FormulaPayload> Workbook<F> {
     pub fn apply(&mut self, op: Op<F>) -> Result<InverseOp<F>, OpError> {
         match op {
             Op::SetCells { sheet, edits } => self.apply_set_cells(sheet, edits),
+            Op::SetCellsIf { sheet, edits } => self.apply_set_cells_if(sheet, edits),
             Op::ClearRange { sheet, rows, cols } => self.apply_clear_range(sheet, &rows, &cols),
             Op::InsertRows { sheet, after, ids } => self.apply_insert_rows(sheet, after, ids),
             Op::InsertCols { sheet, after, ids } => self.apply_insert_cols(sheet, after, ids),
@@ -1117,32 +1323,68 @@ impl<F: FormulaPayload> Workbook<F> {
             }
             InverseOp::RemoveInsertedRows { sheet, ids } => {
                 let target = self.sheet_mut(sheet).ok_or(OpError::SheetNotFound)?;
+                let old_ax = axis_content_hash(sheet, AXIS_KIND_ROW, target.row_axis());
                 target.row_axis_mut().remove_inserted(ids)?;
+                let new_ax = axis_content_hash(sheet, AXIS_KIND_ROW, target.row_axis());
+                self.content_digest = self
+                    .content_digest
+                    .wrapping_sub(old_ax)
+                    .wrapping_add(new_ax);
                 Ok(())
             }
             InverseOp::RemoveInsertedCols { sheet, ids } => {
                 let target = self.sheet_mut(sheet).ok_or(OpError::SheetNotFound)?;
+                let old_ax = axis_content_hash(sheet, AXIS_KIND_COL, target.col_axis());
                 target.col_axis_mut().remove_inserted(ids)?;
+                let new_ax = axis_content_hash(sheet, AXIS_KIND_COL, target.col_axis());
+                self.content_digest = self
+                    .content_digest
+                    .wrapping_sub(old_ax)
+                    .wrapping_add(new_ax);
                 Ok(())
             }
             InverseOp::UndeleteRows { sheet, ids } => {
                 let target = self.sheet_mut(sheet).ok_or(OpError::SheetNotFound)?;
+                let old_ax = axis_content_hash(sheet, AXIS_KIND_ROW, target.row_axis());
                 target.row_axis_mut().undelete_runs(&ids)?;
+                let new_ax = axis_content_hash(sheet, AXIS_KIND_ROW, target.row_axis());
+                self.content_digest = self
+                    .content_digest
+                    .wrapping_sub(old_ax)
+                    .wrapping_add(new_ax);
                 Ok(())
             }
             InverseOp::UndeleteCols { sheet, ids } => {
                 let target = self.sheet_mut(sheet).ok_or(OpError::SheetNotFound)?;
+                let old_ax = axis_content_hash(sheet, AXIS_KIND_COL, target.col_axis());
                 target.col_axis_mut().undelete_runs(&ids)?;
+                let new_ax = axis_content_hash(sheet, AXIS_KIND_COL, target.col_axis());
+                self.content_digest = self
+                    .content_digest
+                    .wrapping_sub(old_ax)
+                    .wrapping_add(new_ax);
                 Ok(())
             }
             InverseOp::RedeleteRows { sheet, ids } => {
                 let target = self.sheet_mut(sheet).ok_or(OpError::SheetNotFound)?;
+                let old_ax = axis_content_hash(sheet, AXIS_KIND_ROW, target.row_axis());
                 target.row_axis_mut().delete_runs(&ids)?;
+                let new_ax = axis_content_hash(sheet, AXIS_KIND_ROW, target.row_axis());
+                self.content_digest = self
+                    .content_digest
+                    .wrapping_sub(old_ax)
+                    .wrapping_add(new_ax);
                 Ok(())
             }
             InverseOp::RedeleteCols { sheet, ids } => {
                 let target = self.sheet_mut(sheet).ok_or(OpError::SheetNotFound)?;
+                let old_ax = axis_content_hash(sheet, AXIS_KIND_COL, target.col_axis());
                 target.col_axis_mut().delete_runs(&ids)?;
+                let new_ax = axis_content_hash(sheet, AXIS_KIND_COL, target.col_axis());
+                self.content_digest = self
+                    .content_digest
+                    .wrapping_sub(old_ax)
+                    .wrapping_add(new_ax);
                 Ok(())
             }
             InverseOp::RestoreMovedRows {
@@ -1151,10 +1393,18 @@ impl<F: FormulaPayload> Workbook<F> {
                 rewritten,
             } => {
                 let target = self.sheet_mut(sheet).ok_or(OpError::SheetNotFound)?;
+                let old_ax = axis_content_hash(sheet, AXIS_KIND_ROW, target.row_axis());
                 target.row_axis_mut().restore_runs(prior_runs)?;
+                let new_ax = axis_content_hash(sheet, AXIS_KIND_ROW, target.row_axis());
+                let mut delta = new_ax.wrapping_sub(old_ax);
                 for (key, formula) in rewritten {
+                    if let Some(cur_f) = self.formulas.get(&key) {
+                        delta = delta.wrapping_sub(hash_formula_cell(key.0, key.1, key.2, cur_f));
+                    }
+                    delta = delta.wrapping_add(hash_formula_cell(key.0, key.1, key.2, &formula));
                     self.put_formula(key, formula);
                 }
+                self.content_digest = self.content_digest.wrapping_add(delta);
                 Ok(())
             }
             InverseOp::RestoreMovedCols {
@@ -1163,24 +1413,42 @@ impl<F: FormulaPayload> Workbook<F> {
                 rewritten,
             } => {
                 let target = self.sheet_mut(sheet).ok_or(OpError::SheetNotFound)?;
+                let old_ax = axis_content_hash(sheet, AXIS_KIND_COL, target.col_axis());
                 target.col_axis_mut().restore_runs(prior_runs)?;
+                let new_ax = axis_content_hash(sheet, AXIS_KIND_COL, target.col_axis());
+                let mut delta = new_ax.wrapping_sub(old_ax);
                 for (key, formula) in rewritten {
+                    if let Some(cur_f) = self.formulas.get(&key) {
+                        delta = delta.wrapping_sub(hash_formula_cell(key.0, key.1, key.2, cur_f));
+                    }
+                    delta = delta.wrapping_add(hash_formula_cell(key.0, key.1, key.2, &formula));
                     self.put_formula(key, formula);
                 }
+                self.content_digest = self.content_digest.wrapping_add(delta);
                 Ok(())
             }
             InverseOp::RestoreRowHeights { sheet, prior } => {
                 let target = self.sheet_mut(sheet).ok_or(OpError::SheetNotFound)?;
+                let mut delta = 0_u128;
                 for (row, px) in prior {
+                    let old_h = hash_row_height(sheet, row, target.row_height_by_id(row));
                     target.set_row_height_by_id(row, px);
+                    let new_h = hash_row_height(sheet, row, target.row_height_by_id(row));
+                    delta = delta.wrapping_sub(old_h).wrapping_add(new_h);
                 }
+                self.content_digest = self.content_digest.wrapping_add(delta);
                 Ok(())
             }
             InverseOp::RestoreColWidths { sheet, prior } => {
                 let target = self.sheet_mut(sheet).ok_or(OpError::SheetNotFound)?;
+                let mut delta = 0_u128;
                 for (col, px) in prior {
+                    let old_h = hash_col_width(sheet, col, target.col_width_by_id(col));
                     target.set_col_width_by_id(col, px);
+                    let new_h = hash_col_width(sheet, col, target.col_width_by_id(col));
+                    delta = delta.wrapping_sub(old_h).wrapping_add(new_h);
                 }
+                self.content_digest = self.content_digest.wrapping_add(delta);
                 Ok(())
             }
             InverseOp::RestoreFreeze {
@@ -1189,31 +1457,78 @@ impl<F: FormulaPayload> Workbook<F> {
                 frozen_cols,
             } => {
                 let target = self.sheet_mut(sheet).ok_or(OpError::SheetNotFound)?;
+                let old_meta = hash_sheet_meta(
+                    sheet,
+                    target.name(),
+                    target.deleted_count(),
+                    target.frozen_rows(),
+                    target.frozen_cols(),
+                );
                 target.set_freeze(frozen_rows, frozen_cols);
+                let new_meta = hash_sheet_meta(
+                    sheet,
+                    target.name(),
+                    target.deleted_count(),
+                    frozen_rows,
+                    frozen_cols,
+                );
+                self.content_digest = self
+                    .content_digest
+                    .wrapping_sub(old_meta)
+                    .wrapping_add(new_meta);
                 Ok(())
             }
             InverseOp::RestoreFormat { sheet, backup } => {
                 let target = self.sheet_mut(sheet).ok_or(OpError::SheetNotFound)?;
+                let mut delta = 0_u128;
                 match backup {
                     FormatBackup::Cells(entries) => {
                         for (r, c, fmt, st) in entries {
+                            let old_h =
+                                hash_cell_format(sheet, r, c, target.cell_format_by_id(r, c))
+                                    .wrapping_add(hash_cell_style(
+                                        sheet,
+                                        r,
+                                        c,
+                                        target.cell_style_patch(r, c),
+                                    ));
                             target.set_cell_format_by_id(r, c, fmt);
                             target.set_cell_style_patch(r, c, st);
+                            let new_h =
+                                hash_cell_format(sheet, r, c, target.cell_format_by_id(r, c))
+                                    .wrapping_add(hash_cell_style(
+                                        sheet,
+                                        r,
+                                        c,
+                                        target.cell_style_patch(r, c),
+                                    ));
+                            delta = delta.wrapping_sub(old_h).wrapping_add(new_h);
                         }
                     }
                     FormatBackup::Rows(entries) => {
                         for (r, fmt, st) in entries {
+                            let old_h = hash_row_format(sheet, r, target.row_format_by_id(r))
+                                .wrapping_add(hash_row_style(sheet, r, target.row_style_patch(r)));
                             target.set_row_format_by_id(r, fmt);
                             target.set_row_style_patch(r, st);
+                            let new_h = hash_row_format(sheet, r, target.row_format_by_id(r))
+                                .wrapping_add(hash_row_style(sheet, r, target.row_style_patch(r)));
+                            delta = delta.wrapping_sub(old_h).wrapping_add(new_h);
                         }
                     }
                     FormatBackup::Cols(entries) => {
                         for (c, fmt, st) in entries {
+                            let old_h = hash_col_format(sheet, c, target.col_format_by_id(c))
+                                .wrapping_add(hash_col_style(sheet, c, target.col_style_patch(c)));
                             target.set_col_format_by_id(c, fmt);
                             target.set_col_style_patch(c, st);
+                            let new_h = hash_col_format(sheet, c, target.col_format_by_id(c))
+                                .wrapping_add(hash_col_style(sheet, c, target.col_style_patch(c)));
+                            delta = delta.wrapping_sub(old_h).wrapping_add(new_h);
                         }
                     }
                 }
+                self.content_digest = self.content_digest.wrapping_add(delta);
                 Ok(())
             }
             InverseOp::RemoveAddedSheet {
@@ -1234,26 +1549,81 @@ impl<F: FormulaPayload> Workbook<F> {
                 }
                 self.sheets.remove(idx);
                 self.next_sheet_id = prior_next_sheet_id;
+                self.recompute_content_and_population();
                 Ok(())
             }
             InverseOp::RestoreSheetName { sheet, prior_name } => {
                 let target = self.sheet_mut(sheet).ok_or(OpError::SheetNotFound)?;
+                let old_meta = hash_sheet_meta(
+                    sheet,
+                    target.name(),
+                    target.deleted_count(),
+                    target.frozen_rows(),
+                    target.frozen_cols(),
+                );
                 target.set_name(prior_name);
+                let new_meta = hash_sheet_meta(
+                    sheet,
+                    target.name(),
+                    target.deleted_count(),
+                    target.frozen_rows(),
+                    target.frozen_cols(),
+                );
+                self.content_digest = self
+                    .content_digest
+                    .wrapping_sub(old_meta)
+                    .wrapping_add(new_meta);
                 Ok(())
             }
             InverseOp::UndeleteSheet { sheet } => {
                 let target = self.sheet_mut(sheet).ok_or(OpError::SheetNotFound)?;
+                let old_meta = hash_sheet_meta(
+                    sheet,
+                    target.name(),
+                    target.deleted_count(),
+                    target.frozen_rows(),
+                    target.frozen_cols(),
+                );
                 if !target.decrement_deleted() {
                     return Err(OpError::InvalidSheetOp);
                 }
+                let new_meta = hash_sheet_meta(
+                    sheet,
+                    target.name(),
+                    target.deleted_count(),
+                    target.frozen_rows(),
+                    target.frozen_cols(),
+                );
+                self.content_digest = self
+                    .content_digest
+                    .wrapping_sub(old_meta)
+                    .wrapping_add(new_meta);
                 Ok(())
             }
             InverseOp::RedeleteSheet { sheet, prior_name } => {
                 let target = self.sheet_mut(sheet).ok_or(OpError::SheetNotFound)?;
+                let old_meta = hash_sheet_meta(
+                    sheet,
+                    target.name(),
+                    target.deleted_count(),
+                    target.frozen_rows(),
+                    target.frozen_cols(),
+                );
                 target.set_name(prior_name);
                 if !target.increment_deleted() {
                     return Err(OpError::InvalidSheetOp);
                 }
+                let new_meta = hash_sheet_meta(
+                    sheet,
+                    target.name(),
+                    target.deleted_count(),
+                    target.frozen_rows(),
+                    target.frozen_cols(),
+                );
+                self.content_digest = self
+                    .content_digest
+                    .wrapping_sub(old_meta)
+                    .wrapping_add(new_meta);
                 Ok(())
             }
             InverseOp::RestoreSheetOrder { order } => {
@@ -1442,6 +1812,87 @@ impl<F: FormulaPayload> Workbook<F> {
         })
     }
 
+    fn apply_set_cells_if(
+        &mut self,
+        sheet_id: SheetId,
+        edits: Vec<ConditionalCellEdit<F>>,
+    ) -> Result<InverseOp<F>, OpError> {
+        if edits.len() > MAX_EDITS_PER_OP {
+            return Err(OpError::TooManyEdits);
+        }
+
+        let added_bytes: usize = {
+            let sheet = self.sheet(sheet_id).ok_or(OpError::SheetNotFound)?;
+            let mut seen = BTreeSet::new();
+            let mut extra_bytes = 0usize;
+            for edit in &edits {
+                if !seen.insert((edit.row, edit.col)) {
+                    return Err(OpError::DuplicateCellTarget);
+                }
+                if !sheet.row_axis().contains_id(edit.row.0)
+                    || !sheet.col_axis().contains_id(edit.col.0)
+                {
+                    return Err(OpError::TargetNotFound);
+                }
+                if !edit.new_format.is_valid()
+                    || edit.expected_format.is_some_and(|fmt| !fmt.is_valid())
+                {
+                    return Err(OpError::InvalidDimensionOrFormat);
+                }
+                let _ = validate_cell_input(&edit.expected_input)?;
+                extra_bytes = extra_bytes.saturating_add(validate_cell_input(&edit.new_input)?);
+            }
+            extra_bytes
+        };
+
+        if self.estimated_bytes().saturating_add(added_bytes) > MAX_WORKBOOK_BYTES {
+            return Err(OpError::MemoryLimitExceeded);
+        }
+
+        self.seed_origin = None;
+
+        let mut prior = Vec::new();
+        for edit in edits {
+            let matches = {
+                let sheet = self.sheet(sheet_id).ok_or(OpError::SheetNotFound)?;
+                let input_ok = if let Some(cur_f) =
+                    self.formulas.get(&(sheet_id, edit.row, edit.col))
+                {
+                    matches!(&edit.expected_input, CellInput::Formula { formula, .. } if cur_f == formula)
+                } else {
+                    let cur_input =
+                        match value_to_scalar(sheet, sheet.value_by_id(edit.row, edit.col)) {
+                            None => CellInput::Empty,
+                            Some(s) => CellInput::Scalar(s),
+                        };
+                    cur_input.logical_eq(&edit.expected_input)
+                };
+                let cur_fmt = sheet
+                    .cell_format_by_id(edit.row, edit.col)
+                    .map(NumberFormat::normalize);
+                let exp_fmt = edit.expected_format.map(NumberFormat::normalize);
+                input_ok && cur_fmt == exp_fmt
+            };
+            if matches {
+                if let Some(snap) = self.cell_snapshot(sheet_id, edit.row, edit.col) {
+                    prior.push(snap);
+                }
+                self.write_validated_cell(
+                    sheet_id,
+                    edit.row,
+                    edit.col,
+                    edit.new_input,
+                    edit.new_format,
+                )?;
+            }
+        }
+
+        Ok(InverseOp::RestoreCells {
+            sheet: sheet_id,
+            cells: prior,
+        })
+    }
+
     fn apply_clear_range(
         &mut self,
         sheet_id: SheetId,
@@ -1507,9 +1958,15 @@ impl<F: FormulaPayload> Workbook<F> {
             return Err(OpError::MemoryLimitExceeded);
         }
         let target = self.sheet_mut(sheet_id).ok_or(OpError::SheetNotFound)?;
+        let old_ax = axis_content_hash(sheet_id, AXIS_KIND_ROW, target.row_axis());
         target
             .row_axis_mut()
             .insert_after(after.map(|r| r.0), ids)?;
+        let new_ax = axis_content_hash(sheet_id, AXIS_KIND_ROW, target.row_axis());
+        self.content_digest = self
+            .content_digest
+            .wrapping_sub(old_ax)
+            .wrapping_add(new_ax);
         self.seed_origin = None;
         Ok(InverseOp::RemoveInsertedRows {
             sheet: sheet_id,
@@ -1527,9 +1984,15 @@ impl<F: FormulaPayload> Workbook<F> {
             return Err(OpError::MemoryLimitExceeded);
         }
         let target = self.sheet_mut(sheet_id).ok_or(OpError::SheetNotFound)?;
+        let old_ax = axis_content_hash(sheet_id, AXIS_KIND_COL, target.col_axis());
         target
             .col_axis_mut()
             .insert_after(after.map(|c| c.0), ids)?;
+        let new_ax = axis_content_hash(sheet_id, AXIS_KIND_COL, target.col_axis());
+        self.content_digest = self
+            .content_digest
+            .wrapping_sub(old_ax)
+            .wrapping_add(new_ax);
         self.seed_origin = None;
         Ok(InverseOp::RemoveInsertedCols {
             sheet: sheet_id,
@@ -1543,7 +2006,13 @@ impl<F: FormulaPayload> Workbook<F> {
         ids: Vec<IdRun>,
     ) -> Result<InverseOp<F>, OpError> {
         let target = self.sheet_mut(sheet_id).ok_or(OpError::SheetNotFound)?;
+        let old_ax = axis_content_hash(sheet_id, AXIS_KIND_ROW, target.row_axis());
         target.row_axis_mut().delete_runs(&ids)?;
+        let new_ax = axis_content_hash(sheet_id, AXIS_KIND_ROW, target.row_axis());
+        self.content_digest = self
+            .content_digest
+            .wrapping_sub(old_ax)
+            .wrapping_add(new_ax);
         self.seed_origin = None;
         Ok(InverseOp::UndeleteRows {
             sheet: sheet_id,
@@ -1557,7 +2026,13 @@ impl<F: FormulaPayload> Workbook<F> {
         ids: Vec<IdRun>,
     ) -> Result<InverseOp<F>, OpError> {
         let target = self.sheet_mut(sheet_id).ok_or(OpError::SheetNotFound)?;
+        let old_ax = axis_content_hash(sheet_id, AXIS_KIND_COL, target.col_axis());
         target.col_axis_mut().delete_runs(&ids)?;
+        let new_ax = axis_content_hash(sheet_id, AXIS_KIND_COL, target.col_axis());
+        self.content_digest = self
+            .content_digest
+            .wrapping_sub(old_ax)
+            .wrapping_add(new_ax);
         self.seed_origin = None;
         Ok(InverseOp::UndeleteCols {
             sheet: sheet_id,
@@ -1571,7 +2046,13 @@ impl<F: FormulaPayload> Workbook<F> {
         ids: Vec<IdRun>,
     ) -> Result<InverseOp<F>, OpError> {
         let target = self.sheet_mut(sheet_id).ok_or(OpError::SheetNotFound)?;
+        let old_ax = axis_content_hash(sheet_id, AXIS_KIND_ROW, target.row_axis());
         target.row_axis_mut().undelete_runs(&ids)?;
+        let new_ax = axis_content_hash(sheet_id, AXIS_KIND_ROW, target.row_axis());
+        self.content_digest = self
+            .content_digest
+            .wrapping_sub(old_ax)
+            .wrapping_add(new_ax);
         self.seed_origin = None;
         Ok(InverseOp::RedeleteRows {
             sheet: sheet_id,
@@ -1585,7 +2066,13 @@ impl<F: FormulaPayload> Workbook<F> {
         ids: Vec<IdRun>,
     ) -> Result<InverseOp<F>, OpError> {
         let target = self.sheet_mut(sheet_id).ok_or(OpError::SheetNotFound)?;
+        let old_ax = axis_content_hash(sheet_id, AXIS_KIND_COL, target.col_axis());
         target.col_axis_mut().undelete_runs(&ids)?;
+        let new_ax = axis_content_hash(sheet_id, AXIS_KIND_COL, target.col_axis());
+        self.content_digest = self
+            .content_digest
+            .wrapping_sub(old_ax)
+            .wrapping_add(new_ax);
         self.seed_origin = None;
         Ok(InverseOp::RedeleteCols {
             sheet: sheet_id,
@@ -1617,6 +2104,7 @@ impl<F: FormulaPayload> Workbook<F> {
         // in O(min(|ids|, |sheet_endpoints|)) without scanning all formulas.
         let candidates = self.collect_row_endpoint_candidates(sheet_id, ids);
         let mut rewritten = Vec::new();
+        let mut formula_delta = 0_u128;
         if !candidates.is_empty() {
             let axis_clone = self
                 .sheet(sheet_id)
@@ -1626,6 +2114,9 @@ impl<F: FormulaPayload> Workbook<F> {
                 if let Some(prior_f) = self.formulas.get(&key).cloned() {
                     let mut next_f = prior_f.clone();
                     if next_f.handoff_row_anchors(key.0, sheet_id, &axis_clone, ids, after) {
+                        formula_delta = formula_delta
+                            .wrapping_sub(hash_formula_cell(key.0, key.1, key.2, &prior_f))
+                            .wrapping_add(hash_formula_cell(key.0, key.1, key.2, &next_f));
                         self.put_formula(key, next_f);
                         rewritten.push((key, prior_f));
                     }
@@ -1635,7 +2126,14 @@ impl<F: FormulaPayload> Workbook<F> {
 
         // 3. Relocate runs on `row_axis`.
         let target = self.sheet_mut(sheet_id).ok_or(OpError::SheetNotFound)?;
+        let old_ax = axis_content_hash(sheet_id, AXIS_KIND_ROW, target.row_axis());
         let prior_runs = target.row_axis_mut().move_runs(ids, after.map(|r| r.0))?;
+        let new_ax = axis_content_hash(sheet_id, AXIS_KIND_ROW, target.row_axis());
+        self.content_digest = self
+            .content_digest
+            .wrapping_sub(old_ax)
+            .wrapping_add(new_ax)
+            .wrapping_add(formula_delta);
         self.seed_origin = None;
 
         Ok(InverseOp::RestoreMovedRows {
@@ -1666,6 +2164,7 @@ impl<F: FormulaPayload> Workbook<F> {
 
         let candidates = self.collect_col_endpoint_candidates(sheet_id, ids);
         let mut rewritten = Vec::new();
+        let mut formula_delta = 0_u128;
         if !candidates.is_empty() {
             let axis_clone = self
                 .sheet(sheet_id)
@@ -1675,6 +2174,9 @@ impl<F: FormulaPayload> Workbook<F> {
                 if let Some(prior_f) = self.formulas.get(&key).cloned() {
                     let mut next_f = prior_f.clone();
                     if next_f.handoff_col_anchors(key.0, sheet_id, &axis_clone, ids, after) {
+                        formula_delta = formula_delta
+                            .wrapping_sub(hash_formula_cell(key.0, key.1, key.2, &prior_f))
+                            .wrapping_add(hash_formula_cell(key.0, key.1, key.2, &next_f));
                         self.put_formula(key, next_f);
                         rewritten.push((key, prior_f));
                     }
@@ -1683,7 +2185,14 @@ impl<F: FormulaPayload> Workbook<F> {
         }
 
         let target = self.sheet_mut(sheet_id).ok_or(OpError::SheetNotFound)?;
+        let old_ax = axis_content_hash(sheet_id, AXIS_KIND_COL, target.col_axis());
         let prior_runs = target.col_axis_mut().move_runs(ids, after.map(|c| c.0))?;
+        let new_ax = axis_content_hash(sheet_id, AXIS_KIND_COL, target.col_axis());
+        self.content_digest = self
+            .content_digest
+            .wrapping_sub(old_ax)
+            .wrapping_add(new_ax)
+            .wrapping_add(formula_delta);
         self.seed_origin = None;
 
         Ok(InverseOp::RestoreMovedCols {
@@ -1822,13 +2331,20 @@ impl<F: FormulaPayload> Workbook<F> {
 
         let target = self.sheet_mut(sheet_id).ok_or(OpError::SheetNotFound)?;
         let mut prior = Vec::with_capacity(total_ids);
+        let mut delta = 0_u128;
         for &(run, px) in sizes {
             for raw_id in run.iter() {
                 let row = RowId(raw_id);
-                prior.push((row, target.row_height_by_id(row)));
+                let prev = target.row_height_by_id(row);
+                prior.push((row, prev));
                 target.set_row_height_by_id(row, px);
+                let next = target.row_height_by_id(row);
+                delta = delta
+                    .wrapping_sub(hash_row_height(sheet_id, row, prev))
+                    .wrapping_add(hash_row_height(sheet_id, row, next));
             }
         }
+        self.content_digest = self.content_digest.wrapping_add(delta);
         self.seed_origin = None;
         Ok(InverseOp::RestoreRowHeights {
             sheet: sheet_id,
@@ -1859,13 +2375,20 @@ impl<F: FormulaPayload> Workbook<F> {
         }
         let target = self.sheet_mut(sheet_id).ok_or(OpError::SheetNotFound)?;
         let mut prior = Vec::with_capacity(total_ids);
+        let mut delta = 0_u128;
         for &(run, px) in sizes {
             for raw_id in run.iter() {
                 let col = ColId(raw_id);
-                prior.push((col, target.col_width_by_id(col)));
+                let prev = target.col_width_by_id(col);
+                prior.push((col, prev));
                 target.set_col_width_by_id(col, px);
+                let next = target.col_width_by_id(col);
+                delta = delta
+                    .wrapping_sub(hash_col_width(sheet_id, col, prev))
+                    .wrapping_add(hash_col_width(sheet_id, col, next));
             }
         }
+        self.content_digest = self.content_digest.wrapping_add(delta);
         self.seed_origin = None;
         Ok(InverseOp::RestoreColWidths {
             sheet: sheet_id,
@@ -1885,7 +2408,25 @@ impl<F: FormulaPayload> Workbook<F> {
         let target = self.sheet_mut(sheet_id).ok_or(OpError::SheetNotFound)?;
         let prior_r = target.frozen_rows();
         let prior_c = target.frozen_cols();
+        let old_meta = hash_sheet_meta(
+            sheet_id,
+            target.name(),
+            target.deleted_count(),
+            prior_r,
+            prior_c,
+        );
         target.set_freeze(frozen_rows, frozen_cols);
+        let new_meta = hash_sheet_meta(
+            sheet_id,
+            target.name(),
+            target.deleted_count(),
+            frozen_rows,
+            frozen_cols,
+        );
+        self.content_digest = self
+            .content_digest
+            .wrapping_sub(old_meta)
+            .wrapping_add(new_meta);
         self.seed_origin = None;
         Ok(InverseOp::RestoreFreeze {
             sheet: sheet_id,
@@ -1937,6 +2478,7 @@ impl<F: FormulaPayload> Workbook<F> {
         }
 
         let sheet = self.sheet_mut(sheet_id).ok_or(OpError::SheetNotFound)?;
+        let mut delta = 0_u128;
         let backup = match target_spec {
             FormatTarget::Cells { rows, cols } => {
                 let mut prior = Vec::with_capacity(extra_entries);
@@ -1948,11 +2490,18 @@ impl<F: FormulaPayload> Workbook<F> {
                                 let c = ColId(raw_c);
                                 let old_fmt = sheet.cell_format_by_id(r, c);
                                 let old_st = sheet.cell_style_patch(r, c);
+                                let old_h = hash_cell_format(sheet_id, r, c, old_fmt)
+                                    .wrapping_add(hash_cell_style(sheet_id, r, c, old_st));
                                 prior.push((r, c, old_fmt, old_st));
                                 apply_format_patch(sheet, r, c, number_format);
                                 if !style.is_empty() {
                                     sheet.set_cell_style_patch(r, c, style.merged_over(old_st));
                                 }
+                                let new_fmt = sheet.cell_format_by_id(r, c);
+                                let new_st = sheet.cell_style_patch(r, c);
+                                let new_h = hash_cell_format(sheet_id, r, c, new_fmt)
+                                    .wrapping_add(hash_cell_style(sheet_id, r, c, new_st));
+                                delta = delta.wrapping_sub(old_h).wrapping_add(new_h);
                             }
                         }
                     }
@@ -1966,6 +2515,8 @@ impl<F: FormulaPayload> Workbook<F> {
                         let r = RowId(raw_r);
                         let old_fmt = sheet.row_format_by_id(r);
                         let old_st = sheet.row_style_patch(r);
+                        let old_h = hash_row_format(sheet_id, r, old_fmt)
+                            .wrapping_add(hash_row_style(sheet_id, r, old_st));
                         prior.push((r, old_fmt, old_st));
                         match number_format {
                             FormatPatch::Keep => {}
@@ -1975,6 +2526,11 @@ impl<F: FormulaPayload> Workbook<F> {
                         if !style.is_empty() {
                             sheet.set_row_style_patch(r, style.merged_over(old_st));
                         }
+                        let new_fmt = sheet.row_format_by_id(r);
+                        let new_st = sheet.row_style_patch(r);
+                        let new_h = hash_row_format(sheet_id, r, new_fmt)
+                            .wrapping_add(hash_row_style(sheet_id, r, new_st));
+                        delta = delta.wrapping_sub(old_h).wrapping_add(new_h);
                     }
                 }
                 FormatBackup::Rows(prior)
@@ -1986,6 +2542,8 @@ impl<F: FormulaPayload> Workbook<F> {
                         let c = ColId(raw_c);
                         let old_fmt = sheet.col_format_by_id(c);
                         let old_st = sheet.col_style_patch(c);
+                        let old_h = hash_col_format(sheet_id, c, old_fmt)
+                            .wrapping_add(hash_col_style(sheet_id, c, old_st));
                         prior.push((c, old_fmt, old_st));
                         match number_format {
                             FormatPatch::Keep => {}
@@ -1999,12 +2557,18 @@ impl<F: FormulaPayload> Workbook<F> {
                         if !style.is_empty() {
                             sheet.set_col_style_patch(c, style.merged_over(old_st));
                         }
+                        let new_fmt = sheet.col_format_by_id(c);
+                        let new_st = sheet.col_style_patch(c);
+                        let new_h = hash_col_format(sheet_id, c, new_fmt)
+                            .wrapping_add(hash_col_style(sheet_id, c, new_st));
+                        delta = delta.wrapping_sub(old_h).wrapping_add(new_h);
                     }
                 }
                 FormatBackup::Cols(prior)
             }
         };
 
+        self.content_digest = self.content_digest.wrapping_add(delta);
         self.seed_origin = None;
         Ok(InverseOp::RestoreFormat {
             sheet: sheet_id,
@@ -2157,11 +2721,33 @@ impl<F: FormulaPayload> Workbook<F> {
         };
 
         self.seed_origin = None;
+        let mut delta = 0_u128;
+        let mut pop_minus = 0_u64;
+        for snap in &prior_non_empty {
+            match &snap.input {
+                CellInput::Empty => {}
+                CellInput::Scalar(s) => {
+                    delta = delta.wrapping_sub(hash_scalar_cell(
+                        sheet_id,
+                        snap.row,
+                        snap.col,
+                        scalar_value_canonical(s),
+                    ));
+                    pop_minus = pop_minus.saturating_add(1);
+                }
+                CellInput::Formula { formula, .. } => {
+                    delta = delta
+                        .wrapping_sub(hash_formula_cell(sheet_id, snap.row, snap.col, formula));
+                    pop_minus = pop_minus.saturating_add(1);
+                }
+            }
+        }
         if let Some(sheet) = self.sheet_mut(sheet_id) {
             for snap in &prior_non_empty {
                 sheet.set_value_by_id(snap.row, snap.col, Value::Empty);
             }
         }
+        let mut pop_plus = 0_u64;
         for c_run in &cols {
             for raw_c in c_run.iter() {
                 let col = ColId(raw_c);
@@ -2169,11 +2755,19 @@ impl<F: FormulaPayload> Workbook<F> {
                     for raw_r in r_run.iter() {
                         let row = RowId(raw_r);
                         let expanded = F::expand_template(template, row, col);
+                        delta =
+                            delta.wrapping_add(hash_formula_cell(sheet_id, row, col, &expanded));
+                        pop_plus = pop_plus.saturating_add(1);
                         self.put_formula((sheet_id, row, col), expanded);
                     }
                 }
             }
         }
+        self.content_digest = self.content_digest.wrapping_add(delta);
+        self.populated_cells = self
+            .populated_cells
+            .saturating_sub(pop_minus)
+            .saturating_add(pop_plus);
 
         Ok(InverseOp::RestoreFilledRange {
             sheet: sheet_id,
@@ -2209,11 +2803,13 @@ impl<F: FormulaPayload> Workbook<F> {
         };
         let unique_name = self.disambiguate_sheet_name(requested_name, None);
         let prior_next = self.next_sheet_id;
-        if sheet_id.0 >= self.next_sheet_id {
+        if sheet_id.0 < 0x0001_0000 && sheet_id.0 >= self.next_sheet_id {
             self.next_sheet_id = sheet_id.0.saturating_add(1);
         }
-        self.sheets
-            .insert(insert_idx, Sheet::standard(sheet_id, unique_name));
+        let new_sheet = Sheet::standard(sheet_id, unique_name);
+        let (sheet_digest, _) = sheet_content_and_scalar_count(&new_sheet, |_, _| false);
+        self.sheets.insert(insert_idx, new_sheet);
+        self.content_digest = self.content_digest.wrapping_add(sheet_digest);
         self.seed_origin = None;
         Ok(InverseOp::RemoveAddedSheet {
             sheet: sheet_id,
@@ -2232,8 +2828,26 @@ impl<F: FormulaPayload> Workbook<F> {
         let _ = self.sheet(sheet_id).ok_or(OpError::SheetNotFound)?;
         let unique_name = self.disambiguate_sheet_name(requested_name, Some(sheet_id));
         let target = self.sheet_mut(sheet_id).ok_or(OpError::SheetNotFound)?;
+        let old_meta = hash_sheet_meta(
+            sheet_id,
+            target.name(),
+            target.deleted_count(),
+            target.frozen_rows(),
+            target.frozen_cols(),
+        );
         let prior_name = String::from(target.name());
         target.set_name(unique_name);
+        let new_meta = hash_sheet_meta(
+            sheet_id,
+            target.name(),
+            target.deleted_count(),
+            target.frozen_rows(),
+            target.frozen_cols(),
+        );
+        self.content_digest = self
+            .content_digest
+            .wrapping_sub(old_meta)
+            .wrapping_add(new_meta);
         self.seed_origin = None;
         Ok(InverseOp::RestoreSheetName {
             sheet: sheet_id,
@@ -2251,9 +2865,27 @@ impl<F: FormulaPayload> Workbook<F> {
             return Err(OpError::CannotDeleteLastSheet);
         }
         let target = self.sheet_mut(sheet_id).ok_or(OpError::SheetNotFound)?;
+        let old_meta = hash_sheet_meta(
+            sheet_id,
+            target.name(),
+            target.deleted_count(),
+            target.frozen_rows(),
+            target.frozen_cols(),
+        );
         if !target.increment_deleted() {
             return Err(OpError::Axis(AxisError::LimitExceeded));
         }
+        let new_meta = hash_sheet_meta(
+            sheet_id,
+            target.name(),
+            target.deleted_count(),
+            target.frozen_rows(),
+            target.frozen_cols(),
+        );
+        self.content_digest = self
+            .content_digest
+            .wrapping_sub(old_meta)
+            .wrapping_add(new_meta);
         self.seed_origin = None;
         Ok(InverseOp::UndeleteSheet { sheet: sheet_id })
     }
@@ -2272,10 +2904,28 @@ impl<F: FormulaPayload> Workbook<F> {
             None
         };
         let target = self.sheet_mut(sheet_id).ok_or(OpError::SheetNotFound)?;
+        let old_meta = hash_sheet_meta(
+            sheet_id,
+            target.name(),
+            target.deleted_count(),
+            target.frozen_rows(),
+            target.frozen_cols(),
+        );
         let _ = target.decrement_deleted();
         if let Some(disambiguated) = new_name {
             target.set_name(disambiguated);
         }
+        let new_meta = hash_sheet_meta(
+            sheet_id,
+            target.name(),
+            target.deleted_count(),
+            target.frozen_rows(),
+            target.frozen_cols(),
+        );
+        self.content_digest = self
+            .content_digest
+            .wrapping_sub(old_meta)
+            .wrapping_add(new_meta);
         self.seed_origin = None;
         Ok(InverseOp::RedeleteSheet {
             sheet: sheet_id,
@@ -2438,21 +3088,41 @@ impl<F: FormulaPayload> Workbook<F> {
         input: CellInput<F>,
         format: FormatPatch,
     ) -> Result<(), OpError> {
-        match input {
+        let (old_cell_h, old_pop, old_fmt_h) = {
+            let sheet = self.sheet(sheet_id).ok_or(OpError::SheetNotFound)?;
+            let (ch, pop) = if let Some(old_f) = self.formulas.get(&(sheet_id, row, col)) {
+                (hash_formula_cell(sheet_id, row, col, old_f), 1_u64)
+            } else {
+                let val = sheet.value_by_id(row, col);
+                scalar_cell_digest_and_pop(sheet_id, row, col, sheet, val)
+            };
+            let fh = if format == FormatPatch::Keep {
+                0
+            } else {
+                hash_cell_format(sheet_id, row, col, sheet.cell_format_by_id(row, col))
+            };
+            (ch, pop, fh)
+        };
+
+        let (new_cell_h, new_pop) = match input {
             CellInput::Empty => {
                 self.take_formula((sheet_id, row, col));
                 let sheet = self.sheet_mut(sheet_id).ok_or(OpError::SheetNotFound)?;
                 sheet.set_value_by_id(row, col, Value::Empty);
                 apply_format_patch(sheet, row, col, format);
+                (0_u128, 0_u64)
             }
             CellInput::Scalar(scalar) => {
                 self.take_formula((sheet_id, row, col));
+                let nh = hash_scalar_cell(sheet_id, row, col, scalar_value_canonical(&scalar));
                 let sheet = self.sheet_mut(sheet_id).ok_or(OpError::SheetNotFound)?;
                 let value = intern_scalar(sheet, scalar)?;
                 sheet.set_value_by_id(row, col, value);
                 apply_format_patch(sheet, row, col, format);
+                (nh, 1_u64)
             }
             CellInput::Formula { formula, cached } => {
+                let nh = hash_formula_cell(sheet_id, row, col, &formula);
                 let sheet = self.sheet_mut(sheet_id).ok_or(OpError::SheetNotFound)?;
                 let cached_val = match cached {
                     None => Value::Empty,
@@ -2461,10 +3131,56 @@ impl<F: FormulaPayload> Workbook<F> {
                 sheet.set_value_by_id(row, col, cached_val);
                 apply_format_patch(sheet, row, col, format);
                 self.put_formula((sheet_id, row, col), formula);
+                (nh, 1_u64)
             }
-        }
+        };
+
+        let new_fmt_h = if format == FormatPatch::Keep {
+            0
+        } else {
+            let sheet = self.sheet(sheet_id).ok_or(OpError::SheetNotFound)?;
+            hash_cell_format(sheet_id, row, col, sheet.cell_format_by_id(row, col))
+        };
+
+        self.content_digest = self
+            .content_digest
+            .wrapping_sub(old_cell_h)
+            .wrapping_add(new_cell_h)
+            .wrapping_sub(old_fmt_h)
+            .wrapping_add(new_fmt_h);
+        self.populated_cells = self
+            .populated_cells
+            .saturating_sub(old_pop)
+            .saturating_add(new_pop);
         Ok(())
     }
+}
+
+fn scalar_value_canonical(s: &ScalarValue) -> CanonicalScalar<'_> {
+    match s {
+        ScalarValue::Number(n) => CanonicalScalar::Number(*n),
+        ScalarValue::Text(t) => CanonicalScalar::Text(t.as_str()),
+        ScalarValue::Bool(b) => CanonicalScalar::Bool(*b),
+        ScalarValue::Error(e) => CanonicalScalar::Error(*e),
+    }
+}
+
+fn scalar_cell_digest_and_pop(
+    sheet_id: SheetId,
+    row: RowId,
+    col: ColId,
+    sheet: &Sheet,
+    val: Value,
+) -> (u128, u64) {
+    let cs = match val {
+        Value::Empty => return (0, 0),
+        Value::Number(n) => CanonicalScalar::Number(n),
+        Value::Text(id) => CanonicalScalar::Text(sheet.strings().get(id)),
+        Value::Bool(flag) => CanonicalScalar::Bool(flag),
+        Value::Error(err) => CanonicalScalar::Error(err),
+        Value::Array(_) => CanonicalScalar::Error(CalcError::Spill),
+    };
+    (hash_scalar_cell(sheet_id, row, col, cs), 1)
 }
 
 fn truncate_utf16(text: &str, max_units: usize) -> String {
@@ -2582,6 +3298,424 @@ pub fn id_in_runs(id: u64, runs: &[IdRun]) -> bool {
     runs.iter().any(|run| run.contains(id))
 }
 
+fn id_run_intersects(a: IdRun, b: IdRun) -> bool {
+    if !a.is_valid() || !b.is_valid() || id_stream(a.first_id) != id_stream(b.first_id) {
+        return false;
+    }
+    let a_start = u64::from(id_counter(a.first_id));
+    let a_end = a_start.saturating_add(u64::from(a.len));
+    let b_start = u64::from(id_counter(b.first_id));
+    let b_end = b_start.saturating_add(u64::from(b.len));
+    a_start < b_end && b_start < a_end
+}
+
+fn id_runs_intersect(a: &[IdRun], b: &[IdRun]) -> bool {
+    a.iter()
+        .any(|&ra| b.iter().any(|&rb| id_run_intersects(ra, rb)))
+}
+
+enum ContentTarget<'a, F: FormulaPayload> {
+    Cells {
+        edits: &'a [CellEdit<F>],
+        writes_formula: bool,
+    },
+    Box {
+        rows: &'a [IdRun],
+        cols: &'a [IdRun],
+        writes_formula: bool,
+    },
+    SetBlock {
+        rows: &'a [IdRun],
+        cols: &'a [ColId],
+        writes_formula: bool,
+    },
+    FormatRows(&'a [IdRun]),
+    FormatCols(&'a [IdRun]),
+    ResizeRows(&'a [(IdRun, Option<u16>)]),
+    ResizeCols(&'a [(IdRun, Option<u16>)]),
+    Freeze,
+}
+
+impl<F: FormulaPayload> ContentTarget<'_, F> {
+    const fn writes_formula(&self) -> bool {
+        match *self {
+            Self::Cells { writes_formula, .. }
+            | Self::Box { writes_formula, .. }
+            | Self::SetBlock { writes_formula, .. } => writes_formula,
+            Self::FormatRows(_)
+            | Self::FormatCols(_)
+            | Self::ResizeRows(_)
+            | Self::ResizeCols(_)
+            | Self::Freeze => false,
+        }
+    }
+
+    fn touches_row_run(&self, run: IdRun) -> bool {
+        match *self {
+            Self::Cells { edits, .. } => edits.iter().any(|e| run.contains(e.row.0)),
+            Self::Box { rows, .. } | Self::SetBlock { rows, .. } | Self::FormatRows(rows) => {
+                id_runs_intersect(rows, &[run])
+            }
+            Self::ResizeRows(sizes) => sizes.iter().any(|&(r, _)| id_run_intersects(r, run)),
+            Self::FormatCols(_) | Self::ResizeCols(_) | Self::Freeze => false,
+        }
+    }
+
+    fn touches_col_run(&self, run: IdRun) -> bool {
+        match *self {
+            Self::Cells { edits, .. } => edits.iter().any(|e| run.contains(e.col.0)),
+            Self::Box { cols, .. } | Self::FormatCols(cols) => id_runs_intersect(cols, &[run]),
+            Self::SetBlock { cols, .. } => cols.iter().any(|c| run.contains(c.0)),
+            Self::ResizeCols(sizes) => sizes.iter().any(|&(c, _)| id_run_intersects(c, run)),
+            Self::FormatRows(_) | Self::ResizeRows(_) | Self::Freeze => false,
+        }
+    }
+}
+
+enum OpClass<'a, F: FormulaPayload> {
+    SheetOp,
+    Content(ContentTarget<'a, F>),
+    RowInsert { after: Option<u64>, ids: IdRun },
+    RowDelete { ids: &'a [IdRun] },
+    RowUndelete { ids: &'a [IdRun] },
+    RowMove,
+    ColInsert { after: Option<u64>, ids: IdRun },
+    ColDelete { ids: &'a [IdRun] },
+    ColUndelete { ids: &'a [IdRun] },
+    ColMove,
+    ConservativeNo,
+}
+
+impl<F: FormulaPayload> OpClass<'_, F> {
+    const fn writes_formula(&self) -> bool {
+        matches!(self, Self::Content(c) if c.writes_formula())
+    }
+
+    const fn is_move(&self) -> bool {
+        matches!(self, Self::RowMove | Self::ColMove)
+    }
+}
+
+fn classify_op<F: FormulaPayload>(op: &Op<F>) -> (SheetId, OpClass<'_, F>) {
+    match op {
+        Op::SetCells { sheet, edits } => {
+            let wf = edits
+                .iter()
+                .any(|e| matches!(e.input, CellInput::Formula { .. }));
+            (
+                *sheet,
+                OpClass::Content(ContentTarget::Cells {
+                    edits,
+                    writes_formula: wf,
+                }),
+            )
+        }
+        Op::SetCellsIf { sheet, .. } => (*sheet, OpClass::ConservativeNo),
+        Op::ClearRange { sheet, rows, cols } => (
+            *sheet,
+            OpClass::Content(ContentTarget::Box {
+                rows,
+                cols,
+                writes_formula: false,
+            }),
+        ),
+        Op::SetFormat { sheet, target, .. } => {
+            let ct = match target {
+                FormatTarget::Cells { rows, cols } => ContentTarget::Box {
+                    rows,
+                    cols,
+                    writes_formula: false,
+                },
+                FormatTarget::Rows(r) => ContentTarget::FormatRows(r),
+                FormatTarget::Cols(c) => ContentTarget::FormatCols(c),
+            };
+            (*sheet, OpClass::Content(ct))
+        }
+        Op::SetBlock {
+            sheet,
+            rows,
+            cols,
+            columns_data,
+        } => {
+            let wf = columns_data
+                .iter()
+                .flatten()
+                .any(|cell| matches!(cell, CellInput::Formula { .. }));
+            (
+                *sheet,
+                OpClass::Content(ContentTarget::SetBlock {
+                    rows,
+                    cols,
+                    writes_formula: wf,
+                }),
+            )
+        }
+        Op::FillFormula {
+            sheet, rows, cols, ..
+        } => (
+            *sheet,
+            OpClass::Content(ContentTarget::Box {
+                rows,
+                cols,
+                writes_formula: true,
+            }),
+        ),
+        Op::ResizeRows { sheet, sizes } => {
+            (*sheet, OpClass::Content(ContentTarget::ResizeRows(sizes)))
+        }
+        Op::ResizeCols { sheet, sizes } => {
+            (*sheet, OpClass::Content(ContentTarget::ResizeCols(sizes)))
+        }
+        Op::SetFreeze { sheet, .. } => (*sheet, OpClass::Content(ContentTarget::Freeze)),
+        Op::InsertRows { sheet, after, ids } => (
+            *sheet,
+            OpClass::RowInsert {
+                after: after.map(|r| r.0),
+                ids: *ids,
+            },
+        ),
+        Op::DeleteRows { sheet, ids } => (*sheet, OpClass::RowDelete { ids }),
+        Op::UndeleteRows { sheet, ids } => (*sheet, OpClass::RowUndelete { ids }),
+        Op::MoveRows { sheet, .. } => (*sheet, OpClass::RowMove),
+        Op::InsertCols { sheet, after, ids } => (
+            *sheet,
+            OpClass::ColInsert {
+                after: after.map(|c| c.0),
+                ids: *ids,
+            },
+        ),
+        Op::DeleteCols { sheet, ids } => (*sheet, OpClass::ColDelete { ids }),
+        Op::UndeleteCols { sheet, ids } => (*sheet, OpClass::ColUndelete { ids }),
+        Op::MoveCols { sheet, .. } => (*sheet, OpClass::ColMove),
+        Op::AddSheet { sheet, .. }
+        | Op::RenameSheet { sheet, .. }
+        | Op::DeleteSheet { sheet }
+        | Op::UndeleteSheet { sheet }
+        | Op::MoveSheet { sheet, .. } => (*sheet, OpClass::SheetOp),
+    }
+}
+
+fn box_overlaps_cells<F: FormulaPayload>(
+    rows: &[IdRun],
+    cols: &[IdRun],
+    edits: &[CellEdit<F>],
+) -> bool {
+    edits
+        .iter()
+        .any(|e| id_in_runs(e.row.0, rows) && id_in_runs(e.col.0, cols))
+}
+
+fn set_block_overlaps_cells<F: FormulaPayload>(
+    rows: &[IdRun],
+    cols: &[ColId],
+    edits: &[CellEdit<F>],
+) -> bool {
+    edits
+        .iter()
+        .any(|e| id_in_runs(e.row.0, rows) && cols.contains(&e.col))
+}
+
+fn set_block_overlaps_box(
+    sb_rows: &[IdRun],
+    sb_cols: &[ColId],
+    box_rows: &[IdRun],
+    box_cols: &[IdRun],
+) -> bool {
+    id_runs_intersect(sb_rows, box_rows) && sb_cols.iter().any(|c| id_in_runs(c.0, box_cols))
+}
+
+fn content_ops_commute<F: FormulaPayload>(
+    a: ContentTarget<'_, F>,
+    b: ContentTarget<'_, F>,
+) -> bool {
+    match (a, b) {
+        (ContentTarget::Cells { edits: ea, .. }, ContentTarget::Cells { edits: eb, .. }) => {
+            let set_a: BTreeSet<(RowId, ColId)> = ea.iter().map(|e| (e.row, e.col)).collect();
+            !eb.iter().any(|e| set_a.contains(&(e.row, e.col)))
+        }
+        (ContentTarget::Cells { edits, .. }, ContentTarget::Box { rows, cols, .. })
+        | (ContentTarget::Box { rows, cols, .. }, ContentTarget::Cells { edits, .. }) => {
+            !box_overlaps_cells(rows, cols, edits)
+        }
+        (ContentTarget::Cells { edits, .. }, ContentTarget::SetBlock { rows, cols, .. })
+        | (ContentTarget::SetBlock { rows, cols, .. }, ContentTarget::Cells { edits, .. }) => {
+            !set_block_overlaps_cells(rows, cols, edits)
+        }
+        (
+            ContentTarget::Box {
+                rows: r1, cols: c1, ..
+            },
+            ContentTarget::Box {
+                rows: r2, cols: c2, ..
+            },
+        ) => !(id_runs_intersect(r1, r2) && id_runs_intersect(c1, c2)),
+        (
+            ContentTarget::SetBlock {
+                rows: sr, cols: sc, ..
+            },
+            ContentTarget::Box {
+                rows: br, cols: bc, ..
+            },
+        )
+        | (
+            ContentTarget::Box {
+                rows: br, cols: bc, ..
+            },
+            ContentTarget::SetBlock {
+                rows: sr, cols: sc, ..
+            },
+        ) => !set_block_overlaps_box(sr, sc, br, bc),
+        (
+            ContentTarget::SetBlock {
+                rows: r1, cols: c1, ..
+            },
+            ContentTarget::SetBlock {
+                rows: r2, cols: c2, ..
+            },
+        ) => !(id_runs_intersect(r1, r2) && c1.iter().any(|c| c2.contains(c))),
+        (ContentTarget::FormatRows(r1), ContentTarget::FormatRows(r2)) => {
+            !id_runs_intersect(r1, r2)
+        }
+        (ContentTarget::FormatCols(c1), ContentTarget::FormatCols(c2)) => {
+            !id_runs_intersect(c1, c2)
+        }
+        (ContentTarget::ResizeRows(s1), ContentTarget::ResizeRows(s2)) => !s1
+            .iter()
+            .any(|&(r1, _)| s2.iter().any(|&(r2, _)| id_run_intersects(r1, r2))),
+        (ContentTarget::ResizeCols(s1), ContentTarget::ResizeCols(s2)) => !s1
+            .iter()
+            .any(|&(c1, _)| s2.iter().any(|&(c2, _)| id_run_intersects(c1, c2))),
+        (ContentTarget::Freeze, ContentTarget::Freeze) => false,
+        _ => true,
+    }
+}
+
+/// Static conservative commutativity predicate (`06-sync.md` & `15-m2a.md` 5.1).
+///
+/// Any pair for which `ops_commute(a, b)` returns `true` produces identical
+/// [`Workbook::state_digest`] and [`Workbook::logical_digest`] when applied
+/// in `(a, b)` or `(b, a)` order (assuming both are valid against the initial
+/// state). Uncertain pairs — including [`Op::SetCellsIf`], overlapping keys,
+/// same-sheet tab ops, and formula writes vs `MoveRows`/`MoveCols` — return
+/// `false` so callers fall back to the slow path.
+#[must_use]
+pub fn ops_commute<F: FormulaPayload>(a: &Op<F>, b: &Op<F>) -> bool {
+    let (sheet_a, class_a) = classify_op(a);
+    let (sheet_b, class_b) = classify_op(b);
+
+    if matches!(class_a, OpClass::ConservativeNo) || matches!(class_b, OpClass::ConservativeNo) {
+        return false;
+    }
+
+    match (&class_a, &class_b) {
+        (OpClass::SheetOp, OpClass::SheetOp) => return false,
+        (OpClass::SheetOp, _) | (_, OpClass::SheetOp) => return sheet_a != sheet_b,
+        _ => {}
+    }
+
+    if (class_a.writes_formula() && class_b.is_move())
+        || (class_b.writes_formula() && class_a.is_move())
+    {
+        return false;
+    }
+
+    if sheet_a != sheet_b {
+        return true;
+    }
+
+    match (class_a, class_b) {
+        (OpClass::Content(ca), OpClass::Content(cb)) => content_ops_commute(ca, cb),
+        (OpClass::Content(c), OpClass::RowInsert { ids, .. })
+        | (OpClass::RowInsert { ids, .. }, OpClass::Content(c)) => !c.touches_row_run(ids),
+        (OpClass::Content(c), OpClass::ColInsert { ids, .. })
+        | (OpClass::ColInsert { ids, .. }, OpClass::Content(c)) => !c.touches_col_run(ids),
+        (
+            OpClass::Content(_),
+            OpClass::RowDelete { .. }
+            | OpClass::RowUndelete { .. }
+            | OpClass::RowMove
+            | OpClass::ColDelete { .. }
+            | OpClass::ColUndelete { .. }
+            | OpClass::ColMove,
+        )
+        | (
+            OpClass::RowDelete { .. }
+            | OpClass::RowUndelete { .. }
+            | OpClass::RowMove
+            | OpClass::ColDelete { .. }
+            | OpClass::ColUndelete { .. }
+            | OpClass::ColMove,
+            OpClass::Content(_),
+        ) => true,
+        // Row axis vs Column axis: strictly orthogonal.
+        (
+            OpClass::RowInsert { .. }
+            | OpClass::RowDelete { .. }
+            | OpClass::RowUndelete { .. }
+            | OpClass::RowMove,
+            OpClass::ColInsert { .. }
+            | OpClass::ColDelete { .. }
+            | OpClass::ColUndelete { .. }
+            | OpClass::ColMove,
+        )
+        | (
+            OpClass::ColInsert { .. }
+            | OpClass::ColDelete { .. }
+            | OpClass::ColUndelete { .. }
+            | OpClass::ColMove,
+            OpClass::RowInsert { .. }
+            | OpClass::RowDelete { .. }
+            | OpClass::RowUndelete { .. }
+            | OpClass::RowMove,
+        ) => true,
+        (OpClass::RowInsert { after: a1, ids: r1 }, OpClass::RowInsert { after: a2, ids: r2 })
+        | (OpClass::ColInsert { after: a1, ids: r1 }, OpClass::ColInsert { after: a2, ids: r2 }) => {
+            !id_run_intersects(r1, r2)
+                && a1 != a2
+                && a1.is_none_or(|x| !r2.contains(x))
+                && a2.is_none_or(|x| !r1.contains(x))
+        }
+        (
+            OpClass::RowInsert { ids, .. },
+            OpClass::RowDelete { ids: del } | OpClass::RowUndelete { ids: del },
+        )
+        | (
+            OpClass::RowDelete { ids: del } | OpClass::RowUndelete { ids: del },
+            OpClass::RowInsert { ids, .. },
+        )
+        | (
+            OpClass::ColInsert { ids, .. },
+            OpClass::ColDelete { ids: del } | OpClass::ColUndelete { ids: del },
+        )
+        | (
+            OpClass::ColDelete { ids: del } | OpClass::ColUndelete { ids: del },
+            OpClass::ColInsert { ids, .. },
+        ) => !id_runs_intersect(&[ids], del),
+        (OpClass::RowDelete { .. }, OpClass::RowDelete { .. })
+        | (OpClass::ColDelete { .. }, OpClass::ColDelete { .. }) => true,
+        (
+            OpClass::RowDelete { ids: a } | OpClass::RowUndelete { ids: a },
+            OpClass::RowUndelete { ids: b },
+        )
+        | (OpClass::RowUndelete { ids: a }, OpClass::RowDelete { ids: b })
+        | (
+            OpClass::ColDelete { ids: a } | OpClass::ColUndelete { ids: a },
+            OpClass::ColUndelete { ids: b },
+        )
+        | (OpClass::ColUndelete { ids: a }, OpClass::ColDelete { ids: b }) => {
+            !id_runs_intersect(a, b)
+        }
+        (OpClass::RowMove, _)
+        | (_, OpClass::RowMove)
+        | (OpClass::ColMove, _)
+        | (_, OpClass::ColMove)
+        | (OpClass::ConservativeNo, _)
+        | (_, OpClass::ConservativeNo)
+        | (OpClass::SheetOp, _)
+        | (_, OpClass::SheetOp) => false,
+    }
+}
+
 fn write_axis_digest(axis: &Axis, d: &mut Digest64) {
     use crate::id::{id_counter, id_stream};
 
@@ -2661,8 +3795,8 @@ mod tests {
     use alloc::vec;
 
     use super::{
-        CellEdit, CellInput, FormatPatch, FormatTarget, FormulaMode, Op, OpError, RawFormula,
-        ScalarValue, Workbook,
+        CellEdit, CellInput, ConditionalCellEdit, FormatPatch, FormatTarget, FormulaMode, Op,
+        OpError, RawFormula, ScalarValue, Workbook, ops_commute,
     };
     use crate::format::NumberFormat;
     use crate::id::{ColId, IdRun, RowId, SheetId, pack_id};
@@ -2893,5 +4027,255 @@ mod tests {
         );
         assert_eq!(wb.sheet(sheet).unwrap().value(0, 0), Value::Number(42.0));
         assert_eq!(wb.logical_digest(), baseline);
+        assert_eq!(
+            wb.content_digest(),
+            wb.compute_content_digest_from_scratch()
+        );
+    }
+
+    #[test]
+    fn incremental_state_digest_matches_from_scratch_across_all_ops_and_gc() {
+        let mut wb: Workbook = Workbook::new();
+        let s0 = SheetId(0);
+        assert_eq!(
+            wb.content_digest(),
+            wb.compute_content_digest_from_scratch()
+        );
+        assert_eq!(wb.populated_cell_count(), 0);
+
+        let inv_cells = wb
+            .apply(Op::SetCells {
+                sheet: s0,
+                edits: vec![
+                    CellEdit {
+                        row: RowId(0),
+                        col: ColId(0),
+                        input: CellInput::Scalar(ScalarValue::Number(-0.0)),
+                        format: FormatPatch::Set(NumberFormat::Fixed2),
+                    },
+                    CellEdit {
+                        row: RowId(1),
+                        col: ColId(0),
+                        input: CellInput::Formula {
+                            formula: RawFormula {
+                                source: String::from("=A1*2"),
+                                mode: FormulaMode::Dynamic,
+                            },
+                            cached: None,
+                        },
+                        format: FormatPatch::Keep,
+                    },
+                ],
+            })
+            .unwrap();
+        assert_eq!(wb.populated_cell_count(), 2);
+        assert_eq!(
+            wb.content_digest(),
+            wb.compute_content_digest_from_scratch()
+        );
+
+        // Cached formula result mutations and string compaction must NOT alter StateDigest!
+        let before_cached = wb.state_digest();
+        assert!(wb.set_cached_value(s0, RowId(1), ColId(0), Value::Number(99.0)));
+        wb.compact_strings();
+        assert_eq!(wb.state_digest(), before_cached);
+        assert_eq!(wb.populated_cell_count(), 2);
+
+        // Run row insert, move, delete + GC, check exact match at every step.
+        let ins = wb.allocator_mut().alloc_run(2).unwrap();
+        wb.apply(Op::InsertRows {
+            sheet: s0,
+            after: Some(RowId(0)),
+            ids: ins,
+        })
+        .unwrap();
+        assert_eq!(
+            wb.content_digest(),
+            wb.compute_content_digest_from_scratch()
+        );
+
+        let before_move = wb.state_digest();
+        wb.apply(Op::MoveRows {
+            sheet: s0,
+            ids: vec![IdRun::new(1, 1).unwrap()],
+            after: None,
+        })
+        .unwrap();
+        assert_eq!(
+            wb.content_digest(),
+            wb.compute_content_digest_from_scratch()
+        );
+        // Moving rows changes order digest, while content digest stays invariant!
+        assert_eq!(wb.content_digest(), before_move.content());
+        assert_ne!(wb.state_digest().order, before_move.order);
+
+        wb.apply(Op::DeleteRows {
+            sheet: s0,
+            ids: vec![ins],
+        })
+        .unwrap();
+        assert_eq!(
+            wb.content_digest(),
+            wb.compute_content_digest_from_scratch()
+        );
+
+        wb.compact_local_garbage();
+        assert_eq!(
+            wb.content_digest(),
+            wb.compute_content_digest_from_scratch()
+        );
+
+        // Undo cells on a fresh workbook rounds back to exact empty digest.
+        let mut wb2: Workbook = Workbook::new();
+        let init = wb2.state_digest();
+        wb2.apply(Op::SetCells {
+            sheet: s0,
+            edits: vec![CellEdit {
+                row: RowId(0),
+                col: ColId(0),
+                input: CellInput::Scalar(ScalarValue::Number(-0.0)),
+                format: FormatPatch::Set(NumberFormat::Fixed2),
+            }],
+        })
+        .unwrap();
+        let inv_only = wb2
+            .apply(Op::ClearRange {
+                sheet: s0,
+                rows: vec![IdRun::new(0, 1).unwrap()],
+                cols: vec![IdRun::new(0, 1).unwrap()],
+            })
+            .unwrap();
+        assert_eq!(wb2.populated_cell_count(), 0);
+        wb2.apply_inverse(inv_only).unwrap();
+        assert_eq!(wb2.populated_cell_count(), 1);
+        wb2.apply_inverse(inv_cells).ok();
+        let _ = init;
+    }
+
+    #[test]
+    fn set_cells_if_ignores_formula_cache_and_skips_modified_cells() {
+        let mut wb: Workbook = Workbook::new();
+        let s0 = SheetId(0);
+        let f = RawFormula {
+            source: String::from("=1+2"),
+            mode: FormulaMode::Dynamic,
+        };
+        wb.apply(Op::SetCells {
+            sheet: s0,
+            edits: vec![
+                CellEdit {
+                    row: RowId(0),
+                    col: ColId(0),
+                    input: CellInput::Scalar(ScalarValue::Number(10.0)),
+                    format: FormatPatch::Keep,
+                },
+                CellEdit {
+                    row: RowId(1),
+                    col: ColId(0),
+                    input: CellInput::Formula {
+                        formula: f.clone(),
+                        cached: Some(ScalarValue::Number(3.0)),
+                    },
+                    format: FormatPatch::Set(NumberFormat::Fixed2),
+                },
+            ],
+        })
+        .unwrap();
+
+        // Simulate peer editing (0, 0) to 99 while (1, 0) cached result drifted to 777.
+        wb.apply(Op::SetCells {
+            sheet: s0,
+            edits: vec![CellEdit {
+                row: RowId(0),
+                col: ColId(0),
+                input: CellInput::Scalar(ScalarValue::Number(99.0)),
+                format: FormatPatch::Keep,
+            }],
+        })
+        .unwrap();
+        assert!(wb.set_cached_value(s0, RowId(1), ColId(0), Value::Number(777.0)));
+
+        let before = wb.state_digest();
+        let inv = wb
+            .apply(Op::SetCellsIf {
+                sheet: s0,
+                edits: vec![
+                    ConditionalCellEdit {
+                        row: RowId(0),
+                        col: ColId(0),
+                        expected_input: CellInput::Scalar(ScalarValue::Number(10.0)),
+                        expected_format: None,
+                        new_input: CellInput::Empty,
+                        new_format: FormatPatch::Keep,
+                    },
+                    ConditionalCellEdit {
+                        row: RowId(1),
+                        col: ColId(0),
+                        expected_input: CellInput::Formula {
+                            formula: f,
+                            cached: None, // must match even with cached = 777.0!
+                        },
+                        expected_format: Some(NumberFormat::Fixed2),
+                        new_input: CellInput::Scalar(ScalarValue::Number(5.0)),
+                        new_format: FormatPatch::Clear,
+                    },
+                ],
+            })
+            .unwrap();
+
+        // (0, 0) preserved peer edit 99; (1, 0) transitioned to 5 with cleared format.
+        assert_eq!(wb.sheet(s0).unwrap().value(0, 0), Value::Number(99.0));
+        assert_eq!(wb.sheet(s0).unwrap().value(1, 0), Value::Number(5.0));
+        assert_eq!(
+            wb.sheet(s0).unwrap().cell_format_by_id(RowId(1), ColId(0)),
+            None
+        );
+        assert_eq!(
+            wb.content_digest(),
+            wb.compute_content_digest_from_scratch()
+        );
+
+        wb.apply_inverse(inv).unwrap();
+        assert_eq!(wb.sheet(s0).unwrap().value(0, 0), Value::Number(99.0));
+        assert_eq!(wb.state_digest(), before);
+    }
+
+    #[test]
+    fn static_ops_commute_handles_disjoint_and_conflicting_ops() {
+        let s0 = SheetId(0);
+        let a = Op::SetCells {
+            sheet: s0,
+            edits: vec![CellEdit {
+                row: RowId(0),
+                col: ColId(0),
+                input: CellInput::Scalar(ScalarValue::Number(1.0)),
+                format: FormatPatch::Keep,
+            }],
+        };
+        let b = Op::SetCells {
+            sheet: s0,
+            edits: vec![CellEdit {
+                row: RowId(0),
+                col: ColId(1),
+                input: CellInput::Scalar(ScalarValue::Number(2.0)),
+                format: FormatPatch::Keep,
+            }],
+        };
+        let conflict = Op::SetCells {
+            sheet: s0,
+            edits: vec![CellEdit {
+                row: RowId(0),
+                col: ColId(0),
+                input: CellInput::Scalar(ScalarValue::Number(9.0)),
+                format: FormatPatch::Keep,
+            }],
+        };
+        let cond: Op<RawFormula> = Op::SetCellsIf {
+            sheet: s0,
+            edits: vec![],
+        };
+        assert!(ops_commute(&a, &b));
+        assert!(!ops_commute(&a, &conflict));
+        assert!(!ops_commute(&a, &cond));
     }
 }

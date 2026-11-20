@@ -215,8 +215,8 @@ pub fn fuzz_one_ops(data: &[u8]) {
             _ => Op::UndeleteSheet { sheet },
         };
 
-        let wire = WireOpV1::from(&op);
-        if let Ok(bytes) = postcard::to_allocvec(&wire)
+        if let Ok(wire) = WireOpV1::try_from(&op)
+            && let Ok(bytes) = postcard::to_allocvec(&wire)
             && let Ok(decoded_w) = postcard::from_bytes::<WireOpV1>(&bytes)
         {
             let _ = Op::<BoundFormula>::try_from(decoded_w);

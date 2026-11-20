@@ -86,6 +86,66 @@ pub const fn id_counter(id: u64) -> u32 {
     lower_u32(id)
 }
 
+/// Masks lower 18 bits of `replica` carried inside collaborative [`SheetId`]s.
+pub const MAX_SHEET_REPLICA_LOW18: u32 = 0x0003_FFFF;
+
+/// Packs `(epoch, per_epoch_seq)` into a 24-bit collaborative `replica` ID
+/// (`replica = ((epoch as u32) << 16) | per_epoch_seq`), keeping
+/// `per_epoch_seq >= 1` so stream `(0, 0)` remains reserved for base rows/cols.
+#[must_use]
+pub const fn pack_replica_id(epoch: u8, per_epoch_seq: u16) -> Option<u32> {
+    if per_epoch_seq == 0 {
+        return None;
+    }
+    Some(((epoch as u32) << 16) | (per_epoch_seq as u32))
+}
+
+/// Unpacks a collaborative `replica` ID created by [`pack_replica_id`] into
+/// `(epoch, per_epoch_seq)`.
+#[must_use]
+pub const fn unpack_replica_id(replica: u32) -> (u8, u16) {
+    let epoch = ((replica >> 16) & 0xFF) as u8;
+    let seq = (replica & 0xFFFF) as u16;
+    (epoch, seq)
+}
+
+/// Packs `(epoch, replica, counter)` into a collision-free 32-bit [`SheetId`]
+/// for collaborative `AddSheet`:
+/// `((epoch & 0x3F) << 26) | ((replica & 0x0003_FFFF) << 8) | counter`.
+///
+/// Requires `counter >= 1`, `replica <= MAX_REPLICA`, and `(replica & 0x0003_FFFF) != 0`
+/// so partitioned IDs never collide with `SheetId(0)` (`Sheet1`) or small local IDs.
+#[must_use]
+pub const fn pack_sheet_id(epoch: u8, replica: u32, counter: u8) -> Option<SheetId> {
+    if counter == 0 || replica > MAX_REPLICA || (replica & MAX_SHEET_REPLICA_LOW18) == 0 {
+        return None;
+    }
+    let raw = (((epoch & 0x3F) as u32) << 26)
+        | ((replica & MAX_SHEET_REPLICA_LOW18) << 8)
+        | (counter as u32);
+    Some(SheetId(raw))
+}
+
+/// Unpacks a collaborative [`SheetId`] into `(epoch_low6, replica_low18, counter)`.
+#[must_use]
+pub const fn unpack_sheet_id(sheet: SheetId) -> (u8, u32, u8) {
+    let raw = sheet.0;
+    let epoch = ((raw >> 26) & 0x3F) as u8;
+    let replica_low18 = (raw >> 8) & MAX_SHEET_REPLICA_LOW18;
+    let counter = (raw & 0xFF) as u8;
+    (epoch, replica_low18, counter)
+}
+
+/// Checks whether `sheet` belongs to `(epoch, replica)` under [`pack_sheet_id`].
+#[must_use]
+pub const fn sheet_id_belongs_to(sheet: SheetId, epoch: u8, replica: u32) -> bool {
+    if replica > MAX_REPLICA || (replica & MAX_SHEET_REPLICA_LOW18) == 0 {
+        return false;
+    }
+    let (e, r18, counter) = unpack_sheet_id(sheet);
+    counter != 0 && e == (epoch & 0x3F) && r18 == (replica & MAX_SHEET_REPLICA_LOW18)
+}
+
 /// A contiguous run of `len` identities from the same `(epoch, replica)`
 /// stream: `first_id, first_id + 1, ..., first_id + len - 1`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -165,6 +225,26 @@ impl IdRun {
     pub fn iter(self) -> impl Iterator<Item = u64> {
         let count = if self.is_valid() { self.len } else { 0 };
         (0..count).map(move |offset| self.first_id.wrapping_add(u64::from(offset)))
+    }
+
+    /// Whether this run is valid and every identity in it belongs to `(epoch, replica)`.
+    #[must_use]
+    pub const fn belongs_to(self, epoch: u8, replica: u32) -> bool {
+        if !self.is_valid() || replica > MAX_REPLICA {
+            return false;
+        }
+        let (e, r, c) = unpack_id(self.first_id);
+        e == epoch && r == replica && (c > 0 || (epoch == 0 && replica == 0))
+    }
+
+    /// Largest counter value covered by this run (`first_counter + len - 1`), or
+    /// `None` if the run is invalid.
+    #[must_use]
+    pub const fn max_counter(self) -> Option<u32> {
+        if !self.is_valid() {
+            return None;
+        }
+        Some(id_counter(self.first_id).saturating_add(self.len.saturating_sub(1)))
     }
 }
 
@@ -259,11 +339,15 @@ const fn top_byte(word: u32) -> u8 {
 }
 
 #[cfg(test)]
+#[allow(clippy::panic, clippy::unwrap_used)]
 mod tests {
     #[cfg(target_arch = "wasm32")]
     use wasm_bindgen_test::wasm_bindgen_test as test;
 
-    use super::{IdAllocator, IdRun, MAX_REPLICA, is_base_id, pack_id, unpack_id};
+    use super::{
+        IdAllocator, IdRun, MAX_REPLICA, SheetId, is_base_id, pack_id, pack_replica_id,
+        pack_sheet_id, sheet_id_belongs_to, unpack_id, unpack_replica_id, unpack_sheet_id,
+    };
 
     #[test]
     fn ids_pack_and_unpack_without_loss() {
@@ -299,5 +383,31 @@ mod tests {
         assert!(run.contains(run.first_id));
         assert!(run.contains(run.first_id.saturating_add(3)));
         assert!(!run.contains(run.first_id.saturating_add(4)));
+        assert!(run.belongs_to(0, 1));
+        assert!(!run.belongs_to(0, 2));
+        assert_eq!(run.max_counter(), Some(4));
+    }
+
+    #[test]
+    fn collaborative_replica_and_sheet_id_partition() {
+        assert_eq!(pack_replica_id(0, 0), None);
+        let r0_1 = pack_replica_id(0, 1).unwrap();
+        let r5_42 = pack_replica_id(5, 42).unwrap();
+        assert_eq!(unpack_replica_id(r0_1), (0, 1));
+        assert_eq!(unpack_replica_id(r5_42), (5, 42));
+
+        let s1 = pack_sheet_id(0, r0_1, 1).unwrap();
+        let s2 = pack_sheet_id(0, r0_1, 255).unwrap();
+        assert_ne!(s1, SheetId(0));
+        assert_ne!(s1, s2);
+        assert!(sheet_id_belongs_to(s1, 0, r0_1));
+        assert!(!sheet_id_belongs_to(s1, 0, pack_replica_id(0, 2).unwrap()));
+        assert!(!sheet_id_belongs_to(SheetId(0), 0, r0_1));
+        assert_eq!(unpack_sheet_id(s2), (0, r0_1 & 0x0003_FFFF, 255));
+
+        let s_epoch = pack_sheet_id(5, r5_42, 3).unwrap();
+        assert!(sheet_id_belongs_to(s_epoch, 5, r5_42));
+        assert!(!sheet_id_belongs_to(s_epoch, 4, r5_42));
+        assert_eq!(pack_sheet_id(0, r0_1, 0), None);
     }
 }

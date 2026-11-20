@@ -2281,14 +2281,20 @@ impl Engine {
             }
         }
         self.wal_seq = self.wal_seq.saturating_add(1);
-        let rec = WireWalRecordV1 {
-            seq: self.wal_seq,
-            timestamp_ms: self.last_timestamp_ms,
-            label: String::from(label),
-            ops: ops.iter().map(WireOpV1::from).collect(),
-        };
-        if let Ok(frame) = encode_wal_record(&rec) {
-            self.pending_wal_frames.push_back(frame);
+        if let Ok(wire_ops) = ops
+            .iter()
+            .map(WireOpV1::try_from)
+            .collect::<Result<Vec<_>, _>>()
+        {
+            let rec = WireWalRecordV1 {
+                seq: self.wal_seq,
+                timestamp_ms: self.last_timestamp_ms,
+                label: String::from(label),
+                ops: wire_ops,
+            };
+            if let Ok(frame) = encode_wal_record(&rec) {
+                self.pending_wal_frames.push_back(frame);
+            }
         }
     }
 

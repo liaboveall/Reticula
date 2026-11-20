@@ -6,7 +6,8 @@ use reticula_core::axis::Axis;
 use reticula_core::format::{CurrencySymbol, NumberFormat};
 use reticula_core::id::{ColId, IdAllocator, IdRun, RowId, SheetId, pack_id};
 use reticula_core::ops::{
-    CellEdit, CellInput, FormatPatch, FormatTarget, FormulaMode, Op, ScalarValue, Workbook,
+    CellEdit, CellInput, ConditionalCellEdit, FormatPatch, FormatTarget, FormulaMode, Op,
+    ScalarValue, Workbook, ops_commute,
 };
 use reticula_core::sheet::Sheet;
 use reticula_core::style::{BorderWeight, ColorPatch, ColorValue, HorizontalAlign, StylePatch};
@@ -1209,7 +1210,7 @@ proptest! {
                 if matches!(op, Op::AddSheet { .. }) {
                     let _ = eng_replayed.alloc_sheet_id();
                 }
-                let wire_op = WireOpV1::from(&op);
+                let wire_op = WireOpV1::try_from(&op).unwrap();
                 let encoded = postcard::to_allocvec(&wire_op).unwrap();
                 let decoded_wire: WireOpV1 = postcard::from_bytes(&encoded).unwrap();
                 let roundtripped_op = Op::<BoundFormula>::try_from(decoded_wire).unwrap();
@@ -1276,7 +1277,7 @@ proptest! {
                 seq,
                 timestamp_ms: 1_760_000_000_000 + seq,
                 label: format!("Txn {seq}"),
-                ops: vec![WireOpV1::from(&op)],
+                ops: vec![WireOpV1::try_from(&op).unwrap()],
             });
         }
         ref_eng.recalc_all();
@@ -1301,7 +1302,7 @@ proptest! {
             seq: last_flushed_seq + 1,
             timestamp_ms: 1_760_000_999_999,
             label: String::from("Unflushed crash tail"),
-            ops: vec![WireOpV1::from(&extra_op)],
+            ops: vec![WireOpV1::try_from(&extra_op).unwrap()],
         })
         .unwrap();
 
@@ -1353,5 +1354,549 @@ proptest! {
                 | WalCorruption::MidFileCorruption { .. }
         );
         prop_assert!(corrupt_ok);
+    }
+}
+
+// ============================================================================
+// 11. M2a `StateDigest` incremental invariance, `ops_commute` & `SetCellsIf`
+// ============================================================================
+
+fn manual_populated_count(wb: &Workbook<BoundFormula>) -> u64 {
+    let mut total = 0_u64;
+    for sheet in wb.sheets() {
+        let sid = sheet.id();
+        for (c_idx, column) in sheet.raw_columns().iter().enumerate() {
+            let Ok(cs) = u32::try_from(c_idx) else {
+                continue;
+            };
+            let Some(cid) = sheet.col_slots().slot_to_id(cs) else {
+                continue;
+            };
+            column.for_each_non_empty(|rs, _| {
+                if let Some(rid) = sheet.row_slots().slot_to_id(rs)
+                    && wb.formula(sid, RowId(rid), ColId(cid)).is_none()
+                {
+                    total += 1;
+                }
+            });
+        }
+    }
+    total + u64::try_from(wb.formulas().len()).unwrap_or(0)
+}
+
+fn build_random_commute_op(
+    wb: &mut Workbook<BoundFormula>,
+    kind: u8,
+    sheet_idx: usize,
+    r0: u64,
+    c0: u64,
+    val_seed: i32,
+) -> Option<Op<BoundFormula>> {
+    let sheets: Vec<SheetId> = wb.sheets().iter().map(Sheet::id).collect();
+    if sheets.is_empty() {
+        return None;
+    }
+    let sheet = sheets[sheet_idx % sheets.len()];
+    let sh = wb.sheet(sheet)?;
+    let row = RowId(r0);
+    let col = ColId(c0);
+    if !sh.row_axis().contains_id(row.0) || !sh.col_axis().contains_id(col.0) {
+        return None;
+    }
+    let single_row = vec![IdRun::new(row.0, 1)?];
+    let single_col = vec![IdRun::new(col.0, 1)?];
+    match kind % 14 {
+        0 => Some(Op::SetCells {
+            sheet,
+            edits: vec![CellEdit {
+                row,
+                col,
+                input: if val_seed % 3 == 0 {
+                    CellInput::Empty
+                } else {
+                    CellInput::Scalar(ScalarValue::Number(f64::from(val_seed)))
+                },
+                format: if val_seed % 5 == 0 {
+                    FormatPatch::Set(NumberFormat::Fixed2)
+                } else {
+                    FormatPatch::Keep
+                },
+            }],
+        }),
+        1 => {
+            let src = "=SUM(A1:B3)+A1";
+            let f = BoundFormula::parse_and_bind(src, FormulaMode::Dynamic, wb, sheet).ok()?;
+            Some(Op::SetCells {
+                sheet,
+                edits: vec![CellEdit {
+                    row,
+                    col,
+                    input: CellInput::Formula {
+                        formula: f,
+                        cached: None,
+                    },
+                    format: FormatPatch::Keep,
+                }],
+            })
+        }
+        2 => Some(Op::SetCellsIf {
+            sheet,
+            edits: vec![ConditionalCellEdit {
+                row,
+                col,
+                expected_input: CellInput::Scalar(ScalarValue::Number(1.0)),
+                expected_format: None,
+                new_input: CellInput::Scalar(ScalarValue::Number(f64::from(val_seed))),
+                new_format: FormatPatch::Keep,
+            }],
+        }),
+        3 => Some(Op::ClearRange {
+            sheet,
+            rows: single_row,
+            cols: single_col,
+        }),
+        4 => Some(Op::SetFormat {
+            sheet,
+            target: match val_seed.rem_euclid(3) {
+                0 => FormatTarget::Cells {
+                    rows: single_row,
+                    cols: single_col,
+                },
+                1 => FormatTarget::Rows(single_row),
+                _ => FormatTarget::Cols(single_col),
+            },
+            number_format: FormatPatch::Set(NumberFormat::Percent),
+            style: StylePatch {
+                bold: Some(true),
+                ..StylePatch::default()
+            },
+        }),
+        5 => Some(Op::ResizeRows {
+            sheet,
+            sizes: vec![(
+                IdRun::new(row.0, 1)?,
+                Some(30 + (val_seed.rem_euclid(20) as u16)),
+            )],
+        }),
+        6 => Some(Op::ResizeCols {
+            sheet,
+            sizes: vec![(
+                IdRun::new(col.0, 1)?,
+                Some(80 + (val_seed.rem_euclid(40) as u16)),
+            )],
+        }),
+        7 => Some(Op::SetFreeze {
+            sheet,
+            frozen_rows: (val_seed.rem_euclid(3)) as u32,
+            frozen_cols: (val_seed.rem_euclid(2)) as u32,
+        }),
+        8 => {
+            let run = wb.allocator_mut().alloc_run(1)?;
+            Some(Op::InsertRows {
+                sheet,
+                after: if val_seed % 2 == 0 { None } else { Some(row) },
+                ids: run,
+            })
+        }
+        9 => Some(Op::DeleteRows {
+            sheet,
+            ids: single_row,
+        }),
+        10 => Some(Op::MoveRows {
+            sheet,
+            ids: single_row,
+            after: if val_seed % 2 == 0 {
+                None
+            } else {
+                Some(RowId(5))
+            },
+        }),
+        11 => {
+            let run = wb.allocator_mut().alloc_run(1)?;
+            Some(Op::InsertCols {
+                sheet,
+                after: if val_seed % 2 == 0 { None } else { Some(col) },
+                ids: run,
+            })
+        }
+        12 => {
+            let tpl_expr = parse_formula("=A1*2").ok()?;
+            let bound = BoundFormula::bind_on_sheet(&tpl_expr, FormulaMode::Dynamic, sh);
+            let tpl = templatize_formula(&bound, row, col);
+            Some(Op::FillFormula {
+                sheet,
+                rows: single_row,
+                cols: single_col,
+                template: tpl,
+            })
+        }
+        _ => {
+            let new_id = wb.alloc_sheet_id();
+            Some(Op::AddSheet {
+                sheet: new_id,
+                name: format!("Tab{}", val_seed.abs()),
+                after: Some(sheet),
+            })
+        }
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn prop_incremental_state_digest_matches_from_scratch_and_recalc_invariant(
+        steps in prop::collection::vec((0_u8..28, 0_usize..3, 0_u64..8, 0_u64..5, -200_i32..200), 5..45)
+    ) {
+        let mut eng = FormulaEngine::from_workbook_clean(Workbook::from_sheet(
+            Sheet::with_axes(SheetId(0), String::from("Sheet1"), 16, 8),
+            None,
+        ));
+        let mut inverses = Vec::new();
+        let mut inserted_rows = Vec::new();
+        let mut added_sheets = Vec::new();
+
+        for (step_idx, (kind, sh_idx, r_seed, c_seed, val)) in steps.into_iter().enumerate() {
+            let sheets: Vec<SheetId> = eng.workbook().sheets().iter().map(Sheet::id).collect();
+            let sheet = sheets[sh_idx % sheets.len()];
+            let row = RowId(r_seed);
+            let col = ColId(c_seed);
+            let op_opt: Option<Op<BoundFormula>> = match kind % 16 {
+                0..=3 => Some(Op::SetCells {
+                    sheet,
+                    edits: vec![CellEdit {
+                        row,
+                        col,
+                        input: match val.rem_euclid(4) {
+                            0 => CellInput::Empty,
+                            1 => CellInput::Scalar(ScalarValue::Number(f64::from(val) / 2.0)),
+                            2 => CellInput::Scalar(ScalarValue::Text(format!("t{val}"))),
+                            _ => {
+                                if let Ok(f) = BoundFormula::parse_and_bind(
+                                    "=SUM(A1:B3)+RAND()",
+                                    FormulaMode::Dynamic,
+                                    eng.workbook(),
+                                    sheet,
+                                ) {
+                                    CellInput::Formula { formula: f, cached: None }
+                                } else {
+                                    CellInput::Empty
+                                }
+                            }
+                        },
+                        format: match val.rem_euclid(3) {
+                            0 => FormatPatch::Keep,
+                            1 => FormatPatch::Set(NumberFormat::Fixed2),
+                            _ => FormatPatch::Clear,
+                        },
+                    }],
+                }),
+                4 => Some(Op::SetCellsIf {
+                    sheet,
+                    edits: vec![ConditionalCellEdit {
+                        row,
+                        col,
+                        expected_input: eng
+                            .workbook()
+                            .cell_snapshot(sheet, row, col)
+                            .map_or(CellInput::Empty, |s| s.input),
+                        expected_format: eng
+                            .workbook()
+                            .sheet(sheet)
+                            .and_then(|s| s.cell_format_by_id(row, col)),
+                        new_input: CellInput::Scalar(ScalarValue::Number(f64::from(val))),
+                        new_format: FormatPatch::Set(NumberFormat::Integer),
+                    }],
+                }),
+                5 => Some(Op::ClearRange {
+                    sheet,
+                    rows: vec![IdRun::new(r_seed, 1).unwrap()],
+                    cols: vec![IdRun::new(c_seed, 1).unwrap()],
+                }),
+                6 => {
+                    let run = eng.allocator_mut().alloc_run(2).unwrap();
+                    inserted_rows.push((sheet, run));
+                    Some(Op::InsertRows { sheet, after: Some(row), ids: run })
+                }
+                7 => Some(Op::DeleteRows {
+                    sheet,
+                    ids: vec![IdRun::new(r_seed, 1).unwrap()],
+                }),
+                8 => {
+                    if let Some((s_del, run)) = inserted_rows.last().copied() {
+                        Some(Op::UndeleteRows { sheet: s_del, ids: vec![run] })
+                    } else {
+                        Some(Op::UndeleteRows { sheet, ids: vec![IdRun::new(r_seed, 1).unwrap()] })
+                    }
+                }
+                9 => Some(Op::MoveRows {
+                    sheet,
+                    ids: vec![IdRun::new(r_seed, 1).unwrap()],
+                    after: if val % 2 == 0 { None } else { Some(RowId((r_seed + 3) % 8)) },
+                }),
+                10 => Some(Op::ResizeRows {
+                    sheet,
+                    sizes: vec![(IdRun::new(r_seed, 1).unwrap(), if val % 2 == 0 { None } else { Some(28) })],
+                }),
+                11 => Some(Op::SetFreeze {
+                    sheet,
+                    frozen_rows: (val.rem_euclid(4)) as u32,
+                    frozen_cols: (val.rem_euclid(3)) as u32,
+                }),
+                12 => Some(Op::SetFormat {
+                    sheet,
+                    target: FormatTarget::Cols(vec![IdRun::new(c_seed, 1).unwrap()]),
+                    number_format: FormatPatch::Set(NumberFormat::Percent),
+                    style: StylePatch { bold: Some(val % 2 == 0), ..StylePatch::default() },
+                }),
+                13 => {
+                    let sh = eng.workbook().sheet(sheet).unwrap();
+                    parse_formula("=A1+1").ok().map(|ast| {
+                        let bound = BoundFormula::bind_on_sheet(&ast, FormulaMode::Dynamic, sh);
+                        let template = templatize_formula(&bound, row, col);
+                        Op::FillFormula {
+                            sheet,
+                            rows: vec![IdRun::new(r_seed, 1).unwrap()],
+                            cols: vec![IdRun::new(c_seed, 1).unwrap()],
+                            template,
+                        }
+                    })
+                }
+                14 => {
+                    let id = eng.alloc_sheet_id();
+                    added_sheets.push(id);
+                    Some(Op::AddSheet {
+                        sheet: id,
+                        name: format!("S{step_idx}"),
+                        after: Some(sheet),
+                    })
+                }
+                _ => {
+                    if let Some(id) = added_sheets.last().copied() {
+                        Some(Op::MoveSheet { sheet: id, after: None })
+                    } else {
+                        Some(Op::RenameSheet { sheet, name: format!("Renamed{step_idx}") })
+                    }
+                }
+            };
+
+            if let Some(op) = op_opt
+                && let Ok(inv) = eng.apply_op(op)
+            {
+                inverses.push(inv);
+            }
+
+            prop_assert_eq!(
+                eng.workbook().content_digest(),
+                eng.workbook().compute_content_digest_from_scratch()
+            );
+            prop_assert_eq!(
+                eng.workbook().populated_cell_count(),
+                manual_populated_count(eng.workbook())
+            );
+
+            // Periodically run recalculation and assert invariance.
+            if step_idx % 5 == 0 {
+                let before_recalc = eng.workbook().state_digest();
+                let before_pop = eng.workbook().populated_cell_count();
+                eng.recalc_all();
+                prop_assert_eq!(eng.workbook().state_digest(), before_recalc);
+                prop_assert_eq!(eng.workbook().populated_cell_count(), before_pop);
+            }
+
+            if step_idx % 7 == 0 && let Some(inv) = inverses.pop() {
+                let _ = eng.apply_inverse(inv);
+                prop_assert_eq!(
+                    eng.workbook().content_digest(),
+                    eng.workbook().compute_content_digest_from_scratch()
+                );
+                prop_assert_eq!(
+                    eng.workbook().populated_cell_count(),
+                    manual_populated_count(eng.workbook())
+                );
+            }
+        }
+
+        // Unwind remaining inverses and test GC.
+        while let Some(inv) = inverses.pop() {
+            let _ = eng.apply_inverse(inv);
+            prop_assert_eq!(
+                eng.workbook().content_digest(),
+                eng.workbook().compute_content_digest_from_scratch()
+            );
+        }
+        eng.compact_local_garbage();
+        prop_assert_eq!(
+            eng.workbook().content_digest(),
+            eng.workbook().compute_content_digest_from_scratch()
+        );
+        prop_assert_eq!(
+            eng.workbook().populated_cell_count(),
+            manual_populated_count(eng.workbook())
+        );
+    }
+
+    #[test]
+    fn prop_ops_commute_guarantees_identical_state_and_logical_digest(
+        ka in 0_u8..14,
+        kb in 0_u8..14,
+        sa in 0_usize..2,
+        sb in 0_usize..2,
+        ra in 0_u64..6,
+        ca in 0_u64..4,
+        rb in 0_u64..6,
+        cb in 0_u64..4,
+        va in -50_i32..50,
+        vb in -50_i32..50,
+    ) {
+        let mut base = Workbook::<BoundFormula>::from_sheet(
+            Sheet::with_axes(SheetId(0), String::from("Sheet1"), 12, 8),
+            None,
+        );
+        let s1 = base.alloc_sheet_id();
+        base.apply(Op::AddSheet {
+            sheet: s1,
+            name: String::from("Sheet2"),
+            after: Some(SheetId(0)),
+        })
+        .unwrap();
+        // Seed a range formula so E25 interactions are exercised too.
+        let seeded_f = BoundFormula::parse_and_bind("=SUM(A1:B4)", FormulaMode::Dynamic, &base, SheetId(0)).unwrap();
+        base.apply(Op::SetCells {
+            sheet: SheetId(0),
+            edits: vec![CellEdit {
+                row: RowId(5),
+                col: ColId(3),
+                input: CellInput::Formula { formula: seeded_f, cached: None },
+                format: FormatPatch::Keep,
+            }],
+        })
+        .unwrap();
+
+        let Some(op_a) = build_random_commute_op(&mut base, ka, sa, ra, ca, va) else {
+            return Ok(());
+        };
+        let Some(op_b) = build_random_commute_op(&mut base, kb, sb, rb, cb, vb) else {
+            return Ok(());
+        };
+
+        if !ops_commute(&op_a, &op_b) {
+            return Ok(());
+        }
+
+        let mut wb_ab = base.clone();
+        let mut wb_ba = base;
+        if wb_ab.apply(op_a.clone()).is_ok()
+            && wb_ab.apply(op_b.clone()).is_ok()
+            && wb_ba.apply(op_b).is_ok()
+            && wb_ba.apply(op_a).is_ok()
+        {
+            prop_assert_eq!(wb_ab.state_digest(), wb_ba.state_digest());
+            prop_assert_eq!(wb_ab.logical_digest(), wb_ba.logical_digest());
+        }
+    }
+
+    #[test]
+    fn prop_set_cells_if_selective_match_and_inverse(
+        initial_val in -100_i32..100,
+        peer_changes_a in any::<bool>(),
+        recalc_before_undo in any::<bool>(),
+    ) {
+        let mut eng = FormulaEngine::from_workbook_clean(Workbook::from_sheet(
+            Sheet::with_axes(SheetId(0), String::from("Sheet1"), 8, 4),
+            None,
+        ));
+        let s0 = SheetId(0);
+        let f_cell = BoundFormula::parse_and_bind("=A1*3", FormulaMode::Dynamic, eng.workbook(), s0).unwrap();
+        eng.apply_op(Op::SetCells {
+            sheet: s0,
+            edits: vec![
+                CellEdit {
+                    row: RowId(0),
+                    col: ColId(0),
+                    input: CellInput::Scalar(ScalarValue::Number(f64::from(initial_val))),
+                    format: FormatPatch::Set(NumberFormat::Fixed2),
+                },
+                CellEdit {
+                    row: RowId(1),
+                    col: ColId(0),
+                    input: CellInput::Formula {
+                        formula: f_cell.clone(),
+                        cached: None,
+                    },
+                    format: FormatPatch::Keep,
+                },
+            ],
+        })
+        .unwrap();
+        if recalc_before_undo {
+            eng.recalc_all();
+        }
+        if peer_changes_a {
+            eng.apply_op(Op::SetCells {
+                sheet: s0,
+                edits: vec![CellEdit {
+                    row: RowId(0),
+                    col: ColId(0),
+                    input: CellInput::Scalar(ScalarValue::Number(999.5)),
+                    format: FormatPatch::Keep,
+                }],
+            })
+            .unwrap();
+        }
+
+        let before_cond = eng.workbook().state_digest();
+        let inv = eng
+            .apply_op(Op::SetCellsIf {
+                sheet: s0,
+                edits: vec![
+                    ConditionalCellEdit {
+                        row: RowId(0),
+                        col: ColId(0),
+                        expected_input: CellInput::Scalar(ScalarValue::Number(f64::from(initial_val))),
+                        expected_format: Some(NumberFormat::Fixed2),
+                        new_input: CellInput::Empty,
+                        new_format: FormatPatch::Clear,
+                    },
+                    ConditionalCellEdit {
+                        row: RowId(1),
+                        col: ColId(0),
+                        expected_input: CellInput::Formula {
+                            formula: f_cell,
+                            cached: None,
+                        },
+                        expected_format: None,
+                        new_input: CellInput::Scalar(ScalarValue::Bool(true)),
+                        new_format: FormatPatch::Keep,
+                    },
+                ],
+            })
+            .unwrap();
+
+        if peer_changes_a {
+            // If peer mutated A1 to a different value, A1 keeps 999.5; (if initial_val happened
+            // not to equal 999.5 which is integer, it always differs).
+            prop_assert_eq!(
+                eng.workbook().sheet(s0).unwrap().value_by_id(RowId(0), ColId(0)),
+                reticula_core::value::Value::Number(999.5)
+            );
+        } else {
+            prop_assert_eq!(
+                eng.workbook().sheet(s0).unwrap().value_by_id(RowId(0), ColId(0)),
+                reticula_core::value::Value::Empty
+            );
+        }
+        // B cell (Row 1) always matched ignoring cached evaluation result.
+        prop_assert_eq!(
+            eng.workbook().sheet(s0).unwrap().value_by_id(RowId(1), ColId(0)),
+            reticula_core::value::Value::Bool(true)
+        );
+        prop_assert_eq!(
+            eng.workbook().content_digest(),
+            eng.workbook().compute_content_digest_from_scratch()
+        );
+
+        eng.apply_inverse(inv).unwrap();
+        prop_assert_eq!(eng.workbook().state_digest(), before_cond);
     }
 }

@@ -550,7 +550,7 @@ mod tests {
             seq,
             timestamp_ms: 1_760_000_000_000 + seq,
             label: String::from("Edit cell"),
-            ops: vec![WireOpV1::from(&op)],
+            ops: vec![WireOpV1::try_from(&op).unwrap()],
         }
     }
 

@@ -1964,19 +1964,28 @@ mod tests {
             seq: 1,
             timestamp_ms: 0,
             label: String::from("Fill"),
-            ops: ops_10.iter().map(WireOpV1::from).collect(),
+            ops: ops_10
+                .iter()
+                .map(|op| WireOpV1::try_from(op).unwrap())
+                .collect(),
         })
         .unwrap();
         let rec_1m = encode_wal_record(&reticula_wire::v1::WireWalRecordV1 {
             seq: 1,
             timestamp_ms: 0,
             label: String::from("Fill"),
-            ops: ops_1m.iter().map(WireOpV1::from).collect(),
+            ops: ops_1m
+                .iter()
+                .map(|op| WireOpV1::try_from(op).unwrap())
+                .collect(),
         })
         .unwrap();
         let _ = WireTxnV1 {
             label: String::from("Fill"),
-            ops: ops_1m.iter().map(WireOpV1::from).collect(),
+            ops: ops_1m
+                .iter()
+                .map(|op| WireOpV1::try_from(op).unwrap())
+                .collect(),
         };
         // Constant O(1) byte size (~104 bytes; only 2 bytes of LEB128 varint
         // difference between `len = 10` and `len = 999_998`)!

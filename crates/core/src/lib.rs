@@ -48,6 +48,7 @@ pub mod rng;
 pub mod sample;
 pub mod sheet;
 pub mod snapshot;
+pub mod state_digest;
 pub mod store;
 pub mod strings;
 pub mod style;

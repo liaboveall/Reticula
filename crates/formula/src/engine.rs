@@ -2118,4 +2118,26 @@ mod tests {
             "=SUM(M2:M499)"
         );
     }
+
+    #[test]
+    fn recalculation_and_volatile_formulas_never_perturb_state_digest() {
+        let mut eng = FormulaEngine::open_sample(7, 40);
+        let s = SheetId(0);
+        eng.edit_cell_raw(s, RowId(0), ColId(0), "=SUM(J2:J10)+RAND()")
+            .unwrap();
+        let before_recalc = eng.workbook().state_digest();
+        let before_pop = eng.workbook().populated_cell_count();
+        assert_eq!(
+            eng.workbook().content_digest(),
+            eng.workbook().compute_content_digest_from_scratch()
+        );
+
+        eng.recalc_all();
+        assert_eq!(eng.workbook().state_digest(), before_recalc);
+        assert_eq!(eng.workbook().populated_cell_count(), before_pop);
+        assert_eq!(
+            eng.workbook().content_digest(),
+            eng.workbook().compute_content_digest_from_scratch()
+        );
+    }
 }

@@ -827,6 +827,15 @@ fn estimate_single_op_bytes(op: &Op<BoundFormula>) -> usize {
                 .saturating_mul(size_of::<CellEdit<BoundFormula>>()),
             |acc, e| acc.saturating_add(estimate_cell_input_bytes(&e.input)),
         ),
+        Op::SetCellsIf { edits, .. } => edits.iter().fold(
+            edits.capacity().saturating_mul(size_of::<
+                reticula_core::ops::ConditionalCellEdit<BoundFormula>,
+            >()),
+            |acc, e| {
+                acc.saturating_add(estimate_cell_input_bytes(&e.expected_input))
+                    .saturating_add(estimate_cell_input_bytes(&e.new_input))
+            },
+        ),
         Op::ClearRange { rows, cols, .. } => rows
             .capacity()
             .saturating_add(cols.capacity())
