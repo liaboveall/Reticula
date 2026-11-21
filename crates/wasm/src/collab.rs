@@ -57,6 +57,15 @@ pub struct PresenceSpan {
     pub end_col: u32,
 }
 
+/// Where the local cursor and its selection sit in display coordinates.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Tsify)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalCursor {
+    pub row: u32,
+    pub col: u32,
+    pub selection: Option<PresenceSpan>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Tsify)]
 #[serde(rename_all = "camelCase")]
 pub struct RemotePresence {
@@ -168,6 +177,14 @@ pub enum CollabEvent {
         sheet: u32,
         overlays: Vec<RemotePresence>,
     },
+    /// A remote or reconciled change moved the rows or columns under the
+    /// local cursor. The host moves its selection from `from` to `to` unless
+    /// the user has moved it since.
+    LocalSelectionMoved {
+        sheet: u32,
+        from: LocalCursor,
+        to: LocalCursor,
+    },
     EpochChanged {
         old_epoch: u8,
         new_epoch: u8,
@@ -198,11 +215,22 @@ struct PresenceEntry {
     received_at: f64,
 }
 
+/// The local cursor by stable row and column IDs, with the display position
+/// the host last reported for it.
+struct LocalAnchor {
+    sheet: SheetId,
+    row: u64,
+    col: u64,
+    range: Option<WirePresenceRangeV1>,
+    at: LocalCursor,
+}
+
 pub(crate) struct CollabSession {
     pub(crate) machine: ClientSyncMachine,
     events: VecDeque<CollabEvent>,
     presences: BTreeMap<u32, PresenceEntry>,
     last_presence_sent: Option<f64>,
+    local_anchor: Option<LocalAnchor>,
     initialized: bool,
     failed: bool,
 }
@@ -285,6 +313,7 @@ impl CollabSession {
             events: VecDeque::new(),
             presences: BTreeMap::new(),
             last_presence_sent: None,
+            local_anchor: None,
             initialized,
             failed: false,
         }
@@ -445,6 +474,35 @@ impl CollabSession {
         col: u32,
         selection: Option<PresenceSpan>,
     ) {
+        let Some(s) = self.machine.visible().live_sheet(sheet) else {
+            self.local_anchor = None;
+            return;
+        };
+        let (Some(cursor_row), Some(cursor_col)) =
+            (s.row_axis().pos_to_id(row), s.col_axis().pos_to_id(col))
+        else {
+            self.local_anchor = None;
+            return;
+        };
+        let range = selection.as_ref().and_then(|span| {
+            Some(WirePresenceRangeV1 {
+                start_row: s.row_axis().pos_to_id(span.first_row)?,
+                end_row: s.row_axis().pos_to_id(span.end_row.checked_sub(1)?)?,
+                start_col: s.col_axis().pos_to_id(span.first_col)?,
+                end_col: s.col_axis().pos_to_id(span.end_col.checked_sub(1)?)?,
+            })
+        });
+        self.local_anchor = Some(LocalAnchor {
+            sheet,
+            row: cursor_row,
+            col: cursor_col,
+            range,
+            at: LocalCursor {
+                row,
+                col,
+                selection: range.and(selection),
+            },
+        });
         let now = now_ms();
         if self.machine.connection_state() != ConnectionState::Online
             || self
@@ -456,22 +514,6 @@ impl CollabSession {
         let Some(replica) = self.machine.replica() else {
             return;
         };
-        let Some(s) = self.machine.visible().live_sheet(sheet) else {
-            return;
-        };
-        let (Some(cursor_row), Some(cursor_col)) =
-            (s.row_axis().pos_to_id(row), s.col_axis().pos_to_id(col))
-        else {
-            return;
-        };
-        let selection = selection.and_then(|span| {
-            Some(WirePresenceRangeV1 {
-                start_row: s.row_axis().pos_to_id(span.first_row)?,
-                end_row: s.row_axis().pos_to_id(span.end_row.checked_sub(1)?)?,
-                start_col: s.col_axis().pos_to_id(span.first_col)?,
-                end_col: s.col_axis().pos_to_id(span.end_col.checked_sub(1)?)?,
-            })
-        });
         self.last_presence_sent = Some(now);
         self.emit(ClientAction::SendFrame(WireSyncFrameV1::Presence(
             WirePresenceV1 {
@@ -482,9 +524,61 @@ impl CollabSession {
                 sheet_id: sheet.0,
                 cursor_row,
                 cursor_col,
-                selection,
+                selection: range,
             },
         )));
+    }
+
+    /// After a change the local user did not make, finds the local cursor by
+    /// its stable IDs and asks the host to follow it if it moved. A cursor
+    /// whose row or column was deleted stays where the host has it.
+    fn relocate_local(&mut self, subscribed: SheetId) {
+        let Some(anchor) = &mut self.local_anchor else {
+            return;
+        };
+        if anchor.sheet != subscribed {
+            return;
+        }
+        let Some(s) = self.machine.visible().live_sheet(anchor.sheet) else {
+            return;
+        };
+        let (Some(row), Some(col)) = (
+            s.row_axis().id_to_pos(anchor.row),
+            s.col_axis().id_to_pos(anchor.col),
+        ) else {
+            return;
+        };
+        let selection = match anchor.range {
+            None => None,
+            Some(range) => {
+                let (Some(r1), Some(r2), Some(c1), Some(c2)) = (
+                    s.row_axis().id_to_pos(range.start_row),
+                    s.row_axis().id_to_pos(range.end_row),
+                    s.col_axis().id_to_pos(range.start_col),
+                    s.col_axis().id_to_pos(range.end_col),
+                ) else {
+                    return;
+                };
+                Some(PresenceSpan {
+                    first_row: r1.min(r2),
+                    end_row: r1.max(r2).saturating_add(1),
+                    first_col: c1.min(c2),
+                    end_col: c1.max(c2).saturating_add(1),
+                })
+            }
+        };
+        let to = LocalCursor {
+            row,
+            col,
+            selection,
+        };
+        if to == anchor.at {
+            return;
+        }
+        let from = core::mem::replace(&mut anchor.at, to.clone());
+        let sheet = anchor.sheet.0;
+        self.events
+            .push_back(CollabEvent::LocalSelectionMoved { sheet, from, to });
     }
 
     pub(crate) fn presence(&mut self, sheet: SheetId) {
@@ -805,6 +899,7 @@ impl Engine {
             self.refresh_subscription_extent();
             self.flush_dirty_pages();
             session.presence(self.subscribed_sheet);
+            session.relocate_local(self.subscribed_sheet);
             Some(EngineEvent::SheetChanged {
                 sheet: self.sheet_info(self.subscribed_sheet),
                 action_ms: 0.0,

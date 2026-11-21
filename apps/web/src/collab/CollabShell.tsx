@@ -642,6 +642,7 @@ export default function CollabShell(props: CollabShellProps) {
               <button
                 type="button"
                 className="toolbar-btn"
+                data-testid="collab-modal-close"
                 onClick={() => {
                   setJoinError(null);
                   setAccessError(null);

@@ -327,6 +327,86 @@ fn remote_presence_is_resolved_again_after_a_structural_commit() {
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), test)]
+fn local_cursor_follows_rows_inserted_by_someone_else() {
+    let (mut engine, mut server) = connect();
+    let span = |first_row, first_col| PresenceSpan {
+        first_row,
+        end_row: first_row + 2,
+        first_col,
+        end_col: first_col + 1,
+    };
+    let _ = engine.handle_sync_command(SyncCommand::LocalPresence {
+        sheet: 0,
+        cursor_row: 2,
+        cursor_col: 1,
+        selection: Some(span(2, 1)),
+    });
+    events(&mut engine);
+
+    let bob = server.allocate_replica(BOB).unwrap();
+    let insert = Op::InsertRows {
+        sheet: SheetId(0),
+        after: None,
+        ids: IdRun::new(pack_id(0, bob, 1).unwrap(), 1).unwrap(),
+    };
+    let inserted = commit(
+        &mut server,
+        BOB,
+        WirePendingTxnV2 {
+            replica: bob,
+            client_seq: 1,
+            base_server_seq: 0,
+            timestamp_ms: 0,
+            txn: ops_to_wire_txn_v2("Insert".into(), &[insert]),
+        },
+    );
+    deliver(&mut engine, inserted);
+    let moved: Vec<_> = events(&mut engine)
+        .into_iter()
+        .filter_map(|event| match event {
+            CollabEvent::LocalSelectionMoved { sheet, from, to } => Some((sheet, from, to)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        moved,
+        vec![(
+            0,
+            LocalCursor {
+                row: 2,
+                col: 1,
+                selection: Some(span(2, 1)),
+            },
+            LocalCursor {
+                row: 3,
+                col: 1,
+                selection: Some(span(3, 1)),
+            },
+        )]
+    );
+
+    // A change that moves nothing leaves the cursor alone.
+    let edit = commit(
+        &mut server,
+        BOB,
+        WirePendingTxnV2 {
+            replica: bob,
+            client_seq: 2,
+            base_server_seq: 1,
+            timestamp_ms: 0,
+            txn: ops_to_wire_txn_v2("Edit".into(), &[edit_op(5, 1.0)]),
+        },
+    );
+    deliver(&mut engine, edit);
+    assert!(
+        !events(&mut engine)
+            .iter()
+            .any(|event| matches!(event, CollabEvent::LocalSelectionMoved { .. }))
+    );
+}
+
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), test)]
 fn digest_mismatch_requests_a_full_catchup_without_dropping_pending_edits() {
     let (mut engine, mut server) = connect();
     raw(&mut engine, 0, "10");

@@ -631,6 +631,7 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
       return;
     }
     const selfChecks: ((digest: string) => void)[] = [];
+    const stateDigests: ((digest: string) => void)[] = [];
     const compactWaiters: ((res: SnapshotSaveResult) => void)[] = [];
     const closeWaiters: (() => void)[] = [];
     let lastInspectKey = "";
@@ -1082,6 +1083,49 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
               }
               break;
             }
+            case "localSelectionMoved": {
+              // Someone else inserted, deleted or moved rows or columns under
+              // the cursor: keep it on the same cells, as long as the user has
+              // not moved it since and is not typing into a cell.
+              const sel = lastSelectionRef.current;
+              const { from, to } = event;
+              if (
+                event.sheet !== activeSheetRef.current ||
+                editor.editing ||
+                !sel ||
+                sel.scope === "all" ||
+                sel.ranges.length !== 1 ||
+                sel.row !== from.row ||
+                sel.col !== from.col
+              ) {
+                break;
+              }
+              const was = from.selection;
+              const now = to.selection;
+              if (!was || !now) {
+                if (!was && !now) {
+                  grid.select({ row: to.row, col: to.col });
+                }
+                break;
+              }
+              if (
+                sel.range.firstRow !== was.firstRow ||
+                sel.range.endRow !== was.endRow ||
+                sel.range.firstCol !== was.firstCol ||
+                sel.range.endCol !== was.endCol
+              ) {
+                break;
+              }
+              grid.selectRange(
+                { row: to.row, col: to.col },
+                {
+                  row: from.row === was.firstRow ? now.endRow - 1 : now.firstRow,
+                  col: from.col === was.firstCol ? now.endCol - 1 : now.firstCol,
+                },
+                sel.scope,
+              );
+              break;
+            }
             default: {
               if (!transportReady) {
                 earlyCollabEvents.push(event);
@@ -1483,6 +1527,11 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
                 resolve(message.digest);
               }
               break;
+            case "stateDigested":
+              for (const resolve of stateDigests.splice(0)) {
+                resolve(message.digest);
+              }
+              break;
             case "failed":
               docLifecycleRef.current = "failed";
               setEngine({ status: "failed", message: message.message });
@@ -1635,6 +1684,10 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
           selfCheck: () => {
             clientRef.current?.send({ kind: "selfCheck" });
             return new Promise<string>((resolve) => selfChecks.push(resolve));
+          },
+          stateDigest: () => {
+            clientRef.current?.send({ kind: "stateDigest" });
+            return new Promise<string>((resolve) => stateDigests.push(resolve));
           },
           docStatus: () => ({
             docId: activeDocIdRef.current,

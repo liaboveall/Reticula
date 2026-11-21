@@ -953,6 +953,10 @@ pub enum EngineCommand {
     ContinueRecalc,
     /// Run the determinism self-check. Answered by [`EngineEvent::SelfChecked`].
     SelfCheck,
+    /// Report the workbook's state digest (`STATE_DIGEST_VERSION`), which two
+    /// replicas share exactly when they hold the same logical content.
+    /// Answered by [`EngineEvent::StateDigested`].
+    StateDigest,
 }
 
 const fn default_one() -> u32 {
@@ -1049,6 +1053,8 @@ pub enum EngineEvent {
     Rejected { reason: String },
     /// The determinism self-check has run.
     SelfChecked { digest: String },
+    /// The workbook's state digest, as `v<version>:<content>:<order>` in hex.
+    StateDigested { digest: String },
 }
 
 /// Facts about the running engine.
@@ -1990,6 +1996,15 @@ impl Engine {
             }
             EngineCommand::ResumeRecalc => Some(self.resume_recalc()),
             EngineCommand::ContinueRecalc => self.continue_recalc(),
+            EngineCommand::StateDigest => {
+                let digest = self.engine.workbook().state_digest();
+                Some(EngineEvent::StateDigested {
+                    digest: format!(
+                        "v{}:{:016x}{:016x}:{:016x}",
+                        digest.version, digest.content_hi, digest.content_lo, digest.order
+                    ),
+                })
+            }
             EngineCommand::SelfCheck => {
                 let digest = determinism::to_hex(determinism::digest());
                 Some(EngineEvent::SelfChecked {

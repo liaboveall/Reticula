@@ -65,6 +65,8 @@ export interface Hooks {
   textAt(row: number, col: number): string | null;
   /** Runs the engine's determinism self-check and resolves to its digest. */
   selfCheck(): Promise<string>;
+  /** The workbook's state digest: equal on two replicas exactly when their content is. */
+  stateDigest(): Promise<string>;
   /** Current local persistence, lock, and Safe Mode status. */
   docStatus(): HookDocStatus;
   /** Triggers a background CoW snapshot compaction and resolves when flushed. */
@@ -95,6 +97,7 @@ export function hooksRequested(): boolean {
 
 export interface HookExtras {
   readonly selfCheck: () => Promise<string>;
+  readonly stateDigest: () => Promise<string>;
   readonly docStatus: () => HookDocStatus;
   readonly compactSnapshot: () => Promise<SnapshotSaveResult>;
   readonly flushAndClose: () => Promise<void>;
@@ -113,6 +116,7 @@ export function installHooks(grid: Grid, extras: HookExtras): () => void {
     selectRange: (anchor, focus) => grid.selectRange(anchor, focus),
     textAt: (row, col) => grid.textAt(row, col),
     selfCheck: extras.selfCheck,
+    stateDigest: extras.stateDigest,
     docStatus: extras.docStatus,
     compactSnapshot: extras.compactSnapshot,
     flushAndClose: extras.flushAndClose,
