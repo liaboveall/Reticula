@@ -29,9 +29,11 @@ Commands:
                           Playwright browsers.
   check [--rust] [--web] [--skip-wasm]
                           Formatting, lints and type checks. With no option, both halves.
-  test [--rust] [--wasm] [--web]
+  test [--rust] [--wasm] [--web] [--server]
                           Tests: native, the kernel tests again under WebAssembly, and
-                          the front-end unit tests. With no option, all three.
+                          the front-end unit tests. With no option, those three.
+                          --server runs the server's PostgreSQL tests, against
+                          RETICULA_TEST_DATABASE_URL or the development database.
   deny                    Dependency licences, advisories and sources.
   wasm [--dev]            Build the WebAssembly module and its bindings.
   codegen [--check]       Write the TypeScript files generated from the Rust sources;
@@ -40,8 +42,10 @@ Commands:
   compat [--freeze v1]    Verify frozen wire v1 SHA-256 hashes (or generate/freeze v1 fixtures).
   diff [--count <n>] [--out <file>]
                           Differential evaluation against ironcalc_base and formualizer-eval.
-  fuzz [--cpu-seconds <s>] [--threads <n>] [--affinity <mask>]
-                          Multi-threaded mutation & structured fuzzing campaign.
+  fuzz [--cpu-seconds <s>] [--threads <n>] [--affinity <mask>] [--target <name>]
+                          Multi-threaded mutation & structured fuzzing campaign over the six
+                          targets, or with --target (parser, snapshot, wal, ops, eval, sync)
+                          over one of them.
   sim [--seeds <n>] [--start-seed <n>] [--seed <s>] [--threads <n>] [--fail-fast] [--out <file>]
                           Deterministic multi-client sync simulation.
   bench [--affinity <mask>] [--browser <name>] [--quick] [--out <file>] [--suite engine|b9]
@@ -96,7 +100,11 @@ fn run(args: &[String]) -> Result {
     match command.as_str() {
         "setup" => setup::run(&Flags::parse(rest, &["browsers"], &[])?),
         "check" => check(&Flags::parse(rest, &["rust", "web", "skip-wasm"], &[])?),
-        "test" => test(&Flags::parse(rest, &["rust", "wasm", "web"], &[])?),
+        "test" => test(&Flags::parse(
+            rest,
+            &["rust", "wasm", "web", "server"],
+            &[],
+        )?),
         "deny" => {
             Flags::parse(rest, &[], &[])?;
             rust::deny()
@@ -116,7 +124,7 @@ fn run(args: &[String]) -> Result {
         "fuzz" => qa::fuzz(&Flags::parse(
             rest,
             &[],
-            &["cpu-seconds", "threads", "affinity", "out"],
+            &["cpu-seconds", "threads", "affinity", "out", "target"],
         )?),
         "sim" => qa::sim(&Flags::parse(
             rest,
@@ -173,7 +181,8 @@ fn check(flags: &Flags) -> Result {
 }
 
 fn test(flags: &Flags) -> Result {
-    let everything = !flags.has("rust") && !flags.has("wasm") && !flags.has("web");
+    let everything =
+        !flags.has("rust") && !flags.has("wasm") && !flags.has("web") && !flags.has("server");
     if everything || flags.has("rust") {
         rust::test()?;
     }
@@ -182,6 +191,9 @@ fn test(flags: &Flags) -> Result {
     }
     if everything || flags.has("web") {
         web::test()?;
+    }
+    if flags.has("server") {
+        rust::test_server()?;
     }
     Ok(())
 }
@@ -233,6 +245,9 @@ fn ci() -> Result {
     compat::check()?;
     setup::check_workflow_pins()?;
     rust::test()?;
+    rust::test_server()?;
+    // 5,000 seeds, as on CI; the nightly workflow runs 100,000.
+    qa::sim(&Flags::parse(&[], &[], &[])?)?;
     rust::test_wasm()?;
     rust::deny()?;
     wasm::build(Profile::Release)?;

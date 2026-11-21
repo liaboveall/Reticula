@@ -8,7 +8,7 @@ use std::process::Command;
 
 use reticula_kernel_bench::bench_workloads::run_native_suite;
 use reticula_kernel_bench::diff::run_differential;
-use reticula_kernel_bench::fuzz_runner::run_fuzz_campaign;
+use reticula_kernel_bench::fuzz_runner::{FUZZ_TARGETS, run_fuzz_campaign};
 use reticula_kernel_bench::sync_bench::run_b9;
 
 fn pin_current_process(mask: &str) {
@@ -132,10 +132,20 @@ fn run_fuzz_cmd(args: &[String]) {
     let mut threads = 16_usize;
     let mut affinity: Option<String> = None;
     let mut out: Option<PathBuf> = None;
+    let mut only: Option<usize> = None;
 
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
+            "--target" => {
+                i += 1;
+                only = Some(
+                    FUZZ_TARGETS
+                        .iter()
+                        .position(|name| *name == args[i])
+                        .unwrap_or_else(|| panic!("unknown fuzz target `{}`", args[i])),
+                );
+            }
             "--cpu-seconds" => {
                 i += 1;
                 cpu_seconds = args[i].parse().expect("valid --cpu-seconds");
@@ -161,7 +171,7 @@ fn run_fuzz_cmd(args: &[String]) {
         pin_current_process(mask);
     }
 
-    let report = run_fuzz_campaign(cpu_seconds, threads);
+    let report = run_fuzz_campaign(cpu_seconds, threads, only);
     println!(
         "Fuzzing complete: {:.1} wall s x {} threads = {:.1} CPU-s ({:.2} CPU-hours)",
         report.wall_seconds,

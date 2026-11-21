@@ -66,6 +66,9 @@ pub fn fuzz(flags: &Flags) -> Result {
     if let Some(mask) = flags.get("affinity") {
         cmd = cmd.args(["--affinity", mask]);
     }
+    if let Some(target) = flags.get("target") {
+        cmd = cmd.args(["--target", target]);
+    }
     cmd.run()
 }
 

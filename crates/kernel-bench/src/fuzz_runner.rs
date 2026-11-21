@@ -31,6 +31,8 @@ use crate::fuzz_harnesses::{
 /// Summary of a completed fuzzing campaign.
 #[derive(Clone, Debug, Serialize)]
 pub struct FuzzReport {
+    /// The target the whole budget went to, or `all`.
+    pub target: &'static str,
     /// Worker threads used.
     pub threads: usize,
     /// Wall-clock duration in seconds.
@@ -187,9 +189,18 @@ pub fn build_seed_corpus() -> Vec<Vec<u8>> {
     seeds
 }
 
-/// Runs all six fuzz targets in parallel across `threads` threads until
-/// `threads * wall_elapsed >= target_cpu_seconds`.
-pub fn run_fuzz_campaign(target_cpu_seconds: u64, threads: usize) -> FuzzReport {
+/// The names `--target` accepts, in the order the campaign cycles through them.
+pub const FUZZ_TARGETS: [&str; 6] = ["parser", "snapshot", "wal", "ops", "eval", "sync"];
+
+/// Runs the six fuzz targets in parallel across `threads` threads until
+/// `threads * wall_elapsed >= target_cpu_seconds`, cycling through all of
+/// them, or running only `FUZZ_TARGETS[only]` so that the whole budget goes
+/// to one target.
+pub fn run_fuzz_campaign(
+    target_cpu_seconds: u64,
+    threads: usize,
+    only: Option<usize>,
+) -> FuzzReport {
     let worker_count = threads.max(1);
     let wall_budget =
         Duration::from_secs_f64(target_cpu_seconds as f64 / worker_count as f64 + 1.0);
@@ -228,7 +239,7 @@ pub fn run_fuzz_campaign(target_cpu_seconds: u64, threads: usize) -> FuzzReport 
 
                 while started.elapsed() < wall_budget {
                     mutate_input(&mut rng, seeds_ref, &mut buf);
-                    match iter % 6 {
+                    match only.unwrap_or((iter % 6) as usize) {
                         0 => {
                             fuzz_one_parser(&buf);
                             local_p += 1;
@@ -273,6 +284,9 @@ pub fn run_fuzz_campaign(target_cpu_seconds: u64, threads: usize) -> FuzzReport 
 
     let wall_seconds = started.elapsed().as_secs_f64();
     FuzzReport {
+        target: only
+            .and_then(|i| FUZZ_TARGETS.get(i).copied())
+            .unwrap_or("all"),
         threads: worker_count,
         wall_seconds,
         cpu_seconds: wall_seconds * (worker_count as f64),

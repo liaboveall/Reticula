@@ -81,6 +81,26 @@ pub fn test() -> Result {
         .run()
 }
 
+/// Runs the server's tests that need PostgreSQL (`#[ignore]` in a plain run):
+/// storage, the permission matrix over HTTP and WebSocket, and the forced
+/// process exit that must not lose an acknowledged transaction.
+pub fn test_server() -> Result {
+    let database = crate::stack::test_database_url()?;
+    util::step("server tests against PostgreSQL");
+    Cmd::new(tool("cargo-nextest"))
+        .args([
+            "nextest",
+            "run",
+            "--package",
+            "reticula-server",
+            "--locked",
+            "--run-ignored",
+            "only",
+        ])
+        .env("RETICULA_TEST_DATABASE_URL", database)
+        .run()
+}
+
 /// Runs the kernel tests again as WebAssembly, in Node.
 pub fn test_wasm() -> Result {
     util::step("kernel tests (wasm32)");
