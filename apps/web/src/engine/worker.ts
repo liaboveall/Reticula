@@ -1730,12 +1730,8 @@ async function handleHostCommand(cmd: HostCommand): Promise<void> {
         activeSheetId = ev.sheet.sheet;
         scope.postMessage({ kind: "historyExited", sheet: ev.sheet });
       }
-      if (lastSubscription) {
-        engine.handle({
-          ...lastSubscription,
-          sheet: activeSheetId,
-        });
-      }
+      // Do not replay stale `lastSubscription`: `historyExited` calls `grid.setSheet(...)`,
+      // which clears PageCache and issues a fresh `subscribe` at the new epoch.
       flushDuePagesAndAux(engine);
       break;
     }
