@@ -289,12 +289,21 @@ fn quoted(text: &str) -> String {
     out
 }
 
+fn suite_rank(val: &serde_json::Value) -> u8 {
+    match val["suite"].as_str().unwrap_or("") {
+        "m2b-load" | "m2b-sync" => 4,
+        "m2a-sync" => 3,
+        "m1b-engine" | "m1b-startup" | "m1b-render" => 2,
+        _ => 1,
+    }
+}
+
 fn latest_result_json(suffix: &str) -> Result<Option<serde_json::Value>> {
     let dir = util::root().join("bench/results");
     if !dir.exists() {
         return Ok(None);
     }
-    let mut matches: Vec<_> = std::fs::read_dir(&dir)
+    let paths: Vec<_> = std::fs::read_dir(&dir)
         .map_err(|e| format!("cannot read {}: {e}", dir.display()))?
         .filter_map(std::result::Result::ok)
         .map(|e| e.path())
@@ -304,15 +313,25 @@ fn latest_result_json(suffix: &str) -> Result<Option<serde_json::Value>> {
                 .is_some_and(|n| n.ends_with(suffix))
         })
         .collect();
-    matches.sort();
-    let Some(path) = matches.pop() else {
-        return Ok(None);
-    };
-    let raw = std::fs::read_to_string(&path)
-        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-    let val: serde_json::Value =
-        serde_json::from_str(&raw).map_err(|e| format!("invalid JSON {}: {e}", path.display()))?;
-    Ok(Some(val))
+    let mut best: Option<((String, u8, String), serde_json::Value)> = None;
+    for path in paths {
+        let raw = std::fs::read_to_string(&path)
+            .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+        let val: serde_json::Value = serde_json::from_str(&raw)
+            .map_err(|e| format!("invalid JSON {}: {e}", path.display()))?;
+        let date = val["date"].as_str().unwrap_or("").to_owned();
+        let rank = suite_rank(&val);
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_owned();
+        let key = (date, rank, name);
+        if best.as_ref().is_none_or(|(bkey, _)| key > *bkey) {
+            best = Some((key, val));
+        }
+    }
+    Ok(best.map(|(_, val)| val))
 }
 
 /// Extracts headline constants from `bench/results/` for the landing page and
@@ -322,6 +341,8 @@ fn benchmarks() -> Result<String> {
         .ok_or_else(|| String::from("no `*-engine.json` found under bench/results/"))?;
     let startup = latest_result_json("-startup.json")?;
     let render = latest_result_json("-render.json")?;
+    let sync = latest_result_json("-sync.json")?;
+    let load = latest_result_json("-load.json")?;
 
     let commit = engine["commit"].as_str().unwrap_or("unknown");
     let date = engine["date"].as_str().unwrap_or("2026-11-18");
@@ -368,6 +389,39 @@ fn benchmarks() -> Result<String> {
         .as_ref()
         .and_then(|s| s["results"]["firstScreen"]["p50"].as_f64());
     let render_p99 = render.as_ref().and_then(|r| r["scrollWorkP99Ms"].as_f64());
+    let b9a_frame_p50 = sync.as_ref().and_then(|s| {
+        s["wasmChrome"]["b9a_1000_single_cells"]["engine_frame_ms"]["p50_ms"].as_f64()
+    });
+    let b9a_total_p50 = sync.as_ref().and_then(|s| {
+        s["wasmChrome"]["b9a_1000_single_cells"]["engine_total_ms"]["p50_ms"].as_f64()
+    });
+    let b9a_total_p95 = sync.as_ref().and_then(|s| {
+        s["wasmChrome"]["b9a_1000_single_cells"]["engine_total_ms"]["p95_ms"].as_f64()
+    });
+    let b9b_total_p50 = sync
+        .as_ref()
+        .and_then(|s| s["wasmChrome"]["b9b_100k_cell_block"]["engine_total_ms"]["p50_ms"].as_f64());
+    let load_clients = load.as_ref().and_then(|l| l["clients"].as_u64());
+    let load_txns_per_sec = load.as_ref().and_then(|l| l["achievedTxnsPerSec"].as_f64());
+    let load_loopback_p50 = load
+        .as_ref()
+        .and_then(|l| l["remoteVisibilityLoopbackMs"]["p50_ms"].as_f64());
+    let load_rtt50_p95 = load
+        .as_ref()
+        .and_then(|l| l["remoteVisibilityRtt50Ms"]["p95_ms"].as_f64());
+    let load_server_peak_mib = load
+        .as_ref()
+        .and_then(|l| l["resources"]["serverPeakMiB"].as_f64());
+    let load_cells_m = load
+        .as_ref()
+        .and_then(|l| l["document"]["populatedCells"].as_f64())
+        .map(|cells| cells / 1_000_000.0);
+    let opt_int = |v: Option<u64>| -> String {
+        match v {
+            Some(n) => format!("{n}"),
+            None => String::from("null as number | null"),
+        }
+    };
 
     let mut out = String::from(BANNER);
     out.push_str("//\n// Archived benchmark constants extracted from `bench/results/`.\n\n");
@@ -401,6 +455,20 @@ fn benchmarks() -> Result<String> {
         opt_num(startup_first)
     );
     let _ = writeln!(out, "  renderScrollWorkP99Ms: {},", opt_num(render_p99));
+    let _ = writeln!(out, "  b9aFrameP50Ms: {},", opt_num(b9a_frame_p50));
+    let _ = writeln!(out, "  b9aTotalP50Ms: {},", opt_num(b9a_total_p50));
+    let _ = writeln!(out, "  b9aTotalP95Ms: {},", opt_num(b9a_total_p95));
+    let _ = writeln!(out, "  b9bTotalP50Ms: {},", opt_num(b9b_total_p50));
+    let _ = writeln!(out, "  loadClients: {},", opt_int(load_clients));
+    let _ = writeln!(out, "  loadTxnsPerSec: {},", opt_num(load_txns_per_sec));
+    let _ = writeln!(out, "  loadLoopbackP50Ms: {},", opt_num(load_loopback_p50));
+    let _ = writeln!(out, "  loadRtt50P95Ms: {},", opt_num(load_rtt50_p95));
+    let _ = writeln!(
+        out,
+        "  loadServerPeakMiB: {},",
+        opt_num(load_server_peak_mib)
+    );
+    let _ = writeln!(out, "  loadCellsM: {},", opt_num(load_cells_m));
     out.push_str("} as const;\n");
     Ok(out)
 }

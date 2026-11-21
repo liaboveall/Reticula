@@ -20,6 +20,7 @@ const STACK_ORIGIN: &str = "http://127.0.0.1:3200";
 const POSTGRES_UTIL_IMAGE: &str = "postgres:18.7-bookworm";
 const DRILL_SRC_PROJECT: &str = "reticula-drill-src";
 const DRILL_DST_PROJECT: &str = "reticula-drill-dst";
+const LOADTEST_PROJECT: &str = "reticula-loadtest";
 
 /// The development database from `infra/compose.dev.yml`.
 pub const DEV_DATABASE_URL: &str = "postgres://reticula:reticula_local_dev@127.0.0.1:5434/reticula";
@@ -578,6 +579,64 @@ pub fn drill(flags: &Flags) -> Result {
     util::step("drill: teardown destination stack");
     dst_guard.down_now()?;
     Ok(())
+}
+
+/// `cargo xtask loadtest [--skip-image] [--out <file>]`: starts the resource-limited
+/// compose stack (`768m`/1.0 CPU server, `768m`/0.5 CPU Postgres), imports a
+/// ~1.95M-cell (~60 MiB) workbook, and drives 50 concurrent WebSocket clients at 100 txns/s.
+pub fn loadtest(flags: &Flags) -> Result {
+    ensure_stack_image(flags.has("skip-image"))?;
+    let driver = build_server_example("loadtest_driver")?;
+
+    let dir = util::root().join("target/loadtest");
+    if dir.exists() {
+        fs::remove_dir_all(&dir).map_err(|e| format!("clean {}: {e}", dir.display()))?;
+    }
+    let url = "http://127.0.0.1:3220";
+    let metrics_url = "http://127.0.0.1:3221";
+    let env_file = write_compose_env(&dir, "loadtest.env", 3220, 3221, url)?;
+
+    let commit = crate::qa::git_output(&["rev-parse", "--short", "HEAD"]);
+    let date = crate::qa::current_utc_date();
+    let out_path = match flags.get("out") {
+        Some(custom) => util::root().join(custom),
+        None => util::root()
+            .join("bench/results")
+            .join(format!("{date}-{commit}-load.json")),
+    };
+
+    compose_cmd(
+        LOADTEST_PROJECT,
+        &env_file,
+        &["down", "--volumes", "--remove-orphans"],
+    )
+    .run()?;
+    let mut guard = ComposeGuard::new(LOADTEST_PROJECT, env_file.clone());
+
+    util::step("loadtest: start resource-limited compose stack (768m server, 768m postgres)");
+    compose_cmd(LOADTEST_PROJECT, &env_file, &["up", "--detach", "--wait"]).run()?;
+
+    util::step("loadtest: 50 concurrent clients at 100 txns/s (5s warmup + 60s measured)");
+    let res = Cmd::new(&driver)
+        .args([
+            "--base-url",
+            url,
+            "--metrics-url",
+            metrics_url,
+            "--project",
+            LOADTEST_PROJECT,
+            "--env-file",
+        ])
+        .arg(&env_file)
+        .arg("--out")
+        .arg(&out_path)
+        .args(["--commit", &commit, "--date", &date])
+        .run();
+
+    util::step("loadtest: teardown compose stack");
+    let down_res = guard.down_now();
+    res?;
+    down_res
 }
 
 fn pipe_tar_volume_out(volume: &str, out_file: &Path) -> Result {

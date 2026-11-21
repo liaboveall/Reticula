@@ -130,7 +130,7 @@
     },
     "document": "sample, 100,000 data rows x 22 columns, 100,000 formulas"
   },
-  "suite": "m2a-sync",
+  "suite": "m2b-sync",
   "uncommittedChanges": false,
   "wasmChrome": {
     "affinity": "FFFF",

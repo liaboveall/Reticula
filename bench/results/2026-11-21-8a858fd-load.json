@@ -1,0 +1,51 @@
+{
+  "achievedTxnsPerSec": 100.0,
+  "allDigestsMatch": true,
+  "clients": 50,
+  "commit": "8a858fd",
+  "date": "2026-11-21",
+  "digestMismatches": 0,
+  "disconnects": 0,
+  "document": {
+    "estimatedBytes": 65177636,
+    "populatedCells": 1977000,
+    "snapshotCompressedBytes": 8717805
+  },
+  "durationSeconds": 60,
+  "lostTxns": 0,
+  "measuredTxns": 6000,
+  "referenceRttMs": 50.0,
+  "remoteDeliverySamples": 294000,
+  "remoteVisibilityLoopbackMs": {
+    "max_ms": 1540.22,
+    "mean_ms": 14.19,
+    "p50_ms": 10.04,
+    "p95_ms": 35.95,
+    "p99_ms": 60.05,
+    "samples": 294000
+  },
+  "remoteVisibilityRtt50Ms": {
+    "max_ms": 1590.22,
+    "mean_ms": 64.19,
+    "p50_ms": 60.04,
+    "p95_ms": 85.95,
+    "p99_ms": 110.05,
+    "samples": 294000
+  },
+  "resources": {
+    "maxLoadedBytes": 65177636,
+    "postgresMemLimitMiB": 768.0,
+    "postgresPeakMiB": 72.27,
+    "sampleCount": 36,
+    "serverMemLimitMiB": 768.0,
+    "serverPeakMiB": 320.2,
+    "serverPeakPct": 41.69,
+    "snapshotsPruned": 6,
+    "snapshotsWritten": 62
+  },
+  "suite": "m2b-load",
+  "targetTxnsPerSec": 100.0,
+  "totalTxns": 6500,
+  "warmupSeconds": 5,
+  "warmupTxns": 500
+}

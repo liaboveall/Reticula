@@ -67,6 +67,9 @@ Commands:
                           database, recreated containers.
   drill [--skip-image]    End-to-end backup, missing-snapshot window cleanup,
                           log_epoch bump (0 -> 1), and T1-ahead client recovery drill.
+  loadtest [--skip-image] [--out <file>]
+                          Run 50 concurrent clients at 100 txns/s against a ~2M-cell
+                          (~60 MiB) workbook under 768m/1.0-CPU compose limits.
   build [--skip-wasm] [--check-budget]
                           Production build with preloads, precompressed assets and size budget check.
   e2e [--browser <name>] [--skip-build]
@@ -147,6 +150,7 @@ fn run(args: &[String]) -> Result {
         "serve" => stack::serve(&Flags::parse(rest, &["skip-build"], &["origin"])?),
         "stack" => stack::stack(&Flags::parse(rest, &["skip-image", "keep"], &[])?),
         "drill" => stack::drill(&Flags::parse(rest, &["skip-image"], &[])?),
+        "loadtest" => stack::loadtest(&Flags::parse(rest, &["skip-image"], &["out"])?),
         "build" => build(&Flags::parse(rest, &["skip-wasm", "check-budget"], &[])?),
         "e2e" => e2e(&Flags::parse(rest, &["skip-build"], &["browser"])?),
         "ci" => {

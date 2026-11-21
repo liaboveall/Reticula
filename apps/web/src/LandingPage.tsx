@@ -164,6 +164,37 @@ export function LandingPage({ onNavigate }: LandingPageProps) {
             <strong className="metric-value">{startupValue}</strong>
             <span className="metric-detail">{startupNote}</span>
           </div>
+          <div className="metric-card">
+            <span className="metric-label">1,000-Op History Replay (B9a)</span>
+            <strong className="metric-value">
+              {BENCHMARKS.b9aFrameP50Ms !== null ? `${BENCHMARKS.b9aFrameP50Ms} ms` : "≤ 5 ms"}
+            </strong>
+            <span className="metric-detail">
+              first-frame p50 ({BENCHMARKS.b9aTotalP50Ms ?? "—"} ms full recalc,{" "}
+              {BENCHMARKS.b9aTotalP95Ms ?? "—"} ms p95; 100k batch{" "}
+              {BENCHMARKS.b9bTotalP50Ms !== null
+                ? `${Math.round(BENCHMARKS.b9bTotalP50Ms)} ms`
+                : "≤ 150 ms"}
+              )
+            </span>
+          </div>
+          <div className="metric-card">
+            <span className="metric-label">
+              {BENCHMARKS.loadClients ?? 50}-Client Live Sync ({BENCHMARKS.loadTxnsPerSec ?? 100}{" "}
+              txn/s)
+            </span>
+            <strong className="metric-value">
+              {BENCHMARKS.loadRtt50P95Ms !== null ? `${BENCHMARKS.loadRtt50P95Ms} ms` : "≤ 150 ms"}
+            </strong>
+            <span className="metric-detail">
+              p95 remote visibility with +50 ms RTT ({BENCHMARKS.loadLoopbackP50Ms ?? "—"} ms
+              loopback p50, {BENCHMARKS.loadCellsM ?? "—"}M cells,{" "}
+              {BENCHMARKS.loadServerPeakMiB !== null
+                ? `${Math.round(BENCHMARKS.loadServerPeakMiB)} MiB`
+                : "≤ 538 MiB"}{" "}
+              server RAM)
+            </span>
+          </div>
         </section>
 
         <p className="landing-footnote">

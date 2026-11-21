@@ -125,7 +125,7 @@ pub fn bench(flags: &Flags) -> Result {
     let suite = flags.get("suite").unwrap_or("engine");
     let (native_command, suite_label, archive_kind) = match suite {
         "engine" => ("native-bench", "m1b-engine", "engine"),
-        "b9" => ("sync-bench", "m2a-sync", "sync"),
+        "b9" => ("sync-bench", "m2b-sync", "sync"),
         other => return Err(format!("unknown benchmark suite `{other}` (engine or b9)")),
     };
 
@@ -250,7 +250,7 @@ pub fn bench(flags: &Flags) -> Result {
     Ok(())
 }
 
-fn git_output(args: &[&str]) -> String {
+pub(crate) fn git_output(args: &[&str]) -> String {
     Command::new("git")
         .args(args)
         .current_dir(util::root())
@@ -261,7 +261,7 @@ fn git_output(args: &[&str]) -> String {
         .unwrap_or_default()
 }
 
-fn current_utc_date() -> String {
+pub(crate) fn current_utc_date() -> String {
     // Query UTC date via Node (`new Date().toISOString().slice(0, 10)`) without extra crates.
     Command::new("node")
         .args([
