@@ -1,11 +1,59 @@
 // Steps the collaborative end-to-end tests share: a server to talk to, and
 // signing in, creating, sharing and editing a workbook through the page.
 import { type ChildProcess, spawn } from "node:child_process";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, open, rm, stat } from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { expect, type Page } from "@playwright/test";
+
+export type DevAccount = "alice" | "bob" | "carol";
+
+function accountDisplayName(account: DevAccount): string {
+  switch (account) {
+    case "alice":
+      return "Alice";
+    case "bob":
+      return "Bob";
+    case "carol":
+      return "Carol";
+  }
+}
+
+export async function withFileLock<T>(lockName: string, fn: () => Promise<T>): Promise<T> {
+  const lockPath = join(tmpdir(), lockName);
+  const deadline = Date.now() + 120_000;
+  for (;;) {
+    try {
+      const handle = await open(lockPath, "wx");
+      await handle.close();
+      break;
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code !== "EEXIST") {
+        throw err;
+      }
+      try {
+        const info = await stat(lockPath);
+        if (Date.now() - info.mtimeMs > 120_000) {
+          await rm(lockPath, { force: true });
+          continue;
+        }
+      } catch {
+        continue;
+      }
+      if (Date.now() > deadline) {
+        throw new Error(`Timed out waiting for file lock ${lockPath}`);
+      }
+      await new Promise((r) => setTimeout(r, 100));
+    }
+  }
+  try {
+    return await fn();
+  } finally {
+    await rm(lockPath, { force: true });
+  }
+}
 
 const DEFAULT_TEST_DB_URL = "postgres://reticula:reticula_local_dev@127.0.0.1:5434/reticula";
 
@@ -119,19 +167,13 @@ export async function settled(page: Page): Promise<void> {
   });
 }
 
-export async function signInDev(
-  page: Page,
-  baseUrl: string,
-  account: "alice" | "bob",
-): Promise<void> {
+export async function signInDev(page: Page, baseUrl: string, account: DevAccount): Promise<void> {
   await page.goto(`${baseUrl}/app?hooks`);
   await expect(page.getByTestId("engine-status")).toHaveText("ready");
   await page.getByTestId("cloud-menu-btn").click();
   await expect(page.getByTestId("collab-modal")).toBeVisible();
   await page.getByTestId(`dev-login-${account}`).click();
-  await expect(page.getByTestId("collab-user-badge")).toContainText(
-    account === "alice" ? "Alice" : "Bob",
-  );
+  await expect(page.getByTestId("collab-user-badge")).toContainText(accountDisplayName(account));
 }
 
 export async function createAndShareSheet(
@@ -167,7 +209,7 @@ export async function joinViaSharePath(
   page: Page,
   baseUrl: string,
   joinPath: string,
-  account: "alice" | "bob",
+  account: DevAccount,
 ): Promise<void> {
   await page.goto(`${baseUrl}${joinPath}?hooks`);
   await expect(page.getByTestId("collab-auth-panel")).toBeVisible({ timeout: 10_000 });
