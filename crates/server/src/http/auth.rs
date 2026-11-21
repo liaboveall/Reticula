@@ -237,6 +237,19 @@ pub(super) fn session_hash(config: &AuthConfig, jar: &CookieJar) -> Option<[u8; 
     token_hash(jar.get(config.session_cookie())?.value())
 }
 
+pub(super) async fn authenticate_optional(
+    state: &ApiState,
+    jar: &CookieJar,
+) -> Result<Option<(User, [u8; 32])>, ApiError> {
+    let Some(hash) = session_hash(&state.auth, jar) else {
+        return Ok(None);
+    };
+    let Some(user) = state.store.session_user(&hash).await? else {
+        return Ok(None);
+    };
+    Ok(Some((user, hash)))
+}
+
 pub(super) async fn authenticate(state: &ApiState, jar: &CookieJar) -> Result<User, ApiError> {
     let hash = session_hash(&state.auth, jar).ok_or(ApiError::Unauthorized)?;
     state
@@ -244,6 +257,16 @@ pub(super) async fn authenticate(state: &ApiState, jar: &CookieJar) -> Result<Us
         .session_user(&hash)
         .await?
         .ok_or(ApiError::Unauthorized)
+}
+
+pub(super) fn clear_session_cookie(config: &AuthConfig, jar: CookieJar) -> CookieJar {
+    jar.remove(cookie(
+        config.session_cookie(),
+        String::new(),
+        "/",
+        config.secure,
+        0,
+    ))
 }
 
 fn cookie(
@@ -297,6 +320,7 @@ pub(super) struct DevLogin {
 enum DevAccount {
     Alice,
     Bob,
+    Carol,
 }
 
 #[utoipa::path(post, path = "/api/auth/dev-login", request_body = DevLogin,
@@ -309,6 +333,7 @@ pub(super) async fn dev_login(
     let (subject, name) = match login.account {
         DevAccount::Alice => ("alice", "Alice"),
         DevAccount::Bob => ("bob", "Bob"),
+        DevAccount::Carol => ("carol", "Carol"),
     };
     let (jar, user) = sign_in(
         &state,
@@ -342,13 +367,7 @@ pub(super) async fn logout(
         let _ = state.revocations.send(hash);
     }
     Ok((
-        jar.remove(cookie(
-            state.auth.session_cookie(),
-            String::new(),
-            "/",
-            state.auth.secure,
-            0,
-        )),
+        clear_session_cookie(&state.auth, jar),
         StatusCode::NO_CONTENT,
     ))
 }
@@ -369,7 +388,7 @@ pub(super) async fn github_login(
     let github = state.auth.github_provider()?;
     let destination = query.return_to.as_deref().unwrap_or("/app");
     if !valid_destination(destination) {
-        return Err(ApiError::Invalid("invalid login destination"));
+        return Err(ApiError::Invalid("invalid login destination".into()));
     }
     let nonce = random_secret()?;
     let verifier = PkceCodeVerifier::new(encode_secret(&random_secret()?));
@@ -454,16 +473,16 @@ async fn complete_github(
         .state
         .as_deref()
         .and_then(decode_secret)
-        .ok_or(ApiError::Invalid("invalid OAuth state"))?;
+        .ok_or_else(|| ApiError::Invalid("invalid OAuth state".into()))?;
     let signed = jar
         .get(STATE_COOKIE)
-        .ok_or(ApiError::Invalid("missing OAuth state"))?
+        .ok_or_else(|| ApiError::Invalid("missing OAuth state".into()))?
         .value();
     let (verifier, destination) = unseal(&github.cookie_key, &nonce, signed, now_seconds())?;
     let code = query
         .code
         .filter(|code| !code.is_empty() && code.len() <= 256)
-        .ok_or(ApiError::Invalid("missing OAuth code"))?;
+        .ok_or_else(|| ApiError::Invalid("missing OAuth code".into()))?;
     let token = github
         .oauth
         .exchange_code(AuthorizationCode::new(code))
@@ -521,6 +540,9 @@ fn new_mac(key: &[u8; 32], nonce: &[u8; 32], payload: &[u8]) -> Result<Hmac<Sha2
 
 fn valid_destination(path: &str) -> bool {
     path == "/app"
+        || path == "/workbooks"
+        || path == "/account"
+        || path == "/sim"
         || path
             .strip_prefix("/app?collab=")
             .is_some_and(|id| Uuid::parse_str(id).is_ok())
@@ -549,7 +571,7 @@ fn unseal(
     signed: &str,
     now: u64,
 ) -> Result<(String, String), ApiError> {
-    let invalid = || ApiError::Invalid("invalid or expired OAuth state");
+    let invalid = || ApiError::Invalid("invalid or expired OAuth state".into());
     if signed.len() > 256 {
         return Err(invalid());
     }

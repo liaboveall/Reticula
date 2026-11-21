@@ -20,9 +20,11 @@ use axum::middleware::{self, Next};
 use axum::response::Response;
 use axum::routing::get;
 use reticula_server::http::{self, ApiState, AuthConfig};
-use reticula_server::store::Store;
+use reticula_server::ops::GovernanceConfig;
+use reticula_server::store::{StorageLimits, Store};
 use tokio::net::TcpListener;
 use tower_http::services::{ServeDir, ServeFile};
+use tracing_subscriber::EnvFilter;
 
 const IMMUTABLE_CACHE: HeaderValue =
     HeaderValue::from_static("public, max-age=31536000, immutable");
@@ -40,12 +42,14 @@ pub fn build_app(static_dir: &Path, api: Option<ApiState>) -> Router {
         .fallback(index_fallback);
 
     let store = api.as_ref().map(|api| api.store().clone());
+    let metrics_router = http::metrics_route(api.clone());
     let routes = match api {
         Some(api) => http::router(api),
         None => Router::new().fallback(|| async { StatusCode::SERVICE_UNAVAILABLE }),
     };
     Router::new()
         .route("/healthz", get(healthz))
+        .merge(metrics_router)
         .nest("/api", routes)
         .route(
             "/readyz",
@@ -70,6 +74,9 @@ async fn healthz() -> &'static str {
 async fn apply_asset_headers(req: Request, next: Next) -> Response {
     let uri_path = req.uri().path().to_owned();
     let mut response = next.run(req).await;
+    if uri_path == "/metrics" {
+        return response;
+    }
     if uri_path == "/healthz" {
         response.headers_mut().insert(CACHE_CONTROL, NO_CACHE);
         return response;
@@ -90,7 +97,7 @@ async fn apply_asset_headers(req: Request, next: Next) -> Response {
             .headers_mut()
             .entry(CACHE_CONTROL)
             .or_insert(NO_CACHE);
-        if uri_path.starts_with("/join/") {
+        if uri_path.starts_with("/join/") || uri_path == "/app" {
             response
                 .headers_mut()
                 .insert(REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
@@ -122,8 +129,50 @@ async fn shutdown_signal() {
     }
 }
 
+fn parse_env<T: std::str::FromStr>(name: &str, default: T) -> T {
+    match env::var(name) {
+        Ok(raw) if !raw.trim().is_empty() => raw
+            .trim()
+            .parse()
+            .unwrap_or_else(|_| panic!("invalid value in {name}: `{raw}`")),
+        _ => default,
+    }
+}
+
+fn storage_limits_from_env() -> StorageLimits {
+    let defaults = StorageLimits::default();
+    StorageLimits {
+        max_doc_cells: parse_env("RETICULA_MAX_DOC_CELLS", defaults.max_doc_cells),
+        max_doc_bytes: parse_env("RETICULA_MAX_DOC_BYTES", defaults.max_doc_bytes),
+        max_import_bytes: parse_env("RETICULA_MAX_IMPORT_BYTES", defaults.max_import_bytes),
+        user_quota_bytes: parse_env("RETICULA_USER_QUOTA_BYTES", defaults.user_quota_bytes),
+        disk_soft_bytes: parse_env("RETICULA_DISK_SOFT_BYTES", defaults.disk_soft_bytes),
+        disk_hard_bytes: parse_env("RETICULA_DISK_HARD_BYTES", defaults.disk_hard_bytes),
+    }
+}
+
+fn governance_from_env() -> GovernanceConfig {
+    let defaults = GovernanceConfig::default();
+    GovernanceConfig {
+        max_loaded_bytes: parse_env("RETICULA_MAX_LOADED_BYTES", defaults.max_loaded_bytes),
+        write_rpm: parse_env("RETICULA_WRITE_RPM", defaults.write_rpm),
+        anon_rpm: parse_env("RETICULA_ANON_RPM", defaults.anon_rpm),
+        max_anon_ws_per_doc: parse_env(
+            "RETICULA_MAX_ANON_WS_PER_DOC",
+            defaults.max_anon_ws_per_doc,
+        ),
+        max_anon_ws_per_ip: parse_env("RETICULA_MAX_ANON_WS_PER_IP", defaults.max_anon_ws_per_ip),
+    }
+}
+
 #[tokio::main]
 async fn main() {
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    tracing_subscriber::fmt()
+        .json()
+        .with_env_filter(filter)
+        .init();
+
     let bind_raw = env::var("BIND_ADDR").unwrap_or_else(|_| String::from("127.0.0.1:3200"));
     let bind_addr: SocketAddr = bind_raw
         .parse()
@@ -137,13 +186,15 @@ async fn main() {
             let data_dir = env::var_os("RETICULA_DATA_DIR")
                 .expect("RETICULA_DATA_DIR is required when collaboration storage is enabled");
             let auth = AuthConfig::from_env(bind_addr.ip()).unwrap_or_else(|error| {
-                eprintln!("could not configure collaboration authentication: {error}");
+                tracing::error!(error = %error, "could not configure collaboration authentication");
                 std::process::exit(1);
             });
-            match Store::connect(&database_url, PathBuf::from(data_dir)).await {
-                Ok(store) => Some(ApiState::new(store, auth)),
+            let limits = storage_limits_from_env();
+            let gov = governance_from_env();
+            match Store::connect_with_limits(&database_url, PathBuf::from(data_dir), limits).await {
+                Ok(store) => Some(ApiState::with_governance(store, auth, gov)),
                 Err(error) => {
-                    eprintln!("could not initialize collaboration storage: {error}");
+                    tracing::error!(error = %error, "could not initialize collaboration storage");
                     std::process::exit(1);
                 }
             }
@@ -155,19 +206,28 @@ async fn main() {
     let listener = TcpListener::bind(bind_addr)
         .await
         .unwrap_or_else(|e| panic!("failed to bind {bind_addr}: {e}"));
+    let local_addr = listener
+        .local_addr()
+        .expect("bound listener has local address");
     println!(
         "reticula-server listening on http://{} (static: {})",
-        listener
-            .local_addr()
-            .expect("bound listener has local address"),
+        local_addr,
         static_dir.display()
     );
+    tracing::info!(
+        addr = %local_addr,
+        static_dir = %static_dir.display(),
+        "reticula-server listening"
+    );
 
-    if let Err(err) = axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
+    if let Err(err) = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await
     {
-        eprintln!("server error: {err}");
+        tracing::error!(%err, "server error");
         std::process::exit(1);
     }
 }
@@ -322,6 +382,68 @@ mod tests {
         assert!(sw_lower.contains("content-encoding: br\r\n"));
         assert!(sw_lower.contains("cache-control: no-cache\r\n"));
         assert!(sw_resp.ends_with("\r\n\r\nBR_SW_PAYLOAD"));
+
+        handle.abort();
+        let _ = fs::remove_dir_all(&site);
+    }
+
+    #[tokio::test]
+    async fn metrics_route_requires_loopback_connect_info() {
+        use axum::body::Body;
+        use axum::extract::ConnectInfo;
+        use tower::ServiceExt;
+
+        let site = make_temp_site();
+        let app = build_app(&site, None);
+
+        let missing_peer = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing_peer.status(), StatusCode::FORBIDDEN);
+
+        let mut external_req = Request::builder()
+            .uri("/metrics")
+            .body(Body::empty())
+            .unwrap();
+        external_req
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([192, 0, 2, 10], 1234))));
+        let external_peer = app.clone().oneshot(external_req).await.unwrap();
+        assert_eq!(external_peer.status(), StatusCode::FORBIDDEN);
+
+        let mut loopback_req = Request::builder()
+            .uri("/metrics")
+            .body(Body::empty())
+            .unwrap();
+        loopback_req
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 1234))));
+        let loopback_peer = app.oneshot(loopback_req).await.unwrap();
+        assert_eq!(loopback_peer.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app_tcp = build_app(&site, None);
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(
+                listener,
+                app_tcp.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await;
+        });
+        let tcp_resp = send_raw_http(
+            addr,
+            "GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(tcp_resp.starts_with("HTTP/1.1 503 Service Unavailable\r\n"));
 
         handle.abort();
         let _ = fs::remove_dir_all(&site);

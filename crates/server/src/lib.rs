@@ -2,4 +2,5 @@
 
 pub mod docs;
 pub mod http;
+pub mod ops;
 pub mod store;

@@ -14,16 +14,24 @@ const HTTP_CLIENT: &str = r#"export class ApiError extends Error {
 }
 
 async function request(
-  method: "GET" | "POST",
+  method: "GET" | "POST" | "PATCH" | "DELETE",
   path: string,
   signal?: AbortSignal,
   data?: unknown,
+  extraHeaders?: Record<string, string>,
 ): Promise<Response> {
   const options: RequestInit = { method, credentials: "same-origin", redirect: "error" };
   if (signal) options.signal = signal;
-  if (data !== undefined) {
-    options.headers = { "Content-Type": "application/json" };
+  const headers: Record<string, string> = extraHeaders ? { ...extraHeaders } : {};
+  if (data instanceof Uint8Array) {
+    headers["Content-Type"] = "application/octet-stream";
+    options.body = new Uint8Array(data);
+  } else if (data !== undefined) {
+    headers["Content-Type"] = "application/json";
     options.body = JSON.stringify(data);
+  }
+  if (Object.keys(headers).length > 0) {
+    options.headers = headers;
   }
   const response = await fetch(path, options);
   if (!response.ok) throw new ApiError(response.status);
@@ -85,6 +93,14 @@ fn type_of(schema: &Value) -> Result<String> {
             .map(ts_primitive)
             .collect::<Result<Vec<_>>>()?
             .join(" | ")),
+        kind if kind == "array" => {
+            let item = type_of(&schema["items"])?;
+            if item.contains(" | ") {
+                Ok(format!("Array<{item}>"))
+            } else {
+                Ok(format!("{item}[]"))
+            }
+        }
         kind if kind == "object" && schema.get("additionalProperties").is_some() => Ok(format!(
             "Record<string, {}>",
             type_of(&schema["additionalProperties"])?
@@ -98,6 +114,35 @@ fn ts_primitive(kind: &Value) -> Result<String> {
         Some(kind @ ("string" | "boolean" | "null")) => Ok(kind.to_owned()),
         Some("integer" | "number") => Ok("number".to_owned()),
         _ => Err(format!("unsupported API schema type: {kind}")),
+    }
+}
+
+fn param_ident(raw: &str) -> String {
+    if !raw.contains(['_', '-']) && !raw.chars().next().is_some_and(char::is_uppercase) {
+        return raw.to_owned();
+    }
+    let mut out = String::new();
+    for (idx, seg) in raw.split(['_', '-']).filter(|s| !s.is_empty()).enumerate() {
+        if idx == 0 {
+            out.push_str(&seg.to_ascii_lowercase());
+        } else {
+            let mut chars = seg.chars();
+            if let Some(first) = chars.next() {
+                out.extend(first.to_uppercase());
+                out.push_str(&chars.as_str().to_ascii_lowercase());
+            }
+        }
+    }
+    out
+}
+
+fn non_null_type(schema: &Value) -> Result<String> {
+    let raw = type_of(schema)?;
+    let parts: Vec<&str> = raw.split(" | ").filter(|part| *part != "null").collect();
+    if parts.is_empty() {
+        Ok(raw)
+    } else {
+        Ok(parts.join(" | "))
     }
 }
 
@@ -116,21 +161,41 @@ fn operation_ts(out: &mut String, method: &str, path: &str, op: &Value) -> Resul
     let url_only = responses.get("101").is_some() || responses.get("303").is_some();
     let mut signature = Vec::new();
     let mut query = Vec::new();
+    let mut opt_query = Vec::new();
+    let mut req_headers = Vec::new();
+    let mut opt_headers = Vec::new();
     let mut route = path.to_owned();
     for parameter in op["parameters"].as_array().into_iter().flatten() {
-        let name = string(&parameter["name"], "parameter name")?;
+        let raw_name = string(&parameter["name"], "parameter name")?;
+        let ident = param_ident(raw_name);
+        let optional = parameter["required"].as_bool() != Some(true);
         match parameter["in"].as_str() {
             Some("path") => {
-                signature.push(format!("{name}: {}", type_of(&parameter["schema"])?));
+                signature.push(format!("{ident}: {}", type_of(&parameter["schema"])?));
                 route = route.replace(
-                    &format!("{{{name}}}"),
-                    &format!("${{encodeURIComponent({name})}}"),
+                    &format!("{{{raw_name}}}"),
+                    &format!("${{encodeURIComponent({ident})}}"),
                 );
             }
             Some("query") if url_only => {
-                let optional = parameter["required"].as_bool() != Some(true);
-                signature.push(format!("{name}{}: string", if optional { "?" } else { "" }));
-                query.push((name, optional));
+                signature.push(format!(
+                    "{ident}{}: string",
+                    if optional { "?" } else { "" }
+                ));
+                query.push((raw_name, ident, optional));
+            }
+            Some("query") if optional => {
+                let ty = non_null_type(&parameter["schema"])?;
+                opt_query.push((raw_name, ident, ty));
+            }
+            Some("header") if !optional => {
+                let ty = non_null_type(&parameter["schema"])?;
+                signature.push(format!("{ident}: {ty}"));
+                req_headers.push((raw_name, ident));
+            }
+            Some("header") => {
+                let ty = non_null_type(&parameter["schema"])?;
+                opt_headers.push((raw_name, ident, ty));
             }
             _ => return Err(format!("unsupported parameters on {id}")),
         }
@@ -150,13 +215,13 @@ fn operation_ts(out: &mut String, method: &str, path: &str, op: &Value) -> Resul
             let _ = writeln!(out, "  return {route};");
         } else {
             out.push_str("  const parameters = new URLSearchParams();\n");
-            for (key, optional) in query {
+            for (raw_key, ident, optional) in query {
                 let condition = if optional {
-                    format!("if ({key} !== undefined) ")
+                    format!("if ({ident} !== undefined) ")
                 } else {
                     String::new()
                 };
-                let _ = writeln!(out, "  {condition}parameters.set(\"{key}\", {key});");
+                let _ = writeln!(out, "  {condition}parameters.set(\"{raw_key}\", {ident});");
             }
             let _ = writeln!(
                 out,
@@ -164,14 +229,34 @@ fn operation_ts(out: &mut String, method: &str, path: &str, op: &Value) -> Resul
             );
         }
     } else {
+        let has_headers = !req_headers.is_empty() || !opt_headers.is_empty();
         let data = if let Some(schema) = op.pointer("/requestBody/content/application~1json/schema")
         {
             signature.push(format!("body: {}", type_of(schema)?));
-            ", body"
+            Some("body")
+        } else if op
+            .pointer("/requestBody/content/application~1octet-stream")
+            .is_some()
+        {
+            signature.push("body: Uint8Array".to_owned());
+            Some("body")
         } else {
-            ""
+            None
         };
         signature.push("signal?: AbortSignal".into());
+        if !opt_query.is_empty() || !opt_headers.is_empty() {
+            let fields = opt_query
+                .iter()
+                .map(|(_, ident, ty)| format!("{ident}?: {ty}"))
+                .chain(
+                    opt_headers
+                        .iter()
+                        .map(|(_, ident, ty)| format!("{ident}?: {ty}")),
+                )
+                .collect::<Vec<_>>()
+                .join("; ");
+            signature.push(format!("options?: {{ {fields} }}"));
+        }
         let response = ["200", "201", "204"]
             .into_iter()
             .find_map(|status| responses.get(status))
@@ -195,14 +280,49 @@ fn operation_ts(out: &mut String, method: &str, path: &str, op: &Value) -> Resul
             "\nexport async function {name}({}): Promise<{ty}> {{",
             signature.join(", ")
         );
+        let target = if opt_query.is_empty() {
+            route
+        } else {
+            out.push_str("  const parameters = new URLSearchParams();\n");
+            for (raw_key, ident, _) in &opt_query {
+                let _ = writeln!(
+                    out,
+                    "  if (options?.{ident} != null) parameters.set(\"{raw_key}\", String(options.{ident}));"
+                );
+            }
+            out.push_str("  const query = parameters.toString();\n");
+            let _ = writeln!(
+                out,
+                "  const target = query ? {route} + `?${{query}}` : {route};"
+            );
+            "target".to_owned()
+        };
+        if has_headers {
+            out.push_str("  const headers: Record<string, string> = {};\n");
+            for (raw_key, ident) in &req_headers {
+                let _ = writeln!(out, "  headers[\"{raw_key}\"] = {ident};");
+            }
+            for (raw_key, ident, _) in &opt_headers {
+                let _ = writeln!(
+                    out,
+                    "  if (options?.{ident} != null) headers[\"{raw_key}\"] = String(options.{ident});"
+                );
+            }
+        }
         let binding = if result.is_empty() {
             ""
         } else {
             "const response = "
         };
+        let trailing = match (data, has_headers) {
+            (Some(body), true) => format!(", {body}, headers"),
+            (Some(body), false) => format!(", {body}"),
+            (None, true) => ", undefined, headers".to_owned(),
+            (None, false) => String::new(),
+        };
         let _ = writeln!(
             out,
-            "  {binding}await request(\"{}\", {route}, signal{data});",
+            "  {binding}await request(\"{}\", {target}, signal{trailing});",
             method.to_uppercase()
         );
         out.push_str(result);
