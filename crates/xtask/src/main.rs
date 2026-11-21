@@ -10,6 +10,7 @@ mod qa;
 mod rust;
 mod setup;
 mod spike;
+mod stack;
 mod util;
 mod wasm;
 mod web;
@@ -46,10 +47,25 @@ Commands:
   bench [--affinity <mask>] [--browser <name>] [--quick] [--out <file>]
                           Run native and Chrome WASM engine benchmarks (B1-B8, B11, B12).
   dev                     Build a debug module and start the development server.
+  db up|down|reset        The development database (PostgreSQL 18 in Docker on
+                          127.0.0.1:5434) for the server, its tests and the end-to-end
+                          tests. `reset` also deletes its data.
+  serve [--skip-build] [--origin <url>]
+                          Serve the production build from a debug server on
+                          http://127.0.0.1:3200 with the development sign-in, for
+                          trying collaboration in two browser windows. With
+                          --origin http://localhost:5273 it serves `cargo xtask dev`.
+  stack [--skip-image] [--keep]
+                          Build the release image, start infra/compose.yml with it
+                          (server, PostgreSQL, volumes, resource limits) and run
+                          tests/stack against it: sync, a killed server, a restarted
+                          database, recreated containers.
   build [--skip-wasm] [--check-budget]
                           Production build with preloads, precompressed assets and size budget check.
   e2e [--browser <name>] [--skip-build]
-                          End-to-end tests in chromium, firefox and webkit.
+                          End-to-end tests in chromium, firefox and webkit. The
+                          collaborative ones use RETICULA_TEST_DATABASE_URL, or else
+                          the development database, which they start.
   ci                      Everything CI runs on a push. Run it before pushing.
   spike <name> [options]  Run one of the experiments under spikes/ and print its report.
                           `s1` and `s2` measure the grid in a browser and pass their
@@ -116,6 +132,9 @@ fn run(args: &[String]) -> Result {
             wasm::build(Profile::Dev)?;
             web::dev()
         }
+        "db" => stack::db(rest),
+        "serve" => stack::serve(&Flags::parse(rest, &["skip-build"], &["origin"])?),
+        "stack" => stack::stack(&Flags::parse(rest, &["skip-image", "keep"], &[])?),
         "build" => build(&Flags::parse(rest, &["skip-wasm", "check-budget"], &[])?),
         "e2e" => e2e(&Flags::parse(rest, &["skip-build"], &["browser"])?),
         "ci" => {

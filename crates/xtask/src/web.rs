@@ -5,7 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::compat::sha256_hex;
-use crate::util::{self, Result, node, pnpm};
+use crate::util::{self, Result, cargo, node, pnpm};
 use crate::wasm::report_sizes;
 
 const APP: &str = "@reticula/web";
@@ -19,11 +19,12 @@ const MAX_FIRST_SCREEN_JS_BROTLI_BYTES: u64 = 165_000;
 const MAX_TOTAL_JS_BROTLI_BYTES: u64 = 220_000;
 
 /// TypeScript projects, each with its own `tsconfig.json`.
-const TS_PROJECTS: [&str; 4] = [
+const TS_PROJECTS: [&str; 5] = [
     "packages/protocol",
     "packages/grid",
     "apps/web",
     "tests/e2e",
+    "tests/stack",
 ];
 
 pub fn check() -> Result {
@@ -315,8 +316,17 @@ pub fn build_spikes() -> Result {
 }
 
 pub fn e2e(browser: Option<&str>) -> Result {
+    // The collaborative tests start this server against a real database.
+    let database = crate::stack::test_database_url()?;
+    util::step("server (debug, for the collaborative tests)");
+    cargo()
+        .args(["build", "--locked", "--package", "reticula-server"])
+        .run()?;
+
     util::step("playwright");
-    let mut test = pnpm().args(["exec", "playwright", "test"]);
+    let mut test = pnpm()
+        .args(["exec", "playwright", "test"])
+        .env("RETICULA_TEST_DATABASE_URL", database);
     if let Some(browser) = browser {
         test = test.arg(format!("--project={browser}"));
     }

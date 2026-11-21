@@ -40,7 +40,7 @@ Measured on an Intel Core i9-13980HX (pinned to P-cores `0xFFFF`, 32 GB RAM, Win
 
 ## Development
 
-Requires [rustup](https://rustup.rs) (installs the pinned Rust `1.100.0` toolchain automatically), Node.js 26, and pnpm. All tasks go through `cargo xtask`:
+Requires [rustup](https://rustup.rs) (installs the pinned Rust `1.100.0` toolchain automatically), Node.js 26, and pnpm; the collaborative server's database and the full-stack run-through also need Docker. All tasks go through `cargo xtask`:
 
 ```sh
 cargo xtask setup --browsers        # install pinned tools into .tools/, JS deps, and Playwright browsers
@@ -51,6 +51,9 @@ cargo xtask diff --count 10000      # differential formula testing against ironc
 cargo xtask fuzz --cpu-seconds 3600 # 5-target fuzzing campaign (parser, snapshot, wal, ops, eval)
 cargo xtask bench --affinity FFFF   # run and archive native + Chrome WASM engine benchmarks (B1-B8, B11, B12)
 cargo xtask ci                      # full pre-push verification (check, test, deny, release build + budget, 3-browser E2E)
+cargo xtask db up                   # development PostgreSQL 18 in Docker on 127.0.0.1:5434
+cargo xtask serve                   # production build + collaborative server with a dev sign-in on http://127.0.0.1:3200
+cargo xtask stack                   # release image + PostgreSQL via infra/compose.yml: sync, server SIGKILL, DB restart
 ```
 
 Run `cargo xtask` with no arguments to see all available commands.

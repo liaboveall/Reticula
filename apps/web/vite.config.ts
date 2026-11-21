@@ -1,9 +1,20 @@
 import react from "@vitejs/plugin-react";
 import { defineConfig } from "vite";
 
+const apiTarget = process.env.RETICULA_SERVER_URL ?? "http://127.0.0.1:3200";
+
 export default defineConfig(({ mode }) => ({
   plugins: [react()],
-  server: { port: 5273, strictPort: true },
+  server: {
+    port: 5273,
+    strictPort: true,
+    proxy: {
+      "/api": {
+        target: apiTarget,
+        ws: true,
+      },
+    },
+  },
   preview: { port: 5274, strictPort: true },
   worker: { format: "es" },
   // `--mode spikes` builds the experiment pages apart from the app.
