@@ -169,7 +169,11 @@ export function coalesceIdRuns(ids: readonly bigint[]): IdRun[] {
 
 type DragInteraction =
   | { readonly kind: "select"; readonly mode: SelectionScope }
-  | { readonly kind: "pointRef"; readonly anchor: { row: number; col: number } }
+  | {
+      readonly kind: "pointRef";
+      readonly anchor: { row: number; col: number };
+      lastSpan: Span;
+    }
   | { readonly kind: "fill"; readonly src: Span }
   | {
       readonly kind: "colResize";
@@ -1205,7 +1209,7 @@ export class Grid {
       };
       if (this.#options.onPointAndClickRange?.(initialSpan)) {
         event.preventDefault();
-        this.#drag = { kind: "pointRef", anchor: cell };
+        this.#drag = { kind: "pointRef", anchor: cell, lastSpan: initialSpan };
         this.#beginPointerCapture(event);
         this.#pendingWork += performance.now() - started;
         return;
@@ -1618,6 +1622,15 @@ export class Grid {
         firstCol: Math.min(drag.anchor.col, next.col),
         endCol: Math.max(drag.anchor.col, next.col) + 1,
       };
+      if (
+        span.firstRow === drag.lastSpan.firstRow &&
+        span.endRow === drag.lastSpan.endRow &&
+        span.firstCol === drag.lastSpan.firstCol &&
+        span.endCol === drag.lastSpan.endCol
+      ) {
+        return;
+      }
+      drag.lastSpan = span;
       this.#options.onPointAndClickRange?.(span);
       return;
     }

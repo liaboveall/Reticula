@@ -86,6 +86,7 @@ interface ActiveEditSession {
   canInsertRef: boolean;
   activeRefSpan: [number, number] | null;
   pointPickedSpan: [number, number] | null;
+  editRev: number;
 }
 
 interface CopiedSnapshot {
@@ -482,6 +483,7 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
   const clearEditState = useCallback((grid: Grid, editor: CellEditor) => {
     editSessionRef.current = null;
     analysisRef.current = null;
+    pendingRangeRefRevsRef.current.length = 0;
     setEditingText(null);
     setFormulaAnalysis(null);
     editor.setFormulaAnalysis(null);
@@ -514,6 +516,7 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
         canInsertRef: initialSource === "=",
         activeRefSpan: null,
         pointPickedSpan: null,
+        editRev: 0,
       };
       editSessionRef.current = session;
       return session;
@@ -522,6 +525,7 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
   );
 
   const pendingAnalyzeSourcesRef = useRef<string[]>([]);
+  const pendingRangeRefRevsRef = useRef<number[]>([]);
 
   const requestAnalyze = useCallback((client: EngineClient, grid: Grid, editor: CellEditor) => {
     const session = editSessionRef.current;
@@ -727,6 +731,8 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
             session.cursorUtf16,
           ];
         }
+        session.editRev += 1;
+        pendingRangeRefRevsRef.current.push(session.editRev);
         client.send({
           kind: "formatRangeRef",
           hostSheet: session.hostSheet,
@@ -821,6 +827,7 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
         if (session) {
           if (session.source !== text) {
             session.pointPickedSpan = null;
+            session.editRev += 1;
           }
           session.source = text;
           session.cursorUtf16 = cursorUtf16;
@@ -832,6 +839,9 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
         }
       },
       onToggleDollar: (text, cursorUtf16) => {
+        if (editSessionRef.current) {
+          editSessionRef.current.editRev += 1;
+        }
         clientRef.current?.send({ kind: "toggleFormulaDollar", source: text, cursorUtf16 });
       },
       onFormulaKeyDown: (event, text, cursorUtf16) => {
@@ -1146,6 +1156,7 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
               if (!session || !message.changed) {
                 break;
               }
+              session.editRev += 1;
               session.source = message.source;
               session.cursorUtf16 = message.endUtf16;
               session.pointPickedSpan = null;
@@ -1164,8 +1175,9 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
               break;
             }
             case "rangeRefFormatted": {
+              const reqRev = pendingRangeRefRevsRef.current.shift();
               const session = editSessionRef.current;
-              if (!session) {
+              if (!session || (reqRev !== undefined && reqRev !== session.editRev)) {
                 break;
               }
               const span = session.pointPickedSpan ??
@@ -1514,6 +1526,7 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
     }
     if (session.source !== next) {
       session.pointPickedSpan = null;
+      session.editRev += 1;
     }
     session.source = next;
     session.cursorUtf16 = cursorUtf16;
@@ -1545,6 +1558,7 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
       editor.focus();
       return;
     }
+    pendingRangeRefRevsRef.current.length = 0;
     setEditingText(null);
     editor.commitExternal(moveDown);
   };
@@ -1582,6 +1596,7 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
 
     const session = ensureEditSession(grid, nextSource, nextCursor);
     if (session) {
+      session.editRev += 1;
       session.source = nextSource;
       session.cursorUtf16 = nextCursor;
       session.pointPickedSpan = null;
@@ -2397,6 +2412,9 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
         onCommit={handleFormulaBarCommit}
         onCancel={handleFormulaBarCancel}
         onToggleDollar={(text, cursorUtf16) => {
+          if (editSessionRef.current) {
+            editSessionRef.current.editRev += 1;
+          }
           clientRef.current?.send({ kind: "toggleFormulaDollar", source: text, cursorUtf16 });
         }}
         onAcceptCompletion={handleAcceptCompletion}
