@@ -24,7 +24,7 @@ use reticula_wire::v2::{
 
 use crate::types::{
     ClientAction, ConnectionState, DEFAULT_MAX_PUSH_BATCH, DEFAULT_MAX_PUSH_BYTES,
-    ReplicaWatermark, apply_ops_atomic, rewind_inverses,
+    ReplicaWatermark, apply_ops_atomic, rewind_inverses_checked,
 };
 use crate::validate::{RemapState, max_id_counter_in_ops};
 
@@ -620,8 +620,15 @@ impl ClientSyncMachine {
             return actions;
         }
 
-        // Foreign (or mismatched tail-loss) commit -> slow path rewind/apply/replay!
-        self.rewind_all_pending();
+        // Foreign (or mismatched tail-loss) commit: the slow path. Rewinding
+        // the pending transactions brings the visible state back to the
+        // confirmed one, so the remote transaction is applied to both and the
+        // pending ones are replayed in place. Only when the rewind did not
+        // come back exactly (an inverse failed, or the digests differ) is the
+        // confirmed state copied instead, which on a large workbook costs far
+        // more than the rewind and replay themselves (benchmark B9).
+        let rewound = self.rewind_all_pending()
+            && self.visible.state_digest() == self.confirmed.state_digest();
         let Ok((_, ops)) = ops_from_wire_txn_v2(commit.txn) else {
             self.replay_all_pending_fresh();
             return vec![ClientAction::RequestReconnect];
@@ -631,7 +638,11 @@ impl ClientSyncMachine {
             return vec![ClientAction::RequestReconnect];
         }
         self.confirmed_seq = commit.seq;
-        self.replay_all_pending_fresh();
+        if rewound && apply_ops_atomic(&mut self.visible, &ops).is_ok() {
+            self.replay_pending_in_place();
+        } else {
+            self.replay_all_pending_fresh();
+        }
         vec![ClientAction::NotifyVisibleChanged]
     }
 
@@ -868,7 +879,10 @@ impl ClientSyncMachine {
         }
     }
 
-    fn rewind_all_pending(&mut self) {
+    /// Rewinds every applied pending transaction off the visible state and
+    /// reports whether all their inverses applied.
+    fn rewind_all_pending(&mut self) -> bool {
+        let mut exact = true;
         let mut idx = self.pending.len();
         while idx > 0 {
             idx = idx.saturating_sub(1);
@@ -876,14 +890,20 @@ impl ClientSyncMachine {
                 && entry.applied_on_visible
             {
                 let invs = core::mem::take(&mut entry.inverses);
-                rewind_inverses(&mut self.visible, invs);
+                exact &= rewind_inverses_checked(&mut self.visible, invs);
                 entry.applied_on_visible = false;
             }
         }
+        exact
     }
 
     fn replay_all_pending_fresh(&mut self) {
         self.visible = self.confirmed.clone();
+        self.replay_pending_in_place();
+    }
+
+    /// Applies every pending transaction to the visible state as it stands.
+    fn replay_pending_in_place(&mut self) {
         for entry in &mut self.pending {
             match apply_ops_atomic(&mut self.visible, &entry.ops) {
                 Ok(invs) => {

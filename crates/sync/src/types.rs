@@ -211,9 +211,20 @@ pub(crate) fn apply_ops_atomic(
 /// Rewinds previously recorded `inverses` in strict LIFO order.
 pub(crate) fn rewind_inverses(
     workbook: &mut reticula_core::ops::Workbook<BoundFormula>,
-    mut inverses: Vec<InverseOp<BoundFormula>>,
+    inverses: Vec<InverseOp<BoundFormula>>,
 ) {
+    let _ = rewind_inverses_checked(workbook, inverses);
+}
+
+/// Rewinds `inverses` in strict LIFO order and reports whether every one of
+/// them applied.
+pub(crate) fn rewind_inverses_checked(
+    workbook: &mut reticula_core::ops::Workbook<BoundFormula>,
+    mut inverses: Vec<InverseOp<BoundFormula>>,
+) -> bool {
+    let mut exact = true;
     while let Some(inv) = inverses.pop() {
-        let _ = workbook.apply_inverse(inv);
+        exact &= workbook.apply_inverse(inv).is_ok();
     }
+    exact
 }
