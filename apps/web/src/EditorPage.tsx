@@ -7,9 +7,11 @@ import {
   type GridStats,
   LIGHT_PALETTE_FILL,
   LIGHT_PALETTE_TEXT,
+  type RemotePresenceOverlay,
   type Selection,
 } from "@reticula/grid";
 import type {
+  CollabEvent,
   EngineInfo,
   SheetInfo,
   SheetTabInfo,
@@ -21,16 +23,19 @@ import type {
   WireStylePatch,
 } from "@reticula/protocol";
 import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
+import type { CollabWorkbookTarget } from "./collab/CollabShell.tsx";
 import {
   type EngineClient,
   type HostCommand,
   type SafeModeInfo,
   startEngine,
 } from "./engine/client.ts";
+import type { CollabTransportHandle } from "./engine/collab-transport.ts";
 import type { StorageBackendKind, WorkbookCatalogEntry } from "./engine/storage.ts";
 import { FormulaBar, type FormulaBarHandle } from "./FormulaBar.tsx";
 import { BENCHMARKS } from "./generated/benchmarks.ts";
 import {
+  type CollabHookStatus,
   type HookDocStatus,
   hooksRequested,
   installHooks,
@@ -40,6 +45,7 @@ import type { LocalModalMode } from "./LocalModals.tsx";
 import { createSwClient, type SwClientHandle } from "./sw-client.ts";
 
 const LazyLocalModals = lazy(() => import("./LocalModals.tsx"));
+const LazyCollabShell = lazy(() => import("./collab/CollabShell.tsx"));
 
 type EngineState =
   | { status: "starting" }
@@ -172,16 +178,27 @@ function sendEvalEnv(client: EngineClient): void {
   });
 }
 
-function readInitialUrlDoc(): { docId: string; safeRequested: boolean } {
+function readInitialUrlDoc(): {
+  docId: string;
+  safeRequested: boolean;
+  collabId: string | null;
+  joinToken: string | null;
+} {
   if (typeof window === "undefined") {
-    return { docId: DEFAULT_DOC_ID, safeRequested: false };
+    return { docId: DEFAULT_DOC_ID, safeRequested: false, collabId: null, joinToken: null };
   }
   const params = new URLSearchParams(window.location.search);
   const rawDoc = params.get("doc")?.trim();
   const safeDoc = rawDoc && /^[a-zA-Z0-9._-]+$/.test(rawDoc) ? rawDoc : DEFAULT_DOC_ID;
+  const rawCollab = params.get("collab")?.trim() ?? null;
+  const collabId = rawCollab && /^[a-zA-Z0-9-]+$/.test(rawCollab) ? rawCollab : null;
+  const joinMatch = /^\/join\/([a-zA-Z0-9_-]+)\/?$/.exec(window.location.pathname);
+  const joinToken = joinMatch?.[1] ?? null;
   return {
     docId: safeDoc,
     safeRequested: params.get("safe") === "1",
+    collabId,
+    joinToken,
   };
 }
 
@@ -191,6 +208,8 @@ function syncUrlForDoc(docId: string): void {
   }
   const url = new URL(window.location.href);
   url.searchParams.delete("safe");
+  url.searchParams.delete("collab");
+  url.pathname = "/app";
   if (docId === DEFAULT_DOC_ID) {
     if (!url.searchParams.has("doc")) {
       return;
@@ -336,8 +355,22 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
   const editorRef = useRef<CellEditor | null>(null);
   const formulaBarRef = useRef<FormulaBarHandle | null>(null);
   const clientRef = useRef<EngineClient | null>(null);
-  const startWorkerFnRef = useRef<((docId: string, initialCmd: HostCommand) => void) | null>(null);
+  const startWorkerFnRef = useRef<
+    | ((docId: string, initialCmd: HostCommand, nextCollab?: CollabWorkbookTarget | null) => void)
+    | null
+  >(null);
   const swClientRef = useRef<SwClientHandle | null>(null);
+  const collabTransportRef = useRef<CollabTransportHandle | null>(null);
+  const collabTargetRef = useRef<CollabWorkbookTarget | null>(null);
+  const collabConnRef = useRef<CollabHookStatus["connection"]>("offline");
+  const collabReplicaRef = useRef<number | null>(null);
+  const collabPendingRef = useRef<number>(0);
+  const collabSlotRef = useRef<string | null>(null);
+  const collabPresencesRef = useRef<readonly RemotePresenceOverlay[]>([]);
+  const collabManualOfflineRef = useRef<boolean>(false);
+  const kernelVersionRef = useRef<string>("0.0.0");
+  const presenceTimerRef = useRef<number>(0);
+  const lastSelectionRef = useRef<Selection | null>(null);
 
   const activeDocIdRef = useRef<string>(initialRoute.current.docId);
   const activeDocTitleRef = useRef<string>(
@@ -395,6 +428,49 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
   const [colorPopover, setColorPopover] = useState<"text" | "fill" | null>(null);
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
   const [renamingSheet, setRenamingSheet] = useState<{ id: number; draft: string } | null>(null);
+  const [collabMenuOpen, setCollabMenuOpen] = useState(false);
+  const [collabTarget, setCollabTarget] = useState<CollabWorkbookTarget | null>(null);
+  const [collabConn, setCollabConn] = useState<CollabHookStatus["connection"]>("offline");
+  const [collabPending, setCollabPending] = useState(0);
+  const [collabPresences, setCollabPresences] = useState<readonly RemotePresenceOverlay[]>([]);
+  const [collabNotice, setCollabNotice] = useState<string | null>(null);
+  const [unsyncedRescue, setUnsyncedRescue] = useState<{
+    readonly localDocId: string;
+    readonly title: string;
+  } | null>(null);
+
+  const sendPresenceNow = useCallback((sheetOverride?: number) => {
+    const client = clientRef.current;
+    if (!client || workerTerminatedRef.current || !collabTargetRef.current) {
+      return;
+    }
+    const sel = lastSelectionRef.current;
+    const sheet = sheetOverride ?? activeSheetRef.current;
+    client.sendSync({
+      kind: "localPresence",
+      sheet,
+      cursorRow: sel?.row ?? 0,
+      cursorCol: sel?.col ?? 0,
+      selection: sel
+        ? {
+            firstRow: sel.range.firstRow,
+            endRow: sel.range.endRow,
+            firstCol: sel.range.firstCol,
+            endCol: sel.range.endCol,
+          }
+        : undefined,
+    });
+  }, []);
+
+  const schedulePresenceSend = useCallback(() => {
+    if (!collabTargetRef.current || presenceTimerRef.current !== 0) {
+      return;
+    }
+    presenceTimerRef.current = window.setTimeout(() => {
+      presenceTimerRef.current = 0;
+      sendPresenceNow();
+    }, 60);
+  }, [sendPresenceNow]);
 
   const refreshStorageEstimate = useCallback(() => {
     if (typeof navigator === "undefined" || !navigator.storage?.estimate) {
@@ -613,9 +689,11 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
         }
       },
       onSelectionChange: (sel) => {
+        lastSelectionRef.current = sel;
         setSelection(sel);
         setContextMenu(null);
         requestInspect(sel);
+        schedulePresenceSend();
       },
       onActivateEdit: () => {
         editor.startEdit("doubleClick");
@@ -940,18 +1018,110 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
     });
     editorRef.current = editor;
 
-    const mountWorkerClient = (targetDocId: string, initialCmd: HostCommand) => {
+    const mountWorkerClient = (
+      targetDocId: string,
+      initialCmd: HostCommand,
+      nextCollab: CollabWorkbookTarget | null = null,
+    ) => {
+      window.clearTimeout(presenceTimerRef.current);
+      presenceTimerRef.current = 0;
+      collabTransportRef.current?.dispose();
+      collabTransportRef.current = null;
       clientRef.current?.stop();
       workerTerminatedRef.current = false;
       activeDocIdRef.current = targetDocId;
       docLifecycleRef.current = initialCmd.kind === "takeOverDoc" ? "takingOver" : "starting";
 
+      collabTargetRef.current = nextCollab;
+      collabReplicaRef.current = null;
+      collabPendingRef.current = 0;
+      collabSlotRef.current = null;
+      collabPresencesRef.current = [];
+      const initialConn: CollabHookStatus["connection"] = nextCollab ? "connecting" : "offline";
+      collabConnRef.current = initialConn;
+      grid.setRemotePresences([]);
+      setCollabTarget(nextCollab);
+      setCollabConn(initialConn);
+      setCollabPending(0);
+      setCollabPresences([]);
+      setCollabNotice(null);
+      if (nextCollab) {
+        activeDocTitleRef.current = nextCollab.title;
+        setDocId(nextCollab.docId);
+        setDocTitle(nextCollab.title);
+      }
+
+      const earlyCollabEvents: CollabEvent[] = [];
+      let transportReady = false;
+      let transportQueue = Promise.resolve();
+      let cancelled = false;
+
       const client = startEngine({
         tabId: tabIdRef.current,
         initialDocId: targetDocId,
         initialCommand: initialCmd,
+        onCollab(event) {
+          switch (event.kind) {
+            case "state": {
+              const prevConn = collabConnRef.current;
+              collabConnRef.current = event.connection;
+              collabReplicaRef.current = event.replica ?? null;
+              collabPendingRef.current = event.pending;
+              setCollabConn(event.connection);
+              setCollabPending(event.pending);
+              if (event.connection === "online" && prevConn !== "online") {
+                sendPresenceNow();
+              }
+              break;
+            }
+            case "presence": {
+              if (event.sheet === activeSheetRef.current) {
+                collabPresencesRef.current = event.overlays;
+                setCollabPresences(event.overlays);
+                grid.setRemotePresences(event.overlays);
+              }
+              break;
+            }
+            default: {
+              if (!transportReady) {
+                earlyCollabEvents.push(event);
+              } else {
+                const handle = collabTransportRef.current;
+                if (handle) {
+                  transportQueue = transportQueue.then(() => handle.handleEvent(event));
+                }
+              }
+              break;
+            }
+          }
+        },
         onMessage(message) {
           switch (message.kind) {
+            case "collabOpened": {
+              window.clearTimeout(yieldWatchdog);
+              activeDocIdRef.current = message.docId;
+              activeDocTitleRef.current = message.title;
+              storageBackendRef.current = message.storageBackend;
+              activeSlotRef.current = null;
+              collabSlotRef.current = message.slot;
+              collabReplicaRef.current = message.replica;
+              waitingForFileRef.current = false;
+              safeModeRef.current = null;
+              setDocId(message.docId);
+              setDocTitle(message.title);
+              setLockOverlay(null);
+              setCsvProgress(null);
+              setModalMode(null);
+              refreshStorageEstimate();
+              break;
+            }
+            case "collabUnsyncedSaved": {
+              setUnsyncedRescue({
+                localDocId: message.localDocId,
+                title: message.title,
+              });
+              break;
+            }
             case "docOpened": {
               window.clearTimeout(yieldWatchdog);
               activeDocIdRef.current = message.docId;
@@ -1058,6 +1228,7 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
             case "ready":
               performance.mark(MARKS.engineReady);
               docLifecycleRef.current = "ready";
+              kernelVersionRef.current = message.info.kernelVersion;
               activeSheetRef.current = message.sheet.sheet;
               walSeqRef.current = message.sheet.walSeq;
               lastInspectKey = "";
@@ -1075,6 +1246,9 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
                 inspectedRef.current = null;
                 setInspected(null);
                 grid.setSheet(message.sheet);
+                if (collabTargetRef.current) {
+                  sendPresenceNow(message.sheet.sheet);
+                }
                 const cp = lastCopiedRef.current;
                 if (cp && cp.sheet === message.sheet.sheet) {
                   grid.setClipboardRange(
@@ -1300,6 +1474,9 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
             case "rejected":
               setCsvProgress(null);
               setRejectedReason(message.reason);
+              if (collabTargetRef.current) {
+                setCollabNotice(message.reason);
+              }
               break;
             case "selfChecked":
               for (const resolve of selfChecks.splice(0)) {
@@ -1316,14 +1493,54 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
       });
 
       clientRef.current = client;
+
+      if (nextCollab) {
+        void import("./engine/collab-transport.ts").then(({ createCollabTransport }) => {
+          if (cancelled || clientRef.current !== client) {
+            return;
+          }
+          const handle = createCollabTransport({
+            docId: nextCollab.docId,
+            client,
+            kernelVersion: () => kernelVersionRef.current,
+            onCheckSwUpdate: () => {
+              void swClientRef.current?.checkForUpdate();
+            },
+            onConnectionEvent: (info) => {
+              if (info.notice) {
+                setCollabNotice(info.notice);
+              } else if (info.authError) {
+                setCollabNotice(info.authError);
+              }
+            },
+          });
+          if (collabManualOfflineRef.current) {
+            handle.setOffline(true);
+          }
+          collabTransportRef.current = handle;
+          transportReady = true;
+          const queued = earlyCollabEvents.splice(0);
+          for (const ev of queued) {
+            transportQueue = transportQueue.then(() => handle.handleEvent(ev));
+          }
+        });
+      }
+
+      const prevStop = client.stop;
+      client.stop = () => {
+        cancelled = true;
+        prevStop();
+      };
     };
 
     startWorkerFnRef.current = mountWorkerClient;
-    mountWorkerClient(initialRoute.current.docId, {
-      kind: "openDoc",
-      docId: initialRoute.current.docId,
-      safeRequested: initialRoute.current.safeRequested,
-    });
+    if (!initialRoute.current.collabId && !initialRoute.current.joinToken) {
+      mountWorkerClient(initialRoute.current.docId, {
+        kind: "openDoc",
+        docId: initialRoute.current.docId,
+        safeRequested: initialRoute.current.safeRequested,
+      });
+    }
     refreshStorageEstimate();
 
     // Main-thread 500 ms takeover watchdog (`14-m1b.md` 7.2 Step 3): terminates a
@@ -1439,6 +1656,19 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
           },
           swStatus: () => ensureSwClient().status(),
           checkSwUpdate: () => ensureSwClient().checkForUpdate(),
+          collabStatus: () => ({
+            active: collabTargetRef.current !== null,
+            docId: collabTargetRef.current?.docId ?? null,
+            connection: collabConnRef.current,
+            replica: collabReplicaRef.current,
+            pending: collabPendingRef.current,
+            slot: collabSlotRef.current,
+            remotePresences: collabPresencesRef.current,
+          }),
+          setCollabOffline: (offline) => {
+            collabManualOfflineRef.current = offline;
+            collabTransportRef.current?.setOffline(offline);
+          },
         })
       : undefined;
     const timer = window.setInterval(() => setStats(grid.stats()), STATUS_INTERVAL_MS);
@@ -1448,15 +1678,37 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
     // reopen if restored from BFCache.
     const onPageHide = () => {
       window.clearTimeout(yieldWatchdog);
+      window.clearTimeout(presenceTimerRef.current);
+      presenceTimerRef.current = 0;
+      collabTransportRef.current?.dispose();
+      collabTransportRef.current = null;
       clientRef.current?.stop();
       workerTerminatedRef.current = true;
     };
     const onPageShow = (event: PageTransitionEvent) => {
       if (event.persisted && workerTerminatedRef.current) {
-        mountWorkerClient(activeDocIdRef.current, {
-          kind: "openDoc",
-          docId: activeDocIdRef.current,
-        });
+        const currentCollab = collabTargetRef.current;
+        if (currentCollab) {
+          mountWorkerClient(
+            currentCollab.docId,
+            {
+              kind: "openCollab",
+              userId: currentCollab.userId,
+              docId: currentCollab.docId,
+              branchId: currentCollab.branchId,
+              title: currentCollab.title,
+              online:
+                !collabManualOfflineRef.current &&
+                (typeof navigator === "undefined" ? true : navigator.onLine !== false),
+            },
+            currentCollab,
+          );
+        } else {
+          mountWorkerClient(activeDocIdRef.current, {
+            kind: "openDoc",
+            docId: activeDocIdRef.current,
+          });
+        }
       }
     };
     window.addEventListener("pagehide", onPageHide);
@@ -1468,7 +1720,10 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
       window.clearInterval(timer);
       window.clearTimeout(yieldWatchdog);
       window.clearTimeout(swStartTimer);
+      window.clearTimeout(presenceTimerRef.current);
       locksWatch?.close();
+      collabTransportRef.current?.dispose();
+      collabTransportRef.current = null;
       swClientRef.current?.dispose();
       swClientRef.current = null;
       stopMarking();
@@ -1487,6 +1742,8 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
     notePersistenceMutation,
     refreshStorageEstimate,
     requestAnalyze,
+    schedulePresenceSend,
+    sendPresenceNow,
     syncGridFormulaRefs,
   ]);
 
@@ -1920,6 +2177,15 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
         >
           Workbooks
         </button>
+        <button
+          type="button"
+          className="toolbar-btn"
+          data-testid="cloud-menu-btn"
+          onClick={() => setCollabMenuOpen(true)}
+          title="Sign in, create, or share collaborative cloud workbooks"
+        >
+          Cloud
+        </button>
         {readySheet && (
           <span className="document" data-testid="document">
             {docTitle} · {integer.format(readySheet.rows)} rows × {readySheet.cols} columns ·{" "}
@@ -1928,7 +2194,8 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
         )}
         <span className="titlebar-spacer" />
         <span className="storage-badge" data-testid="storage-badge">
-          Local browser storage only · {storageUsedMb} MB used ·{" "}
+          {collabTarget ? "Cloud replica cached in OPFS" : "Local browser storage only"} ·{" "}
+          {storageUsedMb} MB used ·{" "}
           <button
             type="button"
             className="storage-export-link"
@@ -1996,6 +2263,59 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
           </button>
         </div>
       </header>
+
+      {(collabMenuOpen ||
+        collabTarget !== null ||
+        initialRoute.current.collabId !== null ||
+        initialRoute.current.joinToken !== null ||
+        unsyncedRescue !== null ||
+        collabNotice !== null) && (
+        <Suspense fallback={null}>
+          <LazyCollabShell
+            open={collabMenuOpen}
+            initialCollabId={initialRoute.current.collabId}
+            initialJoinToken={initialRoute.current.joinToken}
+            activeTarget={collabTarget}
+            connection={collabConn}
+            pendingCount={collabPending}
+            remotePresences={collabPresences}
+            notice={collabNotice}
+            unsyncedRescue={unsyncedRescue}
+            onCloseModal={() => setCollabMenuOpen(false)}
+            onRequestOpenModal={() => setCollabMenuOpen(true)}
+            onOpenCollab={(target) => {
+              startWorkerFnRef.current?.(
+                target.docId,
+                {
+                  kind: "openCollab",
+                  userId: target.userId,
+                  docId: target.docId,
+                  branchId: target.branchId,
+                  title: target.title,
+                  online:
+                    !collabManualOfflineRef.current &&
+                    (typeof navigator === "undefined" ? true : navigator.onLine !== false),
+                },
+                target,
+              );
+            }}
+            onOpenLocalRescue={(localDocId, title) => {
+              setUnsyncedRescue(null);
+              startWorkerFnRef.current?.(localDocId, {
+                kind: "openDoc",
+                docId: localDocId,
+                title,
+              });
+            }}
+            onSwitchToLocal={() => {
+              startWorkerFnRef.current?.(DEFAULT_DOC_ID, {
+                kind: "openDoc",
+                docId: DEFAULT_DOC_ID,
+              });
+            }}
+          />
+        </Suspense>
+      )}
 
       <div className="formatbar" role="toolbar" aria-label="Cell formatting and freeze panes">
         <select
@@ -2883,7 +3203,7 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
             onClose={() => setModalMode(null)}
             onOpenDoc={(nextId, nextTitle) => {
               setModalMode(null);
-              if (workerTerminatedRef.current || !clientRef.current) {
+              if (collabTargetRef.current || workerTerminatedRef.current || !clientRef.current) {
                 startWorkerFnRef.current?.(nextId, {
                   kind: "openDoc",
                   docId: nextId,

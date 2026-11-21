@@ -15,7 +15,8 @@ use reticula_wire::v2::{
     WireCommittedTxnV2, WirePendingTxnV2, WirePresenceRangeV1, WirePresenceV1, WireSyncFrameV1,
 };
 use reticula_wire::wal::{
-    encode_pending_wal_complete, encode_pending_wal_record, scan_pending_wal,
+    encode_pending_wal_complete, encode_pending_wal_init, encode_pending_wal_record,
+    scan_pending_wal,
 };
 use serde::{Deserialize, Serialize};
 use tsify::{Ts, Tsify};
@@ -536,6 +537,13 @@ fn parse_uuid(value: &str) -> Result<[u8; 16], String> {
     Uuid::parse_str(value)
         .map(Uuid::into_bytes)
         .map_err(|_| "Invalid collaborative document or branch identifier.".into())
+}
+
+/// Encodes the 16-byte `RTCLPWAL` header for collaborative `pending.wal` logs.
+#[wasm_bindgen(js_name = encodePendingWalInit)]
+#[must_use]
+pub fn wasm_encode_pending_wal_init() -> Vec<u8> {
+    encode_pending_wal_init()
 }
 
 #[wasm_bindgen]

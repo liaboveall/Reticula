@@ -2,6 +2,7 @@ import {
   type CollabEvent,
   Engine,
   type EngineCommand,
+  encodePendingWalInit,
   encodeWalInit,
   hasEnginePanicked,
   init,
@@ -17,6 +18,7 @@ import type {
   WorkerEnvelope,
   WorkerOutput,
 } from "./client.ts";
+import type { CollabReplicaSession } from "./collab-storage.ts";
 import {
   detectStorageBackend,
   isQuotaExceededError,
@@ -82,6 +84,9 @@ let stopped = false;
 let activeDoc: ActiveDoc | null = null;
 let activeSnap: ActiveSnapshotJob | null = null;
 let collaborative = false;
+let activeCollab: CollabReplicaSession | null = null;
+let collabCheckpointTimer = 0;
+let collabRemoteCommitsSinceCheckpoint = 0;
 
 // Web Locks held by this worker (`lockName -> release callback`).
 const heldLocks = new Map<string, () => void>();
@@ -232,9 +237,71 @@ function scheduleWatermarkFlush(docId: string): void {
   }, 50) as unknown as number;
 }
 
+function clearCollabCheckpointTimer(): void {
+  if (collabCheckpointTimer !== 0) {
+    clearTimeout(collabCheckpointTimer);
+    collabCheckpointTimer = 0;
+  }
+}
+
+async function flushCollabCheckpointNow(eng: Engine): Promise<void> {
+  clearCollabCheckpointTimer();
+  const session = activeCollab;
+  if (!session) {
+    return;
+  }
+  collabRemoteCommitsSinceCheckpoint = 0;
+  eng.handleSync({ kind: "checkpoint" });
+  const cp = eng.takeCollabEvent();
+  if (cp?.kind === "checkpoint") {
+    try {
+      await session.writeCheckpoint(cp.checkpoint);
+    } catch (err) {
+      if (isQuotaExceededError(err)) {
+        scope.postMessage({
+          kind: "quotaExceeded",
+          message:
+            "Browser storage quota was reached while saving collaborative checkpoint. Pending edits remain in memory.",
+        });
+        return;
+      }
+      throw err;
+    }
+  }
+}
+
+function scheduleCollabCheckpoint(): void {
+  if (collabCheckpointTimer !== 0 || !activeCollab) {
+    return;
+  }
+  collabCheckpointTimer = setTimeout(() => {
+    collabCheckpointTimer = 0;
+    enqueueTask(async () => {
+      if (!stopped && engine && activeCollab) {
+        await flushCollabCheckpointNow(engine);
+      }
+    });
+  }, 1_500) as unknown as number;
+}
+
 async function closeActiveDoc(persistFinalState: boolean): Promise<void> {
   clearWatermarkTimer();
+  clearCollabCheckpointTimer();
   abortActiveSnapshot();
+  const collab = activeCollab;
+  if (collab) {
+    if (persistFinalState && engine) {
+      try {
+        await flushCollabCheckpointNow(engine);
+      } catch {
+        // Ignore checkpoint write errors during shutdown/switch.
+      }
+    }
+    activeCollab = null;
+    collaborative = false;
+    collabRemoteCommitsSinceCheckpoint = 0;
+    collab.close();
+  }
   const doc = activeDoc;
   activeDoc = null;
   if (!doc) {
@@ -290,9 +357,15 @@ if (locksChannel) {
 // Register WASM panic hook (`14-m1b.md` 7.3) so OPFS writes halt immediately on trap.
 scope.__reticulaOnWasmPanic = (message: string) => {
   stopped = true;
+  clearCollabCheckpointTimer();
   if (activeSnap) {
     activeSnap.sink.abort();
     activeSnap = null;
+  }
+  if (activeCollab) {
+    activeCollab.close();
+    activeCollab = null;
+    collaborative = false;
   }
   if (activeDoc) {
     // Do NOT clear `openingCount` so a startup crash increments the crash sentinel!
@@ -328,10 +401,116 @@ function collabTransfers(event: CollabEvent): ArrayBuffer[] {
   return buffers.filter((buffer): buffer is ArrayBuffer => buffer instanceof ArrayBuffer);
 }
 
-function flushCollabEvents(eng: Engine): void {
-  for (let event = eng.takeCollabEvent(); event; event = eng.takeCollabEvent()) {
-    scope.postMessage({ channel: "collab", event }, collabTransfers(event));
+async function flushCollabEvents(eng: Engine): Promise<boolean> {
+  const collab = activeCollab;
+  if (!collab) {
+    for (let event = eng.takeCollabEvent(); event; event = eng.takeCollabEvent()) {
+      scope.postMessage({ channel: "collab", event }, collabTransfers(event));
+    }
+    return false;
   }
+
+  const events: CollabEvent[] = [];
+  for (let event = eng.takeCollabEvent(); event; event = eng.takeCollabEvent()) {
+    events.push(event);
+  }
+  let wroteCheckpoint = false;
+  for (const event of events) {
+    switch (event.kind) {
+      case "appendPending": {
+        try {
+          await collab.appendPending(event.bytes, encodePendingWalInit());
+        } catch (err) {
+          if (isQuotaExceededError(err)) {
+            scope.postMessage({
+              kind: "quotaExceeded",
+              message:
+                "Browser storage quota was reached while writing the pending edit log. Your workbook remains in memory.",
+            });
+            break;
+          }
+          throw err;
+        }
+        break;
+      }
+      case "saveUnsynced": {
+        try {
+          const rescued = await collab.saveUnsyncedRescue(
+            event.snapshot,
+            event.pendingWal,
+            encodeWalInit(0),
+          );
+          scope.postMessage({ kind: "catalogListed", docs: rescued.docs });
+          scope.postMessage({
+            kind: "collabUnsyncedSaved",
+            localDocId: rescued.localDocId,
+            title: rescued.title,
+            fromClientSeq: event.fromClientSeq,
+          });
+        } catch (err) {
+          if (isQuotaExceededError(err)) {
+            scope.postMessage({
+              kind: "quotaExceeded",
+              message:
+                "Browser storage quota was reached while saving unsynced edits as a local workbook.",
+            });
+            break;
+          }
+          throw err;
+        }
+        break;
+      }
+      case "replacePending": {
+        let checkpoint: Parameters<typeof collab.rewritePending>[1];
+        if (collab.checkpointNeeded(event.info)) {
+          eng.handleSync({ kind: "checkpoint" });
+          const cp = eng.takeCollabEvent();
+          if (cp?.kind === "checkpoint") {
+            checkpoint = cp.checkpoint;
+            wroteCheckpoint = true;
+          }
+        }
+        try {
+          await collab.rewritePending(event.bytes, checkpoint);
+          if (checkpoint) {
+            collabRemoteCommitsSinceCheckpoint = 0;
+          }
+        } catch (err) {
+          if (isQuotaExceededError(err)) {
+            scope.postMessage({
+              kind: "quotaExceeded",
+              message: "Browser storage quota was reached while updating collaborative storage.",
+            });
+            break;
+          }
+          throw err;
+        }
+        break;
+      }
+      case "state": {
+        if (
+          event.connection === "online" &&
+          event.replica !== null &&
+          collab.persistedInfo()?.replica !== event.replica
+        ) {
+          await flushCollabCheckpointNow(eng);
+          wroteCheckpoint = true;
+        }
+        scope.postMessage({ channel: "collab", event });
+        break;
+      }
+      case "epochChanged": {
+        collabRemoteCommitsSinceCheckpoint = 0;
+        scope.postMessage({ channel: "collab", event });
+        break;
+      }
+      default: {
+        scope.postMessage({ channel: "collab", event }, collabTransfers(event));
+        break;
+      }
+    }
+  }
+  return wroteCheckpoint;
 }
 
 async function drainWalFrames(eng: Engine, latestSheet?: SheetInfo): Promise<void> {
@@ -550,13 +729,15 @@ async function runEngineCommand(command: EngineCommand): Promise<void> {
   }
   const updatedSheet = sheetFromEvent(event);
   await drainWalFrames(engine, updatedSheet);
-  if (collaborative) flushCollabEvents(engine);
+  if (collaborative) {
+    await flushCollabEvents(engine);
+  }
   flushDuePagesAndAux(engine);
   await settleOpeningSentinelIfReady(engine);
   scheduleWorkSlice();
 }
 
-function runSyncCommand(command: SyncCommand): void {
+async function runSyncCommand(command: SyncCommand): Promise<void> {
   if (stopped || !engine) return;
   if (command.kind === "open" && (activeDoc || collaborative)) {
     scope.postMessage({
@@ -568,7 +749,20 @@ function runSyncCommand(command: SyncCommand): void {
   const event = engine.handleSync(command);
   if (event?.kind === "ready") collaborative = true;
   if (event) scope.postMessage(event);
-  flushCollabEvents(engine);
+  const wroteCheckpoint = await flushCollabEvents(engine);
+  if (
+    activeCollab &&
+    !wroteCheckpoint &&
+    command.kind === "receive" &&
+    event?.kind === "sheetChanged"
+  ) {
+    collabRemoteCommitsSinceCheckpoint += 1;
+    if (collabRemoteCommitsSinceCheckpoint >= 20) {
+      await flushCollabCheckpointNow(engine);
+    } else {
+      scheduleCollabCheckpoint();
+    }
+  }
   flushDuePagesAndAux(engine);
   scheduleWorkSlice();
 }
@@ -1152,6 +1346,60 @@ async function handleHostCommand(cmd: HostCommand): Promise<void> {
     case "openDoc":
       await handleOpenDoc(cmd.docId, cmd.title, cmd.safeRequested ?? false);
       break;
+    case "openCollab": {
+      await closeActiveDoc(true);
+      try {
+        const { openCollabReplica } = await import("./collab-storage.ts");
+        const replicaSession = await openCollabReplica({
+          userId: cmd.userId,
+          docId: cmd.docId,
+          branchId: cmd.branchId,
+          title: cmd.title,
+          online: cmd.online,
+          backend,
+          locks: { acquire: acquireExclusiveLock, release: releaseLock },
+        });
+        const readyEv = engine.handleSync({
+          kind: "open",
+          docId: cmd.docId,
+          branchId: cmd.branchId,
+          info: replicaSession.initialInfo ?? undefined,
+          snapshot: replicaSession.initialSnapshot,
+          pendingWal: replicaSession.initialPendingWal,
+        });
+        if (readyEv?.kind !== "ready") {
+          replicaSession.close();
+          scope.postMessage(
+            readyEv ?? {
+              kind: "rejected",
+              reason: "Could not open collaborative replica.",
+            },
+          );
+          return;
+        }
+        activeCollab = replicaSession;
+        collaborative = true;
+        collabRemoteCommitsSinceCheckpoint = 0;
+        scope.postMessage({
+          kind: "collabOpened",
+          docId: cmd.docId,
+          title: replicaSession.title(),
+          slot: replicaSession.slot,
+          replica: replicaSession.initialInfo?.replica ?? null,
+          storageBackend: backend,
+        });
+        scope.postMessage(readyEv);
+        await flushCollabEvents(engine);
+        flushDuePagesAndAux(engine);
+        scheduleWorkSlice();
+      } catch (err) {
+        scope.postMessage({
+          kind: "rejected",
+          reason: err instanceof Error ? err.message : String(err),
+        });
+      }
+      break;
+    }
     case "takeOverDoc":
       await handleTakeOverDoc(cmd.docId);
       break;
@@ -1212,7 +1460,7 @@ async function handleHostCommand(cmd: HostCommand): Promise<void> {
     }
     case "exportRtcl": {
       const snap = engine.encodeSnapshotFull(true);
-      const safeName = (activeDoc?.title ?? "workbook")
+      const safeName = (activeCollab?.title() ?? activeDoc?.title ?? "workbook")
         .replace(/[^a-zA-Z0-9._-]+/g, "-")
         .replace(/^-|-$/g, "");
       const copy = new Uint8Array(snap.byteLength);
@@ -1241,7 +1489,7 @@ async function handleHostCommand(cmd: HostCommand): Promise<void> {
     }
     case "exportCsv": {
       const csvBytes = engine.exportCsv(cmd.sheet);
-      const safeName = (activeDoc?.title ?? "sheet")
+      const safeName = (activeCollab?.title() ?? activeDoc?.title ?? "sheet")
         .replace(/[^a-zA-Z0-9._-]+/g, "-")
         .replace(/^-|-$/g, "");
       const copy = new Uint8Array(csvBytes.byteLength);
@@ -1285,7 +1533,13 @@ function fail(error: unknown): void {
     return;
   }
   stopped = true;
+  clearCollabCheckpointTimer();
   abortActiveSnapshot();
+  if (activeCollab) {
+    activeCollab.close();
+    activeCollab = null;
+    collaborative = false;
+  }
   if (activeDoc) {
     activeDoc.wal.close();
     releaseLock(lockNameOf(activeDoc.docId));
@@ -1300,13 +1554,23 @@ function fail(error: unknown): void {
 
 const startupQueue: (WorkerEnvelope | EngineCommand)[] = [];
 
+const COLLAB_ALLOWED_HOST_COMMANDS = new Set<HostCommand["kind"]>([
+  "openDoc",
+  "openCollab",
+  "createDoc",
+  "listDocs",
+  "exportRtcl",
+  "exportCsv",
+  "flushAndCloseForUpdate",
+]);
+
 function dispatchEnvelope(item: WorkerEnvelope | EngineCommand): void {
   enqueueTask(async () => {
     if ("channel" in item) {
       if (item.channel === "collab") {
-        runSyncCommand(item.command);
+        await runSyncCommand(item.command);
       } else if (item.channel === "host") {
-        if (collaborative && item.command.kind !== "flushAndCloseForUpdate") {
+        if (collaborative && !COLLAB_ALLOWED_HOST_COMMANDS.has(item.command.kind)) {
           scope.postMessage({
             kind: "rejected",
             reason: "This worker holds a collaborative workbook.",

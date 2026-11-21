@@ -32,7 +32,7 @@ interface WorkerFileHandle extends FileSystemFileHandle {
   createSyncAccessHandle?: () => Promise<SyncAccessHandleLike>;
 }
 
-const OPFS_ROOT_DIR = "reticula-v1";
+export const OPFS_ROOT_DIR = "reticula-v1";
 const CATALOG_FILE = "catalog.json";
 const LOCAL_DIR = "local";
 
@@ -46,7 +46,7 @@ export const FILE_IN_USE_ERRORS: ReadonlySet<string> = new Set([
   "InvalidStateError",
 ]);
 
-function errorName(err: unknown): string {
+export function errorName(err: unknown): string {
   return err !== null &&
     typeof err === "object" &&
     "name" in err &&
@@ -117,6 +117,33 @@ function writeAllSync(sync: SyncAccessHandleLike, bytes: Uint8Array, truncateAft
 // Fallback in-memory FS used only if OPFS itself is completely unavailable.
 const memoryFiles = new Map<string, Uint8Array>();
 
+export function readMemoryFile(key: string): Uint8Array | null {
+  const raw = memoryFiles.get(key);
+  return raw ? raw.slice() : null;
+}
+
+export function writeMemoryFile(key: string, bytes: Uint8Array): void {
+  memoryFiles.set(key, bytes.slice());
+}
+
+export function deleteMemoryPrefix(prefix: string): void {
+  for (const key of [...memoryFiles.keys()]) {
+    if (key.startsWith(prefix)) {
+      memoryFiles.delete(key);
+    }
+  }
+}
+
+export function listMemoryKeys(prefix: string): string[] {
+  const out: string[] = [];
+  for (const key of memoryFiles.keys()) {
+    if (key.startsWith(prefix)) {
+      out.push(key);
+    }
+  }
+  return out;
+}
+
 let cachedBackend: StorageBackendKind | null = null;
 
 /**
@@ -171,7 +198,7 @@ export async function detectStorageBackend(): Promise<StorageBackendKind> {
   return cachedBackend;
 }
 
-async function getRootDir(create = true): Promise<FileSystemDirectoryHandle> {
+export async function getRootDir(create = true): Promise<FileSystemDirectoryHandle> {
   const opfs = await navigator.storage.getDirectory();
   return opfs.getDirectoryHandle(OPFS_ROOT_DIR, { create });
 }
@@ -182,7 +209,7 @@ async function getDocDir(docId: string, create = true): Promise<FileSystemDirect
   return local.getDirectoryHandle(docId, { create });
 }
 
-async function readOpfsFileBytes(
+export async function readOpfsFileBytes(
   dir: FileSystemDirectoryHandle,
   name: string,
 ): Promise<Uint8Array | null> {
@@ -198,7 +225,7 @@ async function readOpfsFileBytes(
   }
 }
 
-async function writeOpfsFileAtomic(
+export async function writeOpfsFileAtomic(
   dir: FileSystemDirectoryHandle,
   name: string,
   bytes: Uint8Array,
@@ -405,9 +432,25 @@ export async function openWalHandle(
   patienceMs: number,
   onWaitingForRelease?: () => void,
 ): Promise<WalHandle> {
-  if (backend === "memory") {
-    const key = `${LOCAL_DIR}/${docId}/wal.log`;
-    let buf = memoryFiles.get(key) ?? new Uint8Array(0);
+  const memoryKey = `${LOCAL_DIR}/${docId}/wal.log`;
+  const dir = backend === "memory" ? null : await getDocDir(docId, true);
+  return openFileWalHandle(dir, "wal.log", memoryKey, backend, patienceMs, onWaitingForRelease);
+}
+
+/**
+ * Opens an arbitrary append-only WAL file (`wal.log` or `pending.wal`)
+ * exclusively, reusing the `opfs-sync` / `opfs-writable` / `memory` backends.
+ */
+export async function openFileWalHandle(
+  dir: FileSystemDirectoryHandle | null,
+  fileName: string,
+  memoryKey: string,
+  backend: StorageBackendKind,
+  patienceMs: number,
+  onWaitingForRelease?: () => void,
+): Promise<WalHandle> {
+  if (backend === "memory" || dir === null) {
+    let buf = memoryFiles.get(memoryKey) ?? new Uint8Array(0);
     return {
       get byteLength() {
         return buf.byteLength;
@@ -420,22 +463,21 @@ export async function openWalHandle(
         next.set(buf, 0);
         next.set(frame, buf.byteLength);
         buf = next;
-        memoryFiles.set(key, buf);
+        memoryFiles.set(memoryKey, buf);
       },
       async rewrite(bytes) {
         buf = bytes.slice();
-        memoryFiles.set(key, buf);
+        memoryFiles.set(memoryKey, buf);
       },
       async truncate(validBytes) {
         buf = buf.slice(0, validBytes);
-        memoryFiles.set(key, buf);
+        memoryFiles.set(memoryKey, buf);
       },
       close() {},
     };
   }
 
-  const dir = await getDocDir(docId, true);
-  const fh = (await dir.getFileHandle("wal.log", { create: true })) as WorkerFileHandle;
+  const fh = (await dir.getFileHandle(fileName, { create: true })) as WorkerFileHandle;
 
   if (backend === "opfs-sync" && typeof fh.createSyncAccessHandle === "function") {
     const started = performance.now();

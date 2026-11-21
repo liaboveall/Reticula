@@ -54,6 +54,20 @@ export type HostEvent =
       readonly bytes: ArrayBuffer;
     }
   | { readonly kind: "closedForUpdate" }
+  | {
+      readonly kind: "collabOpened";
+      readonly docId: string;
+      readonly title: string;
+      readonly slot: string;
+      readonly replica: number | null;
+      readonly storageBackend: StorageBackendKind;
+    }
+  | {
+      readonly kind: "collabUnsyncedSaved";
+      readonly localDocId: string;
+      readonly title: string;
+      readonly fromClientSeq: string;
+    }
   | { readonly kind: "failed"; readonly message: string; readonly panicked?: boolean };
 
 export type EngineMessage = EngineEvent | HostEvent;
@@ -64,6 +78,14 @@ export type HostCommand =
       readonly docId: string;
       readonly title?: string | undefined;
       readonly safeRequested?: boolean | undefined;
+    }
+  | {
+      readonly kind: "openCollab";
+      readonly userId: string;
+      readonly docId: string;
+      readonly branchId: string;
+      readonly title: string;
+      readonly online: boolean;
     }
   | { readonly kind: "takeOverDoc"; readonly docId: string }
   | {

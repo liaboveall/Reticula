@@ -1,4 +1,4 @@
-import type { Grid, GridStats } from "@reticula/grid";
+import type { Grid, GridStats, RemotePresenceOverlay } from "@reticula/grid";
 import type { SafeModeInfo } from "./engine/client.ts";
 import type { StorageBackendKind } from "./engine/storage.ts";
 
@@ -35,6 +35,16 @@ export interface SnapshotSaveResult {
   readonly elapsedMs: number;
 }
 
+export interface CollabHookStatus {
+  readonly active: boolean;
+  readonly docId: string | null;
+  readonly connection: "offline" | "connecting" | "catchingUp" | "online";
+  readonly replica: number | null;
+  readonly pending: number;
+  readonly slot: string | null;
+  readonly remotePresences: readonly RemotePresenceOverlay[];
+}
+
 /**
  * A window onto the running app for end-to-end tests and measurements, which
  * assert on what the grid and the engine report instead of comparing pixels.
@@ -67,6 +77,10 @@ export interface Hooks {
   swStatus(): Promise<SwStatus>;
   /** Triggers an immediate Service Worker update check (`registration.update()`). */
   checkSwUpdate(): Promise<void>;
+  /** Current collaborative session status and visible remote presences. */
+  collabStatus(): CollabHookStatus;
+  /** Forces the collaborative WebSocket transport offline or back online (for tests). */
+  setCollabOffline(offline: boolean): void;
 }
 
 declare global {
@@ -87,6 +101,8 @@ export interface HookExtras {
   readonly spinWorker: (ms: number) => void;
   readonly swStatus: () => Promise<SwStatus>;
   readonly checkSwUpdate: () => Promise<void>;
+  readonly collabStatus: () => CollabHookStatus;
+  readonly setCollabOffline: (offline: boolean) => void;
 }
 
 export function installHooks(grid: Grid, extras: HookExtras): () => void {
@@ -103,6 +119,8 @@ export function installHooks(grid: Grid, extras: HookExtras): () => void {
     spinWorker: extras.spinWorker,
     swStatus: extras.swStatus,
     checkSwUpdate: extras.checkSwUpdate,
+    collabStatus: extras.collabStatus,
+    setCollabOffline: extras.setCollabOffline,
   };
   window.__reticula = hooks;
   return () => {

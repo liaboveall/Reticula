@@ -175,7 +175,8 @@ sw.addEventListener("fetch", (event) => {
     url.pathname === "/" ||
     url.pathname === "/index.html" ||
     url.pathname === "/app" ||
-    url.pathname.startsWith("/app/")
+    url.pathname.startsWith("/app/") ||
+    url.pathname.startsWith("/join/")
   ) {
     event.respondWith(networkFirstHtml(request));
   }

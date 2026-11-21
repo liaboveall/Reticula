@@ -3,7 +3,9 @@ import { EditorPage } from "./EditorPage.tsx";
 import { LandingPage } from "./LandingPage.tsx";
 
 function normalizeRoute(pathname: string): "landing" | "app" {
-  return pathname === "/app" || pathname.startsWith("/app/") ? "app" : "landing";
+  return pathname === "/app" || pathname.startsWith("/app/") || pathname.startsWith("/join/")
+    ? "app"
+    : "landing";
 }
 
 export function App() {
