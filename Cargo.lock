@@ -2469,6 +2469,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "reticula-sim-wasm"
+version = "0.0.0"
+dependencies = [
+ "reticula-core",
+ "reticula-formula",
+ "reticula-sim",
+ "reticula-sync",
+ "reticula-wire",
+ "serde",
+ "tsify",
+ "wasm-bindgen",
+ "wasm-bindgen-test",
+]
+
+[[package]]
 name = "reticula-sync"
 version = "0.0.0"
 dependencies = [

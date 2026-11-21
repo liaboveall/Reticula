@@ -17,8 +17,7 @@ use std::time::Instant;
 use serde::Serialize;
 
 pub use crate::workload::{OpChoice, RogueKind, SimEvent, generate_script};
-use crate::world::SimWorld;
-pub use crate::world::{FaultCounts, SeedSummary};
+pub use crate::world::{FaultCounts, SeedSummary, SimReplicaState, SimWorld};
 
 /// Minimal failing counterexample produced by [`minimize_failure`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]

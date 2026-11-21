@@ -1,0 +1,204 @@
+.sim-controls-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 12px 14px;
+  border: 1px solid var(--shell-line);
+  border-radius: 8px;
+  background: var(--shell-surface);
+  margin-bottom: 14px;
+}
+
+.sim-server-banner {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px 14px;
+  border: 1px solid var(--shell-line);
+  border-radius: 8px;
+  background: var(--shell-surface);
+  font-size: 13px;
+  margin-bottom: 14px;
+}
+
+.sim-digest-code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: var(--shell-background);
+  border: 1px solid var(--shell-line);
+}
+
+.sim-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 9px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 600;
+  border: 1px solid var(--shell-line);
+  background: var(--shell-background);
+}
+
+.sim-badge-ok {
+  border-color: color-mix(in srgb, #2e8b57 50%, var(--shell-line));
+  color: #2e8b57;
+}
+
+.sim-badge-warn {
+  border-color: color-mix(in srgb, var(--shell-danger) 50%, var(--shell-line));
+  color: var(--shell-danger);
+}
+
+.sim-replicas-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 14px;
+  margin-bottom: 16px;
+}
+
+.sim-replica-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px;
+  border: 1px solid var(--shell-line);
+  border-radius: 8px;
+  background: var(--shell-surface);
+}
+
+.sim-replica-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.sim-replica-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--shell-muted);
+}
+
+.sim-grid-host {
+  position: relative;
+  height: 220px;
+  border: 1px solid var(--shell-line);
+  border-radius: 6px;
+  overflow: hidden;
+  background: var(--shell-background);
+}
+
+.sim-edit-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+
+.sim-num-input {
+  width: 58px;
+  padding: 5px 6px;
+  border: 1px solid var(--shell-line);
+  border-radius: 5px;
+  background: var(--shell-background);
+  color: var(--shell-text);
+  font: inherit;
+  font-size: 12px;
+}
+
+.sim-queue-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 200px;
+  overflow-y: auto;
+}
+
+.sim-queue-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 6px 10px;
+  border: 1px solid var(--shell-line);
+  border-radius: 5px;
+  background: var(--shell-background);
+  font-size: 12px;
+}
+
+.sim-progress-track {
+  width: 100%;
+  height: 10px;
+  border-radius: 999px;
+  background: var(--shell-background);
+  border: 1px solid var(--shell-line);
+  overflow: hidden;
+}
+
+.sim-progress-fill {
+  height: 100%;
+  background: var(--shell-accent);
+  transition: width 80ms linear;
+}
+
+.sim-invariants-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 8px;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.sim-invariant-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 7px 10px;
+  border: 1px solid var(--shell-line);
+  border-radius: 6px;
+  background: var(--shell-background);
+  font-size: 12px;
+}
+
+.sim-fault-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(170px, 1fr));
+  gap: 8px;
+}
+
+.sim-fault-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 8px 10px;
+  border: 1px solid var(--shell-line);
+  border-radius: 6px;
+  background: var(--shell-background);
+  font-size: 12px;
+}
+
+.sim-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.sim-table th,
+.sim-table td {
+  text-align: left;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--shell-line);
+}

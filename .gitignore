@@ -6,6 +6,7 @@
 dist/
 dist-spikes/
 /packages/protocol/pkg/
+/packages/protocol/sim-pkg/
 
 # Generated inputs of the Excel probes (see spikes/excel/README.md)
 /spikes/excel/data/

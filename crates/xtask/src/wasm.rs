@@ -5,8 +5,10 @@ use std::path::Path;
 use crate::util::{self, Cmd, Result, cargo, node, pnpm, tool};
 
 /// Where the bindings go: the `@reticula/protocol` package re-exports them.
-const OUT_DIR: &str = "packages/protocol/pkg";
-const MODULE: &str = "packages/protocol/pkg/reticula_wasm_bg.wasm";
+const CORE_OUT_DIR: &str = "packages/protocol/pkg";
+const CORE_MODULE: &str = "packages/protocol/pkg/reticula_wasm_bg.wasm";
+const SIM_OUT_DIR: &str = "packages/protocol/sim-pkg";
+const SIM_MODULE: &str = "packages/protocol/sim-pkg/reticula_sim_wasm_bg.wasm";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Profile {
@@ -20,16 +22,44 @@ pub fn build(profile: Profile) -> Result {
         Profile::Release => "wasm (release)",
     });
 
+    build_package(
+        "reticula-wasm",
+        "reticula_wasm.wasm",
+        CORE_OUT_DIR,
+        CORE_MODULE,
+        profile,
+    )?;
+    build_package(
+        "reticula-sim-wasm",
+        "reticula_sim_wasm.wasm",
+        SIM_OUT_DIR,
+        SIM_MODULE,
+        profile,
+    )?;
+
+    if profile == Profile::Release {
+        report_sizes(&[Path::new(CORE_MODULE), Path::new(SIM_MODULE)])?;
+    }
+    Ok(())
+}
+
+fn build_package(
+    package: &str,
+    wasm_name: &str,
+    out_dir: &str,
+    module_path: &str,
+    profile: Profile,
+) -> Result {
     let mut build = cargo().args([
         "build",
         "--locked",
         "--package",
-        "reticula-wasm",
+        package,
         "--target",
         "wasm32-unknown-unknown",
     ]);
     let mut bindgen =
-        Cmd::new(tool("wasm-bindgen")).args(["--target", "web", "--out-dir", OUT_DIR]);
+        Cmd::new(tool("wasm-bindgen")).args(["--target", "web", "--out-dir", out_dir]);
     let directory = match profile {
         Profile::Dev => {
             bindgen = bindgen.args(["--debug", "--keep-debug"]);
@@ -43,15 +73,21 @@ pub fn build(profile: Profile) -> Result {
     build.run()?;
     bindgen
         .arg(format!(
-            "target/wasm32-unknown-unknown/{directory}/reticula_wasm.wasm"
+            "target/wasm32-unknown-unknown/{directory}/{wasm_name}"
         ))
         .run()?;
 
     if profile == Profile::Release {
         pnpm()
-            .args(["exec", "wasm-opt", "-O3", MODULE, "--output", MODULE])
+            .args([
+                "exec",
+                "wasm-opt",
+                "-O3",
+                module_path,
+                "--output",
+                module_path,
+            ])
             .run()?;
-        report_sizes(&[Path::new(MODULE)])?;
     }
     Ok(())
 }

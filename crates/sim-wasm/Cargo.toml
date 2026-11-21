@@ -1,0 +1,28 @@
+[package]
+name = "reticula-sim-wasm"
+description = "On-demand WebAssembly bindings for the interactive sync simulator lab."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[lints]
+workspace = true
+
+[dependencies]
+reticula-core = { workspace = true }
+reticula-formula = { workspace = true }
+reticula-sim = { workspace = true }
+reticula-sync = { workspace = true }
+reticula-wire = { workspace = true }
+serde = { workspace = true, features = ["std"] }
+tsify = { workspace = true }
+wasm-bindgen = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = { workspace = true }

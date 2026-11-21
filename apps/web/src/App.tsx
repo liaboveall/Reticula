@@ -6,6 +6,7 @@ import { type AppRoute, normalizeAppRoute } from "./pages/helpers.ts";
 const LazyWorkbooksPage = lazy(() => import("./pages/WorkbooksPage.tsx"));
 const LazyAccountPage = lazy(() => import("./pages/AccountPage.tsx"));
 const LazyPrivacyPage = lazy(() => import("./pages/PrivacyPage.tsx"));
+const LazySimLabPage = lazy(() => import("./sim/SimLabPage.tsx"));
 
 export function App() {
   const [route, setRoute] = useState<AppRoute>(() => normalizeAppRoute(window.location.pathname));
@@ -59,13 +60,9 @@ export function App() {
   }
   if (route === "sim") {
     return (
-      <main style={{ padding: "32px", fontFamily: "system-ui, sans-serif" }}>
-        <h1>Sync Simulator</h1>
-        <p>Preparing simulator workspace…</p>
-        <button type="button" onClick={() => navigate("/")}>
-          Back to Home
-        </button>
-      </main>
+      <Suspense fallback={<div className="page-loading">Loading…</div>}>
+        <LazySimLabPage onNavigate={navigate} />
+      </Suspense>
     );
   }
   return <LandingPage onNavigate={navigate} />;

@@ -13,6 +13,8 @@ const DIST: &str = "apps/web/dist";
 
 /// Hard upper bound on brotli-compressed core `.wasm` module (`1.2 MB`, `14-m1b.md` 8.3).
 const MAX_CORE_WASM_BROTLI_BYTES: u64 = 1_200_000;
+/// Hard upper bound on brotli-compressed on-demand simulator `.wasm` module (`800 KB`, `16-m2b.md`).
+const MAX_SIM_WASM_BROTLI_BYTES: u64 = 800_000;
 /// Upper bound on brotli-compressed first-screen critical-path JS (`165 KB`, `14-m1b.md` 8.3).
 const MAX_FIRST_SCREEN_JS_BROTLI_BYTES: u64 = 165_000;
 /// Upper bound on brotli-compressed total JS including lazy chunks & service worker (`220 KB`, `14-m1b.md` 8.3).
@@ -113,9 +115,10 @@ fn inject_preloads(dist_dir: &Path) -> Result {
                 .is_some_and(|ext| ext.eq_ignore_ascii_case("js"))
         {
             worker_js = Some(name.to_owned());
-        } else if Path::new(name)
-            .extension()
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("wasm"))
+        } else if name.starts_with("reticula_wasm_bg")
+            && Path::new(name)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("wasm"))
         {
             wasm_bin = Some(name.to_owned());
         }
@@ -161,7 +164,7 @@ fn inject_sw_manifest(dist_dir: &Path) -> Result {
         let Some(name) = name.to_str() else {
             continue;
         };
-        if name.ends_with(".br") || name.ends_with(".gz") {
+        if name.ends_with(".br") || name.ends_with(".gz") || name.starts_with("reticula_sim_wasm") {
             continue;
         }
         asset_names.push(name.to_owned());
@@ -234,7 +237,8 @@ fn check_budgets(dist_dir: &Path) -> Result {
         .map_err(|e| format!("cannot read {}: {e}", index_path.display()))?;
 
     let assets_dir = dist_dir.join("assets");
-    let mut wasm_br: u64 = 0;
+    let mut core_wasm_br: u64 = 0;
+    let mut sim_wasm_br: u64 = 0;
     let mut first_screen_js_br: u64 = 0;
     let mut total_js_br: u64 = 0;
 
@@ -251,7 +255,11 @@ fn check_budgets(dist_dir: &Path) -> Result {
             .map_err(|e| format!("stat {name}: {e}"))?
             .len();
         if name.ends_with(".wasm.br") {
-            wasm_br = wasm_br.saturating_add(len);
+            if name.starts_with("reticula_sim_wasm") {
+                sim_wasm_br = sim_wasm_br.saturating_add(len);
+            } else {
+                core_wasm_br = core_wasm_br.saturating_add(len);
+            }
         } else if let Some(js_name) = name.strip_suffix(".br")
             && js_name.ends_with(".js")
         {
@@ -269,9 +277,15 @@ fn check_budgets(dist_dir: &Path) -> Result {
 
     println!(
         "  core WASM (brotli):        {:>8} / {:>8} bytes ({:.1}%)",
-        wasm_br,
+        core_wasm_br,
         MAX_CORE_WASM_BROTLI_BYTES,
-        (wasm_br as f64 / MAX_CORE_WASM_BROTLI_BYTES as f64) * 100.0
+        (core_wasm_br as f64 / MAX_CORE_WASM_BROTLI_BYTES as f64) * 100.0
+    );
+    println!(
+        "  sim WASM (brotli):         {:>8} / {:>8} bytes ({:.1}%)",
+        sim_wasm_br,
+        MAX_SIM_WASM_BROTLI_BYTES,
+        (sim_wasm_br as f64 / MAX_SIM_WASM_BROTLI_BYTES as f64) * 100.0
     );
     println!(
         "  first-screen JS (brotli):  {:>8} / {:>8} bytes ({:.1}%)",
@@ -286,9 +300,14 @@ fn check_budgets(dist_dir: &Path) -> Result {
         (total_js_br as f64 / MAX_TOTAL_JS_BROTLI_BYTES as f64) * 100.0
     );
 
-    if wasm_br > MAX_CORE_WASM_BROTLI_BYTES {
+    if core_wasm_br == 0 || core_wasm_br > MAX_CORE_WASM_BROTLI_BYTES {
         return Err(format!(
-            "core WASM brotli size ({wasm_br} B) exceeds budget ({MAX_CORE_WASM_BROTLI_BYTES} B)"
+            "core WASM brotli size ({core_wasm_br} B) out of budget (1..={MAX_CORE_WASM_BROTLI_BYTES} B)"
+        ));
+    }
+    if sim_wasm_br == 0 || sim_wasm_br > MAX_SIM_WASM_BROTLI_BYTES {
+        return Err(format!(
+            "sim WASM brotli size ({sim_wasm_br} B) out of budget (1..={MAX_SIM_WASM_BROTLI_BYTES} B)"
         ));
     }
     if first_screen_js_br > MAX_FIRST_SCREEN_JS_BROTLI_BYTES {

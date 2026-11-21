@@ -6,6 +6,7 @@ members = [
     "crates/kernel-bench",
     "crates/server",
     "crates/sim",
+    "crates/sim-wasm",
     "crates/sync",
     "crates/wasm",
     "crates/wire",
@@ -24,6 +25,7 @@ publish = false
 [workspace.dependencies]
 reticula-core = { path = "crates/core" }
 reticula-formula = { path = "crates/formula" }
+reticula-sim = { path = "crates/sim" }
 reticula-sync = { path = "crates/sync" }
 reticula-wire = { path = "crates/wire" }
 

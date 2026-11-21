@@ -10,6 +10,7 @@
       "!**/dist",
       "!**/dist-spikes",
       "!**/pkg",
+      "!**/sim-pkg",
       "!**/generated"
     ]
   },

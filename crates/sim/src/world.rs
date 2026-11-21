@@ -229,7 +229,21 @@ fn to_wire_watermarks(wms: &[ReplicaWatermark]) -> Vec<WireReplicaWatermarkV1> {
         .collect()
 }
 
-pub(crate) struct SimWorld {
+/// Read-only snapshot of one simulated client's sync machine and network queues.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SimReplicaState {
+    pub index: usize,
+    pub role: String,
+    pub replica: Option<u32>,
+    pub connection: String,
+    pub confirmed_seq: u64,
+    pub pending_len: usize,
+    pub queued_c2s: usize,
+    pub queued_s2c: usize,
+}
+
+pub struct SimWorld {
     rng: Rng,
     server: ServerDocMachine,
     server_limits: ServerLimits,
@@ -253,7 +267,8 @@ pub(crate) struct SimWorld {
 }
 
 impl SimWorld {
-    pub(crate) fn new(seed: u64) -> Self {
+    #[must_use]
+    pub fn new(seed: u64) -> Self {
         let server_limits = default_sim_limits();
         let server = ServerDocMachine::new(
             SIM_DOC_ID,
@@ -296,7 +311,7 @@ impl SimWorld {
         }
     }
 
-    pub(crate) fn step(&mut self, event: SimEvent) -> Result<(), String> {
+    pub fn step(&mut self, event: SimEvent) -> Result<(), String> {
         self.timestamp_ms = self.timestamp_ms.saturating_add(1);
         match event {
             SimEvent::LocalEdit {
@@ -333,7 +348,7 @@ impl SimWorld {
         self.check_step_invariants()
     }
 
-    pub(crate) fn drain_and_verify(&mut self) -> Result<SeedSummary, String> {
+    pub fn drain_and_verify(&mut self) -> Result<SeedSummary, String> {
         self.set_tight_quota(false);
         self.broadcast_server_digest();
 
@@ -405,6 +420,63 @@ impl SimWorld {
             final_logical_digest: self.server.workbook().logical_digest(),
             faults: self.faults.clone(),
         })
+    }
+
+    #[must_use]
+    pub fn head_seq(&self) -> u64 {
+        self.server.head_seq()
+    }
+
+    #[must_use]
+    pub fn epoch(&self) -> u8 {
+        self.server.epoch()
+    }
+
+    #[must_use]
+    pub const fn faults(&self) -> &FaultCounts {
+        &self.faults
+    }
+
+    #[must_use]
+    pub fn server_digest(&self) -> StateDigest {
+        self.server.workbook().state_digest()
+    }
+
+    #[must_use]
+    pub fn replica_count(&self) -> usize {
+        self.clients.len()
+    }
+
+    #[must_use]
+    pub fn replica_states(&self) -> Vec<SimReplicaState> {
+        self.clients
+            .iter()
+            .enumerate()
+            .map(|(index, c)| {
+                let role = match c.role {
+                    None => "revoked",
+                    Some(MemberRole::Owner) => "owner",
+                    Some(MemberRole::Editor) => "editor",
+                    Some(MemberRole::Viewer) => "viewer",
+                };
+                let connection = match c.machine.connection_state() {
+                    ConnectionState::Offline => "offline",
+                    ConnectionState::Handshaking => "handshaking",
+                    ConnectionState::AwaitingSnapshot { .. } => "awaitingSnapshot",
+                    ConnectionState::Online => "online",
+                };
+                SimReplicaState {
+                    index,
+                    role: String::from(role),
+                    replica: c.machine.replica(),
+                    connection: String::from(connection),
+                    confirmed_seq: c.machine.confirmed_seq(),
+                    pending_len: c.machine.pending_len(),
+                    queued_c2s: c.c2s_queue.len(),
+                    queued_s2c: c.s2c_queue.len(),
+                }
+            })
+            .collect()
     }
 
     fn exec_local_edit(&mut self, client_idx: usize, choice: OpChoice, op_seed: u64) {

@@ -13,12 +13,13 @@ const NO_STD_TARGET: &str = "wasm32v1-none";
 const KERNEL_CRATES: [&str; 4] = ["core", "formula", "wire", "sync"];
 
 /// Packages that are compiled to WebAssembly.
-const WASM_PACKAGES: [&str; 5] = [
+const WASM_PACKAGES: [&str; 6] = [
     "reticula-core",
     "reticula-formula",
     "reticula-wire",
     "reticula-sync",
     "reticula-wasm",
+    "reticula-sim-wasm",
 ];
 
 pub fn check() -> Result {
