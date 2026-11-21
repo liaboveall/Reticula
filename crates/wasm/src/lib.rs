@@ -47,6 +47,8 @@ use wasm_bindgen::prelude::*;
 
 #[cfg(feature = "bench")]
 pub mod bench;
+#[cfg(feature = "bench")]
+pub mod bench_sync;
 pub mod clipboard;
 pub mod collab;
 pub mod undo;

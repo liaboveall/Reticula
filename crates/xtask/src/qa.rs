@@ -118,6 +118,13 @@ pub fn sim(flags: &Flags) -> Result {
 pub fn bench(flags: &Flags) -> Result {
     let affinity = flags.get("affinity").unwrap_or("FFFF");
     let browser = flags.get("browser").unwrap_or("chrome");
+    // `engine` is B1-B8, B11 and B12; `b9` is the collaborative slow path.
+    let suite = flags.get("suite").unwrap_or("engine");
+    let (native_command, suite_label, archive_kind) = match suite {
+        "engine" => ("native-bench", "m1b-engine", "engine"),
+        "b9" => ("sync-bench", "m2a-sync", "sync"),
+        other => return Err(format!("unknown benchmark suite `{other}` (engine or b9)")),
+    };
 
     util::step("native benchmarks (release)");
     let native_out = util::root().join("target/bench-wasm/native.json");
@@ -133,7 +140,7 @@ pub fn bench(flags: &Flags) -> Result {
         "--bin",
         "runner",
         "--",
-        "native-bench",
+        native_command,
         "--affinity",
         affinity,
         "--out",
@@ -181,7 +188,15 @@ pub fn bench(flags: &Flags) -> Result {
         .arg("bench/run-wasm-bench.mjs")
         .arg("--pkg")
         .arg(&pkg_dir)
-        .args(["--browser", browser, "--affinity", affinity, "--out"])
+        .args([
+            "--browser",
+            browser,
+            "--affinity",
+            affinity,
+            "--suite",
+            suite,
+        ])
+        .arg("--out")
         .arg(&wasm_out);
     if flags.has("quick") {
         wasm_cmd = wasm_cmd.arg("--quick");
@@ -208,14 +223,14 @@ pub fn bench(flags: &Flags) -> Result {
         Some(custom) => util::root().join(custom),
         None => util::root()
             .join("bench/results")
-            .join(format!("{today}-{commit}-engine.json")),
+            .join(format!("{today}-{commit}-{archive_kind}.json")),
     };
     if let Some(parent) = archive_path.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
     }
 
     let combined = serde_json::json!({
-        "suite": "m1b-engine",
+        "suite": suite_label,
         "date": today,
         "commit": commit,
         "uncommittedChanges": dirty,

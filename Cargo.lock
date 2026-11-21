@@ -2399,6 +2399,7 @@ dependencies = [
  "reticula-core",
  "reticula-formula",
  "reticula-sync",
+ "reticula-wasm",
  "reticula-wire",
  "serde",
  "serde_json",

@@ -6,3 +6,4 @@ pub mod bench_workloads;
 pub mod diff;
 pub mod fuzz_harnesses;
 pub mod fuzz_runner;
+pub mod sync_bench;

@@ -44,8 +44,9 @@ Commands:
                           Multi-threaded mutation & structured fuzzing campaign.
   sim [--seeds <n>] [--start-seed <n>] [--seed <s>] [--threads <n>] [--fail-fast] [--out <file>]
                           Deterministic multi-client sync simulation.
-  bench [--affinity <mask>] [--browser <name>] [--quick] [--out <file>]
-                          Run native and Chrome WASM engine benchmarks (B1-B8, B11, B12).
+  bench [--affinity <mask>] [--browser <name>] [--quick] [--out <file>] [--suite engine|b9]
+                          Run native and Chrome WASM engine benchmarks (B1-B8, B11, B12),
+                          or with --suite b9 the collaborative slow path (B9).
   dev                     Build a debug module and start the development server.
   db up|down|reset        The development database (PostgreSQL 18 in Docker on
                           127.0.0.1:5434) for the server, its tests and the end-to-end
@@ -125,7 +126,7 @@ fn run(args: &[String]) -> Result {
         "bench" => qa::bench(&Flags::parse(
             rest,
             &["quick"],
-            &["affinity", "browser", "date", "out"],
+            &["affinity", "browser", "date", "out", "suite"],
         )?),
         "dev" => {
             Flags::parse(rest, &[], &[])?;

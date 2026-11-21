@@ -45,6 +45,7 @@ postcard = { workspace = true }
 reticula-core = { workspace = true }
 reticula-formula = { workspace = true }
 reticula-sync = { workspace = true }
+reticula-wasm = { path = "../wasm", features = ["bench"] }
 reticula-wire = { workspace = true }
 serde = { workspace = true, features = ["std"] }
 serde_json = { version = "1.0", optional = true }

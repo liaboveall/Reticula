@@ -4,7 +4,11 @@
 // inside Cross-Origin-Isolated headless Google Chrome (`09-quality.md`, `13-m1a.md`,
 // `14-m1b.md` 8.3).
 //
-//   node bench/run-wasm-bench.mjs --pkg <pkg-dir> [--browser chrome] [--affinity FFFF] [--out <json-file>] [--only-b4] [--quick]
+//   node bench/run-wasm-bench.mjs --pkg <pkg-dir> [--browser chrome] [--affinity FFFF] [--out <json-file>] [--only-b4] [--quick] [--suite engine|b9]
+//
+// `--suite b9` runs benchmark B9 instead (`15-m2a.md` 8.2): a remote commit
+// arriving while local edits are pending, in the sync machine alone and in
+// the whole collaborative worker engine.
 
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
@@ -21,6 +25,7 @@ const options = {
   out: "",
   "only-b4": false,
   quick: false,
+  suite: "engine",
 };
 
 const argv = process.argv.slice(2);
@@ -43,6 +48,11 @@ for (let i = 0; i < argv.length; i++) {
   options[key] = val;
 }
 
+if (options.suite !== "engine" && options.suite !== "b9") {
+  console.error(`unknown suite: ${options.suite}`);
+  process.exit(2);
+}
+
 if (options.affinity) {
   pin(options.affinity);
 }
@@ -50,7 +60,7 @@ if (options.affinity) {
 const pkgDir = resolve(options.pkg);
 
 const WORKER_JS = `
-import init, { WasmBench } from "/pkg/reticula_wasm.js";
+import init, { B9Case, SyncBench, WasmBench } from "/pkg/reticula_wasm.js";
 
 const wasm = await init({ module_or_path: "/pkg/reticula_wasm_bg.wasm" });
 
@@ -458,6 +468,93 @@ self.onmessage = async (event) => {
       return;
     }
 
+    if (msg.kind === "runB9") {
+      const warmup = msg.quick ? 1 : 3;
+      const samples = msg.quick ? 5 : 50;
+      const clockResolutionUs = measureClockGranularityUs();
+      const runCase = (caseId) => {
+        const bench = SyncBench.new(caseId);
+        const machine = [];
+        for (let i = 0; i < warmup + samples; i++) {
+          const t0 = performance.now();
+          bench.step_machine();
+          const dt = performance.now() - t0;
+          if (i >= warmup) machine.push(dt);
+        }
+        const frame = [];
+        const total = [];
+        let slices = 0;
+        for (let i = 0; i < warmup + samples; i++) {
+          const t0 = performance.now();
+          const frameMs = bench.step_engine();
+          const roundSlices = bench.finish_engine();
+          const dt = performance.now() - t0;
+          if (i >= warmup) {
+            frame.push(frameMs);
+            total.push(dt);
+            slices += roundSlices;
+          }
+        }
+        const out = {
+          pending_txns: bench.pending(),
+          pending_cells: bench.pending_cells(),
+          machine_ms: summarize(warmup, machine),
+          engine_frame_ms: summarize(warmup, frame),
+          engine_total_ms: summarize(warmup, total),
+          recalc_slices_mean: slices / samples,
+        };
+        trackMem();
+        bench.free();
+        return out;
+      };
+      const b9a_1000_single_cells = runCase(B9Case.ThousandSingleCells);
+      const b9b_100k_cell_block = runCase(B9Case.BlockOf100kCells);
+      const control_nothing_pending = runCase(B9Case.NothingPending);
+
+      const bench = SyncBench.new(B9Case.NothingPending);
+      const clone = [];
+      for (let i = 0; i < warmup + samples; i++) {
+        const t0 = performance.now();
+        bench.step_clone();
+        const dt = performance.now() - t0;
+        if (i >= warmup) clone.push(dt);
+      }
+      const rebuild = [];
+      const recalc = [];
+      for (let i = 0; i < warmup + samples; i++) {
+        const rebuildMs = bench.step_rebuild();
+        const t0 = performance.now();
+        bench.finish_engine();
+        const dt = performance.now() - t0;
+        if (i >= warmup) {
+          rebuild.push(rebuildMs);
+          recalc.push(dt);
+        }
+      }
+      trackMem();
+      bench.free();
+
+      self.postMessage({
+        kind: "result",
+        reqId: msg.reqId,
+        value: {
+          crossOriginIsolated: self.crossOriginIsolated,
+          clockResolutionUs,
+          document: "sample, 100,000 data rows x 22 columns, 100,000 formulas",
+          b9a_1000_single_cells,
+          b9b_100k_cell_block,
+          control_nothing_pending,
+          breakdown: {
+            workbook_clone_ms: summarize(warmup, clone),
+            engine_rebuild_ms: summarize(warmup, rebuild),
+            full_recalc_ms: summarize(warmup, recalc),
+          },
+          peakWasmMemoryBytes: peakMem,
+        },
+      });
+      return;
+    }
+
     if (msg.kind === "removeOpfsFiles") {
       for (const name of msg.files) {
         await removeOpfsFile(name);
@@ -697,6 +794,14 @@ const PAGE_HTML = `<!doctype html><meta charset="utf-8"><title>wasm-bench</title
     return out;
   }
 
+  window.__runB9 = async ({ quick }) => {
+    window.__log("running B9 (remote commits with local edits pending)...");
+    const worker = await spawnWorker();
+    const result = await callWorker(worker, { kind: "runB9", quick });
+    worker.terminate();
+    return result;
+  };
+
   window.__runBenchmarks = async ({ onlyB4, quick }) => {
     window.__log("running core engine benchmarks (B2-B5, B7)...");
     const coreWorker = await spawnWorker();
@@ -841,10 +946,13 @@ try {
   });
   await page.goto(url);
   await page.waitForFunction(() => window.__runBenchmarks !== undefined);
-  const metrics = await page.evaluate(
-    (cfg) => window.__runBenchmarks(cfg),
-    { onlyB4: options["only-b4"], quick: options.quick },
-  );
+  const metrics =
+    options.suite === "b9"
+      ? await page.evaluate((cfg) => window.__runB9(cfg), { quick: options.quick })
+      : await page.evaluate((cfg) => window.__runBenchmarks(cfg), {
+          onlyB4: options["only-b4"],
+          quick: options.quick,
+        });
 
   const payload = {
     browser: { name: options.browser, version: browserVersion },

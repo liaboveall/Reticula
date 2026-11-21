@@ -9,6 +9,7 @@ use std::process::Command;
 use reticula_kernel_bench::bench_workloads::run_native_suite;
 use reticula_kernel_bench::diff::run_differential;
 use reticula_kernel_bench::fuzz_runner::run_fuzz_campaign;
+use reticula_kernel_bench::sync_bench::run_b9;
 
 fn pin_current_process(mask: &str) {
     assert!(
@@ -36,7 +37,7 @@ fn pin_current_process(mask: &str) {
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
     let Some((sub, rest)) = args.split_first() else {
-        eprintln!("usage: runner <diff|fuzz|native-bench|hdb-bench> [options]");
+        eprintln!("usage: runner <diff|fuzz|native-bench|sync-bench|hdb-bench> [options]");
         std::process::exit(2);
     };
 
@@ -44,6 +45,7 @@ fn main() {
         "diff" => run_diff_cmd(rest),
         "fuzz" => run_fuzz_cmd(rest),
         "native-bench" => run_bench_cmd(rest),
+        "sync-bench" => run_sync_bench_cmd(rest),
         "hdb-bench" => run_hdb_cmd(rest),
         other => {
             eprintln!("unknown subcommand `{other}`");
@@ -227,6 +229,48 @@ fn run_bench_cmd(args: &[String]) {
             fs::create_dir_all(parent).expect("mkdir");
         }
         fs::write(&path, format!("{json}\n")).expect("write native bench");
+    }
+    println!("{json}");
+}
+
+/// `runner sync-bench [--quick] [--affinity <mask>] [--out <file>]`: B9.
+fn run_sync_bench_cmd(args: &[String]) {
+    let mut quick = false;
+    let mut affinity: Option<String> = None;
+    let mut out: Option<PathBuf> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--quick" => quick = true,
+            "--affinity" => {
+                i += 1;
+                affinity = Some(args[i].clone());
+            }
+            "--out" => {
+                i += 1;
+                out = Some(PathBuf::from(&args[i]));
+            }
+            flag => panic!("unknown sync-bench flag `{flag}`"),
+        }
+        i += 1;
+    }
+    if let Some(mask) = &affinity {
+        pin_current_process(mask);
+    }
+    let report = run_b9(quick);
+    let json = serde_json::to_string_pretty(&report).unwrap();
+    if let Some(path) = out {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("mkdir");
+        }
+        fs::write(
+            &path,
+            format!(
+                "{json}
+"
+            ),
+        )
+        .expect("write sync bench");
     }
     println!("{json}");
 }
