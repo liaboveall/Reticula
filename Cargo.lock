@@ -2484,6 +2484,7 @@ dependencies = [
 name = "reticula-wasm"
 version = "0.0.0"
 dependencies = [
+ "postcard",
  "reticula-core",
  "reticula-formula",
  "reticula-sync",

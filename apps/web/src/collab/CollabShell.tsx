@@ -6,16 +6,31 @@ import {
   devLogin,
   githubLoginUrl,
   join,
+  listMembers,
+  listShareLinks,
   logout,
+  type MemberEntry,
   me,
   type Role,
+  removeMember,
+  revokeShareLink,
+  type ShareLinkRecord,
+  type ShareRole,
   share,
   type User,
+  updateMember,
+  updateWorkbook,
   type WorkbookSummary,
+  type WorkbookVisibility,
   workbook,
 } from "@reticula/protocol/collab-api";
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { apiErrorMessage } from "../pages/helpers.ts";
 import "./collab.css";
+
+const LazyHistoryDrawer = lazy(() =>
+  import("./HistoryDrawer.tsx").then((mod) => ({ default: mod.HistoryDrawer })),
+);
 
 const CACHE_KEY = "reticula:collab-cache:v1";
 
@@ -28,13 +43,20 @@ export interface CollabWorkbookTarget {
   readonly branchId: string;
   readonly title: string;
   readonly role: Role;
+  readonly shareToken?: string | null | undefined;
+  readonly visibility?: WorkbookVisibility;
 }
 
 export interface CollabShellProps {
   readonly open: boolean;
   readonly initialCollabId: string | null;
   readonly initialJoinToken: string | null;
+  readonly initialShareToken?: string | null | undefined;
   readonly activeTarget: CollabWorkbookTarget | null;
+  readonly readOnly: boolean;
+  readonly historyOpen: boolean;
+  readonly historyPreviewSeq: string | null;
+  readonly historyPreviewElapsedMs: number | null;
   readonly connection: "offline" | "connecting" | "catchingUp" | "online";
   readonly pendingCount: number;
   readonly remotePresences: readonly RemotePresenceOverlay[];
@@ -46,8 +68,13 @@ export interface CollabShellProps {
   readonly onCloseModal: () => void;
   readonly onRequestOpenModal: () => void;
   readonly onOpenCollab: (target: CollabWorkbookTarget) => void;
+  readonly onUpdateVisibility: (visibility: WorkbookVisibility) => void;
   readonly onOpenLocalRescue: (localDocId: string, title: string) => void;
   readonly onSwitchToLocal: () => void;
+  readonly onCloseHistory: () => void;
+  readonly onHistorySeek: (targetSeq: string, snapshotSeq: string | null) => void;
+  readonly onHistoryExit: () => void;
+  readonly onNavigate: (path: string) => void;
 }
 
 interface CollabCache {
@@ -90,7 +117,11 @@ function saveWorkbookToCache(user: User, summary: WorkbookSummary): void {
   });
 }
 
-function makeTarget(user: User, summary: WorkbookSummary): CollabWorkbookTarget {
+function makeTarget(
+  user: User,
+  summary: WorkbookSummary,
+  shareToken?: string | null,
+): CollabWorkbookTarget {
   return {
     userId: user.id,
     userDisplayName: user.name,
@@ -98,6 +129,24 @@ function makeTarget(user: User, summary: WorkbookSummary): CollabWorkbookTarget 
     branchId: summary.branchId,
     title: summary.title,
     role: summary.role,
+    visibility: summary.visibility,
+    ...(shareToken ? { shareToken } : {}),
+  };
+}
+
+function makeShareVisitorTarget(
+  summary: WorkbookSummary,
+  shareToken: string,
+): CollabWorkbookTarget {
+  return {
+    userId: "",
+    userDisplayName: "Visitor",
+    docId: summary.id,
+    branchId: summary.branchId,
+    title: summary.title,
+    role: "viewer",
+    visibility: summary.visibility,
+    shareToken,
   };
 }
 
@@ -138,7 +187,12 @@ export default function CollabShell(props: CollabShellProps) {
     open,
     initialCollabId,
     initialJoinToken,
+    initialShareToken,
     activeTarget,
+    readOnly,
+    historyOpen,
+    historyPreviewSeq,
+    historyPreviewElapsedMs,
     connection,
     pendingCount,
     remotePresences,
@@ -147,23 +201,49 @@ export default function CollabShell(props: CollabShellProps) {
     onCloseModal,
     onRequestOpenModal,
     onOpenCollab,
+    onUpdateVisibility,
     onOpenLocalRescue,
     onSwitchToLocal,
+    onCloseHistory,
+    onHistorySeek,
+    onHistoryExit,
+    onNavigate,
   } = props;
 
   const [user, setUser] = useState<User | null>(() => readCache().user);
   const [loadingAuth, setLoadingAuth] = useState(true);
   const [devLoginAvailable, setDevLoginAvailable] = useState(true);
   const [newTitle, setNewTitle] = useState("Cloud Workbook");
+  const [shareRole, setShareRole] = useState<ShareRole>("editor");
+  const [shareLabel, setShareLabel] = useState("");
+  const [shareTtlSeconds, setShareTtlSeconds] = useState<string>("");
   const [singleUseShare, setSingleUseShare] = useState(false);
   const [shareUrl, setShareUrl] = useState<string | null>(null);
   const [copiedShare, setCopiedShare] = useState(false);
+  const [members, setMembers] = useState<MemberEntry[]>([]);
+  const [shareLinks, setShareLinks] = useState<ShareLinkRecord[]>([]);
   const [busy, setBusy] = useState(false);
   const [authError, setAuthError] = useState<string | null>(null);
   const [joinError, setJoinError] = useState<string | null>(null);
   const [accessError, setAccessError] = useState<string | null>(null);
 
   const pendingJoinTokenRef = useRef<string | null>(initialJoinToken);
+
+  const refreshGovernance = useCallback(async (docId: string, role: Role, signal?: AbortSignal) => {
+    try {
+      const [memberRows, linkRows] = await Promise.all([
+        listMembers(docId, signal),
+        role === "owner" ? listShareLinks(docId, signal) : Promise.resolve([]),
+      ]);
+      if (signal?.aborted) {
+        return;
+      }
+      setMembers(memberRows);
+      setShareLinks(linkRows);
+    } catch {
+      // Ignore transient fetch errors when inspecting member lists.
+    }
+  }, []);
 
   const openAfterAuth = useCallback(
     async (signedInUser: User) => {
@@ -202,6 +282,22 @@ export default function CollabShell(props: CollabShellProps) {
           onOpenCollab(makeTarget(signedInUser, summary));
           onCloseModal();
         } catch (err) {
+          if (
+            err instanceof ApiError &&
+            (err.status === 401 || err.status === 403 || err.status === 404) &&
+            initialShareToken
+          ) {
+            try {
+              const summary = await workbook(initialCollabId, undefined, {
+                xReticulaShare: initialShareToken,
+              });
+              onOpenCollab(makeTarget(signedInUser, summary, initialShareToken));
+              onCloseModal();
+              return;
+            } catch {
+              // Fall through to access error reporting below.
+            }
+          }
           if (err instanceof ApiError && (err.status === 403 || err.status === 404)) {
             setAccessError("You do not have permission to open this collaborative workbook.");
             onRequestOpenModal();
@@ -223,16 +319,35 @@ export default function CollabShell(props: CollabShellProps) {
         }
       }
     },
-    [activeTarget?.docId, initialCollabId, onCloseModal, onOpenCollab, onRequestOpenModal],
+    [
+      activeTarget?.docId,
+      initialCollabId,
+      initialShareToken,
+      onCloseModal,
+      onOpenCollab,
+      onRequestOpenModal,
+    ],
   );
 
   // The sign-in check runs once per mount and only unmounting discards its
   // answer. It reads the latest callbacks through a ref: had they been
   // dependencies, a parent re-render while the request was in flight would
   // have discarded the answer and left "Checking sign-in status…" forever.
-  const bootRef = useRef({ initialCollabId, onOpenCollab, onRequestOpenModal, openAfterAuth });
+  const bootRef = useRef({
+    initialCollabId,
+    initialShareToken,
+    onOpenCollab,
+    onRequestOpenModal,
+    openAfterAuth,
+  });
   useLayoutEffect(() => {
-    bootRef.current = { initialCollabId, onOpenCollab, onRequestOpenModal, openAfterAuth };
+    bootRef.current = {
+      initialCollabId,
+      initialShareToken,
+      onOpenCollab,
+      onRequestOpenModal,
+      openAfterAuth,
+    };
   });
 
   useEffect(() => {
@@ -253,28 +368,55 @@ export default function CollabShell(props: CollabShellProps) {
         if (cancelled) {
           return;
         }
-        const { initialCollabId, onOpenCollab, onRequestOpenModal } = bootRef.current;
-        setLoadingAuth(false);
+        const {
+          initialCollabId: collabId,
+          initialShareToken: shareTok,
+          onOpenCollab: openCollab,
+          onRequestOpenModal: requestModal,
+        } = bootRef.current;
         if (err instanceof ApiError && err.status === 401) {
           setUser(null);
-          if (pendingJoinTokenRef.current || initialCollabId) {
-            onRequestOpenModal();
+          if (collabId && shareTok && !pendingJoinTokenRef.current) {
+            try {
+              const summary = await workbook(collabId, undefined, { xReticulaShare: shareTok });
+              if (!cancelled) {
+                setLoadingAuth(false);
+                openCollab(makeShareVisitorTarget(summary, shareTok));
+              }
+              return;
+            } catch (shareErr) {
+              if (!cancelled) {
+                setLoadingAuth(false);
+                setAccessError(
+                  shareErr instanceof ApiError
+                    ? "This share link is invalid, expired, or no longer public."
+                    : "Could not load shared workbook right now.",
+                );
+                requestModal();
+              }
+              return;
+            }
+          }
+          setLoadingAuth(false);
+          if (pendingJoinTokenRef.current || collabId) {
+            requestModal();
           }
           return;
         }
+        setLoadingAuth(false);
         // Network error / offline: allow cached offline collaborative open.
         const cache = readCache();
         if (pendingJoinTokenRef.current) {
           setJoinError("Offline: a network connection is required to redeem a share link.");
-          onRequestOpenModal();
-        } else if (initialCollabId && cache.user && cache.workbooks[initialCollabId]) {
+          requestModal();
+        } else if (collabId && cache.user && cache.workbooks[collabId]) {
           setUser(cache.user);
-          onOpenCollab(makeTarget(cache.user, cache.workbooks[initialCollabId]));
-        } else if (initialCollabId) {
+          openCollab(makeTarget(cache.user, cache.workbooks[collabId]));
+        } else if (collabId) {
           setAccessError(
             "Offline: this collaborative workbook has not been opened on this device yet.",
           );
-          onRequestOpenModal();
+          requestModal();
         }
       }
     })();
@@ -282,6 +424,17 @@ export default function CollabShell(props: CollabShellProps) {
       cancelled = true;
     };
   }, []);
+
+  useEffect(() => {
+    if (!open || !user || !activeTarget) {
+      return;
+    }
+    const controller = new AbortController();
+    void refreshGovernance(activeTarget.docId, activeTarget.role, controller.signal);
+    return () => {
+      controller.abort();
+    };
+  }, [open, user, activeTarget, refreshGovernance]);
 
   const handleDevSignIn = async (account: DevAccount) => {
     setBusy(true);
@@ -357,15 +510,109 @@ export default function CollabShell(props: CollabShellProps) {
     }
     setBusy(true);
     setCopiedShare(false);
+    setAuthError(null);
     try {
-      const created = await share(activeTarget.docId, { singleUse: singleUseShare });
+      const ttlParsed = shareTtlSeconds ? Number(shareTtlSeconds) : null;
+      const created = await share(activeTarget.docId, {
+        role: shareRole,
+        label: shareLabel.trim() || null,
+        singleUse: singleUseShare,
+        ttlSeconds: ttlParsed && Number.isFinite(ttlParsed) ? ttlParsed : null,
+      });
       setShareUrl(`${window.location.origin}${created.url}`);
+      setShareLabel("");
+      await refreshGovernance(activeTarget.docId, activeTarget.role);
     } catch (err) {
-      setAuthError(
-        err instanceof ApiError
-          ? `Could not create share link (HTTP ${err.status}).`
-          : "Could not create share link.",
-      );
+      setAuthError(apiErrorMessage(err, "Could not create share link."));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleToggleVisibility = async () => {
+    if (activeTarget?.role !== "owner") {
+      return;
+    }
+    const currentVisibility = activeTarget.visibility ?? "private";
+    const nextVisibility: WorkbookVisibility =
+      currentVisibility === "link_view" ? "private" : "link_view";
+    setBusy(true);
+    setAuthError(null);
+    try {
+      if (nextVisibility === "link_view") {
+        const hasActiveViewer = shareLinks.some(
+          (link) =>
+            link.role === "viewer" &&
+            !link.revokedAt &&
+            (!link.singleUse || !link.consumed) &&
+            (!link.expiresAt || Date.parse(link.expiresAt) > Date.now()),
+        );
+        if (!hasActiveViewer) {
+          const created = await share(activeTarget.docId, {
+            role: "viewer",
+            label: "Link-view access",
+            singleUse: false,
+          });
+          setShareUrl(`${window.location.origin}${created.url}`);
+        }
+      }
+      const updated = await updateWorkbook(activeTarget.docId, { visibility: nextVisibility });
+      onUpdateVisibility(updated.visibility);
+      await refreshGovernance(activeTarget.docId, activeTarget.role);
+    } catch (err) {
+      setAuthError(apiErrorMessage(err, "Could not update workbook visibility."));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleUpdateMemberRole = async (memberId: string, role: ShareRole) => {
+    if (!activeTarget) {
+      return;
+    }
+    setBusy(true);
+    setAuthError(null);
+    try {
+      await updateMember(activeTarget.docId, memberId, { role });
+      await refreshGovernance(activeTarget.docId, activeTarget.role);
+    } catch (err) {
+      setAuthError(apiErrorMessage(err, "Could not update member role."));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleRemoveMember = async (memberId: string, selfLeave: boolean) => {
+    if (!activeTarget) {
+      return;
+    }
+    setBusy(true);
+    setAuthError(null);
+    try {
+      await removeMember(activeTarget.docId, memberId);
+      if (selfLeave) {
+        handleBackToLocal();
+      } else {
+        await refreshGovernance(activeTarget.docId, activeTarget.role);
+      }
+    } catch (err) {
+      setAuthError(apiErrorMessage(err, "Could not remove member."));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleRevokeShareLink = async (linkId: string) => {
+    if (!activeTarget) {
+      return;
+    }
+    setBusy(true);
+    setAuthError(null);
+    try {
+      await revokeShareLink(activeTarget.docId, linkId);
+      await refreshGovernance(activeTarget.docId, activeTarget.role);
+    } catch (err) {
+      setAuthError(apiErrorMessage(err, "Could not revoke share link."));
     } finally {
       setBusy(false);
     }
@@ -407,6 +654,11 @@ export default function CollabShell(props: CollabShellProps) {
               {statusPillLabel(connection, pendingCount)}
             </span>
           )}
+          {activeTarget && readOnly && (
+            <span className="collab-badge-readonly" data-testid="collab-readonly-badge">
+              Read-only
+            </span>
+          )}
           {remotePresences.length > 0 && (
             <div className="collab-peers" data-testid="collab-peers">
               {remotePresences.map((peer) => (
@@ -430,6 +682,22 @@ export default function CollabShell(props: CollabShellProps) {
             </span>
           )}
         </div>
+      )}
+
+      {historyOpen && activeTarget && (
+        <Suspense fallback={null}>
+          <LazyHistoryDrawer
+            docId={activeTarget.docId}
+            shareToken={activeTarget.shareToken}
+            readOnly={readOnly}
+            open={historyOpen}
+            previewSeq={historyPreviewSeq}
+            previewElapsedMs={historyPreviewElapsedMs}
+            onSeek={onHistorySeek}
+            onExit={onHistoryExit}
+            onClose={onCloseHistory}
+          />
+        </Suspense>
       )}
 
       {unsyncedRescue && (
@@ -522,6 +790,15 @@ export default function CollabShell(props: CollabShellProps) {
                     >
                       Dev Sign In as Bob
                     </button>
+                    <button
+                      type="button"
+                      className="toolbar-btn"
+                      data-testid="dev-login-carol"
+                      disabled={busy}
+                      onClick={() => void handleDevSignIn("carol")}
+                    >
+                      Dev Sign In as Carol
+                    </button>
                   </div>
                 )}
                 <div className="collab-row">
@@ -541,15 +818,39 @@ export default function CollabShell(props: CollabShellProps) {
                     <span data-testid="collab-user-badge">
                       Signed in as <strong>{user.name}</strong>
                     </span>
-                    <button
-                      type="button"
-                      className="toolbar-btn"
-                      data-testid="collab-logout-btn"
-                      disabled={busy}
-                      onClick={() => void handleLogout()}
-                    >
-                      Sign Out
-                    </button>
+                    <div className="collab-row">
+                      <button
+                        type="button"
+                        className="toolbar-btn"
+                        data-testid="collab-go-workbooks-btn"
+                        onClick={() => {
+                          onCloseModal();
+                          onNavigate("/workbooks");
+                        }}
+                      >
+                        Workbooks
+                      </button>
+                      <button
+                        type="button"
+                        className="toolbar-btn"
+                        data-testid="collab-go-account-btn"
+                        onClick={() => {
+                          onCloseModal();
+                          onNavigate("/account");
+                        }}
+                      >
+                        Account
+                      </button>
+                      <button
+                        type="button"
+                        className="toolbar-btn"
+                        data-testid="collab-logout-btn"
+                        disabled={busy}
+                        onClick={() => void handleLogout()}
+                      >
+                        Sign Out
+                      </button>
+                    </div>
                   </div>
                 </div>
 
@@ -583,9 +884,57 @@ export default function CollabShell(props: CollabShellProps) {
                       <span>
                         <strong>{activeTarget.title}</strong> ({activeTarget.role})
                       </span>
+                      {activeTarget.role === "owner" && (
+                        <label className="collab-checkbox">
+                          <input
+                            type="checkbox"
+                            data-testid="workbook-visibility-toggle"
+                            disabled={busy}
+                            checked={(activeTarget.visibility ?? "private") === "link_view"}
+                            onChange={() => void handleToggleVisibility()}
+                          />
+                          Allow link-only viewing
+                        </label>
+                      )}
                     </div>
+
                     {activeTarget.role === "owner" && (
                       <>
+                        <div className="collab-row">
+                          <select
+                            className="collab-select"
+                            data-testid="share-role-select"
+                            aria-label="Share link role"
+                            value={shareRole}
+                            onChange={(e) =>
+                              setShareRole(e.target.value === "viewer" ? "viewer" : "editor")
+                            }
+                          >
+                            <option value="editor">Editor invite</option>
+                            <option value="viewer">Viewer link</option>
+                          </select>
+                          <input
+                            type="text"
+                            className="collab-input"
+                            data-testid="share-label-input"
+                            placeholder="Label (optional)"
+                            maxLength={80}
+                            value={shareLabel}
+                            onChange={(e) => setShareLabel(e.target.value)}
+                          />
+                          <select
+                            className="collab-select"
+                            data-testid="share-ttl-select"
+                            aria-label="Share link expiry"
+                            value={shareTtlSeconds}
+                            onChange={(e) => setShareTtlSeconds(e.target.value)}
+                          >
+                            <option value="">No expiry</option>
+                            <option value="3600">1 hour</option>
+                            <option value="86400">24 hours</option>
+                            <option value="604800">7 days</option>
+                          </select>
+                        </div>
                         <div className="collab-row">
                           <label className="collab-checkbox">
                             <input
@@ -603,7 +952,7 @@ export default function CollabShell(props: CollabShellProps) {
                             disabled={busy}
                             onClick={() => void handleCreateShareLink()}
                           >
-                            Share Editor Link
+                            {shareRole === "viewer" ? "Create Viewer Link" : "Share Editor Link"}
                           </button>
                         </div>
                         {shareUrl && (
@@ -626,6 +975,113 @@ export default function CollabShell(props: CollabShellProps) {
                             </button>
                           </div>
                         )}
+                        {shareLinks.length > 0 && (
+                          <ul className="collab-list" data-testid="share-links-list">
+                            {shareLinks.map((link) => {
+                              const statusText = link.revokedAt
+                                ? "Revoked"
+                                : link.singleUse && link.consumed
+                                  ? "Used"
+                                  : "Active";
+                              const active = !link.revokedAt && !(link.singleUse && link.consumed);
+                              return (
+                                <li key={link.id} className="collab-member-row">
+                                  <div className="collab-member-meta">
+                                    <strong>
+                                      {link.label ||
+                                        (link.role === "viewer" ? "Viewer link" : "Editor invite")}
+                                    </strong>
+                                    <span className="collab-member-sub">
+                                      {link.role} · {link.singleUse ? "single-use" : "multi-use"} ·{" "}
+                                      {statusText}
+                                    </span>
+                                  </div>
+                                  {active && (
+                                    <button
+                                      type="button"
+                                      className="toolbar-btn"
+                                      data-testid={`revoke-share-link-${link.id}`}
+                                      disabled={busy}
+                                      onClick={() => void handleRevokeShareLink(link.id)}
+                                    >
+                                      Revoke
+                                    </button>
+                                  )}
+                                </li>
+                              );
+                            })}
+                          </ul>
+                        )}
+                      </>
+                    )}
+
+                    {members.length > 0 && (
+                      <>
+                        <p className="collab-section-title">Members ({members.length})</p>
+                        <ul className="collab-list" data-testid="members-list">
+                          {members.map((member) => {
+                            const isSelf = member.userId === user.id;
+                            const isOwnerRow = member.role === "owner";
+                            const canManage =
+                              activeTarget.role === "owner" && !isOwnerRow && !isSelf;
+                            const canLeave = isSelf && !isOwnerRow;
+                            return (
+                              <li key={member.userId} className="collab-member-row">
+                                <div className="collab-member-meta">
+                                  <strong>
+                                    {member.name}
+                                    {isSelf ? " (you)" : ""}
+                                  </strong>
+                                  <span className="collab-member-sub">{member.role}</span>
+                                </div>
+                                <div className="collab-row">
+                                  {canManage && (
+                                    <>
+                                      <select
+                                        className="collab-select"
+                                        data-testid={`member-role-${member.userId}`}
+                                        aria-label={`Role for ${member.name}`}
+                                        disabled={busy}
+                                        value={member.role === "viewer" ? "viewer" : "editor"}
+                                        onChange={(e) =>
+                                          void handleUpdateMemberRole(
+                                            member.userId,
+                                            e.target.value === "viewer" ? "viewer" : "editor",
+                                          )
+                                        }
+                                      >
+                                        <option value="editor">editor</option>
+                                        <option value="viewer">viewer</option>
+                                      </select>
+                                      <button
+                                        type="button"
+                                        className="toolbar-btn"
+                                        data-testid={`remove-member-${member.userId}`}
+                                        disabled={busy}
+                                        onClick={() =>
+                                          void handleRemoveMember(member.userId, false)
+                                        }
+                                      >
+                                        Remove
+                                      </button>
+                                    </>
+                                  )}
+                                  {canLeave && (
+                                    <button
+                                      type="button"
+                                      className="toolbar-btn"
+                                      data-testid="leave-workbook-btn"
+                                      disabled={busy}
+                                      onClick={() => void handleRemoveMember(member.userId, true)}
+                                    >
+                                      Leave
+                                    </button>
+                                  )}
+                                </div>
+                              </li>
+                            );
+                          })}
+                        </ul>
                       </>
                     )}
                   </div>

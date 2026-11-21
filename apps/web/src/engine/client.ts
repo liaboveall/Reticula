@@ -2,6 +2,7 @@ import type {
   CollabEvent,
   EngineCommand,
   EngineEvent,
+  SheetInfo,
   SyncCheckpoint,
   SyncCommand,
   WireWalTxnSummary,
@@ -68,6 +69,13 @@ export type HostEvent =
       readonly title: string;
       readonly fromClientSeq: string;
     }
+  | {
+      readonly kind: "historyReady";
+      readonly seq: string;
+      readonly sheet: SheetInfo;
+      readonly elapsedMs: number;
+    }
+  | { readonly kind: "historyExited"; readonly sheet: SheetInfo }
   | { readonly kind: "failed"; readonly message: string; readonly panicked?: boolean };
 
 export type EngineMessage = EngineEvent | HostEvent;
@@ -86,6 +94,7 @@ export type HostCommand =
       readonly branchId: string;
       readonly title: string;
       readonly online: boolean;
+      readonly readOnly?: boolean | undefined;
     }
   | { readonly kind: "takeOverDoc"; readonly docId: string }
   | {
@@ -121,6 +130,14 @@ export type HostCommand =
     }
   | { readonly kind: "forceCompactSnapshot" }
   | { readonly kind: "flushAndCloseForUpdate" }
+  | {
+      readonly kind: "historySeek";
+      readonly docId: string;
+      readonly targetSeq: string;
+      readonly snapshotSeq: string | null;
+      readonly shareToken?: string | null | undefined;
+    }
+  | { readonly kind: "historyExit" }
   | { readonly kind: "debugSpinWorker"; readonly ms: number };
 
 export type WorkerEnvelope =

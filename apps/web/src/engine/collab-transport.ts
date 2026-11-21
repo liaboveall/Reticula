@@ -11,6 +11,7 @@ export interface CollabTransportNotice {
 
 export interface CollabTransportOptions {
   readonly docId: string;
+  readonly shareToken?: string | null | undefined;
   readonly client: EngineClient;
   readonly kernelVersion: () => string;
   readonly onConnectionEvent?: (info: CollabTransportNotice) => void;
@@ -30,7 +31,7 @@ const IDLE_CHECK_MS = 15_000;
 const IDLE_CLOSE_MS = 58_000;
 
 export function createCollabTransport(options: CollabTransportOptions): CollabTransportHandle {
-  const { docId, client, kernelVersion, onConnectionEvent, onCheckSwUpdate } = options;
+  const { docId, shareToken, client, kernelVersion, onConnectionEvent, onCheckSwUpdate } = options;
 
   let ws: WebSocket | null = null;
   let disposed = false;
@@ -102,7 +103,7 @@ export function createCollabTransport(options: CollabTransportOptions): CollabTr
       return;
     }
     const wsProtocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-    const url = `${wsProtocol}//${window.location.host}${syncUrl(docId)}`;
+    const url = `${wsProtocol}//${window.location.host}${syncUrl(docId, shareToken ?? undefined)}`;
     const socket = new WebSocket(url);
     socket.binaryType = "arraybuffer";
     ws = socket;
@@ -164,6 +165,18 @@ export function createCollabTransport(options: CollabTransportOptions): CollabTr
         });
         return;
       }
+      if (ev.code === 4003) {
+        stoppedPermanently = true;
+        onConnectionEvent?.({
+          authError: "Access to this workbook was revoked.",
+        });
+        return;
+      }
+      if (ev.code === 4008) {
+        onConnectionEvent?.({
+          notice: "Server memory budget is currently busy (4008). Retrying shortly…",
+        });
+      }
       scheduleReconnect();
     };
   };
@@ -207,7 +220,10 @@ export function createCollabTransport(options: CollabTransportOptions): CollabTr
         }
         case "fetchSnapshot": {
           try {
-            const resp = await fetch(event.url, { credentials: "same-origin" });
+            const fetchInit: RequestInit = shareToken
+              ? { credentials: "same-origin", headers: { "X-Reticula-Share": shareToken } }
+              : { credentials: "same-origin" };
+            const resp = await fetch(event.url, fetchInit);
             if (resp.status === 401 || resp.status === 403) {
               stoppedPermanently = true;
               closeActiveSocket();

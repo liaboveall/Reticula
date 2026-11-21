@@ -4,6 +4,7 @@ import {
   type EngineCommand,
   encodePendingWalInit,
   encodeWalInit,
+  HistoryPlayer,
   hasEnginePanicked,
   init,
   inspectWal,
@@ -87,6 +88,10 @@ let collaborative = false;
 let activeCollab: CollabReplicaSession | null = null;
 let collabCheckpointTimer = 0;
 let collabRemoteCommitsSinceCheckpoint = 0;
+let lastSubscription: Extract<EngineCommand, { kind: "subscribe" }> | null = null;
+let activeSheetId = 0;
+let historyPlayer: HistoryPlayer | null = null;
+let historyPreviewActive = false;
 
 // Web Locks held by this worker (`lockName -> release callback`).
 const heldLocks = new Map<string, () => void>();
@@ -288,6 +293,9 @@ async function closeActiveDoc(persistFinalState: boolean): Promise<void> {
   clearWatermarkTimer();
   clearCollabCheckpointTimer();
   abortActiveSnapshot();
+  historyPreviewActive = false;
+  historyPlayer?.free();
+  historyPlayer = null;
   const collab = activeCollab;
   if (collab) {
     if (persistFinalState && engine) {
@@ -375,6 +383,16 @@ scope.__reticulaOnWasmPanic = (message: string) => {
   }
   scope.postMessage({ kind: "failed", message, panicked: true });
 };
+
+function flushHistoryPages(player: HistoryPlayer): void {
+  const pages: ArrayBuffer[] = [];
+  for (let page = player.takePage(); page; page = player.takePage()) {
+    pages.push(page.buffer as ArrayBuffer);
+  }
+  for (const buffer of pages) {
+    scope.postMessage(buffer, [buffer]);
+  }
+}
 
 function flushDuePagesAndAux(eng: Engine): void {
   const pages: ArrayBuffer[] = [];
@@ -719,6 +737,61 @@ async function runEngineCommand(command: EngineCommand): Promise<void> {
   if (stopped || !engine) {
     return;
   }
+  if (command.kind === "subscribe") {
+    lastSubscription = command;
+    activeSheetId = command.sheet ?? activeSheetId;
+  }
+  if (historyPreviewActive && historyPlayer) {
+    if (command.kind === "subscribe") {
+      historyPlayer.subscribePages(
+        command.sheet ?? activeSheetId,
+        command.epoch,
+        command.firstRow,
+        command.rowCount,
+        command.firstCol,
+        command.colCount,
+      );
+      flushHistoryPages(historyPlayer);
+      return;
+    }
+    if (command.kind === "switchSheet") {
+      try {
+        const sheet = historyPlayer.setSheet(command.sheet);
+        activeSheetId = sheet.sheet;
+        scope.postMessage({
+          kind: "historyReady",
+          seq: String(historyPlayer.currentSeq()),
+          sheet,
+          elapsedMs: 0,
+        });
+        flushHistoryPages(historyPlayer);
+      } catch (err) {
+        scope.postMessage({
+          kind: "rejected",
+          reason: err instanceof Error ? err.message : String(err),
+        });
+      }
+      return;
+    }
+    if (command.kind === "inspectCell") {
+      try {
+        const ev = historyPlayer.inspectCell(command.sheet, command.rowId, command.colId);
+        if (ev) {
+          scope.postMessage(ev);
+        }
+      } catch {
+        // Ignore invalid cell inspection while scrubbing history.
+      }
+      return;
+    }
+    if (command.kind !== "setEvalEnv") {
+      scope.postMessage({
+        kind: "rejected",
+        reason: "Return to the live workbook before editing.",
+      });
+    }
+    return;
+  }
   if (collaborative && (command.kind === "openEmpty" || command.kind === "openSample")) {
     scope.postMessage({ kind: "rejected", reason: "Open a local workbook in a separate worker." });
     return;
@@ -728,6 +801,9 @@ async function runEngineCommand(command: EngineCommand): Promise<void> {
     scope.postMessage(event);
   }
   const updatedSheet = sheetFromEvent(event);
+  if (updatedSheet) {
+    activeSheetId = updatedSheet.sheet;
+  }
   await drainWalFrames(engine, updatedSheet);
   if (collaborative) {
     await flushCollabEvents(engine);
@@ -748,7 +824,11 @@ async function runSyncCommand(command: SyncCommand): Promise<void> {
   }
   const event = engine.handleSync(command);
   if (event?.kind === "ready") collaborative = true;
-  if (event) scope.postMessage(event);
+  if (event) {
+    if (!historyPreviewActive || (event.kind !== "ready" && event.kind !== "sheetChanged")) {
+      scope.postMessage(event);
+    }
+  }
   const wroteCheckpoint = await flushCollabEvents(engine);
   if (
     activeCollab &&
@@ -763,7 +843,9 @@ async function runSyncCommand(command: SyncCommand): Promise<void> {
       scheduleCollabCheckpoint();
     }
   }
-  flushDuePagesAndAux(engine);
+  if (!historyPreviewActive) {
+    flushDuePagesAndAux(engine);
+  }
   scheduleWorkSlice();
 }
 
@@ -1349,6 +1431,41 @@ async function handleHostCommand(cmd: HostCommand): Promise<void> {
     case "openCollab": {
       await closeActiveDoc(true);
       try {
+        if (cmd.readOnly) {
+          const readyEv = engine.handleSync({
+            kind: "open",
+            docId: cmd.docId,
+            branchId: cmd.branchId,
+            info: undefined,
+            snapshot: new Uint8Array(),
+            pendingWal: new Uint8Array(),
+          });
+          if (readyEv?.kind !== "ready") {
+            scope.postMessage(
+              readyEv ?? {
+                kind: "rejected",
+                reason: "Could not open read-only collaborative view.",
+              },
+            );
+            return;
+          }
+          activeCollab = null;
+          collaborative = true;
+          collabRemoteCommitsSinceCheckpoint = 0;
+          scope.postMessage({
+            kind: "collabOpened",
+            docId: cmd.docId,
+            title: cmd.title,
+            slot: "memory",
+            replica: null,
+            storageBackend: "memory",
+          });
+          scope.postMessage(readyEv);
+          await flushCollabEvents(engine);
+          flushDuePagesAndAux(engine);
+          scheduleWorkSlice();
+          return;
+        }
         const { openCollabReplica } = await import("./collab-storage.ts");
         const replicaSession = await openCollabReplica({
           userId: cmd.userId,
@@ -1517,6 +1634,111 @@ async function handleHostCommand(cmd: HostCommand): Promise<void> {
       await closeActiveDoc(true);
       scope.postMessage({ kind: "closedForUpdate" });
       break;
+    case "historySeek": {
+      if (!collaborative) {
+        scope.postMessage({
+          kind: "rejected",
+          reason: "History playback requires an active collaborative workbook.",
+        });
+        return;
+      }
+      try {
+        const started = performance.now();
+        if (!historyPlayer) {
+          historyPlayer = new HistoryPlayer();
+        }
+        const player = historyPlayer;
+        const targetSeq = BigInt(cmd.targetSeq);
+        const fetchInit: RequestInit = cmd.shareToken
+          ? { credentials: "same-origin", headers: { "X-Reticula-Share": cmd.shareToken } }
+          : { credentials: "same-origin" };
+        if (cmd.snapshotSeq === null) {
+          if (!player.hasSnapshot(0n)) {
+            player.loadEmptyBase();
+          } else if (player.baseSeq() !== 0n) {
+            player.activateCachedSnapshot(0n);
+          }
+        } else {
+          const snapSeq = BigInt(cmd.snapshotSeq);
+          if (!player.hasSnapshot(snapSeq)) {
+            const snapResp = await fetch(
+              `/api/workbooks/${encodeURIComponent(cmd.docId)}/snapshots/${encodeURIComponent(cmd.snapshotSeq)}`,
+              fetchInit,
+            );
+            if (!snapResp.ok) {
+              throw new Error(
+                `Could not load snapshot #${cmd.snapshotSeq} (HTTP ${snapResp.status})`,
+              );
+            }
+            player.loadSnapshot(snapSeq, new Uint8Array(await snapResp.arrayBuffer()));
+          } else if (player.baseSeq() !== snapSeq) {
+            player.activateCachedSnapshot(snapSeq);
+          }
+        }
+        while (player.maxLoadedSeq() < targetSeq) {
+          const afterSeq = player.maxLoadedSeq();
+          const txResp = await fetch(
+            `/api/workbooks/${encodeURIComponent(cmd.docId)}/txns?after_seq=${afterSeq}&limit=500`,
+            fetchInit,
+          );
+          if (!txResp.ok) {
+            throw new Error(`Could not load history transactions (HTTP ${txResp.status})`);
+          }
+          const batch = new Uint8Array(await txResp.arrayBuffer());
+          if (batch.byteLength === 0) {
+            break;
+          }
+          const nextMax = player.appendTxns(batch);
+          if (nextMax <= afterSeq) {
+            break;
+          }
+        }
+        const sheet = player.seekTo(targetSeq);
+        historyPreviewActive = true;
+        activeSheetId = sheet.sheet;
+        scope.postMessage({
+          kind: "historyReady",
+          seq: String(player.currentSeq()),
+          sheet,
+          elapsedMs: performance.now() - started,
+        });
+        const sub = lastSubscription;
+        player.subscribePages(
+          sheet.sheet,
+          sub?.epoch ?? 1,
+          sub?.firstRow ?? 0,
+          sub?.rowCount ?? 64,
+          sub?.firstCol ?? 0,
+          sub?.colCount ?? 16,
+        );
+        flushHistoryPages(player);
+      } catch (err) {
+        scope.postMessage({
+          kind: "rejected",
+          reason: err instanceof Error ? err.message : String(err),
+        });
+      }
+      break;
+    }
+    case "historyExit": {
+      historyPreviewActive = false;
+      let ev = engine.handle({ kind: "switchSheet", sheet: activeSheetId });
+      if (ev?.kind === "rejected") {
+        ev = engine.handle({ kind: "switchSheet", sheet: 0 });
+      }
+      if (ev?.kind === "sheetChanged") {
+        activeSheetId = ev.sheet.sheet;
+        scope.postMessage({ kind: "historyExited", sheet: ev.sheet });
+      }
+      if (lastSubscription) {
+        engine.handle({
+          ...lastSubscription,
+          sheet: activeSheetId,
+        });
+      }
+      flushDuePagesAndAux(engine);
+      break;
+    }
     case "debugSpinWorker": {
       const end = performance.now() + cmd.ms;
       while (performance.now() < end) {
@@ -1562,6 +1784,8 @@ const COLLAB_ALLOWED_HOST_COMMANDS = new Set<HostCommand["kind"]>([
   "exportRtcl",
   "exportCsv",
   "flushAndCloseForUpdate",
+  "historySeek",
+  "historyExit",
 ]);
 
 function dispatchEnvelope(item: WorkerEnvelope | EngineCommand): void {

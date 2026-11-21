@@ -1,10 +1,10 @@
 import { BENCHMARKS } from "./generated/benchmarks.ts";
 
 export interface LandingPageProps {
-  readonly onOpenApp: () => void;
+  readonly onNavigate: (path: string) => void;
 }
 
-export function LandingPage({ onOpenApp }: LandingPageProps) {
+export function LandingPage({ onNavigate }: LandingPageProps) {
   const startupValue =
     BENCHMARKS.startupFirstScreenP50Ms !== null
       ? `${(BENCHMARKS.startupFirstScreenP50Ms / 1000).toFixed(2)} s`
@@ -25,6 +25,26 @@ export function LandingPage({ onOpenApp }: LandingPageProps) {
         <span className="landing-brand">Reticula</span>
         <div className="landing-nav-links">
           <a
+            href="/workbooks"
+            className="landing-link"
+            onClick={(event) => {
+              event.preventDefault();
+              onNavigate("/workbooks");
+            }}
+          >
+            Workbooks
+          </a>
+          <a
+            href="/sim"
+            className="landing-link"
+            onClick={(event) => {
+              event.preventDefault();
+              onNavigate("/sim");
+            }}
+          >
+            Sync Simulator
+          </a>
+          <a
             href="https://github.com/liaboveall/Reticula"
             target="_blank"
             rel="noreferrer"
@@ -37,7 +57,7 @@ export function LandingPage({ onOpenApp }: LandingPageProps) {
             className="landing-cta-small"
             onClick={(event) => {
               event.preventDefault();
-              onOpenApp();
+              onNavigate("/app");
             }}
           >
             Open Demo →
@@ -66,7 +86,7 @@ export function LandingPage({ onOpenApp }: LandingPageProps) {
               data-testid="open-demo"
               onClick={(event) => {
                 event.preventDefault();
-                onOpenApp();
+                onNavigate("/app");
               }}
             >
               Open 1,000,000-Row Live Demo →
@@ -148,7 +168,17 @@ export function LandingPage({ onOpenApp }: LandingPageProps) {
 
         <p className="landing-footnote">
           Measured on {BENCHMARKS.cpu} (pinned P-cores <code>0xFFFF</code>), {BENCHMARKS.browser},
-          archived at commit <code>{BENCHMARKS.engineCommit}</code> ({BENCHMARKS.engineDate}).
+          archived at commit <code>{BENCHMARKS.engineCommit}</code> ({BENCHMARKS.engineDate}).{" "}
+          <a
+            href="/privacy"
+            className="landing-link"
+            onClick={(event) => {
+              event.preventDefault();
+              onNavigate("/privacy");
+            }}
+          >
+            Privacy &amp; Data
+          </a>
         </p>
 
         <section className="landing-arch" aria-label="Architecture data flow">

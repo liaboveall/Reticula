@@ -183,9 +183,16 @@ function readInitialUrlDoc(): {
   safeRequested: boolean;
   collabId: string | null;
   joinToken: string | null;
+  shareToken: string | null;
 } {
   if (typeof window === "undefined") {
-    return { docId: DEFAULT_DOC_ID, safeRequested: false, collabId: null, joinToken: null };
+    return {
+      docId: DEFAULT_DOC_ID,
+      safeRequested: false,
+      collabId: null,
+      joinToken: null,
+      shareToken: null,
+    };
   }
   const params = new URLSearchParams(window.location.search);
   const rawDoc = params.get("doc")?.trim();
@@ -194,11 +201,14 @@ function readInitialUrlDoc(): {
   const collabId = rawCollab && /^[a-zA-Z0-9-]+$/.test(rawCollab) ? rawCollab : null;
   const joinMatch = /^\/join\/([a-zA-Z0-9_-]+)\/?$/.exec(window.location.pathname);
   const joinToken = joinMatch?.[1] ?? null;
+  const rawShare = params.get("share")?.trim() ?? null;
+  const shareToken = rawShare && /^[a-zA-Z0-9_-]+$/.test(rawShare) ? rawShare : null;
   return {
     docId: safeDoc,
     safeRequested: params.get("safe") === "1",
     collabId,
     joinToken,
+    shareToken,
   };
 }
 
@@ -209,6 +219,7 @@ function syncUrlForDoc(docId: string): void {
   const url = new URL(window.location.href);
   url.searchParams.delete("safe");
   url.searchParams.delete("collab");
+  url.searchParams.delete("share");
   url.pathname = "/app";
   if (docId === DEFAULT_DOC_ID) {
     if (!url.searchParams.has("doc")) {
@@ -243,10 +254,10 @@ function makeFreshDocId(): string {
 }
 
 export interface EditorPageProps {
-  readonly onNavigateHome: () => void;
+  readonly onNavigate: (path: string) => void;
 }
 
-export function EditorPage({ onNavigateHome }: EditorPageProps) {
+export function EditorPage({ onNavigate }: EditorPageProps) {
   const [isNarrow, setIsNarrow] = useState<boolean>(() =>
     typeof window !== "undefined" ? window.matchMedia("(max-width: 767px)").matches : false,
   );
@@ -268,7 +279,7 @@ export function EditorPage({ onNavigateHome }: EditorPageProps) {
             className="mobile-brand"
             onClick={(e) => {
               e.preventDefault();
-              onNavigateHome();
+              onNavigate("/");
             }}
           >
             ← Reticula
@@ -343,10 +354,10 @@ export function EditorPage({ onNavigateHome }: EditorPageProps) {
     );
   }
 
-  return <DesktopSpreadsheet onNavigateHome={onNavigateHome} />;
+  return <DesktopSpreadsheet onNavigate={onNavigate} />;
 }
 
-function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
+function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
   const initialRoute = useRef(readInitialUrlDoc());
   const tabIdRef = useRef<string>(Math.random().toString(36).slice(2, 10));
 
@@ -434,6 +445,12 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
   const [collabPending, setCollabPending] = useState(0);
   const [collabPresences, setCollabPresences] = useState<readonly RemotePresenceOverlay[]>([]);
   const [collabNotice, setCollabNotice] = useState<string | null>(null);
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const [historyPreviewSeq, setHistoryPreviewSeq] = useState<string | null>(null);
+  const [historySeekMs, setHistorySeekMs] = useState<number | null>(null);
+  const effectiveReadOnly = collabTarget?.role === "viewer" || historyPreviewSeq !== null;
+  const effectiveReadOnlyRef = useRef(effectiveReadOnly);
+  effectiveReadOnlyRef.current = effectiveReadOnly;
   const [unsyncedRescue, setUnsyncedRescue] = useState<{
     readonly localDocId: string;
     readonly title: string;
@@ -697,11 +714,13 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
         schedulePresenceSend();
       },
       onActivateEdit: () => {
-        editor.startEdit("doubleClick");
+        if (!effectiveReadOnlyRef.current) {
+          editor.startEdit("doubleClick");
+        }
       },
       onResizeRows: (sizes) => {
         const client = clientRef.current;
-        if (!client || workerTerminatedRef.current) {
+        if (!client || workerTerminatedRef.current || effectiveReadOnlyRef.current) {
           return;
         }
         notePersistenceMutation();
@@ -714,7 +733,7 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
       },
       onResizeCols: (sizes) => {
         const client = clientRef.current;
-        if (!client || workerTerminatedRef.current) {
+        if (!client || workerTerminatedRef.current || effectiveReadOnlyRef.current) {
           return;
         }
         notePersistenceMutation();
@@ -727,7 +746,7 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
       },
       onMoveRows: (rows, afterRowId) => {
         const client = clientRef.current;
-        if (!client || workerTerminatedRef.current) {
+        if (!client || workerTerminatedRef.current || effectiveReadOnlyRef.current) {
           return;
         }
         notePersistenceMutation();
@@ -741,7 +760,7 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
       },
       onMoveCols: (cols, afterColId) => {
         const client = clientRef.current;
-        if (!client || workerTerminatedRef.current) {
+        if (!client || workerTerminatedRef.current || effectiveReadOnlyRef.current) {
           return;
         }
         notePersistenceMutation();
@@ -755,7 +774,7 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
       },
       onFillRange: (src, dst) => {
         const client = clientRef.current;
-        if (!client || workerTerminatedRef.current) {
+        if (!client || workerTerminatedRef.current || effectiveReadOnlyRef.current) {
           return;
         }
         notePersistenceMutation();
@@ -780,7 +799,7 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
       },
       onAutoFillDown: (src) => {
         const client = clientRef.current;
-        if (!client || workerTerminatedRef.current) {
+        if (!client || workerTerminatedRef.current || effectiveReadOnlyRef.current) {
           return;
         }
         notePersistenceMutation();
@@ -831,6 +850,7 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
     gridRef.current = grid;
 
     const editor = new CellEditor(grid, element, {
+      isReadOnly: () => effectiveReadOnlyRef.current,
       textOf: (cell) => {
         const cur = grid.selectionDetails();
         if (
@@ -850,7 +870,7 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
         const client = clientRef.current;
         const session = editSessionRef.current;
         clearEditState(grid, editor);
-        if (!client || workerTerminatedRef.current) {
+        if (!client || workerTerminatedRef.current || effectiveReadOnlyRef.current) {
           return;
         }
         const sheet = session ? session.hostSheet : activeSheetRef.current;
@@ -879,7 +899,7 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
       onClear: () => {
         const client = clientRef.current;
         const runs = grid.selectedCellRuns();
-        if (client && !workerTerminatedRef.current && runs) {
+        if (client && !workerTerminatedRef.current && !effectiveReadOnlyRef.current && runs) {
           notePersistenceMutation();
           pendingActionVerbRef.current = "cleared cells";
           client.send({
@@ -950,14 +970,14 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
         }
       },
       onUndo: () => {
-        if (!workerTerminatedRef.current) {
+        if (!workerTerminatedRef.current && !effectiveReadOnlyRef.current) {
           notePersistenceMutation();
           pendingActionVerbRef.current = "undid action";
           clientRef.current?.send({ kind: "undo" });
         }
       },
       onRedo: () => {
-        if (!workerTerminatedRef.current) {
+        if (!workerTerminatedRef.current && !effectiveReadOnlyRef.current) {
           notePersistenceMutation();
           pendingActionVerbRef.current = "redid action";
           clientRef.current?.send({ kind: "redo" });
@@ -966,6 +986,9 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
       onCopy: (cut, clipboardData) => {
         const range = grid.selectionRange;
         if (!range || workerTerminatedRef.current) {
+          return;
+        }
+        if (cut && effectiveReadOnlyRef.current) {
           return;
         }
         if (
@@ -991,7 +1014,7 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
       onPaste: (tsv, html) => {
         const client = clientRef.current;
         const range = grid.selectionRange;
-        if (!client || workerTerminatedRef.current || !range) {
+        if (!client || workerTerminatedRef.current || effectiveReadOnlyRef.current || !range) {
           return;
         }
         let effTsv = tsv;
@@ -1046,6 +1069,9 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
       setCollabPending(0);
       setCollabPresences([]);
       setCollabNotice(null);
+      setHistoryOpen(false);
+      setHistoryPreviewSeq(null);
+      setHistorySeekMs(null);
       if (nextCollab) {
         activeDocTitleRef.current = nextCollab.title;
         setDocId(nextCollab.docId);
@@ -1267,6 +1293,35 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
               for (const resolve of closeWaiters.splice(0)) {
                 resolve();
               }
+              break;
+            }
+            case "historyReady": {
+              activeSheetRef.current = message.sheet.sheet;
+              lastInspectKey = "";
+              inspectedRef.current = null;
+              setInspected(null);
+              grid.setSheet(message.sheet);
+              setEngine((prev) =>
+                prev.status === "ready" ? { ...prev, sheet: message.sheet } : prev,
+              );
+              setHistoryPreviewSeq(message.seq);
+              setHistorySeekMs(message.elapsedMs);
+              requestInspect(grid.selectionDetails(), true);
+              break;
+            }
+            case "historyExited": {
+              activeSheetRef.current = message.sheet.sheet;
+              walSeqRef.current = message.sheet.walSeq;
+              lastInspectKey = "";
+              inspectedRef.current = null;
+              setInspected(null);
+              grid.setSheet(message.sheet);
+              setEngine((prev) =>
+                prev.status === "ready" ? { ...prev, sheet: message.sheet } : prev,
+              );
+              setHistoryPreviewSeq(null);
+              setHistorySeekMs(null);
+              requestInspect(grid.selectionDetails(), true);
               break;
             }
             case "ready":
@@ -1550,6 +1605,7 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
           }
           const handle = createCollabTransport({
             docId: nextCollab.docId,
+            shareToken: nextCollab.shareToken,
             client,
             kernelVersion: () => kernelVersionRef.current,
             onCheckSwUpdate: () => {
@@ -1753,6 +1809,7 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
               online:
                 !collabManualOfflineRef.current &&
                 (typeof navigator === "undefined" ? true : navigator.onLine !== false),
+              readOnly: currentCollab.role === "viewer",
             },
             currentCollab,
           );
@@ -1800,6 +1857,19 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
     syncGridFormulaRefs,
   ]);
 
+  useEffect(() => {
+    if (effectiveReadOnly) {
+      const grid = gridRef.current;
+      const editor = editorRef.current;
+      if (grid && editor) {
+        clearEditState(grid, editor);
+      }
+      editor?.cancelExternal();
+      setColorPopover(null);
+      setRenamingSheet(null);
+    }
+  }, [effectiveReadOnly, clearEditState]);
+
   const activeSheetId = engine.status === "ready" ? engine.sheet.sheet : 0;
   const matchingInspected =
     inspected !== null &&
@@ -1827,7 +1897,13 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
     const grid = gridRef.current;
     const editor = editorRef.current;
     const client = clientRef.current;
-    if (!grid || !editor || !client || workerTerminatedRef.current) {
+    if (
+      !grid ||
+      !editor ||
+      !client ||
+      workerTerminatedRef.current ||
+      effectiveReadOnlyRef.current
+    ) {
       return;
     }
     const session = ensureEditSession(grid, next, cursorUtf16);
@@ -1854,7 +1930,13 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
     const grid = gridRef.current;
     const editor = editorRef.current;
     const client = clientRef.current;
-    if (!grid || !editor || !client || workerTerminatedRef.current) {
+    if (
+      !grid ||
+      !editor ||
+      !client ||
+      workerTerminatedRef.current ||
+      effectiveReadOnlyRef.current
+    ) {
       return;
     }
     const session = editSessionRef.current;
@@ -1896,7 +1978,13 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
     const grid = gridRef.current;
     const editor = editorRef.current;
     const client = clientRef.current;
-    if (!grid || !editor || !client || workerTerminatedRef.current) {
+    if (
+      !grid ||
+      !editor ||
+      !client ||
+      workerTerminatedRef.current ||
+      effectiveReadOnlyRef.current
+    ) {
       return;
     }
     const start = Math.max(0, Math.min(currentSource.length, item.replaceStartUtf16));
@@ -1927,7 +2015,7 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
   const handleInsertRow = (below: boolean) => {
     const grid = gridRef.current;
     const client = clientRef.current;
-    if (!grid || !client || workerTerminatedRef.current) {
+    if (!grid || !client || workerTerminatedRef.current || effectiveReadOnlyRef.current) {
       return;
     }
     const baseRow = selection ? (below ? selection.range.endRow - 1 : selection.range.firstRow) : 0;
@@ -1950,7 +2038,7 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
   const handleDeleteSelectedRows = () => {
     const grid = gridRef.current;
     const client = clientRef.current;
-    if (!grid || !client || workerTerminatedRef.current) {
+    if (!grid || !client || workerTerminatedRef.current || effectiveReadOnlyRef.current) {
       return;
     }
     const rows = grid.selectedRowRuns();
@@ -1970,7 +2058,7 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
   const handleInsertCol = (right: boolean) => {
     const grid = gridRef.current;
     const client = clientRef.current;
-    if (!grid || !client || workerTerminatedRef.current) {
+    if (!grid || !client || workerTerminatedRef.current || effectiveReadOnlyRef.current) {
       return;
     }
     const baseCol = selection ? (right ? selection.range.endCol - 1 : selection.range.firstCol) : 0;
@@ -1993,7 +2081,7 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
   const handleDeleteSelectedCols = () => {
     const grid = gridRef.current;
     const client = clientRef.current;
-    if (!grid || !client || workerTerminatedRef.current) {
+    if (!grid || !client || workerTerminatedRef.current || effectiveReadOnlyRef.current) {
       return;
     }
     const cols = grid.selectedColRuns();
@@ -2013,7 +2101,7 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
   const applyFormat = (patch: { numberFormat?: WireFormatPatch; style?: WireStylePatch }) => {
     const grid = gridRef.current;
     const client = clientRef.current;
-    if (!grid || !client || workerTerminatedRef.current) {
+    if (!grid || !client || workerTerminatedRef.current || effectiveReadOnlyRef.current) {
       return;
     }
     const target = grid.selectedFormatTarget();
@@ -2033,7 +2121,7 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
 
   const handleFreezeChange = (value: string) => {
     const client = clientRef.current;
-    if (!client || workerTerminatedRef.current) {
+    if (!client || workerTerminatedRef.current || effectiveReadOnlyRef.current) {
       return;
     }
     let frozenRows = 0;
@@ -2104,6 +2192,9 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
     }
     const range = grid.selectionRange;
     if (!range) {
+      return;
+    }
+    if (mode !== "copy" && effectiveReadOnlyRef.current) {
       return;
     }
     if (mode === "cut" || mode === "copy") {
@@ -2188,9 +2279,9 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
   };
 
   const readySheet = engine.status === "ready" && lockOverlay === null ? engine.sheet : null;
-  const canDeleteRows = selection !== null && selection.rowId !== null;
-  const canDeleteCols = selection !== null && selection.colId !== null;
-  const hasSelection = readySheet !== null && selection !== null;
+  const canDeleteRows = !effectiveReadOnly && selection !== null && selection.rowId !== null;
+  const canDeleteCols = !effectiveReadOnly && selection !== null && selection.colId !== null;
+  const hasSelection = readySheet !== null && selection !== null && !effectiveReadOnly;
   const activeStyle = matchingInspected?.style;
   const activeFormatCode = matchingInspected?.formatCode ?? "General";
   const currentFreezeValue = readySheet
@@ -2216,7 +2307,7 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
           className="brand-link"
           onClick={(event) => {
             event.preventDefault();
-            onNavigateHome();
+            onNavigate("/");
           }}
         >
           <h1>Reticula</h1>
@@ -2239,6 +2330,17 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
         >
           Cloud
         </button>
+        {collabTarget && (
+          <button
+            type="button"
+            className="toolbar-btn"
+            data-testid="history-btn"
+            onClick={() => setHistoryOpen((open) => !open)}
+            title="Browse revision history and named versions"
+          >
+            History
+          </button>
+        )}
         {readySheet && (
           <span className="document" data-testid="document">
             {docTitle} · {integer.format(readySheet.rows)} rows × {readySheet.cols} columns ·{" "}
@@ -2247,8 +2349,12 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
         )}
         <span className="titlebar-spacer" />
         <span className="storage-badge" data-testid="storage-badge">
-          {collabTarget ? "Cloud replica cached in OPFS" : "Local browser storage only"} ·{" "}
-          {storageUsedMb} MB used ·{" "}
+          {collabTarget
+            ? collabTarget.role === "viewer"
+              ? "Read-only cloud view"
+              : "Cloud replica cached in OPFS"
+            : "Local browser storage only"}{" "}
+          · {storageUsedMb} MB used ·{" "}
           <button
             type="button"
             className="storage-export-link"
@@ -2264,8 +2370,11 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
             type="button"
             className="toolbar-btn"
             data-testid="undo-btn"
-            disabled={!readySheet?.canUndo}
+            disabled={!readySheet?.canUndo || effectiveReadOnly}
             onClick={() => {
+              if (effectiveReadOnlyRef.current) {
+                return;
+              }
               notePersistenceMutation();
               pendingActionVerbRef.current = "undid action";
               clientRef.current?.send({ kind: "undo" });
@@ -2281,8 +2390,11 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
             type="button"
             className="toolbar-btn"
             data-testid="redo-btn"
-            disabled={!readySheet?.canRedo}
+            disabled={!readySheet?.canRedo || effectiveReadOnly}
             onClick={() => {
+              if (effectiveReadOnlyRef.current) {
+                return;
+              }
               notePersistenceMutation();
               pendingActionVerbRef.current = "redid action";
               clientRef.current?.send({ kind: "redo" });
@@ -2298,7 +2410,7 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
             type="button"
             className="toolbar-btn"
             data-testid="insert-row-above"
-            disabled={!readySheet}
+            disabled={!readySheet || effectiveReadOnly}
             onClick={() => handleInsertRow(false)}
             title="Insert 1 row above the selected row (at row 1 if nothing is selected)"
           >
@@ -2321,6 +2433,7 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
         collabTarget !== null ||
         initialRoute.current.collabId !== null ||
         initialRoute.current.joinToken !== null ||
+        initialRoute.current.shareToken !== null ||
         unsyncedRescue !== null ||
         collabNotice !== null) && (
         <Suspense fallback={null}>
@@ -2328,7 +2441,12 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
             open={collabMenuOpen}
             initialCollabId={initialRoute.current.collabId}
             initialJoinToken={initialRoute.current.joinToken}
+            initialShareToken={initialRoute.current.shareToken}
             activeTarget={collabTarget}
+            readOnly={effectiveReadOnly}
+            historyOpen={historyOpen}
+            historyPreviewSeq={historyPreviewSeq}
+            historyPreviewElapsedMs={historySeekMs}
             connection={collabConn}
             pendingCount={collabPending}
             remotePresences={collabPresences}
@@ -2348,9 +2466,17 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
                   online:
                     !collabManualOfflineRef.current &&
                     (typeof navigator === "undefined" ? true : navigator.onLine !== false),
+                  readOnly: target.role === "viewer",
                 },
                 target,
               );
+            }}
+            onUpdateVisibility={(visibility) => {
+              setCollabTarget((prev) => {
+                const next = prev ? { ...prev, visibility } : null;
+                collabTargetRef.current = next;
+                return next;
+              });
             }}
             onOpenLocalRescue={(localDocId, title) => {
               setUnsyncedRescue(null);
@@ -2366,6 +2492,24 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
                 docId: DEFAULT_DOC_ID,
               });
             }}
+            onCloseHistory={() => setHistoryOpen(false)}
+            onHistorySeek={(targetSeq, snapshotSeq) => {
+              const cur = collabTargetRef.current;
+              if (!cur) {
+                return;
+              }
+              clientRef.current?.sendHost({
+                kind: "historySeek",
+                docId: cur.docId,
+                targetSeq,
+                snapshotSeq,
+                shareToken: cur.shareToken,
+              });
+            }}
+            onHistoryExit={() => {
+              clientRef.current?.sendHost({ kind: "historyExit" });
+            }}
+            onNavigate={onNavigate}
           />
         </Suspense>
       )}
@@ -2634,7 +2778,7 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
           className="fmt-select"
           data-testid="freeze-select"
           aria-label="Freeze panes"
-          disabled={!readySheet}
+          disabled={!readySheet || effectiveReadOnly}
           value={currentFreezeValue}
           onChange={(e) => handleFreezeChange(e.target.value)}
         >
@@ -2651,7 +2795,7 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
           type="button"
           className="fmt-btn"
           data-testid="insert-col-left"
-          disabled={!readySheet}
+          disabled={!readySheet || effectiveReadOnly}
           title="Insert 1 column to the left of selection"
           onClick={() => handleInsertCol(false)}
         >
@@ -2772,11 +2916,17 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
         nameBoxText={nameBoxText}
         value={formulaBarValue}
         placeholder={
-          selection || editSessionRef.current
-            ? "Enter a value or =formula (Tab to autocomplete, F4 to toggle $)"
-            : "Select a cell to edit"
+          effectiveReadOnly
+            ? "Read-only mode"
+            : selection || editSessionRef.current
+              ? "Enter a value or =formula (Tab to autocomplete, F4 to toggle $)"
+              : "Select a cell to edit"
         }
-        disabled={readySheet === null || (selection === null && !editSessionRef.current)}
+        disabled={
+          effectiveReadOnly ||
+          readySheet === null ||
+          (selection === null && !editSessionRef.current)
+        }
         isEditing={editingText !== null}
         analysis={formulaAnalysis?.analysis ?? null}
         analysisSource={formulaAnalysis?.source ?? null}
@@ -2785,6 +2935,9 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
         onCommit={handleFormulaBarCommit}
         onCancel={handleFormulaBarCancel}
         onToggleDollar={(text, cursorUtf16) => {
+          if (effectiveReadOnlyRef.current) {
+            return;
+          }
           if (editSessionRef.current) {
             editSessionRef.current.editRev += 1;
           }
@@ -2792,6 +2945,20 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
         }}
         onAcceptCompletion={handleAcceptCompletion}
       />
+
+      {historyPreviewSeq !== null && (
+        <div className="history-preview-banner" data-testid="history-preview-banner" role="status">
+          <span>Previewing history #{historyPreviewSeq} (read-only)</span>
+          <button
+            type="button"
+            className="toolbar-btn primary-btn"
+            data-testid="history-banner-return-live-btn"
+            onClick={() => clientRef.current?.sendHost({ kind: "historyExit" })}
+          >
+            Return to Live
+          </button>
+        </div>
+      )}
 
       {rejectedReason && (
         <div className="rejected-banner" role="alert" data-testid="rejected-banner">
@@ -2926,7 +3093,11 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
                 className={isActive ? "sheet-tab active" : "sheet-tab"}
                 data-testid={`sheet-tab-${tab.id}`}
                 onClick={() => handleSwitchSheet(tab.id)}
-                onDoubleClick={() => setRenamingSheet({ id: tab.id, draft: tab.name })}
+                onDoubleClick={() => {
+                  if (!effectiveReadOnly) {
+                    setRenamingSheet({ id: tab.id, draft: tab.name });
+                  }
+                }}
                 onContextMenu={(e) => {
                   e.preventDefault();
                   setColorPopover(null);
@@ -2946,9 +3117,13 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
             type="button"
             className="sheet-add-btn"
             data-testid="add-sheet-btn"
+            disabled={effectiveReadOnly}
             title="Add worksheet"
             aria-label="Add worksheet"
             onClick={() => {
+              if (effectiveReadOnlyRef.current) {
+                return;
+              }
               notePersistenceMutation();
               pendingActionVerbRef.current = "added sheet";
               clientRef.current?.send({
@@ -3029,6 +3204,7 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
                 role="menuitem"
                 className="ctx-item"
                 data-testid="ctx-cut"
+                disabled={effectiveReadOnly}
                 onClick={() => void handleContextClipboard("cut")}
               >
                 Cut <kbd>Ctrl+X</kbd>
@@ -3047,6 +3223,7 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
                 role="menuitem"
                 className="ctx-item"
                 data-testid="ctx-paste"
+                disabled={effectiveReadOnly}
                 onClick={() => void handleContextClipboard("paste")}
               >
                 Paste <kbd>Ctrl+V</kbd>
@@ -3056,10 +3233,11 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
                 role="menuitem"
                 className="ctx-item"
                 data-testid="ctx-clear"
+                disabled={effectiveReadOnly}
                 onClick={() => {
                   setContextMenu(null);
                   const runs = gridRef.current?.selectedCellRuns();
-                  if (runs) {
+                  if (runs && !effectiveReadOnlyRef.current) {
                     notePersistenceMutation();
                     pendingActionVerbRef.current = "cleared cells";
                     clientRef.current?.send({
@@ -3080,6 +3258,7 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
                 role="menuitem"
                 className="ctx-item"
                 data-testid="ctx-insert-row-above"
+                disabled={effectiveReadOnly}
                 onClick={() => {
                   setContextMenu(null);
                   handleInsertRow(false);
@@ -3092,6 +3271,7 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
                 role="menuitem"
                 className="ctx-item"
                 data-testid="ctx-insert-row-below"
+                disabled={effectiveReadOnly}
                 onClick={() => {
                   setContextMenu(null);
                   handleInsertRow(true);
@@ -3118,6 +3298,7 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
                 role="menuitem"
                 className="ctx-item"
                 data-testid="ctx-insert-col-left"
+                disabled={effectiveReadOnly}
                 onClick={() => {
                   setContextMenu(null);
                   handleInsertCol(false);
@@ -3130,6 +3311,7 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
                 role="menuitem"
                 className="ctx-item"
                 data-testid="ctx-insert-col-right"
+                disabled={effectiveReadOnly}
                 onClick={() => {
                   setContextMenu(null);
                   handleInsertCol(true);
@@ -3158,10 +3340,13 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
                 role="menuitem"
                 className="ctx-item"
                 data-testid="ctx-rename-sheet"
+                disabled={effectiveReadOnly}
                 onClick={() => {
                   const { tab } = contextMenu;
                   setContextMenu(null);
-                  setRenamingSheet({ id: tab.id, draft: tab.name });
+                  if (!effectiveReadOnlyRef.current) {
+                    setRenamingSheet({ id: tab.id, draft: tab.name });
+                  }
                 }}
               >
                 Rename Sheet…
@@ -3169,8 +3354,9 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
               {readySheet &&
                 (() => {
                   const idx = readySheet.sheets.findIndex((s) => s.id === contextMenu.tab.id);
-                  const canLeft = idx > 0;
-                  const canRight = idx >= 0 && idx < readySheet.sheets.length - 1;
+                  const canLeft = !effectiveReadOnly && idx > 0;
+                  const canRight =
+                    !effectiveReadOnly && idx >= 0 && idx < readySheet.sheets.length - 1;
                   return (
                     <>
                       <button
@@ -3182,6 +3368,9 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
                         onClick={() => {
                           const targetTab = contextMenu.tab;
                           setContextMenu(null);
+                          if (effectiveReadOnlyRef.current) {
+                            return;
+                          }
                           const afterSheet = idx >= 2 ? readySheet.sheets[idx - 2]?.id : undefined;
                           notePersistenceMutation();
                           pendingActionVerbRef.current = "reordered sheets";
@@ -3203,6 +3392,9 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
                         onClick={() => {
                           const targetTab = contextMenu.tab;
                           setContextMenu(null);
+                          if (effectiveReadOnlyRef.current) {
+                            return;
+                          }
                           const nextTab = readySheet.sheets[idx + 1];
                           if (nextTab) {
                             notePersistenceMutation();
@@ -3223,10 +3415,13 @@ function DesktopSpreadsheet({ onNavigateHome }: EditorPageProps) {
                         role="menuitem"
                         className="ctx-item danger"
                         data-testid="ctx-delete-sheet"
-                        disabled={readySheet.sheets.length <= 1}
+                        disabled={effectiveReadOnly || readySheet.sheets.length <= 1}
                         onClick={() => {
                           const targetTab = contextMenu.tab;
                           setContextMenu(null);
+                          if (effectiveReadOnlyRef.current) {
+                            return;
+                          }
                           notePersistenceMutation();
                           pendingActionVerbRef.current = "deleted sheet";
                           clientRef.current?.send({

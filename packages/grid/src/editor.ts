@@ -63,6 +63,8 @@ export interface CellEditorOptions {
   readonly onCopy?: (cut: boolean, clipboardData: DataTransfer | null) => void;
   /** `Ctrl+V` paste gesture while navigating. */
   readonly onPaste?: (tsv: string, html: string | null) => void;
+  /** Optional guard preventing in-cell typing, editing, undo/redo, clear, cut, and paste. */
+  readonly isReadOnly?: () => boolean;
   readonly onEvent?: (event: EditorEvent) => void;
 }
 
@@ -108,13 +110,29 @@ export class CellEditor {
       state: EditorState.create({
         extensions: [
           EditorView.contentAttributes.of({ "aria-label": "Cell editor" }),
-          EditorState.transactionFilter.of((transaction) =>
-            transaction.newDoc.lines > 1 ? [] : transaction,
-          ),
+          EditorState.transactionFilter.of((transaction) => {
+            if (transaction.newDoc.lines > 1) {
+              return [];
+            }
+            if (
+              !this.#suppressAutoStart &&
+              !this.#cell &&
+              this.#options.isReadOnly?.() &&
+              transaction.docChanged
+            ) {
+              return [];
+            }
+            return transaction;
+          }),
           formulaDecorationExtension(),
           EditorView.updateListener.of((update) => {
             if (update.docChanged || (this.#cell && update.selectionSet)) {
-              if (!this.#suppressAutoStart && !this.#cell && update.state.doc.length > 0) {
+              if (
+                !this.#suppressAutoStart &&
+                !this.#cell &&
+                !this.#options.isReadOnly?.() &&
+                update.state.doc.length > 0
+              ) {
                 this.#start("typing", "input");
               }
               if (!this.#suppressNotify) {
@@ -130,7 +148,7 @@ export class CellEditor {
             keydown: (event, view) => this.#onKeyDown(event, view),
             compositionstart: (event) => {
               this.#note({ kind: "composition", phase: "start", data: event.data });
-              if (!this.#cell) {
+              if (!this.#cell && !this.#options.isReadOnly?.()) {
                 this.#start("composition", "input");
               }
             },
@@ -189,6 +207,9 @@ export class CellEditor {
     initialText?: string,
     focusEditor = true,
   ): void {
+    if (this.#options.isReadOnly?.()) {
+      return;
+    }
     const cell = this.#grid.selection;
     if (!cell) {
       return;
@@ -317,6 +338,9 @@ export class CellEditor {
     cause: "typing" | "composition" | "F2" | "doubleClick" | "formulaBar",
     mode: "input" | "edit",
   ): void {
+    if (this.#options.isReadOnly?.()) {
+      return;
+    }
     const cell = this.#grid.selection;
     if (!cell) {
       if (!this.composing) {
@@ -425,16 +449,20 @@ export class CellEditor {
       const lower = event.key.toLowerCase();
       if (lower === "z") {
         event.preventDefault();
-        if (event.shiftKey) {
-          this.#options.onRedo?.();
-        } else {
-          this.#options.onUndo?.();
+        if (!this.#options.isReadOnly?.()) {
+          if (event.shiftKey) {
+            this.#options.onRedo?.();
+          } else {
+            this.#options.onUndo?.();
+          }
         }
         return "swallowed";
       }
       if (lower === "y" && !event.shiftKey) {
         event.preventDefault();
-        this.#options.onRedo?.();
+        if (!this.#options.isReadOnly?.()) {
+          this.#options.onRedo?.();
+        }
         return "swallowed";
       }
       if (lower === "a" && !event.shiftKey) {
@@ -500,11 +528,15 @@ export class CellEditor {
       return "moved";
     }
     if (event.key === "F2") {
-      this.startEdit("F2");
+      if (!this.#options.isReadOnly?.()) {
+        this.startEdit("F2");
+      }
       return "swallowed";
     }
     if (event.key === "Backspace" || event.key === "Delete") {
-      this.#options.onClear?.();
+      if (!this.#options.isReadOnly?.()) {
+        this.#options.onClear?.();
+      }
       return "swallowed";
     }
     if (event.key === "Escape") {
@@ -528,6 +560,9 @@ export class CellEditor {
       return false;
     }
     event.preventDefault();
+    if (type !== "copy" && this.#options.isReadOnly?.()) {
+      return true;
+    }
     if (type === "paste") {
       const tsv = event.clipboardData?.getData("text/plain") ?? "";
       const html = event.clipboardData?.getData("text/html") || null;

@@ -1,0 +1,129 @@
+.page-shell {
+  min-height: 100vh;
+  background: var(--shell-background, #f6f7f9);
+  color: var(--shell-text, #111827);
+  display: flex;
+  flex-direction: column;
+}
+
+.page-nav {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 24px;
+  border-bottom: 1px solid var(--shell-line, #e2e8f0);
+  background: var(--shell-surface, #ffffff);
+  flex-wrap: wrap;
+}
+
+.page-brand {
+  font-weight: 700;
+  font-size: 16px;
+  color: inherit;
+  text-decoration: none;
+}
+
+.page-nav-links {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.page-main {
+  width: min(1040px, 94vw);
+  margin: 24px auto;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.page-card {
+  background: var(--shell-surface, #ffffff);
+  border: 1px solid var(--shell-line, #e2e8f0);
+  border-radius: 8px;
+  padding: 16px 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.page-card h1,
+.page-card h2 {
+  margin: 0;
+}
+
+.page-tabs {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.page-tab {
+  padding: 6px 12px;
+  border-radius: 6px;
+  border: 1px solid var(--shell-line, #e2e8f0);
+  background: var(--shell-surface, #ffffff);
+  color: inherit;
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.page-tab.active {
+  background: var(--shell-accent, #0f766e);
+  color: #ffffff;
+  border-color: var(--shell-accent, #0f766e);
+}
+
+.page-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.page-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--shell-line, #e2e8f0);
+  border-radius: 6px;
+  flex-wrap: wrap;
+}
+
+.page-item-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.page-muted {
+  color: var(--shell-muted, #64748b);
+  font-size: 12px;
+}
+
+.page-quota-bar {
+  width: 100%;
+  height: 10px;
+  border-radius: 999px;
+  background: var(--shell-line, #e2e8f0);
+  overflow: hidden;
+}
+
+.page-quota-fill {
+  height: 100%;
+  background: var(--shell-accent, #0f766e);
+}
+
+.page-danger {
+  border-color: var(--shell-danger, #dc2626);
+}
+
+.page-loading {
+  padding: 32px;
+  text-align: center;
+  color: var(--shell-muted, #64748b);
+}

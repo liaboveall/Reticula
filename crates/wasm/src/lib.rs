@@ -51,6 +51,7 @@ pub mod bench;
 pub mod bench_sync;
 pub mod clipboard;
 pub mod collab;
+pub mod history;
 pub mod undo;
 
 use crate::clipboard::{
@@ -2089,88 +2090,20 @@ impl Engine {
     }
 
     fn sheet_info(&mut self, sheet_id: SheetId) -> SheetInfo {
-        self.engine.ensure_sheet_styles_interned(sheet_id);
-        let wb = self.engine.workbook();
-        let sheets: Vec<SheetTabInfo> = wb
-            .live_sheets()
-            .map(|s| SheetTabInfo {
-                id: s.id().0,
-                name: String::from(s.name()),
-            })
-            .collect();
-
-        let (sheet_name, rows, cols, frozen_rows, frozen_cols, custom_rows, custom_cols, styles) =
-            wb.sheet(sheet_id).map_or_else(
-                || {
-                    (
-                        String::new(),
-                        0,
-                        0,
-                        0,
-                        0,
-                        Vec::new(),
-                        Vec::new(),
-                        vec![WireCellStyle::default()],
-                    )
-                },
-                |s| {
-                    let mut cr: Vec<(u32, u16)> = s
-                        .row_heights()
-                        .iter()
-                        .filter_map(|(&r, &px)| s.row_axis().id_to_pos(r.0).map(|pos| (pos, px)))
-                        .collect();
-                    cr.sort_unstable_by_key(|&(pos, _)| pos);
-
-                    let mut cc: Vec<(u32, u16)> = s
-                        .col_widths()
-                        .iter()
-                        .filter_map(|(&c, &px)| s.col_axis().id_to_pos(c.0).map(|pos| (pos, px)))
-                        .collect();
-                    cc.sort_unstable_by_key(|&(pos, _)| pos);
-
-                    let st: Vec<WireCellStyle> = s
-                        .styles()
-                        .entries()
-                        .iter()
-                        .copied()
-                        .map(WireCellStyle::from)
-                        .collect();
-                    (
-                        String::from(s.name()),
-                        s.rows(),
-                        s.cols(),
-                        s.frozen_rows(),
-                        s.frozen_cols(),
-                        cr,
-                        cc,
-                        st,
-                    )
-                },
-            );
-        self.last_sent_styles_len = styles.len();
-
-        let formula_count = u32::try_from(wb.formulas().len()).unwrap_or(0);
-        SheetInfo {
-            sheet: sheet_id.0,
-            sheet_name,
-            sheets,
-            rows,
-            cols,
-            frozen_rows,
-            frozen_cols,
-            custom_rows,
-            custom_cols,
-            styles,
-            formula_count,
-            seed: self.seed,
-            generation_ms: self.generation_ms,
-            can_undo: self.undo_stack.can_undo(),
-            can_redo: self.undo_stack.can_redo(),
-            undo_label: self.undo_stack.undo_label().map(String::from),
-            redo_label: self.undo_stack.redo_label().map(String::from),
-            wal_seq: self.wal_seq,
-            recalc_frozen: self.recalc_frozen,
-        }
+        let (info, styles_len) = build_sheet_info_from_engine(
+            &mut self.engine,
+            sheet_id,
+            self.seed,
+            self.generation_ms,
+            self.undo_stack.can_undo(),
+            self.undo_stack.can_redo(),
+            self.undo_stack.undo_label().map(String::from),
+            self.undo_stack.redo_label().map(String::from),
+            self.wal_seq,
+            self.recalc_frozen,
+        );
+        self.last_sent_styles_len = styles_len;
+        info
     }
 
     fn subscribe(&mut self, sheet_id: SheetId, epoch: u32, rows: (u32, u32), cols: (u32, u32)) {
@@ -2409,22 +2342,7 @@ impl Engine {
     }
 
     fn inspect_cell(&self, sheet_id: SheetId, row_id: RowId, col_id: ColId) -> Option<EngineEvent> {
-        let info = self.engine.inspect_cell(sheet_id, row_id, col_id)?;
-        let sheet = self.engine.workbook().sheet(sheet_id)?;
-        let format_code = String::from(sheet.effective_format_by_id(row_id, col_id).code_str());
-        let style = WireCellStyle::from(sheet.effective_style_by_id(row_id, col_id));
-        Some(EngineEvent::CellInspected {
-            sheet: sheet_id.0,
-            row_id: row_id.0,
-            col_id: col_id.0,
-            address: info.address,
-            raw: info.raw,
-            display: info.display,
-            is_formula: info.is_formula,
-            error: info.error,
-            format_code,
-            style,
-        })
+        build_cell_inspected(&self.engine, sheet_id, row_id, col_id)
     }
 
     fn edit_cell(
@@ -3562,6 +3480,130 @@ fn format_op_error(err: OpError) -> String {
         }
         OpError::ReadOnly => String::from("This workbook is read-only."),
     }
+}
+
+pub(crate) fn build_cell_inspected(
+    engine: &FormulaEngine,
+    sheet_id: SheetId,
+    row_id: RowId,
+    col_id: ColId,
+) -> Option<EngineEvent> {
+    let info = engine.inspect_cell(sheet_id, row_id, col_id)?;
+    let sheet = engine.workbook().sheet(sheet_id)?;
+    let format_code = String::from(sheet.effective_format_by_id(row_id, col_id).code_str());
+    let style = WireCellStyle::from(sheet.effective_style_by_id(row_id, col_id));
+    Some(EngineEvent::CellInspected {
+        sheet: sheet_id.0,
+        row_id: row_id.0,
+        col_id: col_id.0,
+        address: info.address,
+        raw: info.raw,
+        display: info.display,
+        is_formula: info.is_formula,
+        error: info.error,
+        format_code,
+        style,
+    })
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "shared SheetInfo DTO constructor for live Engine and isolated HistoryPlayer"
+)]
+pub(crate) fn build_sheet_info_from_engine(
+    engine: &mut FormulaEngine,
+    sheet_id: SheetId,
+    seed: u32,
+    generation_ms: f64,
+    can_undo: bool,
+    can_redo: bool,
+    undo_label: Option<String>,
+    redo_label: Option<String>,
+    wal_seq: u64,
+    recalc_frozen: bool,
+) -> (SheetInfo, usize) {
+    engine.ensure_sheet_styles_interned(sheet_id);
+    let wb = engine.workbook();
+    let sheets: Vec<SheetTabInfo> = wb
+        .live_sheets()
+        .map(|s| SheetTabInfo {
+            id: s.id().0,
+            name: String::from(s.name()),
+        })
+        .collect();
+
+    let (sheet_name, rows, cols, frozen_rows, frozen_cols, custom_rows, custom_cols, styles) =
+        wb.sheet(sheet_id).map_or_else(
+            || {
+                (
+                    String::new(),
+                    0,
+                    0,
+                    0,
+                    0,
+                    Vec::new(),
+                    Vec::new(),
+                    vec![WireCellStyle::default()],
+                )
+            },
+            |s| {
+                let mut cr: Vec<(u32, u16)> = s
+                    .row_heights()
+                    .iter()
+                    .filter_map(|(&r, &px)| s.row_axis().id_to_pos(r.0).map(|pos| (pos, px)))
+                    .collect();
+                cr.sort_unstable_by_key(|&(pos, _)| pos);
+
+                let mut cc: Vec<(u32, u16)> = s
+                    .col_widths()
+                    .iter()
+                    .filter_map(|(&c, &px)| s.col_axis().id_to_pos(c.0).map(|pos| (pos, px)))
+                    .collect();
+                cc.sort_unstable_by_key(|&(pos, _)| pos);
+
+                let st: Vec<WireCellStyle> = s
+                    .styles()
+                    .entries()
+                    .iter()
+                    .copied()
+                    .map(WireCellStyle::from)
+                    .collect();
+                (
+                    String::from(s.name()),
+                    s.rows(),
+                    s.cols(),
+                    s.frozen_rows(),
+                    s.frozen_cols(),
+                    cr,
+                    cc,
+                    st,
+                )
+            },
+        );
+    let styles_len = styles.len();
+    let formula_count = u32::try_from(wb.formulas().len()).unwrap_or(0);
+    let info = SheetInfo {
+        sheet: sheet_id.0,
+        sheet_name,
+        sheets,
+        rows,
+        cols,
+        frozen_rows,
+        frozen_cols,
+        custom_rows,
+        custom_cols,
+        styles,
+        formula_count,
+        seed,
+        generation_ms,
+        can_undo,
+        can_redo,
+        undo_label,
+        redo_label,
+        wal_seq,
+        recalc_frozen,
+    };
+    (info, styles_len)
 }
 
 #[cfg(test)]

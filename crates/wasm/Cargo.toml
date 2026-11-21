@@ -18,6 +18,7 @@ workspace = true
 bench = []
 
 [dependencies]
+postcard = { workspace = true }
 reticula-core = { workspace = true }
 reticula-formula = { workspace = true }
 reticula-sync = { workspace = true }
