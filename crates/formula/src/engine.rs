@@ -19,7 +19,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::hash::BuildHasherDefault;
 
-use hashbrown::HashMap;
+use hashbrown::{HashMap, HashSet};
 use reticula_core::axis::{Axis, MAX_COL_AXIS_LEN};
 use reticula_core::decimal15::{RoundingMode, round_decimal, snap_cancelled_zero};
 use reticula_core::format::NumberFormat;
@@ -49,6 +49,7 @@ use crate::value_eval::{
 };
 
 type FxMap<K, V> = HashMap<K, V, BuildHasherDefault<FxHasher>>;
+type FxSet<T> = HashSet<T, BuildHasherDefault<FxHasher>>;
 
 const STATE_CLEAN: u8 = 0;
 const STATE_DIRTY: u8 = 1;
@@ -1029,27 +1030,24 @@ impl FormulaEngine {
                     if since_check >= stride {
                         since_check = 0;
                         if self.has_pending_recalc() && should_yield(self.wave_done) {
-                            let rem = self
-                                .dirty_queue
-                                .len()
-                                .saturating_sub(self.dirty_cursor)
-                                .saturating_add(self.call_stack.len());
-                            let total = self
-                                .wave_done
-                                .saturating_add(u32::try_from(rem).unwrap_or(u32::MAX));
-                            return RecalcStatus::InProgress {
-                                done: self.wave_done,
-                                total,
-                            };
+                            return self.in_progress_status();
                         }
                     }
                 }
                 ExprOutcome::Blocked(deps) => {
+                    let count = deps.len();
                     // Push dirty precedents in reverse so the first precedent is
                     // evaluated first on top of `call_stack`.
                     for &dep_fid in deps.iter().rev() {
                         if self.state_of(dep_fid) == STATE_DIRTY {
                             self.call_stack.push(dep_fid);
+                        }
+                    }
+                    since_check = since_check.saturating_add(count.min(stride).max(1));
+                    if since_check >= stride {
+                        since_check = 0;
+                        if self.has_pending_recalc() && should_yield(self.wave_done) {
+                            return self.in_progress_status();
                         }
                     }
                 }
@@ -1066,6 +1064,21 @@ impl FormulaEngine {
         match self.recalc_with_budget(usize::MAX, |_| false) {
             RecalcStatus::Complete { recalculated } => recalculated,
             RecalcStatus::InProgress { done, .. } => done,
+        }
+    }
+
+    fn in_progress_status(&self) -> RecalcStatus {
+        let rem = self
+            .dirty_queue
+            .len()
+            .saturating_sub(self.dirty_cursor)
+            .saturating_add(self.call_stack.len());
+        let total = self
+            .wave_done
+            .saturating_add(u32::try_from(rem).unwrap_or(u32::MAX));
+        RecalcStatus::InProgress {
+            done: self.wave_done,
+            total,
         }
     }
 
@@ -1730,11 +1743,7 @@ impl FormulaEngine {
                     ExprOutcome::Ready(v) => v,
                     ExprOutcome::Cycle(c) => return ExprOutcome::Cycle(c),
                     ExprOutcome::Blocked(b) => {
-                        for f in b {
-                            if !blocked.contains(&f) {
-                                blocked.push(f);
-                            }
-                        }
+                        merge_blocked(&mut blocked, b);
                         evaluated_choices.push(None);
                         continue;
                     }
@@ -1742,13 +1751,7 @@ impl FormulaEngine {
                 if let Err(wait) = self.ensure_value_ready(&val) {
                     match wait {
                         ExprOutcome::Cycle(c) => return ExprOutcome::Cycle(c),
-                        ExprOutcome::Blocked(b) => {
-                            for f in b {
-                                if !blocked.contains(&f) {
-                                    blocked.push(f);
-                                }
-                            }
-                        }
+                        ExprOutcome::Blocked(b) => merge_blocked(&mut blocked, b),
                         ExprOutcome::Ready(_) => {}
                     }
                 }
@@ -1776,24 +1779,14 @@ impl FormulaEngine {
                 ExprOutcome::Ready(v) => v,
                 ExprOutcome::Cycle(c) => return ExprOutcome::Cycle(c),
                 ExprOutcome::Blocked(b) => {
-                    for f in b {
-                        if !all_blocked.contains(&f) {
-                            all_blocked.push(f);
-                        }
-                    }
+                    merge_blocked(&mut all_blocked, b);
                     continue;
                 }
             };
             if deref_args && let Err(wait) = self.ensure_value_ready(&val) {
                 match wait {
                     ExprOutcome::Cycle(c) => return ExprOutcome::Cycle(c),
-                    ExprOutcome::Blocked(b) => {
-                        for f in b {
-                            if !all_blocked.contains(&f) {
-                                all_blocked.push(f);
-                            }
-                        }
-                    }
+                    ExprOutcome::Blocked(b) => merge_blocked(&mut all_blocked, b),
                     ExprOutcome::Ready(_) => {}
                 }
             }
@@ -1952,6 +1945,36 @@ impl FormulaEngine {
     }
 }
 
+fn merge_blocked(dst: &mut SmallVec<[u32; 4]>, src: SmallVec<[u32; 4]>) {
+    if src.is_empty() {
+        return;
+    }
+    if dst.is_empty() {
+        *dst = src;
+        return;
+    }
+    if dst.len().saturating_add(src.len()) <= 32 {
+        for f in src {
+            if !dst.contains(&f) {
+                dst.push(f);
+            }
+        }
+        return;
+    }
+    let mut seen: FxSet<u32> = FxSet::with_capacity_and_hasher(
+        dst.len().saturating_add(src.len()),
+        BuildHasherDefault::default(),
+    );
+    for &f in dst.iter() {
+        seen.insert(f);
+    }
+    for f in src {
+        if seen.insert(f) {
+            dst.push(f);
+        }
+    }
+}
+
 /// Constructs `=ROUND(J{r}*K{r}*(1-L{r}-$V$1), 2)` directly without string
 /// lexing during cold-start sample generation.
 fn build_sample_row_formula(row: RowId) -> BoundFormula {
@@ -2015,12 +2038,14 @@ mod tests {
     use wasm_bindgen_test::wasm_bindgen_test as test;
 
     use alloc::vec;
+    use alloc::vec::Vec;
 
     use reticula_core::id::{ColId, IdRun, RowId, SheetId};
     use reticula_core::ops::Op;
     use reticula_core::value::{CalcError, Value};
+    use smallvec::SmallVec;
 
-    use super::{FormulaEngine, RecalcStatus};
+    use super::{FormulaEngine, RecalcStatus, merge_blocked};
 
     #[test]
     fn layer0_functions_cycles_short_circuit_and_structural_recalc_work() {
@@ -2165,6 +2190,60 @@ mod tests {
         assert_eq!(
             eng.workbook().content_digest(),
             eng.workbook().compute_content_digest_from_scratch()
+        );
+    }
+
+    #[test]
+    fn merge_blocked_preserves_order_and_deduplicates_large_inputs() {
+        let mut dst: SmallVec<[u32; 4]> = (0..64).collect();
+        let src: SmallVec<[u32; 4]> = (32..128).chain(10..40).collect();
+        merge_blocked(&mut dst, src);
+        let expected: Vec<u32> = (0..128).collect();
+        assert_eq!(dst.as_slice(), expected.as_slice());
+    }
+
+    #[test]
+    fn blocked_yield_resumes_cleanly_and_matches_full_recalc() {
+        let mut sliced = FormulaEngine::new();
+        let s = SheetId(0);
+        sliced.edit_cell_raw(s, RowId(0), ColId(2), "1").unwrap();
+        for r in 0..20 {
+            sliced
+                .edit_cell_raw(s, RowId(r), ColId(1), "=$C$1+1")
+                .unwrap();
+        }
+        // A1 sorts ahead of B1:B20, so evaluating A1 blocks on 20 dirty formulas while done == 0.
+        sliced
+            .edit_cell_raw(s, RowId(0), ColId(0), "=SUM(B1:B20)")
+            .unwrap();
+        sliced.recalc_all();
+
+        sliced.edit_cell_raw(s, RowId(0), ColId(2), "5").unwrap();
+        let mut yielded_on_zero_done = false;
+        let mut slices = 0_u32;
+        loop {
+            slices += 1;
+            let mut ticks = 0_u32;
+            let status = sliced.recalc_with_budget(8, |_| {
+                ticks += 1;
+                ticks >= 1
+            });
+            match status {
+                RecalcStatus::InProgress { done, .. } => {
+                    if done == 0 {
+                        yielded_on_zero_done = true;
+                    }
+                    assert!(slices < 500, "recalc must make steady progress");
+                }
+                RecalcStatus::Complete { .. } => break,
+            }
+        }
+        assert!(yielded_on_zero_done);
+
+        let fresh = FormulaEngine::from_workbook_recalc_all(sliced.workbook().clone());
+        assert_eq!(
+            sliced.workbook().logical_digest(),
+            fresh.workbook().logical_digest()
         );
     }
 }

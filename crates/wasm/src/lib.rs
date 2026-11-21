@@ -64,7 +64,7 @@ pub const MAX_CSV_IMPORT_BYTES: usize = 256 * 1024 * 1024;
 /// Time budget per recalculation slice in milliseconds (`13-m1a.md` 5.6).
 const RECALC_SLICE_BUDGET_MS: f64 = 4.0;
 /// Formula count evaluated between monotonic clock checks inside a slice.
-const RECALC_CHECK_INTERVAL: usize = 256;
+const RECALC_CHECK_INTERVAL: usize = 64;
 /// Above this many dirty cell notifications in a single wave, re-enqueue all
 /// currently subscribed pages directly instead of mapping each cell to a page.
 const BULK_DIRTY_PAGE_THRESHOLD: usize = 2_048;
@@ -2351,7 +2351,12 @@ impl Engine {
             .apply_txn(ops.to_vec())
             .map_err(format_op_error)?;
         if let Some(session) = &mut self.collab {
-            match session.queue(label, ops.to_vec(), self.last_timestamp_ms) {
+            match session.queue(
+                label,
+                ops.to_vec(),
+                self.last_timestamp_ms,
+                inverses.clone(),
+            ) {
                 Ok(seq) => Ok((inverses, Some(seq))),
                 Err(error) => {
                     for inverse in inverses.into_iter().rev() {

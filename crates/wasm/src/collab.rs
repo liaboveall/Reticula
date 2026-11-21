@@ -3,8 +3,9 @@
 use std::collections::{BTreeMap, VecDeque};
 
 use reticula_core::id::{MAX_REPLICA, SheetId, unpack_replica_id};
-use reticula_core::ops::{Op, Workbook};
+use reticula_core::ops::{InverseOp, Op, Workbook};
 use reticula_formula::binder::BoundFormula;
+use reticula_formula::engine::FormulaEngine;
 use reticula_sync::types::DEFAULT_MAX_PUSH_BYTES;
 use reticula_sync::{ClientAction, ClientSyncMachine, ConnectionState, ReplicaWatermark};
 use reticula_wire::convert_v2::{ops_from_wire_txn_v2, ops_to_wire_txn_v2};
@@ -225,12 +226,20 @@ struct LocalAnchor {
     at: LocalCursor,
 }
 
+struct EnginePendingTxn {
+    client_seq: u64,
+    ops: Vec<Op<BoundFormula>>,
+    inverses: Vec<InverseOp<BoundFormula>>,
+}
+
 pub(crate) struct CollabSession {
     pub(crate) machine: ClientSyncMachine,
     events: VecDeque<CollabEvent>,
     presences: BTreeMap<u32, PresenceEntry>,
     last_presence_sent: Option<f64>,
     local_anchor: Option<LocalAnchor>,
+    engine_pending: VecDeque<EnginePendingTxn>,
+    engine_inverses_valid: bool,
     initialized: bool,
     failed: bool,
 }
@@ -308,12 +317,15 @@ impl CollabSession {
     }
 
     fn new(machine: ClientSyncMachine, initialized: bool) -> Self {
+        let engine_inverses_valid = machine.pending_len() == 0;
         Self {
             machine,
             events: VecDeque::new(),
             presences: BTreeMap::new(),
             last_presence_sent: None,
             local_anchor: None,
+            engine_pending: VecDeque::new(),
+            engine_inverses_valid,
             initialized,
             failed: false,
         }
@@ -354,14 +366,80 @@ impl CollabSession {
         label: &str,
         ops: Vec<Op<BoundFormula>>,
         timestamp_ms: u64,
+        engine_inverses: Vec<InverseOp<BoundFormula>>,
     ) -> Result<u64, reticula_core::ops::OpError> {
         let seq = self.machine.next_client_seq();
-        let actions = self.machine.push_local(label.into(), ops, timestamp_ms)?;
+        let actions = self
+            .machine
+            .push_local(label.into(), ops.clone(), timestamp_ms)?;
+        if self.engine_inverses_valid {
+            self.engine_pending.push_back(EnginePendingTxn {
+                client_seq: seq,
+                ops,
+                inverses: engine_inverses,
+            });
+        }
         for action in actions {
             self.emit(action);
         }
         self.state();
         Ok(seq)
+    }
+
+    fn reset_engine_pending(&mut self) {
+        self.engine_pending.clear();
+        self.engine_inverses_valid = self.machine.pending_len() == 0;
+    }
+
+    fn pop_confirmed_engine_pending(&mut self) {
+        if self.machine.pending_len() == 0 {
+            self.engine_pending.clear();
+            self.engine_inverses_valid = true;
+            return;
+        }
+        let confirmed_cs = self.machine.confirmed_client_seq();
+        while self
+            .engine_pending
+            .front()
+            .is_some_and(|entry| entry.client_seq <= confirmed_cs)
+        {
+            let _ = self.engine_pending.pop_front();
+        }
+        if self.engine_pending.len() != self.machine.pending_len() {
+            self.engine_pending.clear();
+            self.engine_inverses_valid = false;
+        }
+    }
+
+    fn reconcile_engine_incremental(
+        &mut self,
+        engine: &mut FormulaEngine,
+        remote_ops: Vec<Op<BoundFormula>>,
+    ) -> bool {
+        if !self.engine_inverses_valid
+            || self.engine_pending.is_empty()
+            || self.engine_pending.len() != self.machine.pending_len()
+        {
+            return false;
+        }
+        for entry in self.engine_pending.iter_mut().rev() {
+            let invs = core::mem::take(&mut entry.inverses);
+            for inv in invs.into_iter().rev() {
+                if engine.apply_inverse(inv).is_err() {
+                    return false;
+                }
+            }
+        }
+        if engine.apply_txn(remote_ops).is_err() {
+            return false;
+        }
+        for entry in &mut self.engine_pending {
+            let Ok(new_invs) = engine.apply_txn(entry.ops.clone()) else {
+                return false;
+            };
+            entry.inverses = new_invs;
+        }
+        engine.workbook().state_digest() == self.machine.visible().state_digest()
     }
 
     fn info(&self) -> SyncCheckpointInfo {
@@ -709,6 +787,7 @@ impl Engine {
             return None;
         }
         let mut incremental_ops = None;
+        let mut was_pending = None;
         let actions = match command {
             SyncCommand::Connected => session.machine.on_connected(),
             SyncCommand::Disconnected => {
@@ -735,9 +814,8 @@ impl Engine {
                     timestamp_ms,
                     txn,
                 }) => {
-                    if session.machine.connection_state() == ConnectionState::Online
-                        && session.machine.pending_len() == 0
-                    {
+                    if session.machine.connection_state() == ConnectionState::Online {
+                        was_pending = Some(session.machine.pending_len());
                         incremental_ops =
                             ops_from_wire_txn_v2(txn.clone()).ok().map(|(_, ops)| ops);
                     }
@@ -870,11 +948,13 @@ impl Engine {
                     self.undo_stack.clear();
                     session.presences.clear();
                     session.initialized = false;
+                    session.reset_engine_pending();
                     session.emit(action);
                 }
                 action @ ClientAction::DigestMismatch { .. } => {
                     session.emit(action);
                     session.machine.reset_confirmed_for_resync();
+                    session.reset_engine_pending();
                     session.initialized = false;
                     session.presences.clear();
                     session.presence(self.subscribed_sheet);
@@ -886,10 +966,30 @@ impl Engine {
         if session.machine.connection_state() == ConnectionState::Online {
             session.initialized = true;
         }
+        if !changed
+            && (session.engine_pending.len() != session.machine.pending_len()
+                || !session.engine_inverses_valid)
+        {
+            session.pop_confirmed_engine_pending();
+        }
         let event = if changed {
-            if !incremental_ops.is_some_and(|ops| self.engine.apply_txn(ops).is_ok()) {
+            let reconciled = match (was_pending, incremental_ops) {
+                (Some(0), Some(ops)) if session.machine.pending_len() == 0 => {
+                    self.engine.apply_txn(ops).is_ok()
+                        && self.engine.workbook().state_digest()
+                            == session.machine.visible().state_digest()
+                }
+                (Some(prev_pending), Some(ops))
+                    if prev_pending > 0 && session.machine.pending_len() == prev_pending =>
+                {
+                    session.reconcile_engine_incremental(&mut self.engine, ops)
+                }
+                _ => false,
+            };
+            if !reconciled {
                 self.engine
                     .replace_reconciled_workbook(session.machine.visible().clone());
+                session.reset_engine_pending();
                 self.pending_aux_event = None;
                 for page in self.subscribed_pages.clone() {
                     self.enqueue_page(page);
