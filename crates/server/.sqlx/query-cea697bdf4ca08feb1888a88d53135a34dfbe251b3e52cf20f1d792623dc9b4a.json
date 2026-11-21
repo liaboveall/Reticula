@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE share_links SET consumed_by = $2 WHERE consumed_by = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "cea697bdf4ca08feb1888a88d53135a34dfbe251b3e52cf20f1d792623dc9b4a"
+}

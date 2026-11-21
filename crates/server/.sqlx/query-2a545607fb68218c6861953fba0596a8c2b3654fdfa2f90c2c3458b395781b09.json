@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT u.id, u.name, u.avatar_url FROM sessions s JOIN users u ON u.id = s.user_id\n             WHERE s.token_hash = $1 AND s.expires_at > now()",
+  "query": "SELECT u.id, u.name, u.avatar_url FROM sessions s JOIN users u ON u.id = s.user_id\n             WHERE s.token_hash = $1 AND s.expires_at > now() AND u.id <> $2",
   "describe": {
     "columns": [
       {
@@ -39,7 +39,8 @@
     ],
     "parameters": {
       "Left": [
-        "Bytea"
+        "Bytea",
+        "Uuid"
       ]
     },
     "nullable": [
@@ -48,5 +49,5 @@
       false
     ]
   },
-  "hash": "894bbd3c101ae794fec7d8d45485b1c9549a1642f274f8e9ee95a9f8faabae3f"
+  "hash": "2a545607fb68218c6861953fba0596a8c2b3654fdfa2f90c2c3458b395781b09"
 }

@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM versions WHERE workbook_id = $1 AND branch_id = $2 AND id = $3",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "26ed99ddc66b4db07bfdd61911c8c0c94607cf20f4a0e593bbfdf1971460f38f"
+}

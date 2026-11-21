@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT est_bytes FROM workbooks WHERE id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "est_bytes",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "workbooks",
+            "name": "est_bytes"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "45b1c2257c321c478f5efb673cdc1f1d0d97f1707df5461ed3ae91b41e9eb759"
+}

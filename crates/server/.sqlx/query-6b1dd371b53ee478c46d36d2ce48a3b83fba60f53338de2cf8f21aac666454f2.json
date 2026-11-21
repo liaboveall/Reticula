@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT workbook_id FROM members WHERE user_id = $1 ORDER BY workbook_id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "workbook_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "members",
+            "name": "workbook_id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "6b1dd371b53ee478c46d36d2ce48a3b83fba60f53338de2cf8f21aac666454f2"
+}

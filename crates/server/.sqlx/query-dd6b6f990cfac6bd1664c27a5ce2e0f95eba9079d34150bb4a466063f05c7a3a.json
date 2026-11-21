@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT w.title, w.log_epoch, m.role,\n                    COALESCE((SELECT MAX(seq) FROM txns WHERE workbook_id = w.id AND branch_id = $3), 0) AS \"head!\"\n             FROM members m JOIN workbooks w ON w.id = m.workbook_id WHERE m.workbook_id = $1 AND m.user_id = $2",
+  "query": "SELECT w.title, w.visibility, w.log_epoch, m.role,\n                    COALESCE((SELECT MAX(seq) FROM txns WHERE workbook_id = w.id AND branch_id = $3), 0) AS \"head!\"\n             FROM members m JOIN workbooks w ON w.id = m.workbook_id WHERE m.workbook_id = $1 AND m.user_id = $2",
   "describe": {
     "columns": [
       {
@@ -16,6 +16,17 @@
       },
       {
         "ordinal": 1,
+        "name": "visibility",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "workbooks",
+            "name": "visibility"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
         "name": "log_epoch",
         "type_info": "Int2",
         "origin": {
@@ -26,7 +37,7 @@
         }
       },
       {
-        "ordinal": 2,
+        "ordinal": 3,
         "name": "role",
         "type_info": "Text",
         "origin": {
@@ -37,7 +48,7 @@
         }
       },
       {
-        "ordinal": 3,
+        "ordinal": 4,
         "name": "head!",
         "type_info": "Int8",
         "origin": "Expression"
@@ -54,8 +65,9 @@
       false,
       false,
       false,
+      false,
       null
     ]
   },
-  "hash": "8565b3153970d547cabdd28fbe58f87eb7c569c4340d06b58a486c30891d2f19"
+  "hash": "dd6b6f990cfac6bd1664c27a5ce2e0f95eba9079d34150bb4a466063f05c7a3a"
 }

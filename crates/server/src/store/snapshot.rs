@@ -1,5 +1,6 @@
 //! Writes immutable RTCLSNAP files before publishing their PostgreSQL metadata.
 
+use std::collections::BTreeSet;
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
@@ -128,18 +129,145 @@ impl SnapshotFile {
         Ok(record)
     }
 
-    pub(super) async fn publish(&self, pool: &PgPool) -> Result<(), StoreError> {
-        sqlx::query!(
-            "INSERT INTO snapshots (workbook_id, branch_id, seq, format_version, storage_key, size_bytes, sha256)
-             VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT DO NOTHING",
-            self.workbook_id, MAIN_BRANCH, self.seq, self.format_version,
-            self.storage_key, self.size_bytes, &self.sha256,
-        ).execute(pool).await?;
+    pub(super) async fn publish(&self, pool: &PgPool) -> Result<bool, StoreError> {
+        let mut db = pool.begin().await?;
+        let inserted = self.publish_in_tx(&mut db).await?;
+        if inserted {
+            sqlx::query!(
+                "UPDATE users u SET storage_bytes = u.storage_bytes + $2
+                 FROM workbooks w WHERE w.id = $1 AND u.id = w.owner_id",
+                self.workbook_id,
+                self.size_bytes,
+            )
+            .execute(&mut *db)
+            .await?;
+        }
+        db.commit().await?;
         if at(pool, self.workbook_id, self.seq).await?.as_ref() != Some(self) {
             return Err(StoreError::Invalid("snapshot metadata mismatch"));
         }
-        Ok(())
+        Ok(inserted)
     }
+
+    pub(super) async fn publish_in_tx(&self, db: &mut PgConnection) -> Result<bool, StoreError> {
+        let inserted = sqlx::query_scalar!(
+            "INSERT INTO snapshots (workbook_id, branch_id, seq, format_version, storage_key, size_bytes, sha256)
+             VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT DO NOTHING RETURNING size_bytes",
+            self.workbook_id, MAIN_BRANCH, self.seq, self.format_version,
+            self.storage_key, self.size_bytes, &self.sha256,
+        ).fetch_optional(&mut *db).await?;
+        Ok(inserted.is_some())
+    }
+}
+
+pub(super) async fn prune(
+    db: &mut PgConnection,
+    doc: Uuid,
+    owner_id: Uuid,
+    keep_recent: usize,
+) -> Result<(Vec<String>, i64), StoreError> {
+    let rows = sqlx::query!(
+        "SELECT seq, storage_key, size_bytes FROM snapshots
+         WHERE workbook_id = $1 AND branch_id = $2 ORDER BY seq ASC",
+        doc,
+        MAIN_BRANCH,
+    )
+    .fetch_all(&mut *db)
+    .await?;
+    if rows.len() <= keep_recent {
+        return Ok((Vec::new(), 0));
+    }
+
+    let version_seqs = sqlx::query_scalar!(
+        "SELECT DISTINCT seq FROM versions WHERE workbook_id = $1 AND branch_id = $2 ORDER BY seq ASC",
+        doc,
+        MAIN_BRANCH,
+    )
+    .fetch_all(&mut *db)
+    .await?;
+
+    let mut keep = BTreeSet::new();
+    if rows.first().is_some_and(|r| r.seq == 0) {
+        keep.insert(0);
+    }
+    for v_seq in version_seqs {
+        if let Some(base) = rows.iter().rfind(|r| r.seq <= v_seq) {
+            keep.insert(base.seq);
+        }
+    }
+    let mut seen_buckets = BTreeSet::new();
+    for row in &rows {
+        if row.seq > 0 && seen_buckets.insert(row.seq / 5_000) {
+            keep.insert(row.seq);
+        }
+    }
+    for row in rows.iter().rev().take(keep_recent) {
+        keep.insert(row.seq);
+    }
+
+    let mut prune_seqs = Vec::new();
+    let mut prune_keys = Vec::new();
+    let mut reclaimed = 0_i64;
+    for row in rows {
+        if !keep.contains(&row.seq) {
+            prune_seqs.push(row.seq);
+            prune_keys.push(row.storage_key);
+            reclaimed = reclaimed.saturating_add(row.size_bytes);
+        }
+    }
+    if prune_seqs.is_empty() {
+        return Ok((Vec::new(), 0));
+    }
+
+    sqlx::query!(
+        "DELETE FROM snapshots WHERE workbook_id = $1 AND branch_id = $2 AND seq = ANY($3)",
+        doc,
+        MAIN_BRANCH,
+        &prune_seqs,
+    )
+    .execute(&mut *db)
+    .await?;
+    sqlx::query!(
+        "UPDATE users SET storage_bytes = GREATEST(0, storage_bytes - $2) WHERE id = $1",
+        owner_id,
+        reclaimed,
+    )
+    .execute(&mut *db)
+    .await?;
+    Ok((prune_keys, reclaimed))
+}
+
+pub(super) fn sweep_stale_tmp_files(data_dir: &Path) -> io::Result<usize> {
+    let mut removed = 0_usize;
+    let mut dirs = vec![data_dir.to_path_buf()];
+    let snapshots_dir = data_dir.join("snapshots");
+    if snapshots_dir.is_dir() {
+        dirs.push(snapshots_dir.clone());
+        for entry in fs::read_dir(&snapshots_dir)? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() {
+                dirs.push(entry.path());
+            }
+        }
+    }
+    for dir in dirs {
+        if !dir.is_dir() {
+            continue;
+        }
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            if entry.file_type()?.is_file()
+                && entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with(".tmp") || name.ends_with(".tmp"))
+                && fs::remove_file(entry.path()).is_ok()
+            {
+                removed = removed.saturating_add(1);
+            }
+        }
+    }
+    Ok(removed)
 }
 
 pub(super) async fn at(

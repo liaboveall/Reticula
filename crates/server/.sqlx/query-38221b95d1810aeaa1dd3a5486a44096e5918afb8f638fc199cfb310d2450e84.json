@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM snapshots WHERE workbook_id = $1 AND branch_id = $2 AND seq = ANY($3)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Int8Array"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "38221b95d1810aeaa1dd3a5486a44096e5918afb8f638fc199cfb310d2450e84"
+}

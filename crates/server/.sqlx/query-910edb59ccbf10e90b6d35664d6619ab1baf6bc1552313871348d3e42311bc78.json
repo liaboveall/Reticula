@@ -1,0 +1,103 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT w.id, w.title, w.visibility, m.role,\n                    COALESCE((SELECT MAX(seq) FROM txns WHERE workbook_id = w.id AND branch_id = $2), 0) AS \"head_seq!\",\n                    w.est_bytes, w.log_bytes,\n                    to_char(w.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS \"updated_at!\"\n             FROM members m\n             JOIN workbooks w ON w.id = m.workbook_id\n             WHERE m.user_id = $1\n             ORDER BY w.updated_at DESC, w.id ASC",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "workbooks",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "title",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "workbooks",
+            "name": "title"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "visibility",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "workbooks",
+            "name": "visibility"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "role",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "members",
+            "name": "role"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "head_seq!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 5,
+        "name": "est_bytes",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "workbooks",
+            "name": "est_bytes"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "log_bytes",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "workbooks",
+            "name": "log_bytes"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "updated_at!",
+        "type_info": "Text",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      null,
+      false,
+      false,
+      null
+    ]
+  },
+  "hash": "910edb59ccbf10e90b6d35664d6619ab1baf6bc1552313871348d3e42311bc78"
+}

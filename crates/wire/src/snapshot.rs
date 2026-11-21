@@ -794,13 +794,44 @@ pub fn encode_seed_stub_v1(
 /// Decodes and validates either an `RTCLSNAP` v1 snapshot (full or `SeedOrigin`
 /// stub) or a legacy M1a `RTCLSNAP` v0 snapshot into a ready [`DecodedSnapshot`].
 pub fn decode_snapshot_any(bytes: &[u8]) -> Result<DecodedSnapshot, SnapshotError> {
+    decode_snapshot_any_with_limits(bytes, usize::MAX, MAX_WORKBOOK_BYTES)
+}
+
+/// Decodes and validates a snapshot for collaborative import, enforcing cell
+/// and estimated memory limits before allocating or expanding `SeedOrigin` stubs.
+pub fn decode_snapshot_for_collab(
+    bytes: &[u8],
+    max_cells: usize,
+    max_bytes: usize,
+) -> Result<DecodedSnapshot, SnapshotError> {
+    decode_snapshot_any_with_limits(bytes, max_cells, max_bytes.min(MAX_WORKBOOK_BYTES))
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "sequential snapshot container validation and pre-allocation checks"
+)]
+fn decode_snapshot_any_with_limits(
+    bytes: &[u8],
+    max_cells: usize,
+    max_bytes: usize,
+) -> Result<DecodedSnapshot, SnapshotError> {
+    let section_cap = max_bytes
+        .saturating_mul(2)
+        .clamp(1024 * 1024, MAX_SECTION_UNCOMPRESSED);
     let magic = bytes.get(0..8).ok_or(SnapshotError::Truncated)?;
     if magic != SNAPSHOT_MAGIC {
         return Err(SnapshotError::BadMagic);
     }
     let version = read_u32_le(bytes, 8)?;
     if version == SNAPSHOT_VERSION_V0 {
+        if bytes.len() > max_bytes.saturating_mul(2).max(1024 * 1024) {
+            return Err(SnapshotError::Validation);
+        }
         let (wb, kernel_version): (Workbook<BoundFormula>, String) = decode_snapshot_v0(bytes)?;
+        if wb.populated_cell_count() > max_cells as u64 || wb.estimated_bytes() > max_bytes {
+            return Err(SnapshotError::Validation);
+        }
         return Ok(DecodedSnapshot {
             engine: FormulaEngine::from_workbook_clean(wb),
             kernel_version,
@@ -855,7 +886,9 @@ pub fn decode_snapshot_any(bytes: &[u8]) -> Result<DecodedSnapshot, SnapshotErro
     }
 
     let watermarks = match dir.get(&SECTION_WATERMARKS_V1) {
-        Some(raw) => decode_compressed_section::<WireWatermarksSectionV1>(raw)?.entries,
+        Some(raw) => {
+            decode_compressed_section::<WireWatermarksSectionV1>(raw, section_cap)?.entries
+        }
         None => Vec::new(),
     };
 
@@ -864,11 +897,21 @@ pub fn decode_snapshot_any(bytes: &[u8]) -> Result<DecodedSnapshot, SnapshotErro
         if dir.contains_key(&SECTION_COLUMNS_V1) {
             return Err(SnapshotError::InvalidDirectory);
         }
-        let wire_origin: WireSeedOriginV1 = decode_compressed_section(stub_raw)?;
+        let wire_origin: WireSeedOriginV1 = decode_compressed_section(stub_raw, section_cap)?;
         if wire_origin.rows > reticula_core::axis::MAX_ROW_AXIS_LEN {
             return Err(SnapshotError::Validation);
         }
+        let min_rows = wire_origin.rows as usize;
+        // Sample rows populate at least 18 columns and allocate >=160 B/row across 20 columns.
+        if min_rows.saturating_mul(18) > max_cells || min_rows.saturating_mul(160) > max_bytes {
+            return Err(SnapshotError::Validation);
+        }
         let engine = FormulaEngine::open_sample(wire_origin.seed, wire_origin.rows);
+        if engine.workbook().populated_cell_count() > max_cells as u64
+            || engine.workbook().estimated_bytes() > max_bytes
+        {
+            return Err(SnapshotError::Validation);
+        }
         return Ok(DecodedSnapshot {
             engine,
             kernel_version,
@@ -881,16 +924,19 @@ pub fn decode_snapshot_any(bytes: &[u8]) -> Result<DecodedSnapshot, SnapshotErro
         dir.get(&SECTION_STRINGS_V1)
             .copied()
             .ok_or(SnapshotError::MissingSection)?,
+        section_cap,
     )?;
     let axes_sec: WireAxesMetricsSectionV1 = decode_compressed_section(
         dir.get(&SECTION_AXES_METRICS_V1)
             .copied()
             .ok_or(SnapshotError::MissingSection)?,
+        section_cap,
     )?;
     let styles_sec: WireStylesSectionV1 = decode_compressed_section(
         dir.get(&SECTION_STYLES_V1)
             .copied()
             .ok_or(SnapshotError::MissingSection)?,
+        section_cap,
     )?;
     let cols_slice = dir
         .get(&SECTION_COLUMNS_V1)
@@ -901,17 +947,21 @@ pub fn decode_snapshot_any(bytes: &[u8]) -> Result<DecodedSnapshot, SnapshotErro
         .copied()
         .ok_or(SnapshotError::MissingSection)?;
     let seed_origin: Option<SeedOrigin> = match dir.get(&SECTION_SEED_ORIGIN_V1) {
-        Some(raw) => Some(decode_compressed_section::<WireSeedOriginV1>(raw)?.into()),
+        Some(raw) => Some(decode_compressed_section::<WireSeedOriginV1>(raw, section_cap)?.into()),
         None => None,
     };
 
     // Pre-warm linear memory in one contiguous step so decoding large
     // snapshots on WebAssembly does not invoke `memory.grow` thousands of times.
     let formula_count_hint = read_u32_le(formulas_slice, 0).unwrap_or(0) as usize;
+    if formula_count_hint > max_cells {
+        return Err(SnapshotError::Validation);
+    }
     let reserve_hint = cols_slice
         .len()
         .saturating_mul(5)
         .saturating_add(formula_count_hint.saturating_mul(600))
+        .min(max_bytes)
         .min(768 * 1024 * 1024);
     if reserve_hint >= 4 * 1024 * 1024 {
         let _ = reticula_core::memory::try_reserve_heap(reserve_hint);
@@ -943,6 +993,7 @@ pub fn decode_snapshot_any(bytes: &[u8]) -> Result<DecodedSnapshot, SnapshotErro
 
     let mut sheets = Vec::with_capacity(sheet_count);
     let mut running_bytes = 0usize;
+    let mut running_cells = 0usize;
 
     for ((axes_w, strings_w), styles_w) in axes_sec
         .sheets
@@ -977,6 +1028,9 @@ pub fn decode_snapshot_any(bytes: &[u8]) -> Result<DecodedSnapshot, SnapshotErro
                 row_slots.slot_bound(),
                 string_bound,
                 &mut decode_scratch,
+                section_cap,
+                &mut running_cells,
+                max_cells,
             )?;
             columns.push(col);
         }
@@ -1096,7 +1150,7 @@ pub fn decode_snapshot_any(bytes: &[u8]) -> Result<DecodedSnapshot, SnapshotErro
         }
 
         running_bytes = running_bytes.saturating_add(sheet.estimated_bytes());
-        if running_bytes > MAX_WORKBOOK_BYTES {
+        if running_bytes > max_bytes {
             return Err(SnapshotError::Validation);
         }
         sheets.push(sheet);
@@ -1106,7 +1160,13 @@ pub fn decode_snapshot_any(bytes: &[u8]) -> Result<DecodedSnapshot, SnapshotErro
         return Err(SnapshotError::InvalidDirectory);
     }
 
-    let formulas = decode_formulas_section(formulas_slice, &mut decode_scratch, running_bytes)?;
+    let formulas = decode_formulas_section(
+        formulas_slice,
+        &mut decode_scratch,
+        running_bytes,
+        max_bytes,
+        section_cap,
+    )?;
 
     let workbook = Workbook::from_parts(
         sheets,
@@ -1116,6 +1176,11 @@ pub fn decode_snapshot_any(bytes: &[u8]) -> Result<DecodedSnapshot, SnapshotErro
         seed_origin,
     )
     .map_err(|_: OpError| SnapshotError::Validation)?;
+
+    if workbook.populated_cell_count() > max_cells as u64 || workbook.estimated_bytes() > max_bytes
+    {
+        return Err(SnapshotError::Validation);
+    }
 
     Ok(DecodedSnapshot {
         engine: FormulaEngine::from_workbook_clean(workbook),
@@ -1279,12 +1344,19 @@ fn encode_block_chunk(
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "streaming column decode enforces cell limits incrementally"
+)]
 fn decode_one_column(
     bytes: &[u8],
     cursor: &mut usize,
     max_row_slot: u32,
     string_bound: u32,
     scratch: &mut Vec<u8>,
+    section_cap: usize,
+    running_cells: &mut usize,
+    max_cells: usize,
 ) -> Result<Column, SnapshotError> {
     let col_len = read_u32_le(bytes, *cursor)?;
     let total_blocks = usize::try_from(read_u32_le(bytes, cursor.saturating_add(4))?)
@@ -1331,7 +1403,7 @@ fn decode_one_column(
             .ok_or(SnapshotError::Truncated)?;
         *cursor = comp_end;
 
-        decompress_into_scratch(lz4_slice, raw_len, scratch)?;
+        decompress_into_scratch(lz4_slice, raw_len, scratch, section_cap)?;
         let mut rc = 0_usize;
         for _ in 0..block_count {
             let tag = *scratch.get(rc).ok_or(SnapshotError::Codec)?;
@@ -1356,6 +1428,12 @@ fn decode_one_column(
                         if !validate_cell_word(bits, string_bound) {
                             return Err(SnapshotError::Validation);
                         }
+                        if bits != Value::EMPTY_BITS {
+                            *running_cells = running_cells.saturating_add(1);
+                            if *running_cells > max_cells {
+                                return Err(SnapshotError::Validation);
+                            }
+                        }
                         entries.push((idx, bits));
                     }
                     blocks.push(Block::Sparse(entries.into()));
@@ -1370,6 +1448,12 @@ fn decode_one_column(
                         let bits = u64::from_le_bytes(*src);
                         if !validate_cell_word(bits, string_bound) {
                             return Err(SnapshotError::Validation);
+                        }
+                        if bits != Value::EMPTY_BITS {
+                            *running_cells = running_cells.saturating_add(1);
+                            if *running_cells > max_cells {
+                                return Err(SnapshotError::Validation);
+                            }
                         }
                         *dst = bits;
                     }
@@ -1481,6 +1565,8 @@ fn decode_formulas_section(
     bytes: &[u8],
     scratch: &mut Vec<u8>,
     mut running_bytes: usize,
+    max_bytes: usize,
+    section_cap: usize,
 ) -> Result<BTreeMap<WorkbookCellKey, BoundFormula>, SnapshotError> {
     let total_formulas =
         usize::try_from(read_u32_le(bytes, 0)?).map_err(|_| SnapshotError::Validation)?;
@@ -1513,7 +1599,7 @@ fn decode_formulas_section(
             .ok_or(SnapshotError::Truncated)?;
         cursor = comp_end;
 
-        decompress_into_scratch(lz4_slice, raw_len, scratch)?;
+        decompress_into_scratch(lz4_slice, raw_len, scratch, section_cap)?;
         let entries: Vec<DirectFormulaEntry> =
             postcard::from_bytes(scratch).map_err(|_| SnapshotError::Codec)?;
         if entries.is_empty() || entries.len() > FORMULAS_PER_CHUNK {
@@ -1527,7 +1613,7 @@ fn decode_formulas_section(
                 .validate()
                 .map_err(|_| SnapshotError::Validation)?;
             running_bytes = running_bytes.saturating_add(entry.formula.estimated_bytes());
-            if running_bytes > MAX_WORKBOOK_BYTES {
+            if running_bytes > max_bytes {
                 return Err(SnapshotError::Validation);
             }
             let key = (SheetId(entry.sheet), RowId(entry.row), ColId(entry.col));
@@ -1570,12 +1656,15 @@ fn encode_compressed_section<T: Serialize>(value: &T) -> Result<Vec<u8>, Snapsho
     Ok(out)
 }
 
-fn decode_compressed_section<T: DeserializeOwned>(compressed: &[u8]) -> Result<T, SnapshotError> {
+fn decode_compressed_section<T: DeserializeOwned>(
+    compressed: &[u8],
+    section_cap: usize,
+) -> Result<T, SnapshotError> {
     let expected_len =
         usize::try_from(read_u32_le(compressed, 0)?).map_err(|_| SnapshotError::Validation)?;
     let lz4_body = compressed.get(4..).ok_or(SnapshotError::Truncated)?;
     let mut scratch = Vec::new();
-    decompress_into_scratch(lz4_body, expected_len, &mut scratch)?;
+    decompress_into_scratch(lz4_body, expected_len, &mut scratch, section_cap)?;
     postcard::from_bytes(&scratch).map_err(|_| SnapshotError::Codec)
 }
 
@@ -1583,8 +1672,9 @@ fn decompress_into_scratch(
     lz4_body: &[u8],
     expected_len: usize,
     scratch: &mut Vec<u8>,
+    section_cap: usize,
 ) -> Result<(), SnapshotError> {
-    if expected_len > MAX_SECTION_UNCOMPRESSED {
+    if expected_len > section_cap {
         return Err(SnapshotError::Validation);
     }
     scratch.clear();
@@ -1913,5 +2003,42 @@ mod tests {
             assert_eq!(direct.col, (idx as u64) + 20);
             assert_eq!(&direct.formula, expected);
         }
+    }
+
+    #[test]
+    fn collab_prevalidation_rejects_oversized_seed_stub_and_snapshots() {
+        use reticula_core::ops::SeedOrigin;
+
+        use super::{SnapshotError, decode_snapshot_for_collab};
+
+        let million_stub = encode_seed_stub_v1(
+            SeedOrigin {
+                seed: 42,
+                rows: 1_000_000,
+                generator_version: 1,
+            },
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            decode_snapshot_for_collab(&million_stub, 2_000_000, 64 * 1024 * 1024).err(),
+            Some(SnapshotError::Validation)
+        );
+
+        let small_sample = FormulaEngine::open_sample(42, 250);
+        let small_stub =
+            encode_seed_stub_v1(small_sample.workbook().seed_origin().unwrap(), &[]).unwrap();
+        assert!(decode_snapshot_for_collab(&small_stub, 2_000_000, 64 * 1024 * 1024).is_ok());
+
+        let v1_bytes = encode_snapshot_v1(small_sample.workbook(), &[]).unwrap();
+        assert_eq!(
+            decode_snapshot_for_collab(&v1_bytes, 1_000, 64 * 1024 * 1024).err(),
+            Some(SnapshotError::Validation)
+        );
+        assert_eq!(
+            decode_snapshot_for_collab(&v1_bytes, 2_000_000, 1024).err(),
+            Some(SnapshotError::Validation)
+        );
+        assert!(decode_snapshot_for_collab(&v1_bytes, 2_000_000, 64 * 1024 * 1024).is_ok());
     }
 }

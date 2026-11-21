@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE users SET storage_bytes = GREATEST(0, storage_bytes - $2) WHERE id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "c222c940e4af717c123ed5d13c90e382b10e428c3a14b0495c86255552f298c0"
+}

@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT EXISTS(\n                    SELECT 1 FROM share_links\n                    WHERE workbook_id = $1 AND role = 'viewer' AND revoked_at IS NULL\n                      AND (expires_at IS NULL OR expires_at > now())\n                      AND (NOT single_use OR consumed_by IS NULL)\n                ) AS \"exists!\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "exists!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "0ce08e0219397b38abbe36c65c3ba495ee8e25ca5bf2b01fa2c475e77e78039d"
+}

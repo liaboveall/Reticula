@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT workbook_id, single_use, consumed_by FROM share_links\n             WHERE token_hash = $1 AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > clock_timestamp())\n             FOR UPDATE",
+  "query": "SELECT workbook_id, role, single_use, consumed_by FROM share_links\n             WHERE token_hash = $1 AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > clock_timestamp())\n             FOR UPDATE",
   "describe": {
     "columns": [
       {
@@ -16,6 +16,17 @@
       },
       {
         "ordinal": 1,
+        "name": "role",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "share_links",
+            "name": "role"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
         "name": "single_use",
         "type_info": "Bool",
         "origin": {
@@ -26,7 +37,7 @@
         }
       },
       {
-        "ordinal": 2,
+        "ordinal": 3,
         "name": "consumed_by",
         "type_info": "Uuid",
         "origin": {
@@ -45,8 +56,9 @@
     "nullable": [
       false,
       false,
+      false,
       true
     ]
   },
-  "hash": "1fb7d06457fed5b30a10b618ae21eb9356c0e1217900ef1241c048300f98bfd3"
+  "hash": "cda9d7114649ab092218e8a93f05fc237e2aa1274eff4c8379247c3c7a02c898"
 }
