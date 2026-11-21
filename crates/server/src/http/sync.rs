@@ -21,7 +21,9 @@ use tokio::time::{Instant, MissedTickBehavior, interval_at, sleep_until, timeout
 use uuid::Uuid;
 
 use super::{ApiError, ApiState, auth};
-use crate::docs::{CLOSE_SERVER_BUSY, RoomConnection, RoomError, RoomOutbound};
+use crate::docs::{
+    CLOSE_ACCESS_REVOKED, CLOSE_SERVER_BUSY, RoomConnection, RoomError, RoomOutbound,
+};
 use crate::ops::{AnonWsPermit, client_ip_parts};
 
 const HEARTBEAT: Duration = Duration::from_secs(30);
@@ -223,6 +225,7 @@ async fn run_connection(
                 if let Some(hash) = session_hash
                     && !revoked.is_ok_and(|revoked| revoked != hash)
                 {
+                    close_ws(socket, CLOSE_ACCESS_REVOKED, "Access revoked").await;
                     break;
                 }
             }
@@ -231,6 +234,7 @@ async fn run_connection(
                 if let Some(hash) = session_hash
                     && !state.store.session_user(&hash).await.is_ok_and(|user| user.is_some())
                 {
+                    close_ws(socket, CLOSE_ACCESS_REVOKED, "Session expired").await;
                     break;
                 }
                 ping = ping.wrapping_add(1);
