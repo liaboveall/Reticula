@@ -65,6 +65,8 @@ Commands:
                           (server, PostgreSQL, volumes, resource limits) and run
                           tests/stack against it: sync, a killed server, a restarted
                           database, recreated containers.
+  drill [--skip-image]    End-to-end backup, missing-snapshot window cleanup,
+                          log_epoch bump (0 -> 1), and T1-ahead client recovery drill.
   build [--skip-wasm] [--check-budget]
                           Production build with preloads, precompressed assets and size budget check.
   e2e [--browser <name>] [--skip-build]
@@ -144,6 +146,7 @@ fn run(args: &[String]) -> Result {
         "db" => stack::db(rest),
         "serve" => stack::serve(&Flags::parse(rest, &["skip-build"], &["origin"])?),
         "stack" => stack::stack(&Flags::parse(rest, &["skip-image", "keep"], &[])?),
+        "drill" => stack::drill(&Flags::parse(rest, &["skip-image"], &[])?),
         "build" => build(&Flags::parse(rest, &["skip-wasm", "check-budget"], &[])?),
         "e2e" => e2e(&Flags::parse(rest, &["skip-build"], &["browser"])?),
         "ci" => {

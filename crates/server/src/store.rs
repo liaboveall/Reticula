@@ -653,7 +653,26 @@ impl Store {
         .fetch_optional(&mut *db)
         .await?
         .ok_or(StoreError::NotFound)?;
-        let snapshot = snapshot::latest(&mut db, doc).await?;
+        let snapshots = snapshot::list_desc(&mut db, doc).await?;
+        let mut snapshot = None;
+        for candidate in snapshots {
+            if tokio::fs::try_exists(self.data_dir.join(candidate.storage_key())).await? {
+                snapshot = Some(candidate);
+                break;
+            }
+            if candidate.seq == 0 {
+                return Err(StoreError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "base snapshot seq=0 missing on disk",
+                )));
+            }
+            tracing::warn!(
+                workbook_id = %doc,
+                seq = candidate.seq,
+                storage_key = candidate.storage_key(),
+                "snapshot file missing on disk; falling back to earlier snapshot and replaying txns"
+            );
+        }
         let snapshot_seq = snapshot.as_ref().map_or(0, |file| file.seq);
         let tail = sqlx::query!(
             "SELECT seq, replica, client_seq, user_id, payload FROM txns

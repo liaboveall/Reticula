@@ -1469,4 +1469,79 @@ mod tests {
                 .any(|a| matches!(a, ClientAction::PersistTruncatedPending(rem) if rem.is_empty()))
         );
     }
+
+    #[test]
+    fn imported_non_empty_base_requires_snapshot_on_seq_zero_hello() {
+        let mut base = reticula_core::ops::Workbook::new();
+        base.apply(set_num(0, 0, 42.0)).unwrap();
+
+        let mut server = ServerDocMachine::from_snapshot_and_log(
+            DOC_ID,
+            BRANCH_ID,
+            String::from("/api/w"),
+            0,
+            0,
+            base.clone(),
+            1,
+            Vec::new(),
+            Vec::new(),
+            ServerLimits::default(),
+        )
+        .unwrap();
+
+        let hello = WireSyncFrameV1::Hello {
+            protocol_version: 1,
+            doc_id: DOC_ID,
+            branch_id: BRANCH_ID,
+            replica: None,
+            last_applied_seq: 0,
+            known_epoch: 0,
+        };
+        let welcome = server
+            .on_hello(USER_A, Some(MemberRole::Owner), &hello)
+            .unwrap();
+        assert!(matches!(
+            welcome,
+            WireSyncFrameV1::Welcome {
+                head_seq: 0,
+                catchup: WireCatchupV1::SnapshotRequired {
+                    snapshot_seq: 0,
+                    ..
+                },
+                ..
+            }
+        ));
+
+        let mut alice = ClientSyncMachine::new(DOC_ID, BRANCH_ID);
+        let acts = alice.on_welcome(welcome);
+        assert!(acts.iter().any(|a| matches!(
+            a,
+            ClientAction::RequestSnapshot {
+                snapshot_seq: 0,
+                ..
+            }
+        )));
+        alice.install_snapshot(0, base, &[], Vec::new());
+        assert_eq!(
+            alice.confirmed().state_digest(),
+            server.workbook().state_digest()
+        );
+
+        let mut empty_server = ServerDocMachine::new(
+            DOC_ID,
+            BRANCH_ID,
+            String::from("/api/w"),
+            ServerLimits::default(),
+        );
+        let empty_welcome = empty_server
+            .on_hello(USER_A, Some(MemberRole::Owner), &hello)
+            .unwrap();
+        assert!(matches!(
+            empty_welcome,
+            WireSyncFrameV1::Welcome {
+                catchup: WireCatchupV1::Txns { txns, .. },
+                ..
+            } if txns.is_empty()
+        ));
+    }
 }

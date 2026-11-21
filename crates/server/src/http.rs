@@ -151,6 +151,31 @@ pub fn router(state: ApiState) -> Router {
         .with_state(state)
 }
 
+fn render_metrics_response(api: Option<ApiState>) -> Response {
+    let Some(api) = api else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "collaboration storage unavailable\n",
+        )
+            .into_response();
+    };
+    (
+        StatusCode::OK,
+        [
+            (
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8"),
+            ),
+            (
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("private, no-store"),
+            ),
+        ],
+        api.render_metrics(),
+    )
+        .into_response()
+}
+
 pub fn metrics_route(api: Option<ApiState>) -> Router {
     Router::new().route(
         "/metrics",
@@ -164,29 +189,19 @@ pub fn metrics_route(api: Option<ApiState>) -> Router {
                 if !loopback {
                     return (StatusCode::FORBIDDEN, "forbidden\n").into_response();
                 }
-                let Some(api) = api else {
-                    return (
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "collaboration storage unavailable\n",
-                    )
-                        .into_response();
-                };
-                (
-                    StatusCode::OK,
-                    [
-                        (
-                            header::CONTENT_TYPE,
-                            HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8"),
-                        ),
-                        (
-                            header::CACHE_CONTROL,
-                            HeaderValue::from_static("private, no-store"),
-                        ),
-                    ],
-                    api.render_metrics(),
-                )
-                    .into_response()
+                render_metrics_response(api)
             }
+        }),
+    )
+}
+
+/// Metrics-only router for an internal listener mapped to host loopback.
+pub fn internal_metrics_route(api: Option<ApiState>) -> Router {
+    Router::new().route(
+        "/metrics",
+        get(move || {
+            let api = api.clone();
+            async move { render_metrics_response(api) }
         }),
     )
 }

@@ -38,6 +38,10 @@ impl SnapshotFile {
         self.size_bytes.unsigned_abs()
     }
 
+    pub(super) fn storage_key(&self) -> &str {
+        &self.storage_key
+    }
+
     /// Opens a verified snapshot and rewinds it for streaming or decoding.
     pub fn open(&self, data_dir: &Path) -> Result<File, StoreError> {
         if self.storage_key != storage_key(self.workbook_id, self.seq) {
@@ -287,18 +291,17 @@ pub(super) async fn at(
     .await?)
 }
 
-pub(super) async fn latest(
+pub(super) async fn list_desc(
     db: &mut PgConnection,
     doc: Uuid,
-) -> Result<Option<SnapshotFile>, StoreError> {
-    Ok(sqlx::query_as!(
-        SnapshotFile,
+) -> Result<Vec<SnapshotFile>, StoreError> {
+    Ok(sqlx::query_as::<_, SnapshotFile>(
         "SELECT workbook_id, seq, format_version, storage_key, size_bytes, sha256 FROM snapshots
-         WHERE workbook_id = $1 AND branch_id = $2 ORDER BY seq DESC LIMIT 1",
-        doc,
-        MAIN_BRANCH,
+         WHERE workbook_id = $1 AND branch_id = $2 ORDER BY seq DESC",
     )
-    .fetch_optional(db)
+    .bind(doc)
+    .bind(MAIN_BRANCH)
+    .fetch_all(db)
     .await?)
 }
 

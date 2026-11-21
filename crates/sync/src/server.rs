@@ -36,6 +36,7 @@ pub struct ServerDocMachine {
     /// Lookup `(replica, client_seq) -> (seq, timestamp_ms)` for exact idempotent resend Acks.
     receipts: BTreeMap<(u32, u64), (u64, u64)>,
     last_snapshot_seq: u64,
+    non_empty_base: bool,
     txns_since_snapshot: u32,
     bytes_since_snapshot: usize,
     limits: ServerLimits,
@@ -62,6 +63,7 @@ impl ServerDocMachine {
             recent_txns: VecDeque::new(),
             receipts: BTreeMap::new(),
             last_snapshot_seq: 0,
+            non_empty_base: false,
             txns_since_snapshot: 0,
             bytes_since_snapshot: 0,
             limits,
@@ -87,6 +89,8 @@ impl ServerDocMachine {
         tail_commits: Vec<WireCommittedTxnV2>,
         limits: ServerLimits,
     ) -> Result<Self, WireRejectReasonV1> {
+        let non_empty_base = snapshot_seq == 0
+            && workbook.state_digest() != Workbook::<BoundFormula>::new().state_digest();
         let mut replicas = BTreeMap::new();
         let mut receipts = BTreeMap::new();
         let mut max_seq_for_epoch: u16 = 0;
@@ -158,6 +162,7 @@ impl ServerDocMachine {
             recent_txns,
             receipts,
             last_snapshot_seq: snapshot_seq,
+            non_empty_base,
             txns_since_snapshot,
             bytes_since_snapshot,
             limits,
@@ -354,6 +359,15 @@ impl ServerDocMachine {
     }
 
     fn build_catchup(&self, effective_last_seq: u64) -> WireCatchupV1 {
+        if effective_last_seq == 0 && self.non_empty_base {
+            return WireCatchupV1::SnapshotRequired {
+                snapshot_seq: self.last_snapshot_seq,
+                url: format!(
+                    "{}/snapshots/{}",
+                    self.snapshot_url_prefix, self.last_snapshot_seq
+                ),
+            };
+        }
         let from_seq = effective_last_seq.saturating_add(1);
         if effective_last_seq == self.head_seq {
             return WireCatchupV1::Txns {

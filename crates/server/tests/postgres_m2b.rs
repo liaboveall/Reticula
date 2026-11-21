@@ -24,7 +24,7 @@ use reticula_server::http::{self, ApiState, AuthConfig};
 use reticula_server::ops::{GovernanceConfig, Metrics};
 use reticula_server::store::{
     DEFAULT_SNAPSHOT_KEEP_RECENT, DELETED_USER_ID, MAIN_BRANCH, SessionIdentity, StorageLimits,
-    Store,
+    Store, StoreError,
 };
 use reticula_sync::MemberRole;
 use reticula_wire::convert_v2::ops_to_wire_txn_v2;
@@ -2176,6 +2176,105 @@ async fn metrics_loopback_gate_and_write_rate_limit() {
         )));
     let ext_resp = metrics_router.oneshot(external_req).await.unwrap();
     assert_eq!(ext_resp.status(), StatusCode::FORBIDDEN);
+
+    drop(server);
+    db.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "requires an isolated PostgreSQL database in RETICULA_TEST_DATABASE_URL"]
+async fn load_machine_missing_snapshot_fallback_and_corruption_detection() {
+    let db = IsolatedDb::create().await;
+    let server =
+        TestServer::start(&db, StorageLimits::default(), GovernanceConfig::default()).await;
+    let (_, alice) = server.login("alice").await;
+
+    let import = server
+        .import_bytes(Some(&alice), "Fallback", sample_snapshot(3))
+        .await;
+    assert_eq!(import.status(), StatusCode::CREATED);
+    let doc: Uuid = import.json::<Value>().await.unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+
+    let (mut ws, welcome) = server
+        .ws_connect(doc, Some(&alice), None, ORIGIN)
+        .await
+        .unwrap()
+        .pipe_hello(doc, None, 0)
+        .await;
+    let rep = welcome_replica(&welcome);
+
+    for cseq in 1..=2_u64 {
+        send(
+            &mut ws,
+            &WireSyncFrameV1::Push {
+                txns: vec![edit_txn(rep, cseq, cseq - 1, 100.0 + cseq as f64)],
+            },
+        )
+        .await;
+        assert!(matches!(recv(&mut ws).await, WireSyncFrameV1::Ack { .. }));
+        assert!(matches!(
+            recv(&mut ws).await,
+            WireSyncFrameV1::Commit { .. }
+        ));
+    }
+
+    let snap2_machine = server.store.load_machine(doc).await.unwrap();
+    assert_eq!(snap2_machine.head_seq(), 2);
+    server.store.write_snapshot(&snap2_machine).await.unwrap();
+
+    send(
+        &mut ws,
+        &WireSyncFrameV1::Push {
+            txns: vec![edit_txn(rep, 3, 2, 103.0)],
+        },
+    )
+    .await;
+    assert!(matches!(recv(&mut ws).await, WireSyncFrameV1::Ack { .. }));
+    assert!(matches!(
+        recv(&mut ws).await,
+        WireSyncFrameV1::Commit { .. }
+    ));
+    drop(ws);
+
+    let expected_digest = server
+        .store
+        .load_machine(doc)
+        .await
+        .unwrap()
+        .workbook()
+        .state_digest();
+
+    // Remove the non-zero snapshot (seq=2); load_machine must fall back to seq=0 and replay txns.
+    let snap2_path = server
+        .data_dir()
+        .join(format!("snapshots/{doc}/2.rtclsnap"));
+    assert!(snap2_path.exists());
+    fs::remove_file(&snap2_path).unwrap();
+
+    let recovered = server.store.load_machine(doc).await.unwrap();
+    assert_eq!(recovered.head_seq(), 3);
+    assert_eq!(recovered.workbook().state_digest(), expected_digest);
+
+    // Corrupting the remaining seq=0 snapshot must still fail loudly (checksum/length mismatch).
+    let snap0_path = server
+        .data_dir()
+        .join(format!("snapshots/{doc}/0.rtclsnap"));
+    fs::write(&snap0_path, b"corrupted").unwrap();
+    assert!(matches!(
+        server.store.load_machine(doc).await,
+        Err(StoreError::Invalid("snapshot checksum or length"))
+    ));
+
+    // Missing seq=0 base snapshot must return NotFound rather than silently fabricating an empty book.
+    fs::remove_file(&snap0_path).unwrap();
+    assert!(matches!(
+        server.store.load_machine(doc).await,
+        Err(StoreError::Io(ref err)) if err.kind() == std::io::ErrorKind::NotFound
+    ));
 
     drop(server);
     db.cleanup().await;

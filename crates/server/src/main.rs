@@ -129,6 +129,14 @@ async fn shutdown_signal() {
     }
 }
 
+async fn wait_shutdown(mut rx: tokio::sync::watch::Receiver<bool>) {
+    while !*rx.borrow() {
+        if rx.changed().await.is_err() {
+            break;
+        }
+    }
+}
+
 fn parse_env<T: std::str::FromStr>(name: &str, default: T) -> T {
     match env::var(name) {
         Ok(raw) if !raw.trim().is_empty() => raw
@@ -203,6 +211,27 @@ async fn main() {
         Err(env::VarError::NotPresent) => None,
         Err(error) => panic!("invalid RETICULA_DATABASE_URL: {error}"),
     };
+    let metrics_bind = env::var("RETICULA_METRICS_ADDR")
+        .ok()
+        .map(|raw| raw.trim().to_owned())
+        .filter(|raw| !raw.is_empty())
+        .map(|raw| {
+            raw.parse::<SocketAddr>()
+                .unwrap_or_else(|e| panic!("invalid RETICULA_METRICS_ADDR `{raw}`: {e}"))
+        });
+    let metrics_server = if let Some(metrics_addr) = metrics_bind {
+        let listener = TcpListener::bind(metrics_addr)
+            .await
+            .unwrap_or_else(|e| panic!("failed to bind metrics {metrics_addr}: {e}"));
+        let local_metrics = listener
+            .local_addr()
+            .expect("bound metrics listener has local address");
+        tracing::info!(addr = %local_metrics, "reticula metrics listener ready");
+        Some((listener, http::internal_metrics_route(api.clone())))
+    } else {
+        None
+    };
+
     let app = build_app(&static_dir, api);
     let listener = TcpListener::bind(bind_addr)
         .await
@@ -221,13 +250,27 @@ async fn main() {
         "reticula-server listening"
     );
 
-    if let Err(err) = axum::serve(
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        shutdown_signal().await;
+        let _ = shutdown_tx.send(true);
+    });
+
+    let main_serve = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown_signal())
-    .await
-    {
+    .with_graceful_shutdown(wait_shutdown(shutdown_rx.clone()));
+
+    let serve_result = match metrics_server {
+        Some((m_listener, m_app)) => {
+            let m_serve =
+                axum::serve(m_listener, m_app).with_graceful_shutdown(wait_shutdown(shutdown_rx));
+            tokio::try_join!(main_serve, m_serve).map(|((), ())| ())
+        }
+        None => main_serve.await,
+    };
+    if let Err(err) = serve_result {
         tracing::error!(%err, "server error");
         std::process::exit(1);
     }

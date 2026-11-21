@@ -10,6 +10,7 @@
 #   RETICULA_GITHUB_CLIENT_SECRET
 #   RETICULA_IMAGE                  optional, defaults to the published image
 #   PORT                            optional loopback port, defaults to 3200
+#   METRICS_PORT                    optional loopback metrics port, defaults to 3201
 #
 # `cargo xtask stack` runs this file against a locally built image.
 name: reticula
@@ -48,8 +49,10 @@ services:
         condition: service_healthy
     ports:
       - "127.0.0.1:${PORT:-3200}:3200"
+      - "127.0.0.1:${METRICS_PORT:-3201}:3201"
     environment:
       BIND_ADDR: "0.0.0.0:3200"
+      RETICULA_METRICS_ADDR: "0.0.0.0:3201"
       RETICULA_STATIC_DIR: "/srv/reticula/dist"
       RETICULA_DATA_DIR: "/var/lib/reticula"
       RETICULA_DATABASE_URL: "postgres://reticula:${POSTGRES_PASSWORD}@postgres:5432/reticula"
