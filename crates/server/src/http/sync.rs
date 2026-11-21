@@ -147,6 +147,9 @@ pub(super) async fn upgrade(
                 Err(RoomError::Busy) => {
                     close_ws(&mut socket, CLOSE_SERVER_BUSY, "ServerBusy").await;
                 }
+                Err(RoomError::AccessRevoked) => {
+                    close_ws(&mut socket, CLOSE_ACCESS_REVOKED, "Access revoked").await;
+                }
                 Err(RoomError::Unavailable) => {}
             }
         }))

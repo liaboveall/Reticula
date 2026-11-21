@@ -281,6 +281,34 @@ impl Store {
         .transpose()
     }
 
+    /// Re-verifies inside the serialized room actor that an anonymous link-view
+    /// share link is still active, unrevoked, unexpired, and unconsumed.
+    pub async fn is_anonymous_share_active(
+        &self,
+        doc: Uuid,
+        link_id: Uuid,
+    ) -> Result<bool, StoreError> {
+        let active: bool = sqlx::query_scalar(
+            "SELECT EXISTS (
+                SELECT 1
+                FROM share_links s
+                JOIN workbooks w ON w.id = s.workbook_id
+                WHERE s.id = $1
+                  AND s.workbook_id = $2
+                  AND w.visibility = 'link_view'
+                  AND s.role = 'viewer'
+                  AND s.revoked_at IS NULL
+                  AND (s.expires_at IS NULL OR s.expires_at > now())
+                  AND (NOT s.single_use OR s.consumed_by IS NULL)
+            )",
+        )
+        .bind(link_id)
+        .bind(doc)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(active)
+    }
+
     pub async fn list_workbooks(&self, user: Uuid) -> Result<WorkbookLists, StoreError> {
         let rows = sqlx::query!(
             "SELECT w.id, w.title, w.visibility, m.role,

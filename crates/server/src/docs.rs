@@ -46,6 +46,8 @@ pub enum RoomError {
     Unavailable,
     #[error("server document memory budget is saturated")]
     Busy,
+    #[error("access revoked before session join")]
+    AccessRevoked,
     #[error("handshake rejected: {0:?}")]
     Rejected(WireRejectReasonV1),
 }
@@ -693,13 +695,30 @@ impl DocActor {
     async fn join(
         &mut self,
         user: Uuid,
-        role: MemberRole,
+        _role: MemberRole,
         display_name: String,
         share_link_id: Option<Uuid>,
         hello: &WireSyncFrameV1,
         output: Output,
         reply: oneshot::Sender<Result<u64, RoomError>>,
     ) -> Result<(), StoreError> {
+        let role = if let Some(link_id) = share_link_id {
+            if !self
+                .store
+                .is_anonymous_share_active(self.doc, link_id)
+                .await?
+            {
+                let _ = reply.send(Err(RoomError::AccessRevoked));
+                return Ok(());
+            }
+            MemberRole::Viewer
+        } else {
+            let Some(access) = self.store.workbook_access(self.doc, user).await? else {
+                let _ = reply.send(Err(RoomError::AccessRevoked));
+                return Ok(());
+            };
+            access.role
+        };
         let next_replica = self.machine.next_per_epoch_replica();
         let mut welcome = match self.machine.on_hello(user.into_bytes(), Some(role), hello) {
             Ok(welcome) => welcome,

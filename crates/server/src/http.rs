@@ -278,7 +278,7 @@ impl From<RoomError> for ApiError {
         match error {
             RoomError::Busy => Self::Busy,
             RoomError::Unavailable => Self::NotFound,
-            RoomError::Rejected(_) => Self::Forbidden,
+            RoomError::AccessRevoked | RoomError::Rejected(_) => Self::Forbidden,
         }
     }
 }

@@ -198,6 +198,7 @@ test.describe("M2b governance, workbooks, history, and account lifecycle", () =>
         .toBe("");
 
       await bob.reload();
+      await expect(bob.getByTestId("collab-status-pill")).toHaveText("Synced", { timeout: 10_000 });
       await expect(bob.getByTestId("collab-readonly-badge")).toBeVisible({ timeout: 10_000 });
       await expect(bob.getByTestId("formula-input")).toHaveAttribute("contenteditable", "false");
 
