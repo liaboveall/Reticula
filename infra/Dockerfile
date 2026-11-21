@@ -12,7 +12,9 @@ RUN ln -s /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
 
 WORKDIR /src
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml tsconfig.base.json biome.json ./
-RUN npm install --global "$(node --print "require('./package.json').packageManager")" \
+RUN --mount=type=cache,target=/root/.cache/pnpm \
+    npm install --global "$(node --print "require('./package.json').packageManager")" \
+    && pnpm config set store-dir /root/.cache/pnpm/store \
     && pnpm install --frozen-lockfile
 
 COPY Cargo.toml Cargo.lock rust-toolchain.toml deny.toml ./
@@ -25,23 +27,32 @@ COPY apps ./apps
 COPY tests ./tests
 COPY playwright.config.ts ./
 
-RUN cargo install --locked --root .tools --version 0.2.130 wasm-bindgen-cli \
+# The caches keep dependency builds between local image builds; the server
+# binary is copied out of the cached target directory to reach the next stage.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/src/target \
+    --mount=type=cache,target=/src/.tools \
+    cargo install --locked --root .tools --version 0.2.130 wasm-bindgen-cli \
     && cargo xtask build --check-budget \
-    && cargo build --locked --release --package reticula-server
+    && env SQLX_OFFLINE=true cargo build --locked --release --package reticula-server \
+    && cp target/release/reticula-server /usr/local/bin/reticula-server
 
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
-    && useradd --uid 10001 --user-group --no-create-home --shell /usr/sbin/nologin reticula
+    && useradd --uid 10001 --user-group --no-create-home --shell /usr/sbin/nologin reticula \
+    && mkdir -p /var/lib/reticula \
+    && chown 10001:10001 /var/lib/reticula
 
 WORKDIR /srv/reticula
-COPY --from=builder /src/target/release/reticula-server /usr/local/bin/reticula-server
+COPY --from=builder /usr/local/bin/reticula-server /usr/local/bin/reticula-server
 COPY --from=builder /src/apps/web/dist ./dist
 
 USER 10001:10001
 ENV BIND_ADDR=0.0.0.0:3200
 ENV RETICULA_STATIC_DIR=/srv/reticula/dist
+ENV RETICULA_DATA_DIR=/var/lib/reticula
 EXPOSE 3200
 
 ENTRYPOINT ["/usr/local/bin/reticula-server"]

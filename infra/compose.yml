@@ -1,20 +1,71 @@
+# The whole service: the server image, PostgreSQL 18 and the volume that
+# holds workbook snapshots, with the memory and CPU limits of the target host.
+#
+# Settings and secrets come from an env file that stays out of the repository
+# (`docker compose --env-file <file> up -d`):
+#
+#   POSTGRES_PASSWORD               database password
+#   RETICULA_PUBLIC_ORIGIN          origin browsers use, e.g. https://example.com
+#   RETICULA_GITHUB_CLIENT_ID       GitHub OAuth application
+#   RETICULA_GITHUB_CLIENT_SECRET
+#   RETICULA_IMAGE                  optional, defaults to the published image
+#   PORT                            optional loopback port, defaults to 3200
+#
+# `cargo xtask stack` runs this file against a locally built image.
+name: reticula
+
 services:
+  postgres:
+    image: postgres:18.7-bookworm
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: reticula
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in the env file}
+      POSTGRES_DB: reticula
+    command: ["postgres", "-c", "shared_buffers=128MB", "-c", "max_connections=30"]
+    volumes:
+      - pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U reticula -d reticula"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 768m
+    cpus: 0.5
+    logging: &logging
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
   server:
     image: ${RETICULA_IMAGE:-ghcr.io/liaboveall/reticula:latest}
-    container_name: reticula-server
     restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
     ports:
       - "127.0.0.1:${PORT:-3200}:3200"
     environment:
       BIND_ADDR: "0.0.0.0:3200"
       RETICULA_STATIC_DIR: "/srv/reticula/dist"
+      RETICULA_DATA_DIR: "/var/lib/reticula"
+      RETICULA_DATABASE_URL: "postgres://reticula:${POSTGRES_PASSWORD}@postgres:5432/reticula"
+      RETICULA_PUBLIC_ORIGIN: ${RETICULA_PUBLIC_ORIGIN:?set RETICULA_PUBLIC_ORIGIN in the env file}
+      RETICULA_AUTH_MODE: "github"
+      RETICULA_GITHUB_CLIENT_ID: ${RETICULA_GITHUB_CLIENT_ID:?set RETICULA_GITHUB_CLIENT_ID in the env file}
+      RETICULA_GITHUB_CLIENT_SECRET: ${RETICULA_GITHUB_CLIENT_SECRET:?set RETICULA_GITHUB_CLIENT_SECRET in the env file}
+    volumes:
+      - workbooks:/var/lib/reticula
     read_only: true
     security_opt:
       - no-new-privileges:true
-    mem_limit: 128m
-    cpus: 0.5
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
+    mem_limit: 768m
+    cpus: 1.0
+    logging: *logging
+
+volumes:
+  pgdata:
+  workbooks:

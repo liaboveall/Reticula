@@ -1,0 +1,25 @@
+# Send the build only what infra/Dockerfile copies.
+*
+!package.json
+!pnpm-lock.yaml
+!pnpm-workspace.yaml
+!tsconfig.base.json
+!biome.json
+!Cargo.toml
+!Cargo.lock
+!rust-toolchain.toml
+!deny.toml
+!.cargo
+!crates
+!spikes
+!bench
+!packages
+!apps
+!tests
+!playwright.config.ts
+
+**/node_modules
+**/dist
+**/dist-spikes
+packages/protocol/pkg
+spikes/excel/data
