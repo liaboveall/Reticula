@@ -739,6 +739,8 @@ pub enum OpError {
     StringPoolExhausted,
     /// Operation would push the workbook past [`MAX_WORKBOOK_BYTES`].
     MemoryLimitExceeded,
+    /// Workbook is opened in read-only mode.
+    ReadOnly,
 }
 
 impl From<AxisError> for OpError {

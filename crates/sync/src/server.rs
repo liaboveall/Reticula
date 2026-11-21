@@ -15,8 +15,8 @@ use reticula_wire::v2::{
 };
 
 use crate::types::{
-    MemberRole, ReplicaWatermark, ServerLimits, StagedTxn, TryApplyOutcome, apply_ops_atomic,
-    rewind_inverses,
+    MemberRole, ReplicaWatermark, ServerLimits, StagedTxn, TryApplyOutcome, VIEWER_REPLICA,
+    apply_ops_atomic, rewind_inverses,
 };
 use crate::validate::{max_id_counter_in_ops, validate_txn_ownership};
 
@@ -285,7 +285,7 @@ impl ServerDocMachine {
         role: Option<MemberRole>,
         frame: &WireSyncFrameV1,
     ) -> Result<WireSyncFrameV1, WireRejectReasonV1> {
-        let _member_role = role.ok_or(WireRejectReasonV1::Forbidden)?;
+        let member_role = role.ok_or(WireRejectReasonV1::Forbidden)?;
         let WireSyncFrameV1::Hello {
             protocol_version,
             doc_id,
@@ -305,7 +305,14 @@ impl ServerDocMachine {
         }
 
         let (assigned_replica, last_client_seq, max_id_counter, effective_last_seq) =
-            if *known_epoch != self.epoch {
+            if !member_role.can_write() {
+                let eff_seq = if *known_epoch == self.epoch && *last_applied_seq <= self.head_seq {
+                    *last_applied_seq
+                } else {
+                    0
+                };
+                (VIEWER_REPLICA, 0, 0, eff_seq)
+            } else if *known_epoch != self.epoch {
                 let r = self
                     .allocate_replica(user_id)
                     .ok_or(WireRejectReasonV1::QuotaExceeded)?;
@@ -399,7 +406,10 @@ impl ServerDocMachine {
         pending: WirePendingTxnV2,
         server_timestamp_ms: u64,
     ) -> Result<TryApplyOutcome, WireRejectReasonV1> {
-        let _member_role = role.ok_or(WireRejectReasonV1::Forbidden)?;
+        let member_role = role.ok_or(WireRejectReasonV1::Forbidden)?;
+        if !member_role.can_write() || session_replica == VIEWER_REPLICA {
+            return Err(WireRejectReasonV1::Forbidden);
+        }
 
         if pending.replica != session_replica {
             return Err(WireRejectReasonV1::Forbidden);

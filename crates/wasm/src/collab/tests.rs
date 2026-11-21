@@ -605,3 +605,64 @@ fn reopened_pending_wal_falls_back_cleanly_then_re_enables_incremental_reconcile
     assert_eq!(reopened.collab.as_ref().unwrap().machine.pending_len(), 0);
     assert!(reopened.collab.as_ref().unwrap().engine_inverses_valid);
 }
+
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), test)]
+fn viewer_receives_commits_reports_read_only_rejects_edits_and_skips_presence() {
+    let mut server = ServerDocMachine::new(
+        DOC,
+        MAIN,
+        "/api/workbooks/test".into(),
+        ServerLimits::default(),
+    );
+    let alice = server.allocate_replica(ALICE).unwrap();
+    let c1 = commit(
+        &mut server,
+        ALICE,
+        WirePendingTxnV2 {
+            replica: alice,
+            client_seq: 1,
+            base_server_seq: 0,
+            timestamp_ms: 10,
+            txn: ops_to_wire_txn_v2("Init".into(), &[edit_op(0, 12.0)]),
+        },
+    );
+
+    let viewer_user = [3; 16];
+    let mut engine = open(None, Vec::new(), Vec::new());
+    let _ = engine.handle_sync_command(SyncCommand::Connected);
+    let hello = sent(events(&mut engine));
+    let welcome = server
+        .on_hello(viewer_user, Some(MemberRole::Viewer), &hello)
+        .unwrap();
+    receive(&mut engine, &welcome);
+    let evs = events(&mut engine);
+    assert!(evs.iter().any(|e| matches!(
+        e,
+        CollabEvent::State {
+            connection: SyncConnection::Online,
+            replica: None,
+            pending: 0,
+            read_only: true,
+        }
+    )));
+    assert_eq!(value(&engine, 0), Value::Number(12.0));
+
+    let err = engine
+        .execute_user_txn("Blocked".into(), &[edit_op(0, 99.0)])
+        .unwrap_err();
+    assert!(err.contains("read-only"));
+
+    let _ = engine.handle_sync_command(SyncCommand::LocalPresence {
+        sheet: 0,
+        cursor_row: 0,
+        cursor_col: 0,
+        selection: None,
+    });
+    assert!(
+        !events(&mut engine)
+            .iter()
+            .any(|e| matches!(e, CollabEvent::Send { .. }))
+    );
+    let _ = c1;
+}

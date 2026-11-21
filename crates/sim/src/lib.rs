@@ -7,8 +7,11 @@
 mod workload;
 mod world;
 
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::Mutex;
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::Instant;
 
 use serde::Serialize;
@@ -131,6 +134,7 @@ fn ddmin_with<T: Clone>(
 }
 
 /// Executes `count` consecutive seeds starting at `start_seed` across `threads` workers.
+#[cfg(not(target_arch = "wasm32"))]
 #[must_use]
 pub fn run_seeds_range(start_seed: u64, count: u64, threads: usize, fail_fast: bool) -> SimReport {
     let worker_count = threads.max(1);
@@ -215,7 +219,9 @@ pub fn run_seeds_range(start_seed: u64, count: u64, threads: usize, fail_fast: b
 
 #[cfg(test)]
 mod tests {
-    use super::{ddmin_with, generate_script, run_event_script, run_seed, run_seeds_range};
+    #[cfg(not(target_arch = "wasm32"))]
+    use super::run_seeds_range;
+    use super::{ddmin_with, generate_script, run_event_script, run_seed};
 
     #[test]
     fn identical_seed_reproduces_bit_identical_digest_and_fault_counts() {
@@ -224,6 +230,7 @@ mod tests {
         assert_eq!(a, b);
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn smoke_200_seeds_cover_all_10_fault_categories_with_zero_failures() {
         let report = run_seeds_range(0, 200, 4, true);

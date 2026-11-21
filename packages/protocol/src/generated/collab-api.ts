@@ -24,7 +24,7 @@ export interface ErrorBody {
   error: string;
 }
 
-export type Role = "owner" | "editor";
+export type Role = "owner" | "editor" | "viewer";
 
 export interface ShareLink {
   url: string;

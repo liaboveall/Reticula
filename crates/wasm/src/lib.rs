@@ -3560,6 +3560,7 @@ fn format_op_error(err: OpError) -> String {
         OpError::MemoryLimitExceeded => {
             String::from("Local workbook memory limit (1 GiB) exceeded.")
         }
+        OpError::ReadOnly => String::from("This workbook is read-only."),
     }
 }
 

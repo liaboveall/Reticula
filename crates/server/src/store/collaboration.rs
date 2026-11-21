@@ -204,6 +204,7 @@ fn member_role(role: &str) -> Result<MemberRole, StoreError> {
     match role {
         "owner" => Ok(MemberRole::Owner),
         "editor" => Ok(MemberRole::Editor),
+        "viewer" => Ok(MemberRole::Viewer),
         _ => Err(StoreError::Invalid("member role")),
     }
 }

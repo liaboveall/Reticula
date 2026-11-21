@@ -22,9 +22,10 @@ use reticula_wire::v2::{SYNC_PROTOCOL_VERSION, WirePendingTxnV2, WireSyncFrameV1
 /// Fixed simulated collaborator count:
 /// - `0`: Alice Tab 1 (`USER_A`, Owner)
 /// - `1`: Alice Tab 2 (`USER_A`, Owner) — two-tab concurrency
-/// - `2`: Bob (`USER_B`, Editor, revocable in permission-downgrade tests)
+/// - `2`: Bob (`USER_B`, Editor, revocable/downgradeable in permission tests)
 /// - `3`: Carol (`USER_C`, Editor)
-pub const NUM_CLIENTS: usize = 4;
+/// - `4`: Dave (`USER_D`, permanent Viewer with sentinel replica `0`)
+pub const NUM_CLIENTS: usize = 5;
 
 /// Simulated document UUID.
 pub const SIM_DOC_ID: [u8; 16] = [0xD0; 16];
@@ -35,6 +36,7 @@ pub const SIM_BRANCH_ID: [u8; 16] = [0xB1; 16];
 pub const USER_A: [u8; 16] = [0xA1; 16];
 pub const USER_B: [u8; 16] = [0xB2; 16];
 pub const USER_C: [u8; 16] = [0xC3; 16];
+pub const USER_D: [u8; 16] = [0xD4; 16];
 pub const ROGUE_OUTSIDER: [u8; 16] = [0xEE; 16];
 
 /// Every M2a operation family exercised in deterministic simulation.
@@ -80,6 +82,7 @@ pub enum RogueKind {
     CrossUserReplicaHijack,
     DuplicateMoveRows,
     OversizedPushBatch,
+    ViewerPush,
 }
 
 /// Discrete event in a shrinkable simulation schedule.
@@ -281,7 +284,7 @@ fn pick_op_choice(rng: &mut Rng) -> OpChoice {
 }
 
 fn pick_rogue_kind(rng: &mut Rng) -> RogueKind {
-    match rng.next_below(11) {
+    match rng.next_below(12) {
         0 => RogueKind::NonMemberHello,
         1 => RogueKind::BadProtocolVersion,
         2 => RogueKind::WrongDocOrBranch,
@@ -292,7 +295,8 @@ fn pick_rogue_kind(rng: &mut Rng) -> RogueKind {
         7 => RogueKind::NonMonotonicIdCounter,
         8 => RogueKind::CrossUserReplicaHijack,
         9 => RogueKind::DuplicateMoveRows,
-        _ => RogueKind::OversizedPushBatch,
+        10 => RogueKind::OversizedPushBatch,
+        _ => RogueKind::ViewerPush,
     }
 }
 
@@ -917,7 +921,8 @@ pub(crate) fn build_rogue_pending(
         RogueKind::NonMemberHello
         | RogueKind::BadProtocolVersion
         | RogueKind::WrongDocOrBranch
-        | RogueKind::OversizedPushBatch => {
+        | RogueKind::OversizedPushBatch
+        | RogueKind::ViewerPush => {
             let _ = rng.next_u64();
             return None;
         }

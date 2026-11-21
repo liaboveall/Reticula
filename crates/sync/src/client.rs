@@ -24,7 +24,7 @@ use reticula_wire::v2::{
 
 use crate::types::{
     ClientAction, ConnectionState, DEFAULT_MAX_PUSH_BATCH, DEFAULT_MAX_PUSH_BYTES,
-    ReplicaWatermark, apply_ops_atomic, rewind_inverses_checked,
+    ReplicaWatermark, VIEWER_REPLICA, apply_ops_atomic, rewind_inverses_checked,
 };
 use crate::validate::{RemapState, max_id_counter_in_ops};
 
@@ -72,6 +72,7 @@ pub struct ClientSyncMachine {
     next_sheet_counter: u8,
     connection_state: ConnectionState,
     watermarks_verified: bool,
+    read_only: bool,
 }
 
 impl ClientSyncMachine {
@@ -99,6 +100,7 @@ impl ClientSyncMachine {
             next_sheet_counter: 1,
             connection_state: ConnectionState::Offline,
             watermarks_verified: false,
+            read_only: false,
         }
     }
 
@@ -177,6 +179,7 @@ impl ClientSyncMachine {
             next_sheet_counter: max_sheet_c.saturating_add(1),
             connection_state: ConnectionState::Offline,
             watermarks_verified: false,
+            read_only: false,
         }
     }
 
@@ -184,6 +187,12 @@ impl ClientSyncMachine {
     #[must_use]
     pub const fn connection_state(&self) -> ConnectionState {
         self.connection_state
+    }
+
+    /// Returns `true` when the active session is read-only (`VIEWER_REPLICA`).
+    #[must_use]
+    pub const fn is_read_only(&self) -> bool {
+        self.read_only
     }
 
     /// Current known server epoch.
@@ -332,6 +341,9 @@ impl ClientSyncMachine {
         ops: Vec<Op<BoundFormula>>,
         timestamp_ms: u64,
     ) -> Result<Vec<ClientAction>, OpError> {
+        if self.read_only {
+            return Err(OpError::ReadOnly);
+        }
         let inverses = apply_ops_atomic(&mut self.visible, &ops)?;
         let client_seq = self.next_client_seq;
         self.next_client_seq = client_seq.saturating_add(1);
@@ -380,8 +392,10 @@ impl ClientSyncMachine {
         };
 
         let mut actions = Vec::new();
+        let is_viewer = replica == VIEWER_REPLICA;
+        let effective_replica = (!is_viewer).then_some(replica);
         let epoch_changed = epoch != self.epoch;
-        let replica_changed = self.replica != Some(replica);
+        let replica_changed = self.replica != effective_replica;
         let old_epoch = self.epoch;
 
         if epoch_changed {
@@ -398,23 +412,33 @@ impl ClientSyncMachine {
         }
 
         self.epoch = epoch;
-        self.replica = Some(replica);
+        self.replica = effective_replica;
+        self.read_only = is_viewer;
         self.last_pushed_client_seq = 0;
 
         match catchup {
             WireCatchupV1::SnapshotRequired { snapshot_seq, url } => {
-                let pending_max = self.pending.back().map_or(0, |e| e.wire.client_seq);
-                if epoch_changed || replica_changed {
-                    self.last_acked_client_seq = last_client_seq;
-                    self.next_client_seq = last_client_seq.max(pending_max).saturating_add(1);
-                    self.id_allocator =
-                        IdAllocator::new(epoch, replica, max_id_counter.saturating_add(1))
-                            .unwrap_or_else(IdAllocator::local);
+                if is_viewer {
+                    self.rescue_pending_for_viewer(&mut actions);
+                    self.last_acked_client_seq = 0;
+                    self.next_client_seq = 1;
+                    self.id_allocator = IdAllocator::local();
+                    self.next_sheet_counter = 1;
                 } else {
-                    self.last_acked_client_seq = self.last_acked_client_seq.max(last_client_seq);
-                    self.next_client_seq = self
-                        .next_client_seq
-                        .max(last_client_seq.max(pending_max).saturating_add(1));
+                    let pending_max = self.pending.back().map_or(0, |e| e.wire.client_seq);
+                    if epoch_changed || replica_changed {
+                        self.last_acked_client_seq = last_client_seq;
+                        self.next_client_seq = last_client_seq.max(pending_max).saturating_add(1);
+                        self.id_allocator =
+                            IdAllocator::new(epoch, replica, max_id_counter.saturating_add(1))
+                                .unwrap_or_else(IdAllocator::local);
+                    } else {
+                        self.last_acked_client_seq =
+                            self.last_acked_client_seq.max(last_client_seq);
+                        self.next_client_seq = self
+                            .next_client_seq
+                            .max(last_client_seq.max(pending_max).saturating_add(1));
+                    }
                 }
                 self.pending_welcome = Some(WelcomeProgress {
                     epoch,
@@ -425,7 +449,7 @@ impl ClientSyncMachine {
                 });
                 self.buffered_commits.clear();
                 self.connection_state = ConnectionState::AwaitingSnapshot { snapshot_seq };
-                if epoch_changed {
+                if epoch_changed && !is_viewer {
                     self.replay_all_pending_fresh();
                 }
                 actions.push(ClientAction::RequestSnapshot { snapshot_seq, url });
@@ -453,25 +477,36 @@ impl ClientSyncMachine {
                     }
                 }
 
-                self.align_watermarks_and_remap(
-                    epoch,
-                    replica,
-                    last_client_seq,
-                    max_id_counter,
-                    epoch_changed || replica_changed,
-                    &mut pending_modified,
-                );
-                self.replay_all_pending_fresh();
+                if is_viewer {
+                    self.last_acked_client_seq = 0;
+                    self.next_client_seq = 1;
+                    self.id_allocator = IdAllocator::local();
+                    self.next_sheet_counter = 1;
+                    self.rescue_pending_for_viewer(&mut actions);
+                    self.replay_all_pending_fresh();
+                } else {
+                    self.align_watermarks_and_remap(
+                        epoch,
+                        replica,
+                        last_client_seq,
+                        max_id_counter,
+                        epoch_changed || replica_changed,
+                        &mut pending_modified,
+                    );
+                    self.replay_all_pending_fresh();
+                    if pending_modified {
+                        actions.push(ClientAction::PersistTruncatedPending(
+                            self.pending_wire_txns(),
+                        ));
+                    }
+                }
                 self.connection_state = ConnectionState::Online;
                 self.watermarks_verified = true;
 
-                if pending_modified {
-                    actions.push(ClientAction::PersistTruncatedPending(
-                        self.pending_wire_txns(),
-                    ));
-                }
                 actions.push(ClientAction::NotifyVisibleChanged);
-                self.push_pending_batches(&mut actions);
+                if !self.read_only {
+                    self.push_pending_batches(&mut actions);
+                }
                 actions
             }
         }
@@ -489,30 +524,40 @@ impl ClientSyncMachine {
         let Some(progress) = self.pending_welcome.take() else {
             return Vec::new();
         };
+        let is_viewer = progress.replica == VIEWER_REPLICA;
         let mut actions = Vec::new();
         self.rewind_all_pending();
 
-        let snap_wm = watermarks
-            .iter()
-            .find(|w| w.replica == progress.replica)
-            .copied();
-        let wm_cs = progress
-            .last_client_seq
-            .max(snap_wm.map_or(0, |w| w.last_client_seq));
-        let wm_id = progress
-            .max_id_counter
-            .max(snap_wm.map_or(0, |w| w.max_id_counter));
+        let (snap_wm, wm_cs, wm_id) = if is_viewer {
+            (None, 0, 0)
+        } else {
+            let snap_wm = watermarks
+                .iter()
+                .find(|w| w.replica == progress.replica)
+                .copied();
+            let wm_cs = progress
+                .last_client_seq
+                .max(snap_wm.map_or(0, |w| w.last_client_seq));
+            let wm_id = progress
+                .max_id_counter
+                .max(snap_wm.map_or(0, |w| w.max_id_counter));
+            (snap_wm, wm_cs, wm_id)
+        };
 
         self.confirmed = snapshot_wb;
         self.confirmed_seq = snapshot_seq;
         self.epoch = progress.epoch;
-        self.replica = Some(progress.replica);
-        self.last_acked_client_seq = self
-            .last_acked_client_seq
-            .max(snap_wm.map_or(0, |w| w.last_client_seq));
+        self.replica = (!is_viewer).then_some(progress.replica);
+        self.read_only = is_viewer;
+        self.last_acked_client_seq = if is_viewer {
+            0
+        } else {
+            self.last_acked_client_seq
+                .max(snap_wm.map_or(0, |w| w.last_client_seq))
+        };
 
         let mut pending_modified = false;
-        if !progress.epoch_changed {
+        if !is_viewer && !progress.epoch_changed {
             // Drop any pre-crash persisted pending entries covered by snapshot watermarks.
             while let Some(front) = self.pending.front() {
                 if !front.unverified_offline_edit
@@ -549,26 +594,37 @@ impl ClientSyncMachine {
             }
         }
 
-        self.align_watermarks_and_remap(
-            progress.epoch,
-            progress.replica,
-            wm_cs,
-            wm_id,
-            progress.epoch_changed,
-            &mut pending_modified,
-        );
-        self.replay_all_pending_fresh();
+        if is_viewer {
+            self.last_acked_client_seq = 0;
+            self.next_client_seq = 1;
+            self.id_allocator = IdAllocator::local();
+            self.next_sheet_counter = 1;
+            self.visible = self.confirmed.clone();
+            self.rescue_pending_for_viewer(&mut actions);
+        } else {
+            self.align_watermarks_and_remap(
+                progress.epoch,
+                progress.replica,
+                wm_cs,
+                wm_id,
+                progress.epoch_changed,
+                &mut pending_modified,
+            );
+            self.replay_all_pending_fresh();
+            if pending_modified {
+                actions.push(ClientAction::PersistTruncatedPending(
+                    self.pending_wire_txns(),
+                ));
+            }
+        }
         self.connection_state = ConnectionState::Online;
         self.watermarks_verified = true;
         self.last_pushed_client_seq = 0;
 
-        if pending_modified {
-            actions.push(ClientAction::PersistTruncatedPending(
-                self.pending_wire_txns(),
-            ));
-        }
         actions.push(ClientAction::NotifyVisibleChanged);
-        self.push_pending_batches(&mut actions);
+        if !self.read_only {
+            self.push_pending_batches(&mut actions);
+        }
         actions
     }
 
@@ -945,6 +1001,23 @@ impl ClientSyncMachine {
                 txns: batch,
             }));
         }
+    }
+
+    fn rescue_pending_for_viewer(&mut self, actions: &mut Vec<ClientAction>) {
+        if self.pending.is_empty() {
+            self.visible = self.confirmed.clone();
+            return;
+        }
+        self.rewind_all_pending();
+        let txns: Vec<WirePendingTxnV2> = self.pending.drain(..).map(|e| e.wire).collect();
+        let from_client_seq = txns.first().map_or(1, |t| t.client_seq);
+        actions.push(ClientAction::SaveUnsyncedLocal {
+            from_client_seq,
+            txns,
+        });
+        actions.push(ClientAction::PruneUndoFrom(from_client_seq));
+        actions.push(ClientAction::PersistTruncatedPending(Vec::new()));
+        self.visible = self.confirmed.clone();
     }
 }
 

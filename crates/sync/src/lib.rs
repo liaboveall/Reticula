@@ -39,7 +39,7 @@ pub use client::{ClientSyncMachine, replay_pending_onto};
 pub use server::{ApplyResult, ServerDocMachine};
 pub use types::{
     ClientAction, ConnectionState, MemberRole, ReplicaWatermark, ServerLimits, StagedTxn,
-    TryApplyOutcome,
+    TryApplyOutcome, VIEWER_REPLICA,
 };
 
 #[cfg(test)]
@@ -64,13 +64,13 @@ mod tests {
     use reticula_formula::binder::BoundFormula;
     use reticula_wire::convert_v2::ops_to_wire_txn_v2;
     use reticula_wire::v2::{
-        SYNC_PROTOCOL_VERSION, WireCommittedTxnV2, WirePendingTxnV2, WireRejectReasonV1,
-        WireStateDigestV1, WireSyncFrameV1,
+        SYNC_PROTOCOL_VERSION, WireCatchupV1, WireCommittedTxnV2, WirePendingTxnV2,
+        WireRejectReasonV1, WireStateDigestV1, WireSyncFrameV1,
     };
 
     use crate::{
         ClientAction, ClientSyncMachine, ConnectionState, MemberRole, ReplicaWatermark,
-        ServerDocMachine, ServerLimits, replay_pending_onto,
+        ServerDocMachine, ServerLimits, VIEWER_REPLICA, replay_pending_onto,
     };
 
     const DOC_ID: [u8; 16] = [1; 16];
@@ -116,6 +116,18 @@ mod tests {
             panic!("expected committed transaction");
         };
         c
+    }
+
+    fn set_num(row: u32, col: u32, val: f64) -> Op<BoundFormula> {
+        Op::SetCells {
+            sheet: SheetId(0),
+            edits: vec![CellEdit {
+                row: RowId(u64::from(row)),
+                col: ColId(u64::from(col)),
+                input: CellInput::Scalar(ScalarValue::Number(val)),
+                format: FormatPatch::Keep,
+            }],
+        }
     }
 
     #[test]
@@ -1280,6 +1292,181 @@ mod tests {
         assert_eq!(
             reloaded.confirmed().state_digest(),
             srv1.workbook().state_digest()
+        );
+    }
+
+    #[test]
+    fn viewer_handshake_uses_sentinel_replica_blocks_edits_and_converges_via_snapshot() {
+        let mut server = ServerDocMachine::new(
+            DOC_ID,
+            BRANCH_ID,
+            String::from("/api/w"),
+            ServerLimits {
+                catchup_window: 2,
+                ..ServerLimits::default()
+            },
+        );
+        let mut owner = ClientSyncMachine::new(DOC_ID, BRANCH_ID);
+        connect_client(&mut server, &mut owner, USER_A, Some(MemberRole::Owner));
+
+        for step in 1..=5_u32 {
+            let acts = owner
+                .push_local(
+                    String::from("Owner edit"),
+                    vec![set_num(step, 0, f64::from(step))],
+                    u64::from(step),
+                )
+                .unwrap();
+            for act in acts {
+                if let ClientAction::SendFrame(WireSyncFrameV1::Push { txns }) = act {
+                    for p in txns {
+                        let c = commit_ok(
+                            &mut server,
+                            USER_A,
+                            Some(MemberRole::Owner),
+                            owner.replica().unwrap(),
+                            p,
+                            u64::from(step),
+                        );
+                        owner.on_commit(c);
+                    }
+                }
+            }
+        }
+        let snap_seq = server.head_seq();
+        server.mark_snapshot_written(snap_seq);
+        let snap_wb = server.workbook().clone();
+        let snap_wms = server.watermarks();
+
+        let owner_rep = owner.replica().unwrap();
+        let acts6 = owner
+            .push_local(String::from("Tail"), vec![set_num(6, 0, 6.0)], 60)
+            .unwrap();
+        for act in acts6 {
+            if let ClientAction::SendFrame(WireSyncFrameV1::Push { txns }) = act {
+                for p in txns {
+                    let c = commit_ok(
+                        &mut server,
+                        USER_A,
+                        Some(MemberRole::Owner),
+                        owner_rep,
+                        p,
+                        60,
+                    );
+                    owner.on_commit(c);
+                }
+            }
+        }
+
+        let viewer_user = [0xCC; 16];
+        let mut viewer = ClientSyncMachine::new(DOC_ID, BRANCH_ID);
+        let out = viewer.on_connected();
+        let ClientAction::SendFrame(hello) = &out[0] else {
+            panic!("expected Hello");
+        };
+        let welcome = server
+            .on_hello(viewer_user, Some(MemberRole::Viewer), hello)
+            .unwrap();
+        assert!(matches!(
+            welcome,
+            WireSyncFrameV1::Welcome {
+                replica: VIEWER_REPLICA,
+                last_client_seq: 0,
+                max_id_counter: 0,
+                catchup: WireCatchupV1::SnapshotRequired { .. },
+                ..
+            }
+        ));
+        let welcome_acts = viewer.on_welcome(welcome);
+        assert!(
+            welcome_acts
+                .iter()
+                .any(|a| matches!(a, ClientAction::RequestSnapshot { .. }))
+        );
+        let tail = server.txns_since(snap_seq).unwrap();
+        let snap_acts = viewer.install_snapshot(snap_seq, snap_wb, &snap_wms, tail);
+        assert!(
+            !snap_acts
+                .iter()
+                .any(|a| matches!(a, ClientAction::SendFrame(WireSyncFrameV1::Push { .. })))
+        );
+        assert!(viewer.is_read_only());
+        assert_eq!(viewer.replica(), None);
+        assert_eq!(
+            viewer.visible().state_digest(),
+            server.workbook().state_digest()
+        );
+        assert_eq!(
+            viewer.push_local(String::from("Blocked"), vec![set_num(0, 0, 99.0)], 99),
+            Err(reticula_core::ops::OpError::ReadOnly)
+        );
+        // Viewer Push rejected by server even with sentinel replica 0.
+        let forged = WirePendingTxnV2 {
+            replica: VIEWER_REPLICA,
+            client_seq: 1,
+            base_server_seq: snap_seq,
+            timestamp_ms: 99,
+            txn: ops_to_wire_txn_v2(String::from("Rogue"), &[set_num(0, 0, 99.0)]),
+        };
+        assert!(matches!(
+            server.validate_and_try_apply(
+                viewer_user,
+                Some(MemberRole::Viewer),
+                VIEWER_REPLICA,
+                forged,
+                99
+            ),
+            Err(WireRejectReasonV1::Forbidden)
+        ));
+    }
+
+    #[test]
+    fn editor_downgraded_to_viewer_rescues_pending_edits_and_converges() {
+        let mut server = ServerDocMachine::new(
+            DOC_ID,
+            BRANCH_ID,
+            String::from("/api/w"),
+            ServerLimits::default(),
+        );
+        let mut bob = ClientSyncMachine::new(DOC_ID, BRANCH_ID);
+        connect_client(&mut server, &mut bob, USER_B, Some(MemberRole::Editor));
+        assert!(!bob.is_read_only());
+
+        bob.on_disconnected();
+        bob.push_local(String::from("Offline"), vec![set_num(0, 0, 77.0)], 10)
+            .unwrap();
+        assert_eq!(bob.pending_len(), 1);
+
+        let h = bob.on_connected();
+        let ClientAction::SendFrame(hello) = &h[0] else {
+            panic!();
+        };
+        let welcome = server
+            .on_hello(USER_B, Some(MemberRole::Viewer), hello)
+            .unwrap();
+        let acts = bob.on_welcome(welcome);
+
+        assert!(bob.is_read_only());
+        assert_eq!(bob.replica(), None);
+        assert_eq!(bob.pending_len(), 0);
+        assert_eq!(
+            bob.visible().state_digest(),
+            server.workbook().state_digest()
+        );
+        assert!(acts.iter().any(|a| matches!(
+            a,
+            ClientAction::SaveUnsyncedLocal {
+                from_client_seq: 1,
+                txns
+            } if txns.len() == 1
+        )));
+        assert!(
+            acts.iter()
+                .any(|a| matches!(a, ClientAction::PruneUndoFrom(1)))
+        );
+        assert!(
+            acts.iter()
+                .any(|a| matches!(a, ClientAction::PersistTruncatedPending(rem) if rem.is_empty()))
         );
     }
 }

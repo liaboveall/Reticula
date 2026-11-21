@@ -29,13 +29,26 @@ pub const DEFAULT_SNAPSHOT_TXN_THRESHOLD: u32 = 500;
 /// Default snapshot interval in accumulated transaction payload bytes (`8 MiB`).
 pub const DEFAULT_SNAPSHOT_BYTES_THRESHOLD: usize = 8 * 1024 * 1024;
 
-/// Access control role of a collaborative workbook member in M2a (`08-platform.md`).
+/// Sentinel replica ID returned to read-only viewers (`MemberRole::Viewer`).
+pub const VIEWER_REPLICA: u32 = 0;
+
+/// Access control role of a collaborative workbook member (`08-platform.md` & `16-m2b.md`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum MemberRole {
     /// Workbook creator / owner (full edit + share-link administration).
     Owner,
     /// Invited collaborator with read/write privileges.
     Editor,
+    /// Read-only collaborator or anonymous link viewer (`replica = VIEWER_REPLICA`).
+    Viewer,
+}
+
+impl MemberRole {
+    /// Returns `true` for roles permitted to submit workbook mutations.
+    #[must_use]
+    pub const fn can_write(self) -> bool {
+        matches!(self, Self::Owner | Self::Editor)
+    }
 }
 
 /// Per-replica monotonic progress and identity watermark tracked on the server

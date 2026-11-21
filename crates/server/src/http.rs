@@ -188,6 +188,7 @@ struct WorkbookKey {
 enum Role {
     Owner,
     Editor,
+    Viewer,
 }
 
 impl From<MemberRole> for Role {
@@ -195,6 +196,7 @@ impl From<MemberRole> for Role {
         match role {
             MemberRole::Owner => Self::Owner,
             MemberRole::Editor => Self::Editor,
+            MemberRole::Viewer => Self::Viewer,
         }
     }
 }

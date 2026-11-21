@@ -173,6 +173,7 @@ pub enum CollabEvent {
         connection: SyncConnection,
         replica: Option<u32>,
         pending: u32,
+        read_only: bool,
     },
     Presence {
         sheet: u32,
@@ -337,6 +338,9 @@ impl CollabSession {
         ops: &[Op<BoundFormula>],
         timestamp_ms: u64,
     ) -> Result<(), String> {
+        if self.machine.is_read_only() {
+            return Err("This collaborative workbook is read-only.".into());
+        }
         let Some(replica) = self
             .machine
             .replica()
@@ -463,6 +467,7 @@ impl CollabSession {
             connection,
             replica: self.machine.replica(),
             pending: u32::try_from(self.machine.pending_len()).unwrap_or(u32::MAX),
+            read_only: self.machine.is_read_only(),
         });
     }
 
@@ -583,6 +588,7 @@ impl CollabSession {
         });
         let now = now_ms();
         if self.machine.connection_state() != ConnectionState::Online
+            || self.machine.is_read_only()
             || self
                 .last_presence_sent
                 .is_some_and(|last| now - last < 50.0)

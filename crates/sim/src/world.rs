@@ -4,13 +4,13 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use reticula_core::id::{ColId, RowId, SheetId, unpack_replica_id};
-use reticula_core::ops::{Op, Workbook};
+use reticula_core::ops::{Op, OpError, Workbook};
 use reticula_core::rng::Rng;
 use reticula_core::state_digest::StateDigest;
 use reticula_formula::binder::BoundFormula;
 use reticula_sync::{
     ClientAction, ClientSyncMachine, ConnectionState, MemberRole, ReplicaWatermark,
-    ServerDocMachine, ServerLimits, replay_pending_onto,
+    ServerDocMachine, ServerLimits, VIEWER_REPLICA, replay_pending_onto,
 };
 use reticula_wire::convert_v2::{ops_from_wire_txn_v2, ops_to_wire_txn_v2};
 use reticula_wire::snapshot::{decode_snapshot_any, encode_snapshot_v1};
@@ -27,7 +27,8 @@ use serde::Serialize;
 
 use crate::workload::{
     OpChoice, ROGUE_OUTSIDER, RogueKind, SIM_BRANCH_ID, SIM_DOC_ID, SimEvent, USER_A, USER_B,
-    USER_C, build_op_for_client, build_rogue_hello_frame, build_rogue_pending, record_unique_ids,
+    USER_C, USER_D, build_op_for_client, build_rogue_hello_frame, build_rogue_pending,
+    record_unique_ids,
 };
 
 const TEST_CATCHUP_WINDOW: usize = 5;
@@ -60,6 +61,7 @@ pub struct FaultCounts {
 }
 
 impl FaultCounts {
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn merge(&mut self, other: &Self) {
         self.local_edits += other.local_edits;
         self.set_cells_if_ops += other.set_cells_if_ops;
@@ -267,6 +269,7 @@ impl SimWorld {
             SimClient::new(USER_A, Some(MemberRole::Owner)),
             SimClient::new(USER_B, Some(MemberRole::Editor)),
             SimClient::new(USER_C, Some(MemberRole::Editor)),
+            SimClient::new(USER_D, Some(MemberRole::Viewer)),
         ];
 
         Self {
@@ -408,6 +411,14 @@ impl SimWorld {
         let Some(c) = self.clients.get_mut(client_idx) else {
             return;
         };
+        if c.machine.is_read_only() {
+            assert_eq!(
+                c.machine
+                    .push_local(String::from("Blocked"), Vec::new(), self.timestamp_ms),
+                Err(OpError::ReadOnly)
+            );
+            return;
+        }
         let Some(gen_txn) = build_op_for_client(&mut c.machine, choice, op_seed) else {
             return;
         };
@@ -1256,16 +1267,25 @@ impl SimWorld {
     }
 
     fn toggle_role(&mut self, client_idx: usize) {
-        if client_idx >= self.clients.len() {
+        if client_idx >= self.clients.len() || client_idx == 4 {
             return;
         }
-        if self.clients[client_idx].role.is_some() {
-            if self.clients[client_idx].machine.connection_state() == ConnectionState::Online {
-                self.clients[client_idx].role = None;
-                self.faults.role_downgrades += 1;
+        match self.clients[client_idx].role {
+            Some(MemberRole::Owner | MemberRole::Editor) => {
+                if self.clients[client_idx].machine.connection_state() == ConnectionState::Online {
+                    self.clients[client_idx].role = Some(MemberRole::Viewer);
+                    self.faults.role_downgrades += 1;
+                }
             }
-        } else {
-            self.clients[client_idx].role = Some(MemberRole::Editor);
+            Some(MemberRole::Viewer) => {
+                if self.clients[client_idx].machine.connection_state() == ConnectionState::Online {
+                    self.clients[client_idx].role = None;
+                    self.faults.role_downgrades += 1;
+                }
+            }
+            None => {
+                self.clients[client_idx].role = Some(MemberRole::Editor);
+            }
         }
     }
 
@@ -1358,6 +1378,33 @@ impl SimWorld {
             if self.server.validate_push_batch(&txns, raw.len()).is_ok() {
                 return Err(String::from(
                     "oversized Push batch was unexpectedly accepted",
+                ));
+            }
+        } else if kind == RogueKind::ViewerPush {
+            let rogue_pending = WirePendingTxnV2 {
+                replica: VIEWER_REPLICA,
+                client_seq: 1,
+                base_server_seq: self.server.head_seq(),
+                timestamp_ms: self.timestamp_ms,
+                txn: ops_to_wire_txn_v2(
+                    String::from("viewer_rogue"),
+                    &[Op::SetFreeze {
+                        sheet: SheetId(0),
+                        frozen_rows: 1,
+                        frozen_cols: 0,
+                    }],
+                ),
+            };
+            let res = self.server.apply_and_commit(
+                USER_D,
+                Some(MemberRole::Viewer),
+                VIEWER_REPLICA,
+                rogue_pending,
+                self.timestamp_ms,
+            );
+            if res != Err(WireRejectReasonV1::Forbidden) {
+                return Err(format!(
+                    "rogue ViewerPush was not rejected with Forbidden: {res:?}"
                 ));
             }
         } else {
