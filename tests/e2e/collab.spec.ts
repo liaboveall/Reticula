@@ -9,7 +9,11 @@ import {
 } from "./collab-helpers.ts";
 
 test.describe("M2a collaborative workbooks", () => {
-  test.describe.configure({ mode: "serial" });
+  // Each test drives two browser contexts through a debug server. On a fully
+  // loaded machine (16 workers, three browsers) a first visit's sign-in check
+  // has been seen to wait over 20 s behind the Service Worker's precaching, so
+  // these tests get more than the default 30 s.
+  test.describe.configure({ mode: "serial", timeout: 90_000 });
 
   let server: CollabServerHandle | null = null;
 
