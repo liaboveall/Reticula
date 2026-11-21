@@ -1,0 +1,277 @@
+{
+  "affinity": "FFFF",
+  "commit": "0429bfd",
+  "date": "2026-11-21",
+  "native": {
+    "b9a_1000_single_cells": {
+      "engine_frame_ms": {
+        "max_ms": 136.977,
+        "mean_ms": 112.455,
+        "p50_ms": 111.608,
+        "p95_ms": 119.157,
+        "p99_ms": 136.977,
+        "samples": 50,
+        "warmup": 3
+      },
+      "engine_total_ms": {
+        "max_ms": 467.791,
+        "mean_ms": 419.528,
+        "p50_ms": 417.876,
+        "p95_ms": 443.17,
+        "p99_ms": 467.791,
+        "samples": 50,
+        "warmup": 3
+      },
+      "machine_ms": {
+        "max_ms": 1.014,
+        "mean_ms": 0.822,
+        "p50_ms": 0.805,
+        "p95_ms": 0.897,
+        "p99_ms": 1.014,
+        "samples": 50,
+        "warmup": 3
+      },
+      "pending_cells": 1000,
+      "pending_txns": 1000,
+      "recalc_slices_mean": 27.12
+    },
+    "b9b_100k_cell_block": {
+      "engine_frame_ms": {
+        "max_ms": 163.382,
+        "mean_ms": 156.091,
+        "p50_ms": 155.926,
+        "p95_ms": 162.108,
+        "p99_ms": 163.382,
+        "samples": 50,
+        "warmup": 3
+      },
+      "engine_total_ms": {
+        "max_ms": 465.044,
+        "mean_ms": 454.136,
+        "p50_ms": 453.629,
+        "p95_ms": 463.162,
+        "p99_ms": 465.044,
+        "samples": 50,
+        "warmup": 3
+      },
+      "machine_ms": {
+        "max_ms": 48.492,
+        "mean_ms": 45.487,
+        "p50_ms": 45.327,
+        "p95_ms": 47.181,
+        "p99_ms": 48.492,
+        "samples": 50,
+        "warmup": 3
+      },
+      "pending_cells": 100009,
+      "pending_txns": 10,
+      "recalc_slices_mean": 26.82
+    },
+    "breakdown": {
+      "engine_rebuild_ms": {
+        "max_ms": 80.129,
+        "mean_ms": 72.183,
+        "p50_ms": 72.037,
+        "p95_ms": 77.238,
+        "p99_ms": 80.129,
+        "samples": 50,
+        "warmup": 3
+      },
+      "full_recalc_ms": {
+        "max_ms": 331.637,
+        "mean_ms": 301.73,
+        "p50_ms": 300.591,
+        "p95_ms": 317.071,
+        "p99_ms": 331.637,
+        "samples": 50,
+        "warmup": 3
+      },
+      "workbook_clone_ms": {
+        "max_ms": 66.587,
+        "mean_ms": 61.973,
+        "p50_ms": 61.892,
+        "p95_ms": 65.584,
+        "p99_ms": 66.587,
+        "samples": 50,
+        "warmup": 3
+      }
+    },
+    "control_nothing_pending": {
+      "engine_frame_ms": {
+        "max_ms": 0.004,
+        "mean_ms": 0.003,
+        "p50_ms": 0.003,
+        "p95_ms": 0.004,
+        "p99_ms": 0.004,
+        "samples": 50,
+        "warmup": 3
+      },
+      "engine_total_ms": {
+        "max_ms": 0.005,
+        "mean_ms": 0.004,
+        "p50_ms": 0.004,
+        "p95_ms": 0.004,
+        "p99_ms": 0.005,
+        "samples": 50,
+        "warmup": 3
+      },
+      "machine_ms": {
+        "max_ms": 0.002,
+        "mean_ms": 0.002,
+        "p50_ms": 0.002,
+        "p95_ms": 0.002,
+        "p99_ms": 0.002,
+        "samples": 50,
+        "warmup": 3
+      },
+      "pending_cells": 0,
+      "pending_txns": 0,
+      "recalc_slices_mean": 0.0
+    },
+    "document": "sample, 100,000 data rows x 22 columns, 100,000 formulas"
+  },
+  "suite": "m2a-sync",
+  "uncommittedChanges": false,
+  "wasmChrome": {
+    "affinity": "FFFF",
+    "b9a_1000_single_cells": {
+      "engine_frame_ms": {
+        "max_ms": 63.985,
+        "mean_ms": 54.586,
+        "p50_ms": 54.55,
+        "p95_ms": 60.625,
+        "p99_ms": 63.985,
+        "samples": 50,
+        "warmup": 3
+      },
+      "engine_total_ms": {
+        "max_ms": 1144.95,
+        "mean_ms": 994.995,
+        "p50_ms": 991.285,
+        "p95_ms": 1078.725,
+        "p99_ms": 1144.95,
+        "samples": 50,
+        "warmup": 3
+      },
+      "machine_ms": {
+        "max_ms": 1.37,
+        "mean_ms": 0.923,
+        "p50_ms": 0.865,
+        "p95_ms": 1.235,
+        "p99_ms": 1.37,
+        "samples": 50,
+        "warmup": 3
+      },
+      "pending_cells": 1000,
+      "pending_txns": 1000,
+      "recalc_slices_mean": 22.54
+    },
+    "b9b_100k_cell_block": {
+      "engine_frame_ms": {
+        "max_ms": 129.805,
+        "mean_ms": 105.139,
+        "p50_ms": 104.125,
+        "p95_ms": 119.415,
+        "p99_ms": 129.805,
+        "samples": 50,
+        "warmup": 3
+      },
+      "engine_total_ms": {
+        "max_ms": 1227.79,
+        "mean_ms": 1049.313,
+        "p50_ms": 1043.72,
+        "p95_ms": 1125.245,
+        "p99_ms": 1227.79,
+        "samples": 50,
+        "warmup": 3
+      },
+      "machine_ms": {
+        "max_ms": 56.51,
+        "mean_ms": 49.795,
+        "p50_ms": 49.615,
+        "p95_ms": 52.255,
+        "p99_ms": 56.51,
+        "samples": 50,
+        "warmup": 3
+      },
+      "pending_cells": 100009,
+      "pending_txns": 10,
+      "recalc_slices_mean": 23.38
+    },
+    "breakdown": {
+      "engine_rebuild_ms": {
+        "max_ms": 49.15,
+        "mean_ms": 39.152,
+        "p50_ms": 39.15,
+        "p95_ms": 42.705,
+        "p99_ms": 49.15,
+        "samples": 50,
+        "warmup": 3
+      },
+      "full_recalc_ms": {
+        "max_ms": 1068.7,
+        "mean_ms": 988.765,
+        "p50_ms": 993.8,
+        "p95_ms": 1054.545,
+        "p99_ms": 1068.7,
+        "samples": 50,
+        "warmup": 3
+      },
+      "workbook_clone_ms": {
+        "max_ms": 29.895,
+        "mean_ms": 27.659,
+        "p50_ms": 27.865,
+        "p95_ms": 29.87,
+        "p99_ms": 29.895,
+        "samples": 50,
+        "warmup": 3
+      }
+    },
+    "browser": {
+      "name": "chrome",
+      "version": "158.0.8127.36"
+    },
+    "clockResolutionUs": 5,
+    "control_nothing_pending": {
+      "engine_frame_ms": {
+        "max_ms": 0.055,
+        "mean_ms": 0.006,
+        "p50_ms": 0.005,
+        "p95_ms": 0.01,
+        "p99_ms": 0.055,
+        "samples": 50,
+        "warmup": 3
+      },
+      "engine_total_ms": {
+        "max_ms": 0.055,
+        "mean_ms": 0.006,
+        "p50_ms": 0.005,
+        "p95_ms": 0.01,
+        "p99_ms": 0.055,
+        "samples": 50,
+        "warmup": 3
+      },
+      "machine_ms": {
+        "max_ms": 0.025,
+        "mean_ms": 0.003,
+        "p50_ms": 0,
+        "p95_ms": 0.01,
+        "p99_ms": 0.025,
+        "samples": 50,
+        "warmup": 3
+      },
+      "pending_cells": 0,
+      "pending_txns": 0,
+      "recalc_slices_mean": 0
+    },
+    "crossOriginIsolated": true,
+    "document": "sample, 100,000 data rows x 22 columns, 100,000 formulas",
+    "machine": {
+      "cpus": "13th Gen Intel(R) Core(TM) i9-13980HX",
+      "logicalProcessors": 32,
+      "platform": "win32 10.0.26300",
+      "totalMemGiB": 31.7
+    },
+    "peakWasmMemoryBytes": 792330240
+  }
+}
