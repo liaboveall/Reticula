@@ -403,8 +403,10 @@ test("OPFS SeedOrigin + WAL reload, background CoW snapshot slot flip, and torn-
   });
 
   // Reopen: committed edits survive and the torn final record is silently truncated!
+  // This open decodes the compacted million-row snapshot rather than the
+  // generated sample, which takes 4.5-5.7 s on the development machine.
   await page.reload();
-  await expect(page.getByTestId("engine-status")).toHaveText("ready");
+  await expect(page.getByTestId("engine-status")).toHaveText("ready", { timeout: 15_000 });
   await settled(page);
   expect(await page.evaluate(() => window.__reticula?.textAt(1, 0))).toBe("PersistedOrder-777");
   expect(await page.evaluate(() => window.__reticula?.textAt(2, 0))).toBe("AfterCompact-888");
