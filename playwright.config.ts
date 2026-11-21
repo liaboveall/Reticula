@@ -10,6 +10,11 @@ const onCi = Boolean(process.env.CI);
 export default defineConfig({
   testDir: "tests/e2e",
   forbidOnly: onCi,
+  // Half the logical processors (Playwright's default, 16 on the development
+  // machine) overloads it once the collaborative tests add a server and two
+  // browser contexts each: the million-row fill test then timed out in
+  // Firefox. CI runners have two processors.
+  ...(onCi ? {} : { workers: "25%" }),
   reporter: onCi ? [["github"], ["list"]] : "list",
   use: { baseURL: `http://localhost:${port}` },
   webServer: [

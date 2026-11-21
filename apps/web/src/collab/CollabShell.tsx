@@ -14,7 +14,7 @@ import {
   type WorkbookSummary,
   workbook,
 } from "@reticula/protocol/collab-api";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import "./collab.css";
 
 const CACHE_KEY = "reticula:collab-cache:v1";
@@ -164,7 +164,6 @@ export default function CollabShell(props: CollabShellProps) {
   const [accessError, setAccessError] = useState<string | null>(null);
 
   const pendingJoinTokenRef = useRef<string | null>(initialJoinToken);
-  const resolvedBootRef = useRef(false);
 
   const openAfterAuth = useCallback(
     async (signedInUser: User) => {
@@ -227,11 +226,16 @@ export default function CollabShell(props: CollabShellProps) {
     [activeTarget?.docId, initialCollabId, onCloseModal, onOpenCollab, onRequestOpenModal],
   );
 
+  // The sign-in check runs once per mount and only unmounting discards its
+  // answer. It reads the latest callbacks through a ref: had they been
+  // dependencies, a parent re-render while the request was in flight would
+  // have discarded the answer and left "Checking sign-in status…" forever.
+  const bootRef = useRef({ initialCollabId, onOpenCollab, onRequestOpenModal, openAfterAuth });
+  useLayoutEffect(() => {
+    bootRef.current = { initialCollabId, onOpenCollab, onRequestOpenModal, openAfterAuth };
+  });
+
   useEffect(() => {
-    if (resolvedBootRef.current) {
-      return;
-    }
-    resolvedBootRef.current = true;
     let cancelled = false;
     (async () => {
       setLoadingAuth(true);
@@ -244,11 +248,12 @@ export default function CollabShell(props: CollabShellProps) {
         const cache = readCache();
         writeCache({ ...cache, user: currentUser });
         setLoadingAuth(false);
-        await openAfterAuth(currentUser);
+        await bootRef.current.openAfterAuth(currentUser);
       } catch (err) {
         if (cancelled) {
           return;
         }
+        const { initialCollabId, onOpenCollab, onRequestOpenModal } = bootRef.current;
         setLoadingAuth(false);
         if (err instanceof ApiError && err.status === 401) {
           setUser(null);
@@ -276,7 +281,7 @@ export default function CollabShell(props: CollabShellProps) {
     return () => {
       cancelled = true;
     };
-  }, [initialCollabId, onOpenCollab, onRequestOpenModal, openAfterAuth]);
+  }, []);
 
   const handleDevSignIn = async (account: DevAccount) => {
     setBusy(true);

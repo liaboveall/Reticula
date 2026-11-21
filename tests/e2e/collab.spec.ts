@@ -9,11 +9,7 @@ import {
 } from "./collab-helpers.ts";
 
 test.describe("M2a collaborative workbooks", () => {
-  // Each test drives two browser contexts through a debug server. On a fully
-  // loaded machine (16 workers, three browsers) a first visit's sign-in check
-  // has been seen to wait over 20 s behind the Service Worker's precaching, so
-  // these tests get more than the default 30 s.
-  test.describe.configure({ mode: "serial", timeout: 90_000 });
+  test.describe.configure({ mode: "serial" });
 
   let server: CollabServerHandle | null = null;
 
@@ -24,6 +20,28 @@ test.describe("M2a collaborative workbooks", () => {
   test.afterAll(async () => {
     await server?.stop();
     server = null;
+  });
+
+  test("a slow sign-in check still finishes while the page keeps starting up", async ({
+    browser,
+  }) => {
+    if (!server) {
+      throw new Error("server not started");
+    }
+    const ctx = await browser.newContext();
+    try {
+      const page = await ctx.newPage();
+      // Hold the answer back while the engine starts and the page re-renders.
+      await page.route("**/api/auth/me", async (route) => {
+        await new Promise((resolve) => setTimeout(resolve, 3_000));
+        await route.continue();
+      });
+      await page.goto(`${server.baseUrl}/app?hooks`);
+      await page.getByTestId("cloud-menu-btn").click();
+      await expect(page.getByTestId("dev-login-alice")).toBeVisible({ timeout: 10_000 });
+    } finally {
+      await ctx.close();
+    }
   });
 
   test("dual-window real-time sync, presence tracking across row insert, and conditional undo", async ({
