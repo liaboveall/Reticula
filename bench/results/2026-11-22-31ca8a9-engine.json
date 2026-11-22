@@ -1,0 +1,467 @@
+{
+  "affinity": "FFFF",
+  "commit": "31ca8a9",
+  "date": "2026-11-22",
+  "native": {
+    "b12_50m_limit": {
+      "kernel_estimated_bytes": 450404456,
+      "load_ms": {
+        "max_ms": 1050.421,
+        "mean_ms": 1016.003,
+        "p50_ms": 1000.092,
+        "p95_ms": 1050.421,
+        "p99_ms": 1050.421,
+        "samples": 5,
+        "warmup": 1
+      },
+      "recalc_100k_ms": {
+        "max_ms": 49.183,
+        "mean_ms": 47.108,
+        "p50_ms": 47.192,
+        "p95_ms": 49.183,
+        "p99_ms": 49.183,
+        "samples": 5,
+        "warmup": 1
+      },
+      "save_ms": {
+        "max_ms": 458.406,
+        "mean_ms": 448.919,
+        "p50_ms": 452.212,
+        "p95_ms": 458.406,
+        "p99_ms": 458.406,
+        "samples": 5,
+        "warmup": 1
+      },
+      "snapshot_bytes": 96816013
+    },
+    "b1_b11_20m_numeric_only": {
+      "load_ms": {
+        "max_ms": 389.991,
+        "mean_ms": 345.925,
+        "p50_ms": 337.135,
+        "p95_ms": 389.991,
+        "p99_ms": 389.991,
+        "samples": 5,
+        "warmup": 1
+      },
+      "save_ms": {
+        "max_ms": 164.485,
+        "mean_ms": 157.937,
+        "p50_ms": 158.501,
+        "p95_ms": 164.485,
+        "p99_ms": 164.485,
+        "samples": 5,
+        "warmup": 1
+      },
+      "snapshot_bytes": 37477184
+    },
+    "b1_b11_20m_with_1m_formulas": {
+      "load_ms": {
+        "max_ms": 1351.32,
+        "mean_ms": 1321.328,
+        "p50_ms": 1319.455,
+        "p95_ms": 1351.32,
+        "p99_ms": 1351.32,
+        "samples": 5,
+        "warmup": 1
+      },
+      "save_ms": {
+        "max_ms": 434.868,
+        "mean_ms": 428.299,
+        "p50_ms": 428.918,
+        "p95_ms": 434.868,
+        "p99_ms": 434.868,
+        "samples": 5,
+        "warmup": 1
+      },
+      "snapshot_bytes": 48850868
+    },
+    "b2_sum_1m": {
+      "max_ms": 2.13,
+      "mean_ms": 1.799,
+      "p50_ms": 1.779,
+      "p95_ms": 2.13,
+      "p99_ms": 2.13,
+      "samples": 15,
+      "warmup": 3
+    },
+    "b3_full_recalc_1m": {
+      "max_ms": 658.07,
+      "mean_ms": 623.547,
+      "p50_ms": 614.274,
+      "p95_ms": 658.07,
+      "p99_ms": 658.07,
+      "samples": 5,
+      "warmup": 2
+    },
+    "b4_incremental_100k": {
+      "max_ms": 38.031,
+      "mean_ms": 31.696,
+      "p50_ms": 31.52,
+      "p95_ms": 38.031,
+      "p99_ms": 38.031,
+      "samples": 15,
+      "warmup": 3
+    },
+    "b5_chain_1m": {
+      "max_ms": 654.153,
+      "mean_ms": 643.057,
+      "p50_ms": 647.182,
+      "p95_ms": 654.153,
+      "p99_ms": 654.153,
+      "samples": 5,
+      "warmup": 2
+    },
+    "b6_vlookup_100k_exact": {
+      "max_ms": 41368.096,
+      "mean_ms": 41247.832,
+      "p50_ms": 41215.336,
+      "p95_ms": 41368.096,
+      "p99_ms": 41368.096,
+      "samples": 3,
+      "warmup": 1
+    },
+    "b7a_insert_cross_range": {
+      "max_ms": 2.031,
+      "mean_ms": 1.867,
+      "p50_ms": 1.842,
+      "p95_ms": 2.031,
+      "p99_ms": 2.031,
+      "samples": 15,
+      "warmup": 3
+    },
+    "b7a_insert_structural_row_fn": {
+      "max_ms": 48.284,
+      "mean_ms": 43.694,
+      "p50_ms": 42.876,
+      "p95_ms": 48.284,
+      "p99_ms": 48.284,
+      "samples": 15,
+      "warmup": 3
+    },
+    "b7a_insert_top_row_local": {
+      "max_ms": 0.003,
+      "mean_ms": 0.002,
+      "p50_ms": 0.002,
+      "p95_ms": 0.003,
+      "p99_ms": 0.003,
+      "samples": 15,
+      "warmup": 3
+    },
+    "b7b_edit_after_insert_cross_range": {
+      "max_ms": 2.149,
+      "mean_ms": 1.881,
+      "p50_ms": 1.833,
+      "p95_ms": 2.149,
+      "p99_ms": 2.149,
+      "samples": 15,
+      "warmup": 3
+    },
+    "b7b_edit_after_insert_row_local": {
+      "max_ms": 0.188,
+      "mean_ms": 0.164,
+      "p50_ms": 0.16,
+      "p95_ms": 0.188,
+      "p99_ms": 0.188,
+      "samples": 15,
+      "warmup": 3
+    },
+    "b7b_edit_after_insert_structural": {
+      "max_ms": 0.319,
+      "mean_ms": 0.202,
+      "p50_ms": 0.194,
+      "p95_ms": 0.319,
+      "p99_ms": 0.319,
+      "samples": 15,
+      "warmup": 3
+    },
+    "b8_memory": {
+      "formulas_1m": {
+        "cells": 3000001,
+        "formulas": 1000000,
+        "kernel_estimated_bytes": 512097304,
+        "unique_strings": 0
+      },
+      "numeric_10m": {
+        "cells": 10000000,
+        "formulas": 0,
+        "kernel_estimated_bytes": 80321256,
+        "unique_strings": 0
+      },
+      "strings_1m_repeated": {
+        "cells": 1000000,
+        "formulas": 0,
+        "kernel_estimated_bytes": 8067352,
+        "unique_strings": 500
+      },
+      "strings_1m_unique": {
+        "cells": 1000000,
+        "formulas": 0,
+        "kernel_estimated_bytes": 79335704,
+        "unique_strings": 1000000
+      }
+    }
+  },
+  "suite": "m3a-engine",
+  "uncommittedChanges": false,
+  "wasmChrome": {
+    "affinity": "FFFF",
+    "b12_50m_limit": {
+      "kernel_estimated_bytes": 440706608,
+      "load_ms": {
+        "max_ms": 1470.525,
+        "mean_ms": 1457.074,
+        "p50_ms": 1455.395,
+        "p95_ms": 1470.525,
+        "p99_ms": 1470.525,
+        "samples": 5,
+        "warmup": 1
+      },
+      "load_wasm_memory_bytes": 634650624,
+      "peak_wasm_memory_bytes": 634650624,
+      "recalc_100k_ms": {
+        "max_ms": 53.85,
+        "mean_ms": 44.115,
+        "p50_ms": 41.965,
+        "p95_ms": 53.85,
+        "p99_ms": 53.85,
+        "samples": 10,
+        "warmup": 2
+      },
+      "save_ms": {
+        "max_ms": 716.19,
+        "mean_ms": 702.27,
+        "p50_ms": 710.105,
+        "p95_ms": 716.19,
+        "p99_ms": 716.19,
+        "samples": 3,
+        "warmup": 1
+      },
+      "save_probe_ms": {
+        "max_ms": 41.37,
+        "mean_ms": 4.178,
+        "p50_ms": 2.785,
+        "p95_ms": 9.945,
+        "p99_ms": 41.37,
+        "probe_interval_ms": 25,
+        "samples": 83,
+        "warmup": 0
+      },
+      "snapshot_bytes": 96566728
+    },
+    "b1_b11_20m_numeric_only": {
+      "kernel_estimated_bytes": 160603008,
+      "load_ms": {
+        "max_ms": 569.495,
+        "mean_ms": 555.035,
+        "p50_ms": 553.15,
+        "p95_ms": 569.495,
+        "p99_ms": 569.495,
+        "samples": 5,
+        "warmup": 1
+      },
+      "load_wasm_memory_bytes": 225312768,
+      "peak_wasm_memory_bytes": 225312768,
+      "save_ms": {
+        "max_ms": 298.43,
+        "mean_ms": 277.705,
+        "p50_ms": 270.535,
+        "p95_ms": 298.43,
+        "p99_ms": 298.43,
+        "samples": 3,
+        "warmup": 1
+      },
+      "save_probe_ms": {
+        "max_ms": 46.93,
+        "mean_ms": 5.935,
+        "p50_ms": 3.365,
+        "p95_ms": 22.82,
+        "p99_ms": 46.93,
+        "probe_interval_ms": 25,
+        "samples": 31,
+        "warmup": 0
+      },
+      "snapshot_bytes": 37350764
+    },
+    "b1_b11_20m_with_1m_formulas": {
+      "kernel_estimated_bytes": 552603008,
+      "load_ms": {
+        "max_ms": 1493.695,
+        "mean_ms": 1472.896,
+        "p50_ms": 1466.345,
+        "p95_ms": 1493.695,
+        "p99_ms": 1493.695,
+        "samples": 5,
+        "warmup": 1
+      },
+      "load_wasm_memory_bytes": 1030946816,
+      "peak_wasm_memory_bytes": 1030946816,
+      "save_ms": {
+        "max_ms": 526.755,
+        "mean_ms": 523.818,
+        "p50_ms": 526.07,
+        "p95_ms": 526.755,
+        "p99_ms": 526.755,
+        "samples": 3,
+        "warmup": 1
+      },
+      "save_probe_ms": {
+        "max_ms": 27.315,
+        "mean_ms": 3.782,
+        "p50_ms": 2.775,
+        "p95_ms": 5.355,
+        "p99_ms": 27.315,
+        "probe_interval_ms": 25,
+        "samples": 62,
+        "warmup": 0
+      },
+      "snapshot_bytes": 48754383
+    },
+    "b2_sum_1m": {
+      "max_ms": 3.185,
+      "mean_ms": 2.581,
+      "p50_ms": 2.545,
+      "p95_ms": 3.185,
+      "p99_ms": 3.185,
+      "samples": 20,
+      "warmup": 3
+    },
+    "b3_full_recalc_1m": {
+      "max_ms": 549.245,
+      "mean_ms": 520.967,
+      "p50_ms": 526.84,
+      "p95_ms": 549.245,
+      "p99_ms": 549.245,
+      "samples": 10,
+      "warmup": 2
+    },
+    "b4_incremental_100k": {
+      "max_ms": 38.67,
+      "mean_ms": 31.724,
+      "p50_ms": 30.02,
+      "p95_ms": 38.67,
+      "p99_ms": 38.67,
+      "samples": 20,
+      "warmup": 3
+    },
+    "b5_chain_1m": {
+      "max_ms": 696.36,
+      "mean_ms": 666.492,
+      "p50_ms": 673.525,
+      "p95_ms": 696.36,
+      "p99_ms": 696.36,
+      "samples": 10,
+      "warmup": 2
+    },
+    "b6_vlookup_100k_exact": {
+      "formulas": 100000,
+      "max_ms": 74982.55,
+      "mean_ms": 74697.085,
+      "p50_ms": 74966.875,
+      "p95_ms": 74982.55,
+      "p99_ms": 74982.55,
+      "samples": 3,
+      "table_rows": 100000,
+      "warmup": 1
+    },
+    "b7a_insert_cross_range": {
+      "max_ms": 2.815,
+      "mean_ms": 2.484,
+      "p50_ms": 2.46,
+      "p95_ms": 2.815,
+      "p99_ms": 2.815,
+      "samples": 20,
+      "warmup": 3
+    },
+    "b7a_insert_structural_row_fn": {
+      "max_ms": 36.515,
+      "mean_ms": 34.441,
+      "p50_ms": 34.67,
+      "p95_ms": 36.515,
+      "p99_ms": 36.515,
+      "samples": 15,
+      "warmup": 3
+    },
+    "b7a_insert_top_row_local": {
+      "batch100_mean_ms": 0.0051,
+      "batch_note": "mean of 100 consecutive top-row insertions (single op approaches 5 us timer quantum)",
+      "max_ms": 0.025,
+      "mean_ms": 0.006,
+      "p50_ms": 0.005,
+      "p95_ms": 0.02,
+      "p99_ms": 0.025,
+      "samples": 30,
+      "warmup": 5
+    },
+    "b7b_edit_after_insert_cross_range": {
+      "max_ms": 2.92,
+      "mean_ms": 2.491,
+      "p50_ms": 2.465,
+      "p95_ms": 2.92,
+      "p99_ms": 2.92,
+      "samples": 20,
+      "warmup": 3
+    },
+    "b7b_edit_after_insert_row_local": {
+      "max_ms": 0.62,
+      "mean_ms": 0.299,
+      "p50_ms": 0.28,
+      "p95_ms": 0.51,
+      "p99_ms": 0.62,
+      "samples": 30,
+      "warmup": 5
+    },
+    "b7b_edit_after_insert_structural": {
+      "max_ms": 0.3,
+      "mean_ms": 0.257,
+      "p50_ms": 0.25,
+      "p95_ms": 0.3,
+      "p99_ms": 0.3,
+      "samples": 15,
+      "warmup": 3
+    },
+    "b8_memory": {
+      "formulas_1m": {
+        "cells": 3000001,
+        "formulas": 1000000,
+        "kernel_estimated_bytes": 416091088,
+        "unique_strings": 0,
+        "wasm_memory_bytes": 825032704
+      },
+      "numeric_10m": {
+        "cells": 10000000,
+        "formulas": 0,
+        "kernel_estimated_bytes": 80301616,
+        "unique_strings": 0,
+        "wasm_memory_bytes": 81592320
+      },
+      "strings_1m_repeated": {
+        "cells": 1000000,
+        "formulas": 0,
+        "kernel_estimated_bytes": 8058184,
+        "unique_strings": 500,
+        "wasm_memory_bytes": 9306112
+      },
+      "strings_1m_unique": {
+        "cells": 1000000,
+        "formulas": 0,
+        "kernel_estimated_bytes": 64653640,
+        "unique_strings": 1000000,
+        "wasm_memory_bytes": 110624768
+      }
+    },
+    "browser": {
+      "name": "chrome",
+      "version": "158.0.8127.36"
+    },
+    "clockResolutionUs": 5,
+    "crossOriginIsolated": true,
+    "machine": {
+      "cpus": "13th Gen Intel(R) Core(TM) i9-13980HX",
+      "logicalProcessors": 32,
+      "platform": "win32 10.0.26300",
+      "totalMemGiB": 31.7
+    },
+    "memoryBytes": 1636892672
+  }
+}

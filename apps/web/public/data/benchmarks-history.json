@@ -77,6 +77,45 @@
         "b7aInsertCrossP50Ms": 1.84,
         "b7aInsertTopUs": 1.9
       }
+    },
+    {
+      "browser": "chrome 158.0.8127.36",
+      "commit": "31ca8a9",
+      "cpu": "13th Gen Intel(R) Core(TM) i9-13980HX",
+      "date": "2026-11-22",
+      "native": {
+        "b11ProbeP95Ms": null,
+        "b11Save20mMs": 428.92,
+        "b12Load50mMs": 1000.09,
+        "b12PeakWasmMiB": null,
+        "b12Recalc100kMs": 47.19,
+        "b12Save50mMs": 452.21,
+        "b1Load20mMs": 1319.46,
+        "b2Sum1mMs": 1.78,
+        "b3FullRecalc1mMs": 614.27,
+        "b4Incremental100kP50Ms": 31.52,
+        "b4Incremental100kP95Ms": 38.03,
+        "b5Chain1mMs": 647.18,
+        "b7aInsertCrossP50Ms": 1.84,
+        "b7aInsertTopUs": 2.0
+      },
+      "suite": "m3a-engine",
+      "wasmChrome": {
+        "b11ProbeP95Ms": 5.36,
+        "b11Save20mMs": 526.07,
+        "b12Load50mMs": 1455.4,
+        "b12PeakWasmMiB": 605.25,
+        "b12Recalc100kMs": 41.97,
+        "b12Save50mMs": 710.11,
+        "b1Load20mMs": 1466.35,
+        "b2Sum1mMs": 2.55,
+        "b3FullRecalc1mMs": 526.84,
+        "b4Incremental100kP50Ms": 30.02,
+        "b4Incremental100kP95Ms": 38.67,
+        "b5Chain1mMs": 673.53,
+        "b7aInsertCrossP50Ms": 2.46,
+        "b7aInsertTopUs": 5.1
+      }
     }
   ],
   "latestDiff": {
@@ -517,6 +556,15 @@
       "firefoxJumpP99Ms": null,
       "scrollWorkP99Ms": 1.01,
       "suite": "m1b-render"
+    },
+    {
+      "browser": "chrome 158.0.8127.36",
+      "chromeMargin2P99Ms": 1.28,
+      "commit": "31ca8a9",
+      "date": "2026-11-22",
+      "firefoxJumpP99Ms": null,
+      "scrollWorkP99Ms": 1.28,
+      "suite": "m3a-render"
     }
   ],
   "startupRuns": [
@@ -534,6 +582,14 @@
       "firstScreenP50Ms": 877.8,
       "networkLabel": "20 Mbps / 50 ms RTT",
       "shellP50Ms": 474.7,
+      "suite": "s9"
+    },
+    {
+      "commit": "31ca8a9",
+      "date": "2026-11-22",
+      "firstScreenP50Ms": 1115.1,
+      "networkLabel": "20 Mbps / 50 ms RTT",
+      "shellP50Ms": 538.0,
       "suite": "s9"
     }
   ],
@@ -576,6 +632,19 @@
       "wasmB9aTotalP50Ms": 4.95,
       "wasmB9aTotalP95Ms": 6.19,
       "wasmB9bTotalP50Ms": 135.53
+    },
+    {
+      "commit": "31ca8a9",
+      "date": "2026-11-22",
+      "nativeB9aFrameP50Ms": 2.55,
+      "nativeB9aTotalP50Ms": 4.83,
+      "nativeB9bTotalP50Ms": 138.48,
+      "stage": "M3a wire v3 + permute",
+      "suite": "m3a-sync",
+      "wasmB9aFrameP50Ms": 2.81,
+      "wasmB9aTotalP50Ms": 6.23,
+      "wasmB9aTotalP95Ms": 10.01,
+      "wasmB9bTotalP50Ms": 157.68
     }
   ]
 }
