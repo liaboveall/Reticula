@@ -44,6 +44,59 @@ test.describe("M2a collaborative workbooks", () => {
     }
   });
 
+  test("loading governance lists does not shift modal buttons out from under a click", async ({
+    browser,
+  }) => {
+    if (!server) {
+      throw new Error("server not started");
+    }
+    const ctx = await browser.newContext();
+    try {
+      const page = await ctx.newPage();
+      await signInDev(page, server.baseUrl, "alice");
+      await page.getByTestId("new-cloud-title-input").fill("Stable Modal Click");
+      await page.getByTestId("new-cloud-sheet-btn").click();
+      await expect(page.getByTestId("collab-status-pill")).toHaveText("Synced", {
+        timeout: 10_000,
+      });
+
+      let releaseMembers: (() => void) | undefined;
+      const membersHeld = new Promise<void>((resolve) => {
+        releaseMembers = resolve;
+      });
+      await page.route("**/api/workbooks/*/members", async (route) => {
+        await membersHeld;
+        await route.continue();
+      });
+
+      await page.getByTestId("cloud-menu-btn").click();
+      const createBtn = page.getByTestId("create-share-link-btn");
+      await expect(createBtn).toBeVisible();
+      const boxBefore = await createBtn.boundingBox();
+      if (!boxBefore) {
+        throw new Error("create-share-link-btn boundingBox was null before members loaded");
+      }
+
+      await page.mouse.move(boxBefore.x + boxBefore.width / 2, boxBefore.y + boxBefore.height / 2);
+      await page.mouse.down();
+      releaseMembers?.();
+      await expect(page.getByTestId("members-list")).toBeVisible({ timeout: 10_000 });
+
+      const boxAfter = await createBtn.boundingBox();
+      if (!boxAfter) {
+        throw new Error("create-share-link-btn boundingBox was null after members loaded");
+      }
+      expect(Math.abs(boxAfter.y - boxBefore.y)).toBeLessThan(1);
+
+      await page.mouse.up();
+      await expect(page.getByTestId("share-link-url")).toHaveValue(/\/join\//, {
+        timeout: 10_000,
+      });
+    } finally {
+      await ctx.close();
+    }
+  });
+
   test("dual-window real-time sync, presence tracking across row insert, and conditional undo", async ({
     browser,
   }) => {

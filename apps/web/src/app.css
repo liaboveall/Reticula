@@ -682,9 +682,22 @@ body {
   inset: 0;
   z-index: 80;
   display: grid;
-  place-items: center;
   padding: 20px;
   background: rgba(15, 23, 42, 0.45);
+}
+
+.lock-overlay {
+  place-items: center;
+}
+
+/* Anchor modals to a fixed top inset rather than vertical center so
+   asynchronously loaded sections below (members, share links, filter
+   values, named ranges, doc lists) do not shift buttons under a pointer. */
+.modal-backdrop {
+  justify-items: center;
+  align-items: start;
+  padding: clamp(24px, 8vh, 72px) 20px 24px;
+  overflow-y: auto;
 }
 
 .lock-card,
@@ -701,6 +714,10 @@ body {
   color: var(--shell-text);
   box-shadow: 0 20px 48px rgba(0, 0, 0, 0.28);
   overflow-y: auto;
+}
+
+.modal-card {
+  max-height: calc(100vh - clamp(24px, 8vh, 72px) - 24px);
 }
 
 .lock-card h2,

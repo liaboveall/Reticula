@@ -198,7 +198,9 @@ export async function createAndShareSheet(
     await page.getByTestId("share-single-use-toggle").check();
   }
   await page.getByTestId("create-share-link-btn").click();
-  const fullShareUrl = await page.getByTestId("share-link-url").inputValue();
+  const shareLinkInput = page.getByTestId("share-link-url");
+  await expect(shareLinkInput).toHaveValue(/\/join\//, { timeout: 10_000 });
+  const fullShareUrl = await shareLinkInput.inputValue();
   const joinPath = new URL(fullShareUrl).pathname;
   await page.getByTestId("collab-modal-close").click();
   await expect(page.getByTestId("collab-modal")).toBeHidden();

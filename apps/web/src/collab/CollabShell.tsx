@@ -519,9 +519,9 @@ export default function CollabShell(props: CollabShellProps) {
         singleUse: singleUseShare,
         ttlSeconds: ttlParsed && Number.isFinite(ttlParsed) ? ttlParsed : null,
       });
+      await refreshGovernance(activeTarget.docId, activeTarget.role);
       setShareUrl(`${window.location.origin}${created.url}`);
       setShareLabel("");
-      await refreshGovernance(activeTarget.docId, activeTarget.role);
     } catch (err) {
       setAuthError(apiErrorMessage(err, "Could not create share link."));
     } finally {

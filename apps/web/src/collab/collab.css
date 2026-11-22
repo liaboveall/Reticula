@@ -81,7 +81,6 @@
 
 .collab-modal {
   width: min(540px, 94vw);
-  max-height: 88vh;
   overflow-y: auto;
   display: flex;
   flex-direction: column;
