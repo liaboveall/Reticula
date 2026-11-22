@@ -51,6 +51,19 @@ pub struct ClearSpillOutcome {
     pub had_state: bool,
 }
 
+/// Relative dependency ordering between two colliding dynamic spill anchors.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpillCollisionOrder {
+    /// Colliding anchor is strictly upstream of the committing anchor (`other ->* anchor`),
+    /// so `anchor` yields cleanly (`#SPILL!`) without revoking `other`.
+    OtherUpstream,
+    /// Committing anchor is strictly upstream of the colliding anchor (`anchor ->* other`),
+    /// so `anchor` evicts/wakes `other`.
+    AnchorUpstream,
+    /// Independent or mutually dependent anchors; symmetric `#SPILL!` applies.
+    Symmetric,
+}
+
 /// Outcome of committing an [`Array2D`] at `anchor`.
 #[derive(Clone, Debug, PartialEq)]
 pub enum CommitSpillOutcome {
@@ -63,6 +76,8 @@ pub enum CommitSpillOutcome {
         changed_shadows: Vec<WorkbookCellKey>,
         /// Previously blocked anchors watching any shadow cell vacated by shrinkage.
         unblocked_watchers: Vec<WorkbookCellKey>,
+        /// Strictly downstream active anchors evicted so `anchor` could materialize.
+        displaced_anchors: Vec<WorkbookCellKey>,
     },
     /// Array failed (`#SPILL!`) due to bounds overflow, static obstacle, or
     /// symmetric dynamic spill collision.
@@ -133,6 +148,16 @@ impl SpillRegistry {
     #[must_use]
     pub fn is_blocked_anchor(&self, anchor: WorkbookCellKey) -> bool {
         self.blocked_anchors.contains_key(&anchor)
+    }
+
+    /// Returns the watched shadow footprint of `anchor` when blocked solely
+    /// by dynamic spill collisions (`blocked_by_static == false`).
+    #[must_use]
+    pub fn dynamic_blocked_footprint(&self, anchor: WorkbookCellKey) -> Option<&[WorkbookCellKey]> {
+        self.blocked_anchors
+            .get(&anchor)
+            .filter(|b| !b.blocked_by_static)
+            .map(|b| b.footprint.as_slice())
     }
 
     /// Returns the `(rows, cols)` dimensions of an active spill anchored at `anchor`.
@@ -238,6 +263,30 @@ impl SpillRegistry {
         arr: Array2D,
         workbook: &Workbook<BoundFormula>,
     ) -> CommitSpillOutcome {
+        self.commit_array_with_order(anchor, arr, workbook, |_, _, _, _| {
+            SpillCollisionOrder::Symmetric
+        })
+    }
+
+    /// Commits a dynamic-array formula result at `anchor`, classifying each
+    /// colliding spill anchor via `classify(registry, anchor, footprint, other)`
+    /// so strictly downstream spills yield cleanly to upstream spills while
+    /// independent or mutually dependent spills collide symmetrically.
+    pub fn commit_array_with_order<F>(
+        &mut self,
+        anchor: WorkbookCellKey,
+        arr: Array2D,
+        workbook: &Workbook<BoundFormula>,
+        mut classify: F,
+    ) -> CommitSpillOutcome
+    where
+        F: FnMut(
+            &Self,
+            WorkbookCellKey,
+            &[WorkbookCellKey],
+            WorkbookCellKey,
+        ) -> SpillCollisionOrder,
+    {
         let (sheet_id, anchor_row, anchor_col) = anchor;
         let old_blocked = self.remove_blocked_only(anchor);
 
@@ -302,7 +351,7 @@ impl SpillRegistry {
 
         let mut has_static_blocker = false;
         let mut active_collisions = BTreeSet::new();
-        let mut has_dynamic_blocked_collision = false;
+        let mut dynamic_blocked_collisions = BTreeSet::new();
 
         for &cell in &footprint {
             if sheet.value_by_id(cell.1, cell.2) != Value::Empty
@@ -324,19 +373,58 @@ impl SpillRegistry {
                             .get(&watcher)
                             .is_some_and(|b| !b.blocked_by_static)
                     {
-                        has_dynamic_blocked_collision = true;
+                        dynamic_blocked_collisions.insert(watcher);
                     }
                 }
             }
         }
 
-        if has_static_blocker {
+        let mut has_upstream_blocker = false;
+        let mut symmetric_active = Vec::new();
+        let mut downstream_active = Vec::new();
+        let mut symmetric_blocked = Vec::new();
+        let mut downstream_blocked = Vec::new();
+
+        if !has_static_blocker
+            && (!active_collisions.is_empty() || !dynamic_blocked_collisions.is_empty())
+        {
+            for &other in &active_collisions {
+                match classify(self, anchor, &footprint, other) {
+                    SpillCollisionOrder::OtherUpstream => {
+                        has_upstream_blocker = true;
+                        break;
+                    }
+                    SpillCollisionOrder::AnchorUpstream => {
+                        downstream_active.push(other);
+                    }
+                    SpillCollisionOrder::Symmetric => {
+                        symmetric_active.push(other);
+                    }
+                }
+            }
+            if !has_upstream_blocker {
+                for &other in &dynamic_blocked_collisions {
+                    match classify(self, anchor, &footprint, other) {
+                        SpillCollisionOrder::OtherUpstream => {
+                            has_upstream_blocker = true;
+                            break;
+                        }
+                        SpillCollisionOrder::AnchorUpstream => {
+                            downstream_blocked.push(other);
+                        }
+                        SpillCollisionOrder::Symmetric => {
+                            symmetric_blocked.push(other);
+                        }
+                    }
+                }
+            }
+        }
+
+        if has_static_blocker || has_upstream_blocker {
             let freed_shadows = self.remove_active_only(anchor).unwrap_or_default();
             let mut unblocked_watchers = Vec::new();
             for &cell in &freed_shadows {
-                if !footprint.contains(&cell) {
-                    self.collect_watchers_into(cell, &mut unblocked_watchers, Some(anchor));
-                }
+                self.collect_watchers_into(cell, &mut unblocked_watchers, Some(anchor));
             }
             if let Some(ref b) = old_blocked
                 && !b.blocked_by_static
@@ -353,13 +441,23 @@ impl SpillRegistry {
             };
         }
 
-        if !active_collisions.is_empty() || has_dynamic_blocked_collision {
+        if !symmetric_active.is_empty() || !symmetric_blocked.is_empty() {
             let mut freed_shadows = self.remove_active_only(anchor).unwrap_or_default();
-            let mut revoked_anchors = Vec::with_capacity(active_collisions.len());
-            for other in active_collisions {
+            let mut revoked_anchors = Vec::with_capacity(
+                symmetric_active
+                    .len()
+                    .saturating_add(downstream_active.len()),
+            );
+            for &other in &symmetric_active {
                 let other_footprint = self.remove_active_only(other).unwrap_or_default();
                 freed_shadows.extend(other_footprint.iter().copied());
                 self.record_blocked(other, other_footprint, false);
+                revoked_anchors.push(other);
+            }
+            for &other in &downstream_active {
+                let other_footprint = self.remove_active_only(other).unwrap_or_default();
+                freed_shadows.extend(other_footprint.iter().copied());
+                self.record_blocked(other, other_footprint, true);
                 revoked_anchors.push(other);
             }
             let mut unblocked_watchers = Vec::new();
@@ -375,8 +473,14 @@ impl SpillRegistry {
                     }
                 }
             }
-            // Note: do not wake the anchors we just revoked into blocked state.
-            unblocked_watchers.retain(|w| !revoked_anchors.contains(w));
+            // Note: do not wake symmetric blockers we just revoked into blocked state,
+            // while waking strictly downstream anchors so they re-evaluate cleanly.
+            unblocked_watchers.retain(|w| !symmetric_active.contains(w));
+            for &other in downstream_active.iter().chain(downstream_blocked.iter()) {
+                if !unblocked_watchers.contains(&other) {
+                    unblocked_watchers.push(other);
+                }
+            }
             self.record_blocked(anchor, footprint, false);
             return CommitSpillOutcome::Blocked {
                 revoked_anchors,
@@ -385,7 +489,28 @@ impl SpillRegistry {
             };
         }
 
-        // Clean fit: compare against `anchor`'s prior active spill (if any) to track exact diffs.
+        // Clean fit: first evict any strictly downstream active/blocked anchors cleanly.
+        let mut displaced_shadows = Vec::new();
+        let mut displaced_anchors = Vec::new();
+        let mut unblocked_watchers = Vec::new();
+        for &other in &downstream_active {
+            let other_shadows = self.remove_active_only(other).unwrap_or_default();
+            for &cell in &other_shadows {
+                self.collect_watchers_into(cell, &mut unblocked_watchers, Some(anchor));
+            }
+            displaced_shadows.extend(other_shadows);
+            displaced_anchors.push(other);
+            if !unblocked_watchers.contains(&other) {
+                unblocked_watchers.push(other);
+            }
+        }
+        for &other in &downstream_blocked {
+            if !unblocked_watchers.contains(&other) {
+                unblocked_watchers.push(other);
+            }
+        }
+
+        // Compare against `anchor`'s prior active spill (if any) to track exact diffs.
         let mut old_shadow_vals = BTreeMap::new();
         let old_shadows = self.remove_active_only_with_values(anchor, &mut old_shadow_vals);
 
@@ -414,7 +539,6 @@ impl SpillRegistry {
             }
         }
 
-        let mut unblocked_watchers = Vec::new();
         for old_cell in old_shadows {
             if !new_shadows_map.contains_key(&old_cell) {
                 changed_shadows.push(old_cell);
@@ -428,6 +552,11 @@ impl SpillRegistry {
                 if !new_shadows_map.contains_key(&old_cell) {
                     self.collect_watchers_into(old_cell, &mut unblocked_watchers, Some(anchor));
                 }
+            }
+        }
+        for cell in displaced_shadows {
+            if !new_shadows_map.contains_key(&cell) && !changed_shadows.contains(&cell) {
+                changed_shadows.push(cell);
             }
         }
 
@@ -449,6 +578,7 @@ impl SpillRegistry {
             anchor_scalar,
             changed_shadows,
             unblocked_watchers,
+            displaced_anchors,
         }
     }
 

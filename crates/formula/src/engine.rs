@@ -52,7 +52,7 @@ use crate::filter::{
 };
 use crate::functions::{EvalEnv, combine_choose, combine_if, combine_iferror, eval_eager_function};
 use crate::parser::ParseError;
-use crate::spill::{CommitSpillOutcome, SpillRegistry};
+use crate::spill::{CommitSpillOutcome, SpillCollisionOrder, SpillRegistry};
 use crate::value_eval::{
     Array2D, CallerContext, EvalScalar, EvalValue, ResolvedRef, ScalarOrArray,
     coerce_for_scalar_op, eval_binary, eval_unary, finalize_top_level, materialise_reference,
@@ -65,6 +65,7 @@ type FxSet<T> = HashSet<T, BuildHasherDefault<FxHasher>>;
 const STATE_CLEAN: u8 = 0;
 const STATE_DIRTY: u8 = 1;
 const STATE_EVALUATING: u8 = 2;
+const STATE_SCC_WAIT: u8 = 3;
 const MAX_WAVE_SPILL_REQUEUES: u8 = 16;
 
 /// Number of live formula rows populated in `M2..=M100001` of the default
@@ -152,7 +153,17 @@ struct CycleSpillRecord {
 enum ExprOutcome {
     Ready(EvalValue),
     Blocked(SmallVec<[u32; 4]>),
-    Cycle(u32),
+    Cycle(usize),
+}
+
+#[derive(Clone, Copy)]
+struct DepView<'a> {
+    dep_graph: &'a DepGraph,
+    name_dep_graph: &'a DepGraph,
+    name_slots: &'a [Option<(NamedRangeKey, FormulaRegistration)>],
+    cell_to_fid: &'a FxMap<WorkbookCellKey, u32>,
+    slots: &'a [Option<FormulaSlot>],
+    workbook: &'a Workbook<BoundFormula>,
 }
 
 /// Complete single-node spreadsheet engine (`Workbook` + `DepGraph` + time-sliced
@@ -170,6 +181,10 @@ pub struct FormulaEngine {
     filter_sensitive_names: BTreeSet<u32>,
     name_eval_stack: Vec<NamedRangeKey>,
     wave_spill_requeues: BTreeMap<u32, u8>,
+    wave_cycle_verified: BTreeSet<u32>,
+    scc_stack: Vec<u32>,
+    scc_low: BTreeMap<u32, usize>,
+    wave_deferred_dirty: Vec<u32>,
     cycle_spills: BTreeMap<WorkbookCellKey, CycleSpillRecord>,
     cycle_shadow_watch: BTreeMap<WorkbookCellKey, Vec<WorkbookCellKey>>,
     slots: Vec<Option<FormulaSlot>>,
@@ -263,6 +278,10 @@ impl FormulaEngine {
             filter_sensitive_names,
             name_eval_stack: Vec::new(),
             wave_spill_requeues: BTreeMap::new(),
+            wave_cycle_verified: BTreeSet::new(),
+            scc_stack: Vec::new(),
+            scc_low: BTreeMap::new(),
+            wave_deferred_dirty: Vec::new(),
             cycle_spills: BTreeMap::new(),
             cycle_shadow_watch: BTreeMap::new(),
             slots,
@@ -461,6 +480,10 @@ impl FormulaEngine {
             filter_sensitive_names: BTreeSet::new(),
             name_eval_stack: Vec::new(),
             wave_spill_requeues: BTreeMap::new(),
+            wave_cycle_verified: BTreeSet::new(),
+            scc_stack: Vec::new(),
+            scc_low: BTreeMap::new(),
+            wave_deferred_dirty: Vec::new(),
             cycle_spills: BTreeMap::new(),
             cycle_shadow_watch: BTreeMap::new(),
             slots,
@@ -854,7 +877,9 @@ impl FormulaEngine {
     /// Whether dirty formulas remain queued for recalculation.
     #[must_use]
     pub fn has_pending_recalc(&self) -> bool {
-        self.dirty_cursor < self.dirty_queue.len() || !self.call_stack.is_empty()
+        self.dirty_cursor < self.dirty_queue.len()
+            || !self.call_stack.is_empty()
+            || !self.scc_stack.is_empty()
     }
 
     /// O(1) check whether `(sheet_id, row, col)` holds a bound formula.
@@ -1503,6 +1528,9 @@ impl FormulaEngine {
 
         loop {
             if self.call_stack.is_empty() {
+                if !self.scc_stack.is_empty() {
+                    self.release_all_scc_wait_to_dirty();
+                }
                 if self.dirty_needs_sort {
                     self.prepare_dirty_queue();
                 }
@@ -1522,6 +1550,10 @@ impl FormulaEngine {
                     self.dirty_needs_sort = false;
                     self.wave_done = 0;
                     self.wave_spill_requeues.clear();
+                    self.wave_cycle_verified.clear();
+                    self.scc_stack.clear();
+                    self.scc_low.clear();
+                    self.wave_deferred_dirty.clear();
                     return RecalcStatus::Complete { recalculated: done };
                 };
                 self.call_stack.push(root_fid);
@@ -1530,7 +1562,9 @@ impl FormulaEngine {
             let Some(&cur_fid) = self.call_stack.last() else {
                 continue;
             };
-            if self.state_of(cur_fid) == STATE_CLEAN || self.slot_of(cur_fid).is_none() {
+            if matches!(self.state_of(cur_fid), STATE_CLEAN | STATE_SCC_WAIT)
+                || self.slot_of(cur_fid).is_none()
+            {
                 let _ = self.call_stack.pop();
                 continue;
             }
@@ -1555,7 +1589,11 @@ impl FormulaEngine {
 
             match self.eval_root_formula(&formula.root, caller) {
                 ExprOutcome::Ready(val) => {
+                    let my_pos = self.call_stack.len().saturating_sub(1);
                     self.commit_evaluated_formula(cur_fid, key, caller, val);
+                    if !self.scc_stack.is_empty() {
+                        self.release_scc_wait_at_or_above(my_pos);
+                    }
                     self.wave_done = self.wave_done.saturating_add(1);
                     since_check = since_check.saturating_add(1);
                     if since_check >= stride {
@@ -1582,8 +1620,8 @@ impl FormulaEngine {
                         }
                     }
                 }
-                ExprOutcome::Cycle(target_fid) => {
-                    self.unwind_cycle(target_fid);
+                ExprOutcome::Cycle(min_pos) => {
+                    self.handle_cycle(cur_fid, min_pos);
                 }
             }
         }
@@ -1603,7 +1641,8 @@ impl FormulaEngine {
             .dirty_queue
             .len()
             .saturating_sub(self.dirty_cursor)
-            .saturating_add(self.call_stack.len());
+            .saturating_add(self.call_stack.len())
+            .saturating_add(self.scc_stack.len());
         let total = self
             .wave_done
             .saturating_add(u32::try_from(rem).unwrap_or(u32::MAX));
@@ -1670,11 +1709,27 @@ impl FormulaEngine {
                     .map(|s| s.value_by_id(key.1, key.2).pack());
                 let old_shape = self.spills.spill_shape(key);
                 let was_active = old_shape.is_some();
-                match self.spills.commit_array(key, arr, &self.workbook) {
+                let dep_view = DepView {
+                    dep_graph: &self.dep_graph,
+                    name_dep_graph: &self.name_dep_graph,
+                    name_slots: &self.name_slots,
+                    cell_to_fid: &self.cell_to_fid,
+                    slots: &self.slots,
+                    workbook: &self.workbook,
+                };
+                match self.spills.commit_array_with_order(
+                    key,
+                    arr,
+                    dep_view.workbook,
+                    |spills, a, a_fp, b| {
+                        Self::classify_spill_collision_in(&dep_view, spills, a, a_fp, b)
+                    },
+                ) {
                     CommitSpillOutcome::Materialized {
                         anchor_scalar,
                         changed_shadows,
                         unblocked_watchers,
+                        displaced_anchors,
                     } => {
                         let new_shape = self.spills.spill_shape(key);
                         let shape_changed = old_shape != new_shape;
@@ -1695,6 +1750,9 @@ impl FormulaEngine {
                         if shape_changed || anchor_changed || !changed_shadows.is_empty() {
                             self.collect_spill_anchor_dependents(key, &mut post_dirty);
                         }
+                        for displaced in displaced_anchors {
+                            self.collect_direct_dependents(displaced, &mut post_dirty);
+                        }
                         // Strip `cur_fid` for direct anchor / spill-anchor dependents before
                         // collecting changed-shadow dependents so self-shadow cycles
                         // (`A1 = =A2:A3`) re-evaluate once and report `#CYCLE!` consistently
@@ -1706,6 +1764,7 @@ impl FormulaEngine {
                                 self.wake_cycle_shadow_watchers(
                                     shadow_key,
                                     Some(cur_fid),
+                                    Some(key),
                                     &mut post_dirty,
                                 );
                             }
@@ -1742,6 +1801,18 @@ impl FormulaEngine {
                         }
                         self.push_unblocked_watchers(&unblocked_watchers, cur_fid, &mut post_dirty);
                         post_dirty.retain(|&fid| fid != cur_fid);
+                        if !self.cycle_shadow_watch.is_empty()
+                            && let Some(fp) = self.spills.dynamic_blocked_footprint(key)
+                        {
+                            for &cell in fp {
+                                self.wake_cycle_shadow_watchers(
+                                    cell,
+                                    Some(cur_fid),
+                                    Some(key),
+                                    &mut post_dirty,
+                                );
+                            }
+                        }
                         self.drain_cycle_spill_anchor(key, Some(cur_fid), &mut post_dirty);
                         self.propagate_dirty_in_wave(post_dirty, &[]);
                     }
@@ -1852,17 +1923,53 @@ impl FormulaEngine {
         &self,
         cell: WorkbookCellKey,
         exclude_fid: Option<u32>,
+        claimer: Option<WorkbookCellKey>,
         out: &mut Vec<u32>,
     ) {
-        if let Some(anchors) = self.cycle_shadow_watch.get(&cell) {
-            for &anchor in anchors {
-                if let Some(&afid) = self.cell_to_fid.get(&anchor)
-                    && Some(afid) != exclude_fid
-                    && self.state_of(afid) == STATE_CLEAN
-                {
-                    out.push(afid);
+        let Some(anchors) = self.cycle_shadow_watch.get(&cell) else {
+            return;
+        };
+        let dep_view = DepView {
+            dep_graph: &self.dep_graph,
+            name_dep_graph: &self.name_dep_graph,
+            name_slots: &self.name_slots,
+            cell_to_fid: &self.cell_to_fid,
+            slots: &self.slots,
+            workbook: &self.workbook,
+        };
+        for &anchor in anchors {
+            let Some(&afid) = self.cell_to_fid.get(&anchor) else {
+                continue;
+            };
+            if Some(afid) == exclude_fid || self.state_of(afid) != STATE_CLEAN {
+                continue;
+            }
+            if let Some(claimer_key) = claimer {
+                let cleared = self
+                    .cycle_spills
+                    .get(&anchor)
+                    .map_or(&[][..], |r| r.cleared_shadows.as_slice());
+                let anchor_reaches_claimer = Self::formula_reaches_in(
+                    &dep_view,
+                    &self.spills,
+                    anchor,
+                    claimer_key,
+                    anchor,
+                    cleared,
+                );
+                let claimer_reaches_anchor = Self::formula_reaches_in(
+                    &dep_view,
+                    &self.spills,
+                    claimer_key,
+                    anchor,
+                    anchor,
+                    cleared,
+                );
+                if anchor_reaches_claimer && !claimer_reaches_anchor {
+                    continue;
                 }
             }
+            out.push(afid);
         }
     }
 
@@ -1897,7 +2004,7 @@ impl FormulaEngine {
             return;
         }
         self.drain_cycle_spill_anchor(key, None, root_dirty);
-        self.wake_cycle_shadow_watchers(key, None, root_dirty);
+        self.wake_cycle_shadow_watchers(key, None, None, root_dirty);
         let clear_out = self.spills.clear_anchor(key);
         if clear_out.had_state {
             self.record_changed_cells(&clear_out.cleared_shadows);
@@ -2412,19 +2519,65 @@ impl FormulaEngine {
     }
 
     fn collect_name_dependents_from_nids(&self, seed_nids: &[u32], out: &mut Vec<u32>) {
+        Self::collect_name_dependents_from_nids_with(
+            &self.dep_graph,
+            &self.name_dep_graph,
+            &self.name_slots,
+            seed_nids,
+            |fid| {
+                if self.state_of(fid) == STATE_CLEAN {
+                    out.push(fid);
+                }
+            },
+        );
+    }
+
+    fn collect_name_dependents_from_nids_with(
+        dep_graph: &DepGraph,
+        name_dep_graph: &DepGraph,
+        name_slots: &[Option<(NamedRangeKey, FormulaRegistration)>],
+        seed_nids: &[u32],
+        emit: impl FnMut(u32),
+    ) {
         if seed_nids.is_empty() {
             return;
         }
         let mut names = Vec::with_capacity(seed_nids.len());
         for &nid in seed_nids {
-            if let Some((nkey, _)) = self.name_slots.get(nid as usize).and_then(Option::as_ref) {
+            if let Some((nkey, _)) = name_slots.get(nid as usize).and_then(Option::as_ref) {
                 names.push(nkey.canonical_name.clone());
             }
         }
-        self.collect_name_dependents_for_names(&names, out);
+        Self::collect_name_dependents_for_names_with(
+            dep_graph,
+            name_dep_graph,
+            name_slots,
+            &names,
+            emit,
+        );
     }
 
     fn collect_name_dependents_for_names(&self, seed_names: &[String], out: &mut Vec<u32>) {
+        Self::collect_name_dependents_for_names_with(
+            &self.dep_graph,
+            &self.name_dep_graph,
+            &self.name_slots,
+            seed_names,
+            |fid| {
+                if self.state_of(fid) == STATE_CLEAN {
+                    out.push(fid);
+                }
+            },
+        );
+    }
+
+    fn collect_name_dependents_for_names_with(
+        dep_graph: &DepGraph,
+        name_dep_graph: &DepGraph,
+        name_slots: &[Option<(NamedRangeKey, FormulaRegistration)>],
+        seed_names: &[String],
+        mut emit: impl FnMut(u32),
+    ) {
         if seed_names.is_empty() {
             return;
         }
@@ -2439,14 +2592,9 @@ impl FormulaEngine {
         let mut head = 0usize;
         while let Some(canon) = queue.get(head).cloned() {
             head = head.saturating_add(1);
-            self.dep_graph.for_each_name_dependent(&canon, |fid| {
-                if self.state_of(fid) == STATE_CLEAN {
-                    out.push(fid);
-                }
-            });
-            self.name_dep_graph.for_each_name_dependent(&canon, |nid| {
-                if let Some((dep_key, _)) =
-                    self.name_slots.get(nid as usize).and_then(Option::as_ref)
+            dep_graph.for_each_name_dependent(&canon, &mut emit);
+            name_dep_graph.for_each_name_dependent(&canon, |nid| {
+                if let Some((dep_key, _)) = name_slots.get(nid as usize).and_then(Option::as_ref)
                     && seen_names.insert(dep_key.canonical_name.clone())
                 {
                     queue.push(dep_key.canonical_name.clone());
@@ -2572,7 +2720,146 @@ impl FormulaEngine {
         }
     }
 
+    fn collect_cell_dependents_unfiltered(
+        view: &DepView<'_>,
+        key: WorkbookCellKey,
+        include_spill_anchor: bool,
+        out: &mut Vec<u32>,
+    ) {
+        view.dep_graph
+            .for_each_cell_dependent(key, view.workbook, |fid| out.push(fid));
+        if include_spill_anchor {
+            view.dep_graph
+                .for_each_spill_dependent(key, |fid| out.push(fid));
+        }
+        if !view.name_slots.is_empty() {
+            let mut seed_nids = Vec::new();
+            view.name_dep_graph
+                .for_each_cell_dependent(key, view.workbook, |nid| seed_nids.push(nid));
+            if include_spill_anchor {
+                view.name_dep_graph
+                    .for_each_spill_dependent(key, |nid| seed_nids.push(nid));
+            }
+            Self::collect_name_dependents_from_nids_with(
+                view.dep_graph,
+                view.name_dep_graph,
+                view.name_slots,
+                &seed_nids,
+                |fid| out.push(fid),
+            );
+        }
+    }
+
+    fn formula_reaches_in(
+        view: &DepView<'_>,
+        spills: &SpillRegistry,
+        start: WorkbookCellKey,
+        target: WorkbookCellKey,
+        override_anchor: WorkbookCellKey,
+        override_footprint: &[WorkbookCellKey],
+    ) -> bool {
+        let Some(&start_fid) = view.cell_to_fid.get(&start) else {
+            return false;
+        };
+        let Some(&target_fid) = view.cell_to_fid.get(&target) else {
+            return false;
+        };
+        if start_fid == target_fid {
+            return false;
+        }
+        let mut visited: BTreeSet<u32> = BTreeSet::new();
+        let mut queue: Vec<u32> = Vec::new();
+        visited.insert(start_fid);
+        queue.push(start_fid);
+
+        let mut head = 0usize;
+        let mut next_fids: Vec<u32> = Vec::new();
+        while let Some(&fid) = queue.get(head) {
+            head = head.saturating_add(1);
+            let Some(cell_key) = view
+                .slots
+                .get(fid as usize)
+                .and_then(Option::as_ref)
+                .map(|s| s.key)
+            else {
+                continue;
+            };
+            next_fids.clear();
+            Self::collect_cell_dependents_unfiltered(view, cell_key, true, &mut next_fids);
+            if cell_key == override_anchor {
+                for &shadow_key in override_footprint {
+                    if shadow_key != cell_key {
+                        Self::collect_cell_dependents_unfiltered(
+                            view,
+                            shadow_key,
+                            false,
+                            &mut next_fids,
+                        );
+                    }
+                }
+            } else if spills.has_spills_on_sheet(cell_key.0)
+                && let Some(entry) = spills.active_spill(cell_key)
+            {
+                for &row in &entry.rows {
+                    for &col in &entry.cols {
+                        let shadow_key = (cell_key.0, row, col);
+                        if shadow_key != cell_key {
+                            Self::collect_cell_dependents_unfiltered(
+                                view,
+                                shadow_key,
+                                false,
+                                &mut next_fids,
+                            );
+                        }
+                    }
+                }
+            } else if let Some(fp) = spills.dynamic_blocked_footprint(cell_key) {
+                for &shadow_key in fp {
+                    if shadow_key != cell_key {
+                        Self::collect_cell_dependents_unfiltered(
+                            view,
+                            shadow_key,
+                            false,
+                            &mut next_fids,
+                        );
+                    }
+                }
+            }
+
+            for &dep_fid in &next_fids {
+                if dep_fid == target_fid {
+                    return true;
+                }
+                if visited.insert(dep_fid) {
+                    queue.push(dep_fid);
+                }
+            }
+        }
+        false
+    }
+
+    fn classify_spill_collision_in(
+        view: &DepView<'_>,
+        spills: &SpillRegistry,
+        anchor: WorkbookCellKey,
+        anchor_footprint: &[WorkbookCellKey],
+        other: WorkbookCellKey,
+    ) -> SpillCollisionOrder {
+        let a_reaches_b =
+            Self::formula_reaches_in(view, spills, anchor, other, anchor, anchor_footprint);
+        let b_reaches_a =
+            Self::formula_reaches_in(view, spills, other, anchor, anchor, anchor_footprint);
+        if b_reaches_a && !a_reaches_b {
+            SpillCollisionOrder::OtherUpstream
+        } else if a_reaches_b && !b_reaches_a {
+            SpillCollisionOrder::AnchorUpstream
+        } else {
+            SpillCollisionOrder::Symmetric
+        }
+    }
+
     fn propagate_dirty(&mut self, roots: Vec<u32>) {
+        self.wave_cycle_verified.clear();
         self.propagate_dirty_impl(roots, &[], false);
     }
 
@@ -2590,10 +2877,17 @@ impl FormulaEngine {
         cap_wave_requeues: bool,
         bfs: &mut Vec<u32>,
     ) {
-        if exclude.contains(&fid)
-            || self.state_of(fid) != STATE_CLEAN
-            || self.slot_of(fid).is_none()
-        {
+        if exclude.contains(&fid) || self.slot_of(fid).is_none() {
+            return;
+        }
+        let st = self.state_of(fid);
+        if st == STATE_SCC_WAIT {
+            if !self.wave_deferred_dirty.contains(&fid) {
+                self.wave_deferred_dirty.push(fid);
+            }
+            return;
+        }
+        if st != STATE_CLEAN {
             return;
         }
         if cap_wave_requeues {
@@ -2646,12 +2940,44 @@ impl FormulaEngine {
                         newly_found.push(dep_fid);
                     }
                 });
-            if !self.name_slots.is_empty() {
-                let mut seed_nids = Vec::new();
+            let has_names = !self.name_slots.is_empty();
+            let mut seed_nids = Vec::new();
+            if has_names {
                 self.name_dep_graph
                     .for_each_cell_dependent(cell_key, wb_ref, |nid| seed_nids.push(nid));
                 self.name_dep_graph
                     .for_each_spill_dependent(cell_key, |nid| seed_nids.push(nid));
+            }
+            if self.spills.has_spills_on_sheet(cell_key.0)
+                && let Some(entry) = self.spills.active_spill(cell_key)
+            {
+                for &row in &entry.rows {
+                    for &col in &entry.cols {
+                        let shadow_key = (cell_key.0, row, col);
+                        if shadow_key == cell_key {
+                            continue;
+                        }
+                        self.dep_graph
+                            .for_each_cell_dependent(shadow_key, wb_ref, |dep_fid| {
+                                let st = states_ref
+                                    .get(dep_fid as usize)
+                                    .copied()
+                                    .unwrap_or(STATE_CLEAN);
+                                if st == STATE_CLEAN {
+                                    newly_found.push(dep_fid);
+                                }
+                            });
+                        if has_names {
+                            self.name_dep_graph.for_each_cell_dependent(
+                                shadow_key,
+                                wb_ref,
+                                |nid| seed_nids.push(nid),
+                            );
+                        }
+                    }
+                }
+            }
+            if !seed_nids.is_empty() {
                 let mut name_fids = Vec::new();
                 self.collect_name_dependents_from_nids(&seed_nids, &mut name_fids);
                 newly_found.extend(name_fids);
@@ -2666,12 +2992,98 @@ impl FormulaEngine {
     }
 
     fn abort_paused_call_stack(&mut self) {
-        if self.call_stack.is_empty() {
+        self.wave_cycle_verified.clear();
+        self.wave_deferred_dirty.clear();
+        if self.call_stack.is_empty() && self.scc_stack.is_empty() {
             return;
         }
         let paused = core::mem::take(&mut self.call_stack);
         for fid in paused {
             if self.state_of(fid) == STATE_EVALUATING {
+                self.set_state(fid, STATE_DIRTY);
+                self.dirty_queue.push(fid);
+                self.dirty_needs_sort = true;
+            }
+        }
+        let parked = core::mem::take(&mut self.scc_stack);
+        self.scc_low.clear();
+        for fid in parked {
+            if self.state_of(fid) == STATE_SCC_WAIT {
+                self.set_state(fid, STATE_DIRTY);
+                self.dirty_queue.push(fid);
+                self.dirty_needs_sort = true;
+            }
+        }
+    }
+
+    fn release_scc_wait_at_or_above(&mut self, min_pos: usize) {
+        self.release_scc_wait_while(Some(min_pos));
+    }
+
+    fn release_all_scc_wait_to_dirty(&mut self) {
+        self.release_scc_wait_while(None);
+    }
+
+    fn release_scc_wait_while(&mut self, min_pos: Option<usize>) {
+        let mut repropagate = Vec::new();
+        while let Some(&top) = self.scc_stack.last() {
+            if let Some(threshold) = min_pos
+                && self.scc_low.get(&top).copied().unwrap_or(0) < threshold
+            {
+                break;
+            }
+            let _ = self.scc_stack.pop();
+            let _ = self.scc_low.remove(&top);
+            if self.state_of(top) == STATE_SCC_WAIT {
+                if self.wave_deferred_dirty.contains(&top) {
+                    self.wave_deferred_dirty.retain(|&f| f != top);
+                    self.set_state(top, STATE_CLEAN);
+                    repropagate.push(top);
+                } else {
+                    self.set_state(top, STATE_DIRTY);
+                    self.dirty_queue.push(top);
+                    self.dirty_needs_sort = true;
+                }
+            }
+        }
+        if !repropagate.is_empty() {
+            self.propagate_dirty_in_wave(repropagate.clone(), &[]);
+            for fid in repropagate {
+                if self.state_of(fid) == STATE_CLEAN && self.slot_of(fid).is_some() {
+                    self.set_state(fid, STATE_DIRTY);
+                    self.dirty_queue.push(fid);
+                    self.dirty_needs_sort = true;
+                }
+            }
+        }
+    }
+
+    fn flush_deferred_dirty(&mut self) {
+        if self.wave_deferred_dirty.is_empty() {
+            return;
+        }
+        let deferred = core::mem::take(&mut self.wave_deferred_dirty);
+        let mut ready = Vec::new();
+        let mut ensure_dirty = Vec::new();
+        let mut remaining = Vec::new();
+        for fid in deferred {
+            match self.state_of(fid) {
+                STATE_CLEAN => ready.push(fid),
+                STATE_DIRTY => {
+                    self.set_state(fid, STATE_CLEAN);
+                    ready.push(fid);
+                    ensure_dirty.push(fid);
+                }
+                STATE_SCC_WAIT => remaining.push(fid),
+                _ => {}
+            }
+        }
+        self.wave_deferred_dirty = remaining;
+        if !ready.is_empty() {
+            self.propagate_dirty_in_wave(ready, &[]);
+        }
+        for fid in ensure_dirty {
+            if self.state_of(fid) == STATE_CLEAN && self.slot_of(fid).is_some() {
                 self.set_state(fid, STATE_DIRTY);
                 self.dirty_queue.push(fid);
                 self.dirty_needs_sort = true;
@@ -2700,55 +3112,113 @@ impl FormulaEngine {
         self.dirty_needs_sort = false;
     }
 
-    fn unwind_cycle(&mut self, target_fid: u32) {
-        let start_idx = self
-            .call_stack
-            .iter()
-            .rposition(|&f| f == target_fid)
-            .unwrap_or(0);
-        let mut cleared_anchors = Vec::new();
-        let mut unwound_fids: SmallVec<[u32; 8]> = SmallVec::new();
-        let mut unwound_keys: SmallVec<[WorkbookCellKey; 8]> = SmallVec::new();
-        while self.call_stack.len() > start_idx {
-            let Some(fid) = self.call_stack.pop() else {
+    fn collect_cleared_spill_dependents(
+        &self,
+        fid: u32,
+        key: WorkbookCellKey,
+        clear_out: &crate::spill::ClearSpillOutcome,
+        post_dirty: &mut Vec<u32>,
+    ) {
+        for &shadow_key in &clear_out.cleared_shadows {
+            self.collect_direct_dependents(shadow_key, post_dirty);
+        }
+        self.collect_spill_anchor_dependents(key, post_dirty);
+        self.push_unblocked_watchers(&clear_out.unblocked_watchers, fid, post_dirty);
+    }
+
+    fn handle_cycle(&mut self, cur_fid: u32, min_pos: usize) {
+        let my_pos = self.call_stack.len().saturating_sub(1);
+        if min_pos < my_pos {
+            let _ = self.call_stack.pop();
+            self.set_state(cur_fid, STATE_SCC_WAIT);
+            self.scc_stack.push(cur_fid);
+            self.scc_low.insert(cur_fid, min_pos);
+            return;
+        }
+        let _ = self.call_stack.pop();
+        let mut scc_fids: SmallVec<[u32; 8]> = SmallVec::new();
+        scc_fids.push(cur_fid);
+        while let Some(&top) = self.scc_stack.last() {
+            let top_low = self.scc_low.get(&top).copied().unwrap_or(0);
+            if top_low < my_pos {
                 break;
-            };
-            match self.state_of(fid) {
-                STATE_EVALUATING => {
-                    if let Some(key) = self.slot_of(fid).map(|s| s.key) {
-                        let clear_out = self.spills.clear_anchor(key);
-                        if clear_out.had_state {
-                            self.record_changed_cells(&clear_out.cleared_shadows);
-                            cleared_anchors.push((fid, key, clear_out));
-                        }
-                        self.store_eval_scalar(key, EvalScalar::Error(CalcError::Cycle));
-                        unwound_keys.push(key);
+            }
+            let _ = self.scc_stack.pop();
+            let _ = self.scc_low.remove(&top);
+            if self.state_of(top) == STATE_SCC_WAIT {
+                scc_fids.push(top);
+            }
+        }
+
+        let mut active_spill_fids: SmallVec<[u32; 4]> = SmallVec::new();
+        let mut needs_verify = false;
+        for &fid in &scc_fids {
+            if let Some(key) = self.slot_of(fid).map(|s| s.key)
+                && self.spills.active_spill(key).is_some()
+            {
+                active_spill_fids.push(fid);
+                if !self.wave_cycle_verified.contains(&fid) {
+                    needs_verify = true;
+                }
+            }
+        }
+        if needs_verify {
+            // Clear stale active spills along the candidate SCC once per wave so
+            // conditional formulas that stop spilling re-evaluate before `#CYCLE!` is committed.
+            for fid in active_spill_fids {
+                self.wave_cycle_verified.insert(fid);
+            }
+            let mut cleared_anchors = Vec::new();
+            for &fid in &scc_fids {
+                if let Some(key) = self.slot_of(fid).map(|s| s.key)
+                    && self.spills.active_spill(key).is_some()
+                {
+                    let clear_out = self.spills.clear_anchor(key);
+                    if clear_out.had_state {
+                        self.record_changed_cells(&clear_out.cleared_shadows);
+                        cleared_anchors.push((fid, key, clear_out));
                     }
-                    self.set_state(fid, STATE_CLEAN);
-                    self.wave_done = self.wave_done.saturating_add(1);
-                    unwound_fids.push(fid);
                 }
-                STATE_DIRTY => {
-                    // Sibling dependency queued from `Blocked(deps)` that has not
-                    // begun evaluating yet; keep it dirty and re-queue for evaluation.
-                    self.dirty_queue.push(fid);
-                    self.dirty_needs_sort = true;
-                }
-                _ => {}
+                self.set_state(fid, STATE_DIRTY);
+                self.dirty_queue.push(fid);
+                self.dirty_needs_sort = true;
             }
-        }
-        if !cleared_anchors.is_empty() {
-            let mut post_dirty = Vec::new();
-            for (fid, key, clear_out) in cleared_anchors {
-                self.record_cycle_spill(key, &unwound_keys, &clear_out.cleared_shadows);
-                for shadow_key in clear_out.cleared_shadows {
-                    self.collect_direct_dependents(shadow_key, &mut post_dirty);
+            if !cleared_anchors.is_empty() {
+                let mut post_dirty = Vec::new();
+                for (fid, key, clear_out) in cleared_anchors {
+                    self.collect_cleared_spill_dependents(fid, key, &clear_out, &mut post_dirty);
                 }
-                self.collect_spill_anchor_dependents(key, &mut post_dirty);
-                self.push_unblocked_watchers(&clear_out.unblocked_watchers, fid, &mut post_dirty);
+                self.propagate_dirty_in_wave(post_dirty, &[]);
             }
-            self.propagate_dirty_in_wave(post_dirty, &unwound_fids);
+            self.flush_deferred_dirty();
+            return;
         }
+
+        let mut cleared_anchors = Vec::new();
+        let mut unwound_keys: SmallVec<[WorkbookCellKey; 8]> = SmallVec::new();
+        let mut post_dirty = Vec::new();
+        for &fid in &scc_fids {
+            if let Some(key) = self.slot_of(fid).map(|s| s.key) {
+                let clear_out = self.spills.clear_anchor(key);
+                if clear_out.had_state {
+                    self.record_changed_cells(&clear_out.cleared_shadows);
+                    cleared_anchors.push((fid, key, clear_out));
+                }
+                self.drain_cycle_spill_anchor(key, None, &mut post_dirty);
+                self.store_eval_scalar(key, EvalScalar::Error(CalcError::Cycle));
+                unwound_keys.push(key);
+            }
+            self.set_state(fid, STATE_CLEAN);
+            self.wave_done = self.wave_done.saturating_add(1);
+        }
+        for (fid, key, clear_out) in cleared_anchors {
+            self.record_cycle_spill(key, &unwound_keys, &clear_out.cleared_shadows);
+            self.collect_cleared_spill_dependents(fid, key, &clear_out, &mut post_dirty);
+        }
+        if !post_dirty.is_empty() {
+            self.propagate_dirty_in_wave(post_dirty, &scc_fids);
+        }
+        self.flush_deferred_dirty();
     }
 
     fn store_eval_scalar(&mut self, key: WorkbookCellKey, scalar: EvalScalar) {
@@ -2916,20 +3386,30 @@ impl FormulaEngine {
                 ))
             }
             BoundExpr::Binary { op, left, right } => {
-                let lhs = match self.eval_expr(left, caller, false, next_depth) {
-                    ExprOutcome::Ready(v) => v,
-                    other => return other,
-                };
-                if let Err(wait) = self.ensure_value_ready(&lhs) {
+                let mut blocked: SmallVec<[u32; 4]> = SmallVec::new();
+                let mut cycle_low: Option<usize> = None;
+                let lhs_val = self.eval_and_check_ready(
+                    left,
+                    caller,
+                    next_depth,
+                    &mut blocked,
+                    &mut cycle_low,
+                );
+                let rhs_val = self.eval_and_check_ready(
+                    right,
+                    caller,
+                    next_depth,
+                    &mut blocked,
+                    &mut cycle_low,
+                );
+                if let Some(wait) = Self::wait_outcome(blocked, cycle_low) {
                     return wait;
                 }
-                let rhs = match self.eval_expr(right, caller, false, next_depth) {
-                    ExprOutcome::Ready(v) => v,
-                    other => return other,
+                let (Some(lhs), Some(rhs)) = (lhs_val, rhs_val) else {
+                    return ExprOutcome::Ready(EvalValue::Scalar(EvalScalar::Error(
+                        CalcError::Value,
+                    )));
                 };
-                if let Err(wait) = self.ensure_value_ready(&rhs) {
-                    return wait;
-                }
                 let snap = is_outermost && matches!(op, BinaryOp::Add | BinaryOp::Sub);
                 ExprOutcome::Ready(eval_binary(
                     *op,
@@ -3016,20 +3496,15 @@ impl FormulaEngine {
                 }
             };
 
+            let mut blocked: SmallVec<[u32; 4]> = SmallVec::new();
+            let mut cycle_low: Option<usize> = None;
             let when_true = if need_true {
                 let Some(t_expr) = args.get(1) else {
                     return ExprOutcome::Ready(EvalValue::Scalar(EvalScalar::Error(
                         CalcError::Value,
                     )));
                 };
-                let tv = match self.eval_expr(t_expr, caller, false, depth) {
-                    ExprOutcome::Ready(v) => v,
-                    other => return other,
-                };
-                if let Err(wait) = self.ensure_value_ready(&tv) {
-                    return wait;
-                }
-                Some(tv)
+                self.eval_and_check_ready(t_expr, caller, depth, &mut blocked, &mut cycle_low)
             } else {
                 None
             };
@@ -3040,17 +3515,14 @@ impl FormulaEngine {
                         CalcError::Value,
                     )));
                 };
-                let fv = match self.eval_expr(f_expr, caller, false, depth) {
-                    ExprOutcome::Ready(v) => v,
-                    other => return other,
-                };
-                if let Err(wait) = self.ensure_value_ready(&fv) {
-                    return wait;
-                }
-                Some(fv)
+                self.eval_and_check_ready(f_expr, caller, depth, &mut blocked, &mut cycle_low)
             } else {
                 None
             };
+
+            if let Some(wait) = Self::wait_outcome(blocked, cycle_low) {
+                return wait;
+            }
 
             return ExprOutcome::Ready(combine_if(
                 cond_sa,
@@ -3155,31 +3627,18 @@ impl FormulaEngine {
             let mut evaluated_choices: Vec<Option<EvalValue>> =
                 Vec::with_capacity(choice_exprs.len());
             let mut blocked: SmallVec<[u32; 4]> = SmallVec::new();
+            let mut cycle_low: Option<usize> = None;
             for (i, c_expr) in choice_exprs.iter().enumerate() {
                 if !needed_mask.get(i).copied().unwrap_or(false) {
                     evaluated_choices.push(None);
                     continue;
                 }
-                let val = match self.eval_expr(c_expr, caller, false, depth) {
-                    ExprOutcome::Ready(v) => v,
-                    ExprOutcome::Cycle(c) => return ExprOutcome::Cycle(c),
-                    ExprOutcome::Blocked(b) => {
-                        merge_blocked(&mut blocked, b);
-                        evaluated_choices.push(None);
-                        continue;
-                    }
-                };
-                if let Err(wait) = self.ensure_value_ready(&val) {
-                    match wait {
-                        ExprOutcome::Cycle(c) => return ExprOutcome::Cycle(c),
-                        ExprOutcome::Blocked(b) => merge_blocked(&mut blocked, b),
-                        ExprOutcome::Ready(_) => {}
-                    }
-                }
-                evaluated_choices.push(Some(val));
+                let val =
+                    self.eval_and_check_ready(c_expr, caller, depth, &mut blocked, &mut cycle_low);
+                evaluated_choices.push(val);
             }
-            if !blocked.is_empty() {
-                return ExprOutcome::Blocked(blocked);
+            if let Some(wait) = Self::wait_outcome(blocked, cycle_low) {
+                return wait;
             }
             return ExprOutcome::Ready(combine_choose(
                 idx_sa,
@@ -3261,6 +3720,7 @@ impl FormulaEngine {
             }
             let mut branch_vals = Vec::with_capacity(pair_count);
             let mut blocked: SmallVec<[u32; 4]> = SmallVec::new();
+            let mut cycle_low: Option<usize> = None;
             for pair_idx in 0..pair_count {
                 let Some(cond_sa) = conds_so_far.get(pair_idx) else {
                     branch_vals.push(None);
@@ -3280,26 +3740,17 @@ impl FormulaEngine {
                     branch_vals.push(None);
                     continue;
                 };
-                let val = match self.eval_expr(val_expr, caller, false, depth) {
-                    ExprOutcome::Ready(v) => v,
-                    ExprOutcome::Cycle(c) => return ExprOutcome::Cycle(c),
-                    ExprOutcome::Blocked(b) => {
-                        merge_blocked(&mut blocked, b);
-                        branch_vals.push(None);
-                        continue;
-                    }
-                };
-                if let Err(wait) = self.ensure_value_ready(&val) {
-                    match wait {
-                        ExprOutcome::Cycle(c) => return ExprOutcome::Cycle(c),
-                        ExprOutcome::Blocked(b) => merge_blocked(&mut blocked, b),
-                        ExprOutcome::Ready(_) => {}
-                    }
-                }
-                branch_vals.push(Some(val));
+                let val = self.eval_and_check_ready(
+                    val_expr,
+                    caller,
+                    depth,
+                    &mut blocked,
+                    &mut cycle_low,
+                );
+                branch_vals.push(val);
             }
-            if !blocked.is_empty() {
-                return ExprOutcome::Blocked(blocked);
+            if let Some(wait) = Self::wait_outcome(blocked, cycle_low) {
+                return wait;
             }
             return ExprOutcome::Ready(crate::functions::combine_ifs_array(
                 &conds_so_far,
@@ -3412,6 +3863,8 @@ impl FormulaEngine {
             // Array target fallback: evaluate arguments and match elementwise.
             let mut evaled_cands = Vec::with_capacity(pair_count);
             let mut evaled_res = Vec::with_capacity(pair_count);
+            let mut blocked: SmallVec<[u32; 4]> = SmallVec::new();
+            let mut cycle_low: Option<usize> = None;
             for p in 0..pair_count {
                 let (Some(cand_e), Some(res_e)) = (
                     rest.get(p.saturating_mul(2)),
@@ -3419,36 +3872,21 @@ impl FormulaEngine {
                 ) else {
                     continue;
                 };
-                let cv = match self.eval_expr(cand_e, caller, false, depth) {
-                    ExprOutcome::Ready(v) => v,
-                    other => return other,
-                };
-                if let Err(wait) = self.ensure_value_ready(&cv) {
-                    return wait;
+                let cv =
+                    self.eval_and_check_ready(cand_e, caller, depth, &mut blocked, &mut cycle_low);
+                let rv =
+                    self.eval_and_check_ready(res_e, caller, depth, &mut blocked, &mut cycle_low);
+                if let (Some(c), Some(r)) = (cv, rv) {
+                    evaled_cands.push(c);
+                    evaled_res.push(r);
                 }
-                let rv = match self.eval_expr(res_e, caller, false, depth) {
-                    ExprOutcome::Ready(v) => v,
-                    other => return other,
-                };
-                if let Err(wait) = self.ensure_value_ready(&rv) {
-                    return wait;
-                }
-                evaled_cands.push(cv);
-                evaled_res.push(rv);
             }
-            let evaled_def = match default_expr {
-                None => None,
-                Some(def_e) => {
-                    let dv = match self.eval_expr(def_e, caller, false, depth) {
-                        ExprOutcome::Ready(v) => v,
-                        other => return other,
-                    };
-                    if let Err(wait) = self.ensure_value_ready(&dv) {
-                        return wait;
-                    }
-                    Some(dv)
-                }
-            };
+            let evaled_def = default_expr.and_then(|def_e| {
+                self.eval_and_check_ready(def_e, caller, depth, &mut blocked, &mut cycle_low)
+            });
+            if let Some(wait) = Self::wait_outcome(blocked, cycle_low) {
+                return wait;
+            }
             let crate::value_eval::ScalarOrArray::Array(arr) = target_sa else {
                 return ExprOutcome::Ready(EvalValue::Scalar(EvalScalar::Error(CalcError::Value)));
             };
@@ -3539,26 +3977,16 @@ impl FormulaEngine {
             let mut evaled = Vec::with_capacity(args.len());
             evaled.push(base_ref.clone());
             let mut blocked: SmallVec<[u32; 4]> = SmallVec::new();
+            let mut cycle_low: Option<usize> = None;
             for arg in args.get(1..).unwrap_or(&[]) {
-                let v = match self.eval_expr(arg, caller, false, depth) {
-                    ExprOutcome::Ready(v) => v,
-                    ExprOutcome::Cycle(c) => return ExprOutcome::Cycle(c),
-                    ExprOutcome::Blocked(b) => {
-                        merge_blocked(&mut blocked, b);
-                        continue;
-                    }
-                };
-                if let Err(wait) = self.ensure_value_ready(&v) {
-                    match wait {
-                        ExprOutcome::Cycle(c) => return ExprOutcome::Cycle(c),
-                        ExprOutcome::Blocked(b) => merge_blocked(&mut blocked, b),
-                        ExprOutcome::Ready(_) => {}
-                    }
+                if let Some(v) =
+                    self.eval_and_check_ready(arg, caller, depth, &mut blocked, &mut cycle_low)
+                {
+                    evaled.push(v);
                 }
-                evaled.push(v);
             }
-            if !blocked.is_empty() {
-                return ExprOutcome::Blocked(blocked);
+            if let Some(wait) = Self::wait_outcome(blocked, cycle_low) {
+                return wait;
             }
             let out_ref = crate::functions::eval_offset(
                 base_ref,
@@ -3696,26 +4124,29 @@ impl FormulaEngine {
 
         let mut evaluated_args = Vec::with_capacity(args.len());
         let mut all_blocked: SmallVec<[u32; 4]> = SmallVec::new();
+        let mut cycle_low: Option<usize> = None;
         for arg in args {
-            let val = match self.eval_expr(arg, caller, false, depth) {
-                ExprOutcome::Ready(v) => v,
-                ExprOutcome::Cycle(c) => return ExprOutcome::Cycle(c),
-                ExprOutcome::Blocked(b) => {
-                    merge_blocked(&mut all_blocked, b);
-                    continue;
+            let val_opt = if deref_args {
+                self.eval_and_check_ready(arg, caller, depth, &mut all_blocked, &mut cycle_low)
+            } else {
+                match self.eval_expr(arg, caller, false, depth) {
+                    ExprOutcome::Ready(v) => Some(v),
+                    ExprOutcome::Blocked(b) => {
+                        merge_blocked(&mut all_blocked, b);
+                        None
+                    }
+                    ExprOutcome::Cycle(low) => {
+                        merge_cycle(&mut cycle_low, low);
+                        None
+                    }
                 }
             };
-            if deref_args && let Err(wait) = self.ensure_value_ready(&val) {
-                match wait {
-                    ExprOutcome::Cycle(c) => return ExprOutcome::Cycle(c),
-                    ExprOutcome::Blocked(b) => merge_blocked(&mut all_blocked, b),
-                    ExprOutcome::Ready(_) => {}
-                }
+            if let Some(val) = val_opt {
+                evaluated_args.push(val);
             }
-            evaluated_args.push(val);
         }
-        if !all_blocked.is_empty() {
-            return ExprOutcome::Blocked(all_blocked);
+        if let Some(wait) = Self::wait_outcome(all_blocked, cycle_low) {
+            return wait;
         }
 
         let filters = &self.filters;
@@ -3740,6 +4171,51 @@ impl FormulaEngine {
         ))
     }
 
+    fn eval_and_check_ready(
+        &mut self,
+        expr: &BoundExpr,
+        caller: CallerContext,
+        depth: usize,
+        blocked: &mut SmallVec<[u32; 4]>,
+        cycle_low: &mut Option<usize>,
+    ) -> Option<EvalValue> {
+        let val = match self.eval_expr(expr, caller, false, depth) {
+            ExprOutcome::Ready(v) => v,
+            ExprOutcome::Blocked(b) => {
+                merge_blocked(blocked, b);
+                return None;
+            }
+            ExprOutcome::Cycle(low) => {
+                merge_cycle(cycle_low, low);
+                return None;
+            }
+        };
+        if let Err(wait) = self.ensure_value_ready(&val) {
+            match wait {
+                ExprOutcome::Blocked(b) => merge_blocked(blocked, b),
+                ExprOutcome::Cycle(low) => merge_cycle(cycle_low, low),
+                ExprOutcome::Ready(_) => {}
+            }
+            return None;
+        }
+        Some(val)
+    }
+
+    fn wait_outcome(blocked: SmallVec<[u32; 4]>, cycle_low: Option<usize>) -> Option<ExprOutcome> {
+        if !blocked.is_empty() {
+            return Some(ExprOutcome::Blocked(blocked));
+        }
+        cycle_low.map(ExprOutcome::Cycle)
+    }
+
+    fn cycle_low_of(&self, fid: u32) -> Option<usize> {
+        match self.state_of(fid) {
+            STATE_EVALUATING => self.call_stack.iter().rposition(|&f| f == fid),
+            STATE_SCC_WAIT => self.scc_low.get(&fid).copied(),
+            _ => None,
+        }
+    }
+
     fn ensure_value_ready(&self, val: &EvalValue) -> Result<(), ExprOutcome> {
         let EvalValue::Reference(r) = val else {
             return Ok(());
@@ -3755,7 +4231,11 @@ impl FormulaEngine {
                 });
                 if let Some(fid) = fid_opt {
                     match self.state_of(fid) {
-                        STATE_EVALUATING => return Err(ExprOutcome::Cycle(fid)),
+                        STATE_EVALUATING | STATE_SCC_WAIT => {
+                            if let Some(low) = self.cycle_low_of(fid) {
+                                return Err(ExprOutcome::Cycle(low));
+                            }
+                        }
                         STATE_DIRTY => {
                             let mut b = SmallVec::new();
                             b.push(fid);
@@ -3856,22 +4336,20 @@ impl FormulaEngine {
         }
 
         let mut blocked: SmallVec<[u32; 4]> = SmallVec::new();
-        let mut cycle_target: Option<u32> = None;
+        let mut cycle_low: Option<usize> = None;
         if !active_cols.is_empty() {
             sheet
                 .row_axis()
                 .for_each_live_in_range(first_row, last_row, |run| {
-                    if cycle_target.is_some() {
-                        return;
-                    }
                     for raw_r in run.iter() {
                         let row = RowId(raw_r);
                         for &col in &active_cols {
                             if let Some(&fid) = self.cell_to_fid.get(&(sheet_id, row, col)) {
                                 match self.state_of(fid) {
-                                    STATE_EVALUATING => {
-                                        cycle_target = Some(fid);
-                                        return;
+                                    STATE_EVALUATING | STATE_SCC_WAIT => {
+                                        if let Some(low) = self.cycle_low_of(fid) {
+                                            merge_cycle(&mut cycle_low, low);
+                                        }
                                     }
                                     STATE_DIRTY => {
                                         blocked.push(fid);
@@ -3884,22 +4362,18 @@ impl FormulaEngine {
                 });
         }
 
-        if cycle_target.is_none() && !shadow_cols.is_empty() {
+        if !shadow_cols.is_empty() {
             for col in shadow_cols {
-                if cycle_target.is_some() {
-                    break;
-                }
                 self.spills
                     .for_each_shadow_in_col_span(sheet, col, r1_ord, r2_ord, |row_id, _| {
-                        if cycle_target.is_some() {
-                            return;
-                        }
                         if let Some(anchor) = self.spills.anchor_of_cell((sheet_id, row_id, col))
                             && let Some(&fid) = self.cell_to_fid.get(&anchor)
                         {
                             match self.state_of(fid) {
-                                STATE_EVALUATING => {
-                                    cycle_target = Some(fid);
+                                STATE_EVALUATING | STATE_SCC_WAIT => {
+                                    if let Some(low) = self.cycle_low_of(fid) {
+                                        merge_cycle(&mut cycle_low, low);
+                                    }
                                 }
                                 STATE_DIRTY if !blocked.contains(&fid) => {
                                     blocked.push(fid);
@@ -3911,11 +4385,8 @@ impl FormulaEngine {
             }
         }
 
-        if let Some(cyc) = cycle_target {
-            return Err(ExprOutcome::Cycle(cyc));
-        }
-        if !blocked.is_empty() {
-            return Err(ExprOutcome::Blocked(blocked));
+        if let Some(wait) = Self::wait_outcome(blocked, cycle_low) {
+            return Err(wait);
         }
         Ok(())
     }
@@ -3927,6 +4398,13 @@ fn workbook_fallback_sheet(workbook: &Workbook<BoundFormula>) -> SheetId {
         .next()
         .or_else(|| workbook.sheets().first())
         .map_or(SheetId(0), Sheet::id)
+}
+
+const fn merge_cycle(dst: &mut Option<usize>, pos: usize) {
+    *dst = Some(match *dst {
+        Some(cur) if cur <= pos => cur,
+        _ => pos,
+    });
 }
 
 fn merge_blocked(dst: &mut SmallVec<[u32; 4]>, src: SmallVec<[u32; 4]>) {
@@ -5463,6 +5941,598 @@ mod tests {
                 .value_by_id(RowId(4), ColId(0)),
             Value::Error(CalcError::Spill)
         );
+
+        // 8. Multi-hop pure shadow cycle (`C1 -> D3 -> A2 -> C1` via shadows) matches fresh recalc.
+        let mut cyc = FormulaEngine::new();
+        cyc.edit_cell_raw(s0, RowId(1), ColId(0), "=C2:C3").unwrap();
+        cyc.edit_cell_raw(s0, RowId(2), ColId(2), "={1,2;3,4}")
+            .unwrap();
+        let del_row3 = RowId(
+            cyc.workbook()
+                .sheet(s0)
+                .unwrap()
+                .row_axis()
+                .pos_to_id(3)
+                .unwrap(),
+        );
+        cyc.apply_op(Op::DeleteRows {
+            sheet: s0,
+            ids: vec![IdRun::new(del_row3.0, 1).unwrap()],
+        })
+        .unwrap();
+        cyc.edit_cell_raw(s0, RowId(0), ColId(2), "=D3:D4").unwrap();
+        cyc.edit_cell_raw(s0, RowId(2), ColId(3), "=COUNTIF(A3:C5, \">1\")")
+            .unwrap();
+        cyc.recalc_all();
+        let fresh_cyc = FormulaEngine::from_workbook_recalc_all(cyc.workbook().clone());
+        for (r, c, expected) in [
+            (RowId(0), ColId(2), Value::Error(CalcError::Cycle)),
+            (RowId(1), ColId(0), Value::Error(CalcError::Cycle)),
+            (RowId(2), ColId(3), Value::Error(CalcError::Cycle)),
+            (RowId(2), ColId(2), Value::Error(CalcError::Spill)),
+        ] {
+            assert_eq!(
+                cyc.workbook().sheet(s0).unwrap().value_by_id(r, c),
+                expected
+            );
+            assert_eq!(
+                fresh_cyc.workbook().sheet(s0).unwrap().value_by_id(r, c),
+                expected
+            );
+        }
+        assert!(cyc.spills().shadow_value(s0, RowId(1), ColId(2)).is_none());
+        assert!(cyc.spills().shadow_value(s0, RowId(2), ColId(0)).is_none());
+        assert!(
+            fresh_cyc
+                .spills()
+                .shadow_value(s0, RowId(1), ColId(2))
+                .is_none()
+        );
+        assert!(
+            fresh_cyc
+                .spills()
+                .shadow_value(s0, RowId(2), ColId(0))
+                .is_none()
+        );
+
+        // 9. Stale-shadow conditional switch must not produce a false `#CYCLE!`.
+        // (a) Direct scalar switch clearing a self-referencing fallback branch.
+        let mut sw = FormulaEngine::new();
+        sw.edit_cell_raw(s0, RowId(0), ColId(1), "1").unwrap();
+        sw.edit_cell_raw(s0, RowId(0), ColId(0), "=IF(B1=1, {1;2}, A2)")
+            .unwrap();
+        sw.recalc_all();
+        sw.edit_cell_raw(s0, RowId(0), ColId(1), "0").unwrap();
+        sw.recalc_all();
+        let fresh_sw = FormulaEngine::from_workbook_recalc_all(sw.workbook().clone());
+        assert_eq!(
+            sw.workbook()
+                .sheet(s0)
+                .unwrap()
+                .value_by_id(RowId(0), ColId(0)),
+            Value::Number(0.0)
+        );
+        assert_eq!(
+            fresh_sw
+                .workbook()
+                .sheet(s0)
+                .unwrap()
+                .value_by_id(RowId(0), ColId(0)),
+            Value::Number(0.0)
+        );
+        assert!(sw.spills().shadow_value(s0, RowId(1), ColId(0)).is_none());
+
+        // (b) In-wave conditional switch driven by a spill shadow (`A6 -> A7 -> B1 -> C1`).
+        for initial_a6 in [None, Some("={10;99}")] {
+            let mut wave_sw = FormulaEngine::new();
+            wave_sw
+                .edit_cell_raw(s0, RowId(0), ColId(1), "=IF(A7=20, 0, 1)")
+                .unwrap();
+            wave_sw
+                .edit_cell_raw(s0, RowId(0), ColId(2), "=IF(B1=1, {1;2}, D3)")
+                .unwrap();
+            wave_sw
+                .edit_cell_raw(s0, RowId(1), ColId(0), "=C2:C3")
+                .unwrap();
+            wave_sw
+                .edit_cell_raw(s0, RowId(2), ColId(3), "=COUNTIF(A3:C5, \">1\")")
+                .unwrap();
+            if let Some(a6_raw) = initial_a6 {
+                wave_sw
+                    .edit_cell_raw(s0, RowId(5), ColId(0), a6_raw)
+                    .unwrap();
+            }
+            wave_sw.recalc_all();
+            wave_sw
+                .edit_cell_raw(s0, RowId(5), ColId(0), "={10;20}")
+                .unwrap();
+            wave_sw.recalc_all();
+            let fresh_wave = FormulaEngine::from_workbook_recalc_all(wave_sw.workbook().clone());
+            for (r, c) in [(RowId(0), ColId(2)), (RowId(2), ColId(3))] {
+                assert_eq!(
+                    wave_sw.workbook().sheet(s0).unwrap().value_by_id(r, c),
+                    Value::Number(0.0)
+                );
+                assert_eq!(
+                    fresh_wave.workbook().sheet(s0).unwrap().value_by_id(r, c),
+                    Value::Number(0.0)
+                );
+            }
+            assert!(
+                wave_sw
+                    .spills()
+                    .shadow_value(s0, RowId(1), ColId(2))
+                    .is_none()
+            );
+        }
+
+        // 10. Figure-8 overlapping SCC with COUNTIF + active spill matches fresh recalc regardless of root order.
+        let mut scc = FormulaEngine::new();
+        let row_at = |e: &FormulaEngine, pos: u32| {
+            RowId(
+                e.workbook()
+                    .sheet(s0)
+                    .unwrap()
+                    .row_axis()
+                    .pos_to_id(pos)
+                    .unwrap(),
+            )
+        };
+        scc.edit_cell_raw(s0, row_at(&scc, 0), ColId(0), "=A1")
+            .unwrap();
+        scc.recalc_all();
+        let ins = scc.allocator_mut().alloc_run(1).unwrap();
+        scc.apply_op(Op::InsertRows {
+            sheet: s0,
+            after: None,
+            ids: ins,
+        })
+        .unwrap();
+        scc.recalc_all();
+        scc.edit_cell_raw(s0, row_at(&scc, 2), ColId(0), "=COUNTIF(C1:E3, \">1\")")
+            .unwrap();
+        scc.recalc_all();
+        let del_p3 = row_at(&scc, 3);
+        scc.apply_op(Op::DeleteRows {
+            sheet: s0,
+            ids: vec![IdRun::new(del_p3.0, 1).unwrap()],
+        })
+        .unwrap();
+        scc.recalc_all();
+        scc.edit_cell_raw(s0, row_at(&scc, 1), ColId(2), "=COUNTIF(D2:F4, \">1\")")
+            .unwrap();
+        scc.recalc_all();
+        scc.edit_cell_raw(s0, row_at(&scc, 2), ColId(3), "=COUNTIF(A1:C3, \">1\")")
+            .unwrap();
+        scc.recalc_all();
+        scc.edit_cell_raw(s0, row_at(&scc, 0), ColId(3), "=A4:A5")
+            .unwrap();
+        scc.recalc_all();
+        scc.edit_cell_raw(s0, row_at(&scc, 2), ColId(2), "=COUNTIF(D1:F3, \">1\")")
+            .unwrap();
+        scc.recalc_all();
+        scc.edit_cell_raw(s0, row_at(&scc, 0), ColId(6), "=COUNTIF(D3:D3, \">1\")")
+            .unwrap();
+        scc.recalc_all();
+
+        let fresh_scc = FormulaEngine::from_workbook_recalc_all(scc.workbook().clone());
+        for (pos_r, c, expected) in [
+            (1, ColId(0), Value::Error(CalcError::Cycle)),
+            (1, ColId(2), Value::Error(CalcError::Cycle)),
+            (2, ColId(0), Value::Error(CalcError::Cycle)),
+            (2, ColId(2), Value::Error(CalcError::Cycle)),
+            (2, ColId(3), Value::Error(CalcError::Cycle)),
+            (0, ColId(3), Value::Number(0.0)),
+            (0, ColId(6), Value::Number(0.0)),
+        ] {
+            let rid = row_at(&scc, pos_r);
+            assert_eq!(
+                scc.workbook().sheet(s0).unwrap().value_by_id(rid, c),
+                expected
+            );
+            assert_eq!(
+                fresh_scc.workbook().sheet(s0).unwrap().value_by_id(rid, c),
+                expected
+            );
+        }
+        let d2_rid = row_at(&scc, 1);
+        assert_eq!(
+            scc.spills().shadow_value(s0, d2_rid, ColId(3)),
+            Some(&crate::value_eval::EvalScalar::Number(0.0))
+        );
+        assert_eq!(
+            fresh_scc.spills().shadow_value(s0, d2_rid, ColId(3)),
+            Some(&crate::value_eval::EvalScalar::Number(0.0))
+        );
+
+        // 11. Dependent `#` / shadow spills yield cleanly to upstream spills across all orders.
+        // (a) 3-cell symmetric + downstream `#` collision (`C6`, `B7`, `D5 = =C6#`, proptest seed).
+        let c6 = (RowId(5), ColId(2), "={1,2;3,4}");
+        let b7 = (RowId(6), ColId(1), "={1,2}");
+        let d5 = (RowId(4), ColId(3), "=C6#");
+        let orders_3 = [
+            [c6, b7, d5],
+            [c6, d5, b7],
+            [b7, c6, d5],
+            [b7, d5, c6],
+            [d5, c6, b7],
+            [d5, b7, c6],
+        ];
+        for order in orders_3 {
+            let mut dep_eng = FormulaEngine::new();
+            for &(row, col, raw) in &order {
+                dep_eng.edit_cell_raw(s0, row, col, raw).unwrap();
+                dep_eng.recalc_all();
+            }
+            let fresh_dep = FormulaEngine::from_workbook_recalc_all(dep_eng.workbook().clone());
+            for (row, col, expected) in [
+                (RowId(5), ColId(2), Value::Error(CalcError::Spill)),
+                (RowId(6), ColId(1), Value::Error(CalcError::Spill)),
+                (RowId(4), ColId(3), Value::Error(CalcError::Ref)),
+            ] {
+                assert_eq!(
+                    dep_eng.workbook().sheet(s0).unwrap().value_by_id(row, col),
+                    expected
+                );
+                assert_eq!(
+                    fresh_dep
+                        .workbook()
+                        .sheet(s0)
+                        .unwrap()
+                        .value_by_id(row, col),
+                    expected
+                );
+            }
+            assert!(!dep_eng.spills().has_spills_on_sheet(s0));
+            assert!(!fresh_dep.spills().has_spills_on_sheet(s0));
+
+            // Delete B7 -> C6 pops open cleanly and D5 becomes `#SPILL!`.
+            dep_eng.edit_cell_raw(s0, RowId(6), ColId(1), "").unwrap();
+            dep_eng.recalc_all();
+            let fresh_open = FormulaEngine::from_workbook_recalc_all(dep_eng.workbook().clone());
+            for (row, col, expected) in [
+                (RowId(5), ColId(2), Value::Number(1.0)),
+                (RowId(6), ColId(1), Value::Empty),
+                (RowId(4), ColId(3), Value::Error(CalcError::Spill)),
+            ] {
+                assert_eq!(
+                    dep_eng.workbook().sheet(s0).unwrap().value_by_id(row, col),
+                    expected
+                );
+                assert_eq!(
+                    fresh_open
+                        .workbook()
+                        .sheet(s0)
+                        .unwrap()
+                        .value_by_id(row, col),
+                    expected
+                );
+            }
+            assert_eq!(dep_eng.spill_range((s0, RowId(5), ColId(2))), Some((2, 2)));
+            assert_eq!(
+                fresh_open.spill_range((s0, RowId(5), ColId(2))),
+                Some((2, 2))
+            );
+
+            // Restore B7 -> returns to `C6=#SPILL!`, `B7=#SPILL!`, `D5=#REF!`.
+            dep_eng
+                .edit_cell_raw(s0, RowId(6), ColId(1), "={1,2}")
+                .unwrap();
+            dep_eng.recalc_all();
+            let fresh_restored =
+                FormulaEngine::from_workbook_recalc_all(dep_eng.workbook().clone());
+            for (row, col, expected) in [
+                (RowId(5), ColId(2), Value::Error(CalcError::Spill)),
+                (RowId(6), ColId(1), Value::Error(CalcError::Spill)),
+                (RowId(4), ColId(3), Value::Error(CalcError::Ref)),
+            ] {
+                assert_eq!(
+                    dep_eng.workbook().sheet(s0).unwrap().value_by_id(row, col),
+                    expected
+                );
+                assert_eq!(
+                    fresh_restored
+                        .workbook()
+                        .sheet(s0)
+                        .unwrap()
+                        .value_by_id(row, col),
+                    expected
+                );
+            }
+        }
+
+        // (b) 2-cell dependent overlap (`C6 = ={1,2;3,4}`, `D5 = =C6#`) in both orders.
+        for order in [[c6, d5], [d5, c6]] {
+            let mut two = FormulaEngine::new();
+            for &(row, col, raw) in &order {
+                two.edit_cell_raw(s0, row, col, raw).unwrap();
+                two.recalc_all();
+            }
+            let fresh_two = FormulaEngine::from_workbook_recalc_all(two.workbook().clone());
+            for engine_ref in [&two, &fresh_two] {
+                assert_eq!(
+                    engine_ref
+                        .workbook()
+                        .sheet(s0)
+                        .unwrap()
+                        .value_by_id(RowId(5), ColId(2)),
+                    Value::Number(1.0)
+                );
+                assert_eq!(
+                    engine_ref
+                        .workbook()
+                        .sheet(s0)
+                        .unwrap()
+                        .value_by_id(RowId(4), ColId(3)),
+                    Value::Error(CalcError::Spill)
+                );
+                assert_eq!(
+                    engine_ref.spill_range((s0, RowId(5), ColId(2))),
+                    Some((2, 2))
+                );
+            }
+        }
+
+        // (c) 4-cell cascade (`C6`, `B7`, `B1 = =C6#`, `A2 = ={10,20}`).
+        let mut cas = FormulaEngine::new();
+        cas.edit_cell_raw(s0, RowId(5), ColId(2), "={1,2;3,4}")
+            .unwrap();
+        cas.edit_cell_raw(s0, RowId(6), ColId(1), "={1,2}").unwrap();
+        cas.edit_cell_raw(s0, RowId(0), ColId(1), "=C6#").unwrap();
+        cas.edit_cell_raw(s0, RowId(1), ColId(0), "={10,20}")
+            .unwrap();
+        cas.recalc_all();
+        let fresh_cas = FormulaEngine::from_workbook_recalc_all(cas.workbook().clone());
+        for (row, col, expected) in [
+            (RowId(5), ColId(2), Value::Error(CalcError::Spill)),
+            (RowId(6), ColId(1), Value::Error(CalcError::Spill)),
+            (RowId(0), ColId(1), Value::Error(CalcError::Ref)),
+            (RowId(1), ColId(0), Value::Number(10.0)),
+        ] {
+            assert_eq!(
+                cas.workbook().sheet(s0).unwrap().value_by_id(row, col),
+                expected
+            );
+            assert_eq!(
+                fresh_cas
+                    .workbook()
+                    .sheet(s0)
+                    .unwrap()
+                    .value_by_id(row, col),
+                expected
+            );
+        }
+        assert_eq!(
+            cas.spills().shadow_value(s0, RowId(1), ColId(1)),
+            Some(&crate::value_eval::EvalScalar::Number(20.0))
+        );
+        assert_eq!(
+            fresh_cas.spills().shadow_value(s0, RowId(1), ColId(1)),
+            Some(&crate::value_eval::EvalScalar::Number(20.0))
+        );
+
+        // (d) Shadow-dependency displacement (`D5 = =C7:C8`, `C6 = ={1,2;3,4}`) in both orders.
+        let d5_rng = (RowId(4), ColId(3), "=C7:C8");
+        for order in [[d5_rng, c6], [c6, d5_rng]] {
+            let mut disp = FormulaEngine::new();
+            for &(row, col, raw) in &order {
+                disp.edit_cell_raw(s0, row, col, raw).unwrap();
+                disp.recalc_all();
+            }
+            let fresh_disp = FormulaEngine::from_workbook_recalc_all(disp.workbook().clone());
+            for engine_ref in [&disp, &fresh_disp] {
+                assert_eq!(
+                    engine_ref
+                        .workbook()
+                        .sheet(s0)
+                        .unwrap()
+                        .value_by_id(RowId(5), ColId(2)),
+                    Value::Number(1.0)
+                );
+                assert_eq!(
+                    engine_ref
+                        .workbook()
+                        .sheet(s0)
+                        .unwrap()
+                        .value_by_id(RowId(4), ColId(3)),
+                    Value::Error(CalcError::Spill)
+                );
+                assert_eq!(
+                    engine_ref.spill_range((s0, RowId(5), ColId(2))),
+                    Some((2, 2))
+                );
+            }
+        }
+
+        // 12. Dynamically-blocked spill overlapping a cleared cycle shadow wakes `#CYCLE!` to `#SPILL!`.
+        let mut s4 = FormulaEngine::new();
+        s4.edit_cell_raw(s0, RowId(1), ColId(0), "=B2:C2").unwrap();
+        s4.recalc_all();
+        let ins_s4 = s4.allocator_mut().alloc_run(1).unwrap();
+        s4.apply_op(Op::InsertRows {
+            sheet: s0,
+            after: Some(RowId(0)),
+            ids: ins_s4,
+        })
+        .unwrap();
+        s4.recalc_all();
+        s4.edit_cell_raw(s0, row_at(&s4, 1), ColId(0), "={1,2}")
+            .unwrap();
+        s4.recalc_all();
+        s4.edit_cell_raw(s0, row_at(&s4, 0), ColId(1), "={1;2;3}")
+            .unwrap();
+        s4.recalc_all();
+        let fresh_s4 = FormulaEngine::from_workbook_recalc_all(s4.workbook().clone());
+        for (pos_r, c, expected) in [
+            (0, ColId(1), Value::Error(CalcError::Spill)),
+            (1, ColId(0), Value::Error(CalcError::Spill)),
+            (2, ColId(0), Value::Error(CalcError::Spill)),
+        ] {
+            let rid = row_at(&s4, pos_r);
+            assert_eq!(
+                s4.workbook().sheet(s0).unwrap().value_by_id(rid, c),
+                expected
+            );
+            assert_eq!(
+                fresh_s4.workbook().sheet(s0).unwrap().value_by_id(rid, c),
+                expected
+            );
+        }
+
+        // Clone 1: deleting B1 pops A2 open and returns A3 to `#CYCLE!`.
+        let mut c1 = s4.clone();
+        c1.edit_cell_raw(s0, row_at(&c1, 0), ColId(1), "").unwrap();
+        c1.recalc_all();
+        let fresh_c1 = FormulaEngine::from_workbook_recalc_all(c1.workbook().clone());
+        for (pos_r, c, expected) in [
+            (0, ColId(1), Value::Empty),
+            (1, ColId(0), Value::Number(1.0)),
+            (2, ColId(0), Value::Error(CalcError::Cycle)),
+        ] {
+            let rid = row_at(&c1, pos_r);
+            assert_eq!(
+                c1.workbook().sheet(s0).unwrap().value_by_id(rid, c),
+                expected
+            );
+            assert_eq!(
+                fresh_c1.workbook().sheet(s0).unwrap().value_by_id(rid, c),
+                expected
+            );
+        }
+        assert_eq!(c1.spill_range((s0, row_at(&c1, 1), ColId(0))), Some((1, 2)));
+
+        // Clone 2: deleting A2 lets B1 spill over B1:B3, keeping A3 at `#SPILL!`.
+        let mut c2 = s4.clone();
+        c2.edit_cell_raw(s0, row_at(&c2, 1), ColId(0), "").unwrap();
+        c2.recalc_all();
+        let fresh_c2 = FormulaEngine::from_workbook_recalc_all(c2.workbook().clone());
+        for (pos_r, c, expected) in [
+            (0, ColId(1), Value::Number(1.0)),
+            (1, ColId(0), Value::Empty),
+            (2, ColId(0), Value::Error(CalcError::Spill)),
+        ] {
+            let rid = row_at(&c2, pos_r);
+            assert_eq!(
+                c2.workbook().sheet(s0).unwrap().value_by_id(rid, c),
+                expected
+            );
+            assert_eq!(
+                fresh_c2.workbook().sheet(s0).unwrap().value_by_id(rid, c),
+                expected
+            );
+        }
+        assert_eq!(c2.spill_range((s0, row_at(&c2, 0), ColId(1))), Some((3, 1)));
+
+        // Clone 3: static write at B2 keeps B1/A2 `#SPILL!` and returns A3 to `#CYCLE!`.
+        let mut c3 = s4;
+        c3.edit_cell_raw(s0, row_at(&c3, 1), ColId(1), "x").unwrap();
+        c3.recalc_all();
+        let fresh_c3 = FormulaEngine::from_workbook_recalc_all(c3.workbook().clone());
+        for (pos_r, c, expected) in [
+            (0, ColId(1), Value::Error(CalcError::Spill)),
+            (1, ColId(0), Value::Error(CalcError::Spill)),
+            (2, ColId(0), Value::Error(CalcError::Cycle)),
+        ] {
+            let rid = row_at(&c3, pos_r);
+            assert_eq!(
+                c3.workbook().sheet(s0).unwrap().value_by_id(rid, c),
+                expected
+            );
+            assert_eq!(
+                fresh_c3.workbook().sheet(s0).unwrap().value_by_id(rid, c),
+                expected
+            );
+        }
+
+        // Reverse sorted-order variant: cycle anchor C1 precedes blocking A2 in fresh recalc order.
+        let mut rev = FormulaEngine::new();
+        rev.edit_cell_raw(s0, RowId(0), ColId(2), "=C2:C3").unwrap();
+        rev.recalc_all();
+        rev.edit_cell_raw(s0, RowId(0), ColId(1), "={10;20}")
+            .unwrap();
+        rev.recalc_all();
+        rev.edit_cell_raw(s0, RowId(1), ColId(0), "={1,2,3}")
+            .unwrap();
+        rev.recalc_all();
+        let fresh_rev = FormulaEngine::from_workbook_recalc_all(rev.workbook().clone());
+        for (row, col, expected) in [
+            (RowId(0), ColId(1), Value::Error(CalcError::Spill)),
+            (RowId(1), ColId(0), Value::Error(CalcError::Spill)),
+            (RowId(0), ColId(2), Value::Error(CalcError::Spill)),
+        ] {
+            assert_eq!(
+                rev.workbook().sheet(s0).unwrap().value_by_id(row, col),
+                expected
+            );
+            assert_eq!(
+                fresh_rev
+                    .workbook()
+                    .sheet(s0)
+                    .unwrap()
+                    .value_by_id(row, col),
+                expected
+            );
+        }
+
+        // 13. Stale `cycle_spills` peers wake cleanly when an anchor enters a new `#CYCLE!`.
+        let mut s5 = FormulaEngine::new();
+        s5.edit_cell_raw(s0, RowId(3), ColId(1), "=B1:C1").unwrap();
+        s5.recalc_all();
+        s5.edit_cell_raw(s0, RowId(0), ColId(2), "=COUNTIF(C2:E4, \">1\")")
+            .unwrap();
+        s5.recalc_all();
+        assert_eq!(
+            s5.workbook()
+                .sheet(s0)
+                .unwrap()
+                .value_by_id(RowId(3), ColId(1)),
+            Value::Error(CalcError::Cycle)
+        );
+        assert_eq!(
+            s5.workbook()
+                .sheet(s0)
+                .unwrap()
+                .value_by_id(RowId(0), ColId(2)),
+            Value::Error(CalcError::Cycle)
+        );
+        s5.edit_cell_raw(s0, RowId(0), ColId(1), "=B3:B4").unwrap();
+        s5.recalc_all();
+        let fresh_s5 = FormulaEngine::from_workbook_recalc_all(s5.workbook().clone());
+        for (row, col, expected) in [
+            (RowId(0), ColId(1), Value::Error(CalcError::Cycle)),
+            (RowId(3), ColId(1), Value::Error(CalcError::Cycle)),
+            (RowId(0), ColId(2), Value::Number(0.0)),
+        ] {
+            assert_eq!(
+                s5.workbook().sheet(s0).unwrap().value_by_id(row, col),
+                expected
+            );
+            assert_eq!(
+                fresh_s5.workbook().sheet(s0).unwrap().value_by_id(row, col),
+                expected
+            );
+        }
+        s5.edit_cell_raw(s0, RowId(0), ColId(1), "").unwrap();
+        s5.recalc_all();
+        let fresh_s5_after = FormulaEngine::from_workbook_recalc_all(s5.workbook().clone());
+        for (row, col, expected) in [
+            (RowId(0), ColId(1), Value::Empty),
+            (RowId(3), ColId(1), Value::Error(CalcError::Cycle)),
+            (RowId(0), ColId(2), Value::Error(CalcError::Cycle)),
+        ] {
+            assert_eq!(
+                s5.workbook().sheet(s0).unwrap().value_by_id(row, col),
+                expected
+            );
+            assert_eq!(
+                fresh_s5_after
+                    .workbook()
+                    .sheet(s0)
+                    .unwrap()
+                    .value_by_id(row, col),
+                expected
+            );
+        }
     }
 
     #[test]
