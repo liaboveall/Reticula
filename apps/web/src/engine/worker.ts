@@ -798,14 +798,17 @@ async function runEngineCommand(command: EngineCommand): Promise<void> {
     return;
   }
   const event = engine.handle(command);
-  if (event) {
-    scope.postMessage(event);
-  }
   const updatedSheet = sheetFromEvent(event);
   if (updatedSheet) {
     activeSheetId = updatedSheet.sheet;
   }
+  // Flush pending local WAL frames to OPFS before reporting the updated
+  // `walSeq` / sheet metadata to the main thread, so callers observing the
+  // completion event can rely on `wal.log` already reflecting the transaction.
   await drainWalFrames(engine, updatedSheet);
+  if (event) {
+    scope.postMessage(event);
+  }
   if (collaborative) {
     await flushCollabEvents(engine);
   }

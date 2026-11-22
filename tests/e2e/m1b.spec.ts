@@ -275,8 +275,10 @@ test("1,000,000-row formula fill handle encodes in constant O(1) WAL transaction
     return t !== null && t !== undefined && t.length > 0 && t !== "=F2*2";
   });
 
-  // Wait for WAL flush and measure WAL size before 10-row drag fill.
-  await page.waitForTimeout(80);
+  // Capture WAL sequence & length after A2 commit and before 10-row drag fill.
+  const seqBefore10 = await page.evaluate(() =>
+    Number(window.__reticula?.docStatus().walSeq ?? "0"),
+  );
   const walBefore10 = await readOpfsWalLength(page, "sample-1m");
 
   // Drag fill handle on `A2` down 10 rows (`A2:A12`, rows 1..11).
@@ -293,8 +295,18 @@ test("1,000,000-row formula fill handle encodes in constant O(1) WAL transaction
   await page.mouse.up();
 
   await expect(page.getByTestId("name-box")).toHaveText("A2:A12");
+  await page.waitForFunction(
+    (seq) => Number(window.__reticula?.docStatus().walSeq ?? "0") > seq,
+    seqBefore10,
+  );
+  await page.waitForFunction(() => {
+    const t = window.__reticula?.textAt(11, 0);
+    return t !== null && t !== undefined && t.length > 0 && t !== "=F12*2";
+  });
   await settled(page);
-  await page.waitForTimeout(80);
+  const seqAfter10 = await page.evaluate(() =>
+    Number(window.__reticula?.docStatus().walSeq ?? "0"),
+  );
   const walAfter10 = await readOpfsWalLength(page, "sample-1m");
 
   // Now select `A12` (`row = 11, col = 0`) and double-click its fill handle to auto-fill down to row 1,000,000!
@@ -308,7 +320,10 @@ test("1,000,000-row formula fill handle encodes in constant O(1) WAL transaction
   await expect(page.getByTestId("document")).toContainText("1,100,000 formulas", {
     timeout: 15_000,
   });
-  await page.waitForTimeout(80);
+  await page.waitForFunction(
+    (seq) => Number(window.__reticula?.docStatus().walSeq ?? "0") > seq,
+    seqAfter10,
+  );
   const walAfter1M = await readOpfsWalLength(page, "sample-1m");
 
   if (walBefore10 !== null && walAfter10 !== null && walAfter1M !== null) {
