@@ -333,23 +333,23 @@ pub fn eval_rate(
         let Some(f0) = eval_f(r) else {
             break;
         };
-        if f0.abs() < 1e-11 {
+        if f0.abs() < 1e-13 {
             return fin_result(r);
         }
         let h = (r.abs() * 1e-6).max(1e-7);
-        let Some(f1) = eval_f(r + h) else {
+        let (Some(f_hi), Some(f_lo)) = (eval_f(r + h), eval_f(r - h)) else {
             break;
         };
-        let deriv = (f1 - f0) / h;
+        let deriv = (f_hi - f_lo) / (2.0 * h);
         if !deriv.is_finite() || deriv.abs() < 1e-18 {
             break;
         }
         let next = (r - f0 / deriv).clamp(-0.999_999, 1e6);
         let delta = (next - r).abs();
         r = next;
-        if delta < 1e-12
+        if delta < 1e-14
             && let Some(chk) = eval_f(r)
-            && chk.abs() < 1e-7
+            && chk.abs() < 1e-9
         {
             return fin_result(r);
         }
@@ -378,7 +378,7 @@ pub fn eval_rate(
                 let Some(fmid) = eval_f(mid) else {
                     break;
                 };
-                if fmid == 0.0 || (hi - lo) * 0.5 < 1e-12 {
+                if fmid == 0.0 || (hi - lo) * 0.5 < 1e-14 {
                     return fin_result(mid);
                 }
                 if (flo < 0.0 && fmid < 0.0) || (flo > 0.0 && fmid > 0.0) {
@@ -534,7 +534,7 @@ pub fn eval_irr(
         let Some((f0, df)) = irr_val(r) else {
             break;
         };
-        if f0.abs() < 1e-11 {
+        if f0.abs() < 1e-13 {
             return fin_result(r);
         }
         if df.abs() < 1e-18 {
@@ -543,9 +543,9 @@ pub fn eval_irr(
         let next = (r - f0 / df).clamp(-0.999_999, 1e6);
         let delta = (next - r).abs();
         r = next;
-        if delta < 1e-12
+        if delta < 1e-14
             && let Some((chk, _)) = irr_val(r)
-            && chk.abs() < 1e-7
+            && chk.abs() < 1e-9
         {
             return fin_result(r);
         }
@@ -574,7 +574,7 @@ pub fn eval_irr(
                 let Some((fmid, _)) = irr_val(mid) else {
                     break;
                 };
-                if fmid == 0.0 || (hi - lo) * 0.5 < 1e-12 {
+                if fmid == 0.0 || (hi - lo) * 0.5 < 1e-14 {
                     return fin_result(mid);
                 }
                 if (flo < 0.0 && fmid < 0.0) || (flo > 0.0 && fmid > 0.0) {

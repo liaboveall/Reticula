@@ -1324,6 +1324,11 @@ fn parse_worksheet_xml(
                         c.formula_text = Some(String::new());
                     }
                 }
+                "v" if cur_cell.is_some() => {
+                    if let Some(c) = &mut cur_cell {
+                        c.v_text = Some(String::new());
+                    }
+                }
                 "mergeCell" => out.merged_cells_count = out.merged_cells_count.saturating_add(1),
                 "conditionalFormatting" => {
                     out.conditional_fmt_count = out.conditional_fmt_count.saturating_add(1);

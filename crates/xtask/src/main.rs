@@ -40,8 +40,8 @@ Commands:
                           --check only reports whether they are up to date.
   digest [--update]       Print the determinism digest; --update records it as expected.
   compat [--freeze v1]    Verify frozen wire v1 SHA-256 hashes (or generate/freeze v1 fixtures).
-  diff [--count <n>] [--out <file>]
-                          Differential evaluation against ironcalc_base and formualizer-eval.
+  diff [--engine rust|libreoffice|all] [--count <n>] [--quota-per-fn <n>] [--seed <n>] [--image <tag>] [--skip-image] [--dump-xlsx <dir>] [--archive] [--out <file>]
+                          Differential evaluation against ironcalc_base, formualizer-eval, and/or headless LibreOffice Calc.
   fuzz [--cpu-seconds <s>] [--threads <n>] [--affinity <mask>] [--target <name>]
                           Multi-threaded mutation & structured fuzzing campaign over the six
                           targets, or with --target (parser, snapshot, wal, ops, eval, sync)
@@ -125,7 +125,20 @@ fn run(args: &[String]) -> Result {
         "codegen" => codegen::run(Flags::parse(rest, &["check"], &[])?.has("check")),
         "digest" => digest(&Flags::parse(rest, &["update"], &[])?),
         "compat" => compat::run(&Flags::parse(rest, &[], &["freeze"])?),
-        "diff" => qa::diff(&Flags::parse(rest, &[], &["count", "out"])?),
+        "diff" => qa::diff(&Flags::parse(
+            rest,
+            &["skip-image", "archive"],
+            &[
+                "engine",
+                "count",
+                "quota-per-fn",
+                "seed",
+                "image",
+                "dump-xlsx",
+                "out",
+                "date",
+            ],
+        )?),
         "fuzz" => qa::fuzz(&Flags::parse(
             rest,
             &[],

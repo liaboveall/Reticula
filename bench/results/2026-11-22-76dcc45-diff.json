@@ -1,0 +1,2266 @@
+{
+  "suite": "m3a-diff",
+  "date": "2026-11-22",
+  "commit": "76dcc45",
+  "seed": 3523158054,
+  "quota_per_fn": 250,
+  "libreoffice_version": "LibreOffice 26.8.2.2 680(Build:2)",
+  "container_image": "reticula-libreoffice:26.8.2",
+  "total_formulas": 51250,
+  "total_cells_compared": 76510,
+  "deterministic_functions_covered": 195,
+  "unique_functions_covered": 188,
+  "min_samples_per_function": 250,
+  "non_error_count": 50185,
+  "non_error_ratio": 0.9792195121951219,
+  "matches": 51072,
+  "agreement_ratio": 0.9965268292682927,
+  "unclassified_count": 0,
+  "by_family": [
+    {
+      "family": "aggregation",
+      "total": 1500,
+      "non_error": 1500,
+      "matches": 1500,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "family": "compound_expr",
+      "total": 2500,
+      "non_error": 2250,
+      "matches": 2500,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "family": "criteria_agg",
+      "total": 3000,
+      "non_error": 3000,
+      "matches": 3000,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "family": "datetime",
+      "total": 5250,
+      "non_error": 5250,
+      "matches": 5208,
+      "agreement_ratio": 0.992,
+      "unclassified": 0
+    },
+    {
+      "family": "dynamic_array",
+      "total": 3500,
+      "non_error": 3500,
+      "matches": 3490,
+      "agreement_ratio": 0.9971428571428571,
+      "unclassified": 0
+    },
+    {
+      "family": "financial",
+      "total": 2000,
+      "non_error": 2000,
+      "matches": 2000,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "family": "logic_info",
+      "total": 6000,
+      "non_error": 5948,
+      "matches": 5920,
+      "agreement_ratio": 0.9866666666666667,
+      "unclassified": 0
+    },
+    {
+      "family": "lookup",
+      "total": 4000,
+      "non_error": 3798,
+      "matches": 4000,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "family": "math_trig",
+      "total": 10000,
+      "non_error": 9964,
+      "matches": 9984,
+      "agreement_ratio": 0.9984,
+      "unclassified": 0
+    },
+    {
+      "family": "stats",
+      "total": 5250,
+      "non_error": 5230,
+      "matches": 5230,
+      "agreement_ratio": 0.9961904761904762,
+      "unclassified": 0
+    },
+    {
+      "family": "text_conv",
+      "total": 8250,
+      "non_error": 7745,
+      "matches": 8240,
+      "agreement_ratio": 0.9987878787878788,
+      "unclassified": 0
+    }
+  ],
+  "by_function": [
+    {
+      "function": "ABS",
+      "family": "math_trig",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "ACOS",
+      "family": "math_trig",
+      "total": 250,
+      "non_error": 240,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "ADDRESS",
+      "family": "lookup",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "AGGREGATE",
+      "family": "criteria_agg",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "AND",
+      "family": "logic_info",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "AREAS",
+      "family": "lookup",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "ASIN",
+      "family": "math_trig",
+      "total": 250,
+      "non_error": 240,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "ATAN",
+      "family": "math_trig",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "ATAN2",
+      "family": "math_trig",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "AVERAGE",
+      "family": "aggregation",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "AVERAGEIF",
+      "family": "criteria_agg",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "AVERAGEIFS",
+      "family": "criteria_agg",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "CEILING",
+      "family": "math_trig",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "CHAR",
+      "family": "text_conv",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "CHOOSE",
+      "family": "lookup",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "CHOOSECOLS",
+      "family": "dynamic_array",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "CHOOSEROWS",
+      "family": "dynamic_array",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "CLEAN",
+      "family": "text_conv",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "CODE",
+      "family": "text_conv",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "COLUMN",
+      "family": "lookup",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "COLUMNS",
+      "family": "lookup",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "COMBIN",
+      "family": "math_trig",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "COMPOUND",
+      "family": "compound_expr",
+      "total": 2500,
+      "non_error": 2250,
+      "matches": 2500,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "CONCAT",
+      "family": "text_conv",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "CONCATENATE",
+      "family": "text_conv",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "CORREL",
+      "family": "stats",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "COS",
+      "family": "math_trig",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "COSH",
+      "family": "math_trig",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "COUNT",
+      "family": "aggregation",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "COUNTA",
+      "family": "aggregation",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "COUNTBLANK",
+      "family": "criteria_agg",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "COUNTIF",
+      "family": "criteria_agg",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "COUNTIFS",
+      "family": "criteria_agg",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "DATE",
+      "family": "datetime",
+      "total": 250,
+      "non_error": 250,
+      "matches": 238,
+      "agreement_ratio": 0.952,
+      "unclassified": 0
+    },
+    {
+      "function": "DATEDIF",
+      "family": "datetime",
+      "total": 250,
+      "non_error": 250,
+      "matches": 228,
+      "agreement_ratio": 0.912,
+      "unclassified": 0
+    },
+    {
+      "function": "DATEVALUE",
+      "family": "datetime",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "DAY",
+      "family": "datetime",
+      "total": 250,
+      "non_error": 250,
+      "matches": 242,
+      "agreement_ratio": 0.968,
+      "unclassified": 0
+    },
+    {
+      "function": "DAYS",
+      "family": "datetime",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "DAYS360",
+      "family": "datetime",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "DEGREES",
+      "family": "math_trig",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "DOLLAR",
+      "family": "text_conv",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "DROP",
+      "family": "dynamic_array",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "EDATE",
+      "family": "datetime",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "EOMONTH",
+      "family": "datetime",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "ERROR.TYPE",
+      "family": "logic_info",
+      "total": 250,
+      "non_error": 198,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "EVEN",
+      "family": "math_trig",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "EXACT",
+      "family": "text_conv",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "EXP",
+      "family": "math_trig",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "FACT",
+      "family": "math_trig",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "FALSE",
+      "family": "logic_info",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "FILTER",
+      "family": "dynamic_array",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "FIND",
+      "family": "text_conv",
+      "total": 250,
+      "non_error": 132,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "FIXED",
+      "family": "text_conv",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "FLOOR",
+      "family": "math_trig",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "FREQUENCY",
+      "family": "dynamic_array",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "FV",
+      "family": "financial",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "GCD",
+      "family": "math_trig",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "HLOOKUP",
+      "family": "lookup",
+      "total": 250,
+      "non_error": 200,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "HOUR",
+      "family": "datetime",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "HSTACK",
+      "family": "dynamic_array",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "IF",
+      "family": "logic_info",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "IFERROR",
+      "family": "logic_info",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "IFNA",
+      "family": "logic_info",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "IFS",
+      "family": "logic_info",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "INDEX",
+      "family": "lookup",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "INDIRECT",
+      "family": "lookup",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "INT",
+      "family": "math_trig",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "IRR",
+      "family": "financial",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "ISBLANK",
+      "family": "logic_info",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "ISERR",
+      "family": "logic_info",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "ISERROR",
+      "family": "logic_info",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "ISEVEN",
+      "family": "logic_info",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "ISFORMULA",
+      "family": "logic_info",
+      "total": 250,
+      "non_error": 250,
+      "matches": 240,
+      "agreement_ratio": 0.96,
+      "unclassified": 0
+    },
+    {
+      "function": "ISLOGICAL",
+      "family": "logic_info",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "ISNA",
+      "family": "logic_info",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "ISNONTEXT",
+      "family": "logic_info",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "ISNUMBER",
+      "family": "logic_info",
+      "total": 250,
+      "non_error": 250,
+      "matches": 240,
+      "agreement_ratio": 0.96,
+      "unclassified": 0
+    },
+    {
+      "function": "ISODD",
+      "family": "logic_info",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "ISOWEEKNUM",
+      "family": "datetime",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "ISREF",
+      "family": "logic_info",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "ISTEXT",
+      "family": "text_conv",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "LARGE",
+      "family": "stats",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "LCM",
+      "family": "math_trig",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "LEFT",
+      "family": "text_conv",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "LEN",
+      "family": "text_conv",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "LN",
+      "family": "math_trig",
+      "total": 250,
+      "non_error": 242,
+      "matches": 242,
+      "agreement_ratio": 0.968,
+      "unclassified": 0
+    },
+    {
+      "function": "LOG",
+      "family": "math_trig",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "LOG10",
+      "family": "math_trig",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "LOOKUP",
+      "family": "lookup",
+      "total": 250,
+      "non_error": 212,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "LOWER",
+      "family": "text_conv",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "MATCH",
+      "family": "lookup",
+      "total": 250,
+      "non_error": 224,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "MAX",
+      "family": "aggregation",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "MAXIFS",
+      "family": "criteria_agg",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "MEDIAN",
+      "family": "stats",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "MID",
+      "family": "text_conv",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "MIN",
+      "family": "aggregation",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "MINIFS",
+      "family": "criteria_agg",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "MINUTE",
+      "family": "datetime",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "MOD",
+      "family": "math_trig",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "MODE",
+      "family": "stats",
+      "total": 250,
+      "non_error": 240,
+      "matches": 240,
+      "agreement_ratio": 0.96,
+      "unclassified": 0
+    },
+    {
+      "function": "MODE.SNGL",
+      "family": "stats",
+      "total": 250,
+      "non_error": 240,
+      "matches": 240,
+      "agreement_ratio": 0.96,
+      "unclassified": 0
+    },
+    {
+      "function": "MONTH",
+      "family": "datetime",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "MROUND",
+      "family": "math_trig",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "N",
+      "family": "text_conv",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "NA",
+      "family": "text_conv",
+      "total": 250,
+      "non_error": 0,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "NETWORKDAYS",
+      "family": "datetime",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "NOT",
+      "family": "logic_info",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "NPER",
+      "family": "financial",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "NPV",
+      "family": "financial",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "NUMBERVALUE",
+      "family": "text_conv",
+      "total": 250,
+      "non_error": 250,
+      "matches": 240,
+      "agreement_ratio": 0.96,
+      "unclassified": 0
+    },
+    {
+      "function": "ODD",
+      "family": "math_trig",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "OFFSET",
+      "family": "lookup",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "OR",
+      "family": "logic_info",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "PERCENTILE",
+      "family": "stats",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "PERCENTILE.EXC",
+      "family": "stats",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "PERCENTILE.INC",
+      "family": "stats",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "PERMUT",
+      "family": "math_trig",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "PI",
+      "family": "math_trig",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "PMT",
+      "family": "financial",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "POWER",
+      "family": "math_trig",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "PRODUCT",
+      "family": "math_trig",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "PROPER",
+      "family": "text_conv",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "PV",
+      "family": "financial",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "QUARTILE",
+      "family": "stats",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "QUARTILE.EXC",
+      "family": "stats",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "QUARTILE.INC",
+      "family": "stats",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "QUOTIENT",
+      "family": "math_trig",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "RADIANS",
+      "family": "math_trig",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "RANK",
+      "family": "stats",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "RANK.AVG",
+      "family": "stats",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "RANK.EQ",
+      "family": "stats",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "RATE",
+      "family": "financial",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "REPLACE",
+      "family": "text_conv",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "REPT",
+      "family": "text_conv",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "RIGHT",
+      "family": "text_conv",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "ROUND",
+      "family": "math_trig",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "ROUNDDOWN",
+      "family": "math_trig",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "ROUNDUP",
+      "family": "math_trig",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "ROW",
+      "family": "lookup",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "ROWS",
+      "family": "lookup",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "SEARCH",
+      "family": "text_conv",
+      "total": 250,
+      "non_error": 113,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "SECOND",
+      "family": "datetime",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "SEQUENCE",
+      "family": "dynamic_array",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "SIGN",
+      "family": "math_trig",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "SIN",
+      "family": "math_trig",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "SINH",
+      "family": "math_trig",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "SLN",
+      "family": "financial",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "SMALL",
+      "family": "stats",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "SORT",
+      "family": "dynamic_array",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "SORTBY",
+      "family": "dynamic_array",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "SQRT",
+      "family": "math_trig",
+      "total": 250,
+      "non_error": 242,
+      "matches": 242,
+      "agreement_ratio": 0.968,
+      "unclassified": 0
+    },
+    {
+      "function": "STDEV",
+      "family": "stats",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "STDEV.P",
+      "family": "stats",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "STDEV.S",
+      "family": "stats",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "SUBSTITUTE",
+      "family": "text_conv",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "SUBTOTAL",
+      "family": "criteria_agg",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "SUM",
+      "family": "aggregation",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "SUMIF",
+      "family": "criteria_agg",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "SUMIFS",
+      "family": "criteria_agg",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "SUMPRODUCT",
+      "family": "criteria_agg",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "SUMSQ",
+      "family": "math_trig",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "SWITCH",
+      "family": "logic_info",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "T",
+      "family": "text_conv",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "TAKE",
+      "family": "dynamic_array",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "TAN",
+      "family": "math_trig",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "TANH",
+      "family": "math_trig",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "TEXT",
+      "family": "text_conv",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "TEXTAFTER",
+      "family": "text_conv",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "TEXTBEFORE",
+      "family": "text_conv",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "TEXTJOIN",
+      "family": "text_conv",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "TEXTSPLIT",
+      "family": "dynamic_array",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "TIME",
+      "family": "datetime",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "TIMEVALUE",
+      "family": "datetime",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "TRANSPOSE",
+      "family": "dynamic_array",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "TRIM",
+      "family": "text_conv",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "TRUE",
+      "family": "logic_info",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "TRUNC",
+      "family": "math_trig",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "TYPE",
+      "family": "logic_info",
+      "total": 250,
+      "non_error": 250,
+      "matches": 190,
+      "agreement_ratio": 0.76,
+      "unclassified": 0
+    },
+    {
+      "function": "UNICHAR",
+      "family": "text_conv",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "UNICODE",
+      "family": "text_conv",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "UNIQUE",
+      "family": "dynamic_array",
+      "total": 250,
+      "non_error": 250,
+      "matches": 240,
+      "agreement_ratio": 0.96,
+      "unclassified": 0
+    },
+    {
+      "function": "UPPER",
+      "family": "text_conv",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "VALUE",
+      "family": "text_conv",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "VAR",
+      "family": "stats",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "VAR.P",
+      "family": "stats",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "VAR.S",
+      "family": "stats",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "VLOOKUP",
+      "family": "lookup",
+      "total": 250,
+      "non_error": 236,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "VSTACK",
+      "family": "dynamic_array",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "WEEKDAY",
+      "family": "datetime",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "WEEKNUM",
+      "family": "datetime",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "WORKDAY",
+      "family": "datetime",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "XLOOKUP",
+      "family": "lookup",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "XMATCH",
+      "family": "lookup",
+      "total": 250,
+      "non_error": 176,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "XOR",
+      "family": "logic_info",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "YEAR",
+      "family": "datetime",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    },
+    {
+      "function": "YEARFRAC",
+      "family": "datetime",
+      "total": 250,
+      "non_error": 250,
+      "matches": 250,
+      "agreement_ratio": 1.0,
+      "unclassified": 0
+    }
+  ],
+  "clusters": [
+    {
+      "reference_engine": "libreoffice-calc",
+      "category": "DATE",
+      "family": "datetime",
+      "disposition": "excel_1900_calendar_rule",
+      "reason": "Excel 1900 leap-year compatibility (1900-02-29 = serial 60, Jan-Feb 1900 +1 offset) vs proleptic Gregorian in LibreOffice",
+      "count": 12,
+      "sample_formula": "=DATE(1900,2,29)",
+      "reticula_result": {
+        "Number": 60.0
+      },
+      "libreoffice_result": {
+        "Number": 61.0
+      }
+    },
+    {
+      "reference_engine": "libreoffice-calc",
+      "category": "DATEDIF",
+      "family": "datetime",
+      "disposition": "datedif_yd_leap_year_anchor",
+      "reason": "DATEDIF \"YD\" spanning leap year 2024 (start-year vs end-year anchor) differs by 1 day across spreadsheet engines",
+      "count": 22,
+      "sample_formula": "=DATEDIF(Data!K2,Data!K5,\"YD\")",
+      "reticula_result": {
+        "Number": 123.0
+      },
+      "libreoffice_result": {
+        "Number": 122.0
+      }
+    },
+    {
+      "reference_engine": "libreoffice-calc",
+      "category": "DAY",
+      "family": "datetime",
+      "disposition": "excel_1900_calendar_rule",
+      "reason": "Excel 1900 leap-year compatibility (1900-02-29 = serial 60, Jan-Feb 1900 +1 offset) vs proleptic Gregorian in LibreOffice",
+      "count": 8,
+      "sample_formula": "=DAY(Data!K9)",
+      "reticula_result": {
+        "Number": 29.0
+      },
+      "libreoffice_result": {
+        "Number": 28.0
+      }
+    },
+    {
+      "reference_engine": "libreoffice-calc",
+      "category": "ISFORMULA",
+      "family": "logic_info",
+      "disposition": "libreoffice_boolean_cell_as_formula",
+      "reason": "LibreOffice serializes boolean constants as TRUE()/FALSE() formulas, making ISFORMULA(TRUE) return TRUE",
+      "count": 10,
+      "sample_formula": "=ISFORMULA(Data!F1)",
+      "reticula_result": {
+        "Bool": false
+      },
+      "libreoffice_result": {
+        "Bool": true
+      }
+    },
+    {
+      "reference_engine": "libreoffice-calc",
+      "category": "ISNUMBER",
+      "family": "logic_info",
+      "disposition": "libreoffice_boolean_is_number",
+      "reason": "LibreOffice evaluates ISNUMBER(TRUE/FALSE) as TRUE vs FALSE in Excel/Reticula",
+      "count": 10,
+      "sample_formula": "=ISNUMBER(Data!F1)",
+      "reticula_result": {
+        "Bool": false
+      },
+      "libreoffice_result": {
+        "Bool": true
+      }
+    },
+    {
+      "reference_engine": "libreoffice-calc",
+      "category": "LN",
+      "family": "math_trig",
+      "disposition": "libreoffice_err502_domain_value_error",
+      "reason": "LibreOffice exports Err:502 negative real domain errors on LN/SQRT as #VALUE! vs #NUM! in Excel/Reticula",
+      "count": 8,
+      "sample_formula": "=LN(-1)",
+      "reticula_result": {
+        "Error": "#NUM!"
+      },
+      "libreoffice_result": {
+        "Error": "#VALUE!"
+      }
+    },
+    {
+      "reference_engine": "libreoffice-calc",
+      "category": "MODE",
+      "family": "stats",
+      "disposition": "libreoffice_mode_no_dup_error",
+      "reason": "MODE with no duplicate values returns #N/A in Excel/Reticula vs #VALUE! in LibreOffice Calc",
+      "count": 10,
+      "sample_formula": "=MODE(Data!B1:B16)",
+      "reticula_result": {
+        "Error": "#N/A"
+      },
+      "libreoffice_result": {
+        "Error": "#VALUE!"
+      }
+    },
+    {
+      "reference_engine": "libreoffice-calc",
+      "category": "MODE.SNGL",
+      "family": "stats",
+      "disposition": "libreoffice_mode_no_dup_error",
+      "reason": "MODE with no duplicate values returns #N/A in Excel/Reticula vs #VALUE! in LibreOffice Calc",
+      "count": 10,
+      "sample_formula": "=MODE.SNGL(Data!B1:B16)",
+      "reticula_result": {
+        "Error": "#N/A"
+      },
+      "libreoffice_result": {
+        "Error": "#VALUE!"
+      }
+    },
+    {
+      "reference_engine": "libreoffice-calc",
+      "category": "NUMBERVALUE",
+      "family": "text_conv",
+      "disposition": "libreoffice_odf_numbervalue_optional_arg",
+      "reason": "1-arg NUMBERVALUE defaults decimal separator in Excel OOXML but requires 2nd arg in LibreOffice Calc",
+      "count": 10,
+      "sample_formula": "=NUMBERVALUE(\"-42.25\")",
+      "reticula_result": {
+        "Number": -42.25
+      },
+      "libreoffice_result": {
+        "Error": "#VALUE!"
+      }
+    },
+    {
+      "reference_engine": "libreoffice-calc",
+      "category": "SQRT",
+      "family": "math_trig",
+      "disposition": "libreoffice_err502_domain_value_error",
+      "reason": "LibreOffice exports Err:502 negative real domain errors on LN/SQRT as #VALUE! vs #NUM! in Excel/Reticula",
+      "count": 8,
+      "sample_formula": "=SQRT(-4)",
+      "reticula_result": {
+        "Error": "#NUM!"
+      },
+      "libreoffice_result": {
+        "Error": "#VALUE!"
+      }
+    },
+    {
+      "reference_engine": "libreoffice-calc",
+      "category": "TYPE",
+      "family": "logic_info",
+      "disposition": "libreoffice_boolean_cell_as_formula",
+      "reason": "LibreOffice evaluates TYPE() on stored boolean TRUE()/FALSE() cells as 8 (Formula) vs 4 (Logical) in Excel",
+      "count": 10,
+      "sample_formula": "=TYPE(Data!F1)",
+      "reticula_result": {
+        "Number": 4.0
+      },
+      "libreoffice_result": {
+        "Number": 8.0
+      }
+    },
+    {
+      "reference_engine": "libreoffice-calc",
+      "category": "TYPE",
+      "family": "logic_info",
+      "disposition": "libreoffice_type_array_arg",
+      "reason": "TYPE(range) returns 64 (Array) in Excel 365/Reticula vs #VALUE! in LibreOffice non-array call",
+      "count": 10,
+      "sample_formula": "=TYPE(Data!N1:Q2)",
+      "reticula_result": {
+        "Number": 64.0
+      },
+      "libreoffice_result": {
+        "Error": "#VALUE!"
+      }
+    },
+    {
+      "reference_engine": "libreoffice-calc",
+      "category": "TYPE",
+      "family": "logic_info",
+      "disposition": "libreoffice_type_formula_return_8",
+      "reason": "LibreOffice TYPE(formula_cell) returns 8 (Formula) per ODF whereas Excel returns the evaluated value type (1)",
+      "count": 40,
+      "sample_formula": "=TYPE(Data!W1)",
+      "reticula_result": {
+        "Number": 1.0
+      },
+      "libreoffice_result": {
+        "Number": 8.0
+      }
+    },
+    {
+      "reference_engine": "libreoffice-calc",
+      "category": "UNIQUE",
+      "family": "dynamic_array",
+      "disposition": "libreoffice_array_bool_number_serialization",
+      "reason": "LibreOffice serializes boolean array spill elements as numeric 1/0 without t=\"b\"",
+      "count": 10,
+      "sample_formula": "=UNIQUE(Data!F1:F6)",
+      "reticula_result": {
+        "Bool": true
+      },
+      "libreoffice_result": {
+        "Number": 1.0
+      }
+    }
+  ],
+  "rust_reference": {
+    "seed": 3523158054,
+    "total_formulas": 10000,
+    "non_error_count": 9741,
+    "non_error_ratio": 0.9741,
+    "ironcalc_matches": 9837,
+    "formualizer_matches": 9772,
+    "clusters": [
+      {
+        "reference_engine": "formualizer-eval",
+        "category": "ADD_SUB_CANCEL",
+        "disposition": "excel_15_digit_rule",
+        "count": 99,
+        "sample_formula": "=A3-(A1+A2)",
+        "reticula_result": {
+          "Number": 0.0
+        },
+        "reference_result": {
+          "Number": -5.55111512312578e-17
+        }
+      },
+      {
+        "reference_engine": "formualizer-eval",
+        "category": "CMP_NUM",
+        "disposition": "excel_15_digit_rule",
+        "count": 17,
+        "sample_formula": "=(A1+A2)>A3",
+        "reticula_result": {
+          "Bool": false
+        },
+        "reference_result": {
+          "Bool": true
+        }
+      },
+      {
+        "reference_engine": "formualizer-eval",
+        "category": "DATE",
+        "disposition": "excel_1900_calendar_rule",
+        "count": 31,
+        "sample_formula": "=DATE(1900,2,29)",
+        "reticula_result": {
+          "Number": 60.0
+        },
+        "reference_result": {
+          "Number": 61.0
+        }
+      },
+      {
+        "reference_engine": "formualizer-eval",
+        "category": "EDATE",
+        "disposition": "excel_1900_calendar_rule",
+        "count": 5,
+        "sample_formula": "=EDATE(M2,-5)",
+        "reticula_result": {
+          "Error": "#NUM!"
+        },
+        "reference_result": {
+          "Number": -91.0
+        }
+      },
+      {
+        "reference_engine": "formualizer-eval",
+        "category": "EOMONTH",
+        "disposition": "excel_1900_calendar_rule",
+        "count": 7,
+        "sample_formula": "=EOMONTH(M2,-8)",
+        "reticula_result": {
+          "Error": "#NUM!"
+        },
+        "reference_result": {
+          "Number": -153.0
+        }
+      },
+      {
+        "reference_engine": "formualizer-eval",
+        "category": "FLOOR",
+        "disposition": "excel_15_digit_rule",
+        "count": 44,
+        "sample_formula": "=FLOOR(1.2,0.1)",
+        "reticula_result": {
+          "Number": 1.2
+        },
+        "reference_result": {
+          "Number": 1.1
+        }
+      },
+      {
+        "reference_engine": "formualizer-eval",
+        "category": "FLOOR",
+        "disposition": "excel_negative_floor_rule",
+        "count": 25,
+        "sample_formula": "=FLOOR(-2.5,-1)",
+        "reticula_result": {
+          "Number": -2.0
+        },
+        "reference_result": {
+          "Number": -3.0
+        }
+      },
+      {
+        "reference_engine": "ironcalc_base",
+        "category": "ADD_SUB_CANCEL",
+        "disposition": "excel_15_digit_rule",
+        "count": 99,
+        "sample_formula": "=A3-(A1+A2)",
+        "reticula_result": {
+          "Number": 0.0
+        },
+        "reference_result": {
+          "Number": -5.55111512312578e-17
+        }
+      },
+      {
+        "reference_engine": "ironcalc_base",
+        "category": "DATE",
+        "disposition": "excel_1900_calendar_rule",
+        "count": 31,
+        "sample_formula": "=DATE(1900,2,29)",
+        "reticula_result": {
+          "Number": 60.0
+        },
+        "reference_result": {
+          "Number": 61.0
+        }
+      },
+      {
+        "reference_engine": "ironcalc_base",
+        "category": "DAY",
+        "disposition": "excel_1900_calendar_rule",
+        "count": 18,
+        "sample_formula": "=DAY(M1)",
+        "reticula_result": {
+          "Number": 29.0
+        },
+        "reference_result": {
+          "Number": 28.0
+        }
+      },
+      {
+        "reference_engine": "ironcalc_base",
+        "category": "EDATE",
+        "disposition": "excel_1900_calendar_rule",
+        "count": 2,
+        "sample_formula": "=EDATE(M2,-1)",
+        "reticula_result": {
+          "Number": 32.0
+        },
+        "reference_result": {
+          "Number": 33.0
+        }
+      },
+      {
+        "reference_engine": "ironcalc_base",
+        "category": "EOMONTH",
+        "disposition": "excel_1900_calendar_rule",
+        "count": 4,
+        "sample_formula": "=EOMONTH(M2,-2)",
+        "reticula_result": {
+          "Number": 31.0
+        },
+        "reference_result": {
+          "Number": 32.0
+        }
+      },
+      {
+        "reference_engine": "ironcalc_base",
+        "category": "TEXT",
+        "disposition": "excel_half_away_rounding",
+        "count": 9,
+        "sample_formula": "=TEXT(A7,\"0\")",
+        "reticula_result": {
+          "Text": "43"
+        },
+        "reference_result": {
+          "Text": "42"
+        }
+      }
+    ]
+  }
+}

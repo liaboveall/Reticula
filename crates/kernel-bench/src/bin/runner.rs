@@ -9,6 +9,9 @@ use std::process::Command;
 use reticula_kernel_bench::bench_workloads::run_native_suite;
 use reticula_kernel_bench::diff::run_differential;
 use reticula_kernel_bench::fuzz_runner::{FUZZ_TARGETS, run_fuzz_campaign};
+use reticula_kernel_bench::lo_diff::{
+    DEFAULT_LIBREOFFICE_IMAGE, LibreOfficeDiffConfig, run_libreoffice_differential,
+};
 use reticula_kernel_bench::sync_bench::run_b9;
 
 fn pin_current_process(mask: &str) {
@@ -55,20 +58,54 @@ fn main() {
 }
 
 fn run_diff_cmd(args: &[String]) {
+    let mut engine = String::from("rust");
     let mut count = 10_000_usize;
+    let mut quota_per_fn = 250_usize;
     let mut seed = 0xD1FF_2026_u64;
+    let mut image = String::from(DEFAULT_LIBREOFFICE_IMAGE);
+    let mut skip_image = false;
+    let mut dump_xlsx: Option<PathBuf> = None;
+    let mut commit = String::from("local");
+    let mut date = String::from("2026-11-22");
     let mut out: Option<PathBuf> = None;
 
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
+            "--engine" => {
+                i += 1;
+                engine = args[i].clone();
+            }
             "--count" => {
                 i += 1;
                 count = args[i].parse().expect("valid --count");
             }
+            "--quota-per-fn" => {
+                i += 1;
+                quota_per_fn = args[i].parse().expect("valid --quota-per-fn");
+            }
             "--seed" => {
                 i += 1;
                 seed = args[i].parse().expect("valid --seed");
+            }
+            "--image" => {
+                i += 1;
+                image = args[i].clone();
+            }
+            "--skip-image" => {
+                skip_image = true;
+            }
+            "--dump-xlsx" => {
+                i += 1;
+                dump_xlsx = Some(PathBuf::from(&args[i]));
+            }
+            "--commit" => {
+                i += 1;
+                commit = args[i].clone();
+            }
+            "--date" => {
+                i += 1;
+                date = args[i].clone();
             }
             "--out" => {
                 i += 1;
@@ -79,51 +116,178 @@ fn run_diff_cmd(args: &[String]) {
         i += 1;
     }
 
-    let report = run_differential(seed, count);
-    println!(
-        "Differential report (seed={:#x}, total={} formulas, non-error={:.1}%):",
-        report.seed,
-        report.total_formulas,
-        report.non_error_ratio * 100.0
-    );
-    println!(
-        "  ironcalc_base    exact/15-digit matches: {} / {}",
-        report.ironcalc_matches, report.total_formulas
-    );
-    println!(
-        "  formualizer-eval exact/15-digit matches: {} / {}",
-        report.formualizer_matches, report.total_formulas
-    );
-    for c in &report.clusters {
+    let run_rust = match engine.as_str() {
+        "rust" | "all" => true,
+        "libreoffice" => false,
+        other => panic!("unknown --engine `{other}` (expected rust, libreoffice, or all)"),
+    };
+    let run_lo = matches!(engine.as_str(), "libreoffice" | "all");
+
+    let mut rust_report = None;
+    if run_rust {
+        let report = run_differential(seed, count);
         println!(
-            "  cluster [{}] {} ({}) x{}: `{}` -> reticula={:?}, ref={:?}",
-            c.reference_engine,
-            c.category,
-            c.disposition,
-            c.count,
-            c.sample_formula,
-            c.reticula_result,
-            c.reference_result
+            "Differential report (seed={:#x}, total={} formulas, non-error={:.1}%):",
+            report.seed,
+            report.total_formulas,
+            report.non_error_ratio * 100.0
         );
-    }
-
-    if let Some(path) = out {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).expect("mkdir");
+        println!(
+            "  ironcalc_base    exact/15-digit matches: {} / {}",
+            report.ironcalc_matches, report.total_formulas
+        );
+        println!(
+            "  formualizer-eval exact/15-digit matches: {} / {}",
+            report.formualizer_matches, report.total_formulas
+        );
+        for c in &report.clusters {
+            println!(
+                "  cluster [{}] {} ({}) x{}: `{}` -> reticula={:?}, ref={:?}",
+                c.reference_engine,
+                c.category,
+                c.disposition,
+                c.count,
+                c.sample_formula,
+                c.reticula_result,
+                c.reference_result
+            );
         }
-        fs::write(
-            &path,
-            format!("{}\n", serde_json::to_string_pretty(&report).unwrap()),
-        )
-        .expect("write diff report");
+
+        if report.unclassified_count() > 0 {
+            eprintln!(
+                "error: {} unclassified Rust differential divergences!",
+                report.unclassified_count()
+            );
+            std::process::exit(1);
+        }
+
+        if !run_lo {
+            if let Some(path) = &out {
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent).expect("mkdir");
+                }
+                fs::write(
+                    path,
+                    format!("{}\n", serde_json::to_string_pretty(&report).unwrap()),
+                )
+                .expect("write diff report");
+            }
+            return;
+        }
+        rust_report = Some(report);
     }
 
-    if report.unclassified_count() > 0 {
-        eprintln!(
-            "error: {} unclassified differential divergences!",
-            report.unclassified_count()
+    if run_lo {
+        let lo_cfg = LibreOfficeDiffConfig {
+            seed,
+            quota_per_fn,
+            image,
+            skip_image_build: skip_image,
+            dump_xlsx_dir: dump_xlsx,
+            commit,
+            date,
+            rust_reference: rust_report,
+        };
+        let lo_report = match run_libreoffice_differential(&lo_cfg) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("error: LibreOffice differential failed: {e}");
+                std::process::exit(1);
+            }
+        };
+
+        println!(
+            "LibreOffice differential ({}, image={}, formulas={}, cells={}, funcs={}/{} unique):",
+            lo_report.libreoffice_version,
+            lo_report.container_image,
+            lo_report.total_formulas,
+            lo_report.total_cells_compared,
+            lo_report.deterministic_functions_covered,
+            lo_report.unique_functions_covered
         );
-        std::process::exit(1);
+        println!(
+            "  non-error: {} / {} ({:.2}%)",
+            lo_report.non_error_count,
+            lo_report.total_formulas,
+            lo_report.non_error_ratio * 100.0
+        );
+        println!(
+            "  agreement: {} / {} ({:.2}%), unclassified={}",
+            lo_report.matches,
+            lo_report.total_formulas,
+            lo_report.agreement_ratio * 100.0,
+            lo_report.unclassified_count
+        );
+        for fam in &lo_report.by_family {
+            println!(
+                "  family {:<14} total={:<6} non_err={:<6} agree={:.2}% unclassified={}",
+                fam.family,
+                fam.total,
+                fam.non_error,
+                fam.agreement_ratio * 100.0,
+                fam.unclassified
+            );
+        }
+        for c in &lo_report.clusters {
+            println!(
+                "  cluster [{}] {} ({}) x{}: `{}` -> reticula={:?}, lo={:?} ({})",
+                c.family,
+                c.category,
+                c.disposition,
+                c.count,
+                c.sample_formula,
+                c.reticula_result,
+                c.libreoffice_result,
+                c.reason
+            );
+        }
+
+        if let Some(path) = &out {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).expect("mkdir");
+            }
+            fs::write(
+                path,
+                format!("{}\n", serde_json::to_string_pretty(&lo_report).unwrap()),
+            )
+            .expect("write LibreOffice diff report");
+        }
+
+        if quota_per_fn >= 250 && lo_report.total_formulas < 50_000 {
+            eprintln!(
+                "error: expected >= 50,000 formulas for LibreOffice differential, got {}",
+                lo_report.total_formulas
+            );
+            std::process::exit(1);
+        }
+        if lo_report.min_samples_per_function < quota_per_fn {
+            eprintln!(
+                "error: minimum samples per deterministic function ({}) < quota_per_fn ({quota_per_fn})",
+                lo_report.min_samples_per_function
+            );
+            std::process::exit(1);
+        }
+        if lo_report.non_error_ratio < 0.80 {
+            eprintln!(
+                "error: non-error ratio {:.2}% < 80.0% gate",
+                lo_report.non_error_ratio * 100.0
+            );
+            std::process::exit(1);
+        }
+        if lo_report.agreement_ratio < 0.995 {
+            eprintln!(
+                "error: LibreOffice agreement ratio {:.2}% < 99.5% gate",
+                lo_report.agreement_ratio * 100.0
+            );
+            std::process::exit(1);
+        }
+        if lo_report.unclassified_count > 0 {
+            eprintln!(
+                "error: {} unclassified LibreOffice divergence(s)!",
+                lo_report.unclassified_count
+            );
+            std::process::exit(1);
+        }
     }
 }
 

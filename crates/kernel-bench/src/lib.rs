@@ -6,4 +6,6 @@ pub mod bench_workloads;
 pub mod diff;
 pub mod fuzz_harnesses;
 pub mod fuzz_runner;
+#[cfg(feature = "diff")]
+pub mod lo_diff;
 pub mod sync_bench;

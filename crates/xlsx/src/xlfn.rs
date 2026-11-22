@@ -7,9 +7,10 @@ use reticula_formula::functions::catalog::lookup_function_meta;
 const XLWS_PREFIX: &str = "_xlfn._xlws.";
 const XLFN_PREFIX: &str = "_xlfn.";
 const SINGLE_PREFIX: &str = "_xlfn.SINGLE(";
+const ANCHORARRAY_PREFIX: &str = "_xlfn.ANCHORARRAY(";
 
 /// Functions requiring the `_xlfn._xlws.` worksheet-function prefix in OOXML.
-const XLWS_FUNCTIONS: &[&str] = &["FILTER", "SORT", "SORTBY"];
+const XLWS_FUNCTIONS: &[&str] = &["FILTER", "SORT"];
 
 /// Modern Excel 2010–365 functions requiring the `_xlfn.` prefix in OOXML `<f>` text.
 const XLFN_FUNCTIONS: &[&str] = &[
@@ -120,6 +121,7 @@ const XLFN_FUNCTIONS: &[&str] = &[
     "SHEET",
     "SHEETS",
     "SKEW.P",
+    "SORTBY",
     "STDEV.P",
     "STDEV.S",
     "SWITCH",
@@ -211,8 +213,87 @@ fn slice_next_char(bytes: &[u8], pos: usize) -> Option<char> {
         })
 }
 
+fn find_matching_paren(bytes: &[u8], open_paren_end: usize) -> Option<usize> {
+    let mut depth = 1usize;
+    let mut i = open_paren_end;
+    while i < bytes.len() {
+        let b = *bytes.get(i)?;
+        if b == b'"' || b == b'\'' {
+            let quote = b;
+            i = i.saturating_add(1);
+            while i < bytes.len() {
+                let qb = *bytes.get(i)?;
+                i = i.saturating_add(1);
+                if qb == quote {
+                    if bytes.get(i) == Some(&quote) {
+                        i = i.saturating_add(1);
+                        continue;
+                    }
+                    break;
+                }
+            }
+            continue;
+        }
+        if b == b'(' {
+            depth = depth.saturating_add(1);
+        } else if b == b')' {
+            depth = depth.saturating_sub(1);
+            if depth == 0 {
+                return Some(i);
+            }
+        }
+        i = i.saturating_add(1);
+    }
+    None
+}
+
+fn preceding_spill_ref_start(out: &[u8]) -> Option<usize> {
+    let last = *out.last()?;
+    if !(last.is_ascii_alphanumeric() || last == b'$' || last == b'_') {
+        return None;
+    }
+    let mut pos = out.len();
+    while pos > 0
+        && out
+            .get(pos.saturating_sub(1))
+            .is_some_and(|b| b.is_ascii_alphanumeric() || matches!(*b, b'$' | b'_' | b'.'))
+    {
+        pos = pos.saturating_sub(1);
+    }
+    if pos == out.len() {
+        return None;
+    }
+    if pos > 0 && out.get(pos.saturating_sub(1)) == Some(&b'!') {
+        let mut s_pos = pos.saturating_sub(1);
+        if s_pos > 0 && out.get(s_pos.saturating_sub(1)) == Some(&b'\'') {
+            s_pos = s_pos.saturating_sub(1);
+            while s_pos > 0 {
+                s_pos = s_pos.saturating_sub(1);
+                if out.get(s_pos) == Some(&b'\'') {
+                    if s_pos > 0 && out.get(s_pos.saturating_sub(1)) == Some(&b'\'') {
+                        s_pos = s_pos.saturating_sub(1);
+                        continue;
+                    }
+                    return Some(s_pos);
+                }
+            }
+        } else {
+            while s_pos > 0
+                && out
+                    .get(s_pos.saturating_sub(1))
+                    .is_some_and(|b| b.is_ascii_alphanumeric() || matches!(*b, b'_' | b'.'))
+            {
+                s_pos = s_pos.saturating_sub(1);
+            }
+            return Some(s_pos);
+        }
+    }
+    Some(pos)
+}
+
 /// Strips OOXML `_xlfn._xlws.` and `_xlfn.` prefixes outside quotes and sheet
-/// identifiers, translating `_xlfn.SINGLE(` to Reticula `@(`.
+/// identifiers, translating `_xlfn.SINGLE(` to Reticula `@(` and
+/// `_xlfn.ANCHORARRAY(Ref)` to `Ref#`.
 #[must_use]
 pub fn strip_xlfn_prefixes(formula: &str) -> String {
     let bytes = formula.as_bytes();
@@ -233,6 +314,17 @@ pub fn strip_xlfn_prefixes(formula: &str) -> String {
             .is_some_and(|prev| is_ident_continue(*prev));
         if !prev_is_ident {
             let tail = bytes.get(i..).unwrap_or_default();
+            if starts_with_ignore_ascii_case(tail, ANCHORARRAY_PREFIX.as_bytes())
+                && let Some(close_idx) =
+                    find_matching_paren(bytes, i.saturating_add(ANCHORARRAY_PREFIX.len()))
+                && let Some(inner) =
+                    formula.get(i.saturating_add(ANCHORARRAY_PREFIX.len())..close_idx)
+            {
+                out.push_str(&strip_xlfn_prefixes(inner.trim()));
+                out.push('#');
+                i = close_idx.saturating_add(1);
+                continue;
+            }
             if starts_with_ignore_ascii_case(tail, SINGLE_PREFIX.as_bytes()) {
                 out.push_str("@(");
                 i = i.saturating_add(SINGLE_PREFIX.len());
@@ -267,7 +359,8 @@ pub fn strip_xlfn_prefixes(formula: &str) -> String {
 }
 
 /// Restores OOXML `_xlfn.` / `_xlfn._xlws.` prefixes on function calls that
-/// require them without double-prefixing or mutating literals.
+/// require them (plus `_xlfn.ANCHORARRAY(Ref)` for `Ref#`) without
+/// double-prefixing or mutating literals.
 #[must_use]
 pub fn add_xlfn_prefixes(formula: &str) -> String {
     let bytes = formula.as_bytes();
@@ -280,6 +373,17 @@ pub fn add_xlfn_prefixes(formula: &str) -> String {
         };
         if b == b'"' || b == b'\'' {
             i = copy_quoted(bytes, i, b, &mut out);
+            continue;
+        }
+        if b == b'#'
+            && let Some(ref_start) = preceding_spill_ref_start(out.as_bytes())
+            && let Some(anchor_ref) = out.get(ref_start..).map(str::to_owned)
+        {
+            out.truncate(ref_start);
+            out.push_str(ANCHORARRAY_PREFIX);
+            out.push_str(&anchor_ref);
+            out.push(')');
+            i = i.saturating_add(1);
             continue;
         }
         let prev_is_ident = i
@@ -364,6 +468,10 @@ mod tests {
         let restored = add_xlfn_prefixes(&stripped);
         assert_eq!(restored, src);
         assert_eq!(add_xlfn_prefixes(&restored), src);
+        assert_eq!(
+            add_xlfn_prefixes("SORTBY(A1:A5,B1:B5,1)"),
+            "_xlfn.SORTBY(A1:A5,B1:B5,1)"
+        );
     }
 
     #[test]
@@ -373,6 +481,21 @@ mod tests {
             strip_xlfn_prefixes("'_xlfn.Sheet'!A1+_xlfn.SUMSQ_UNKNOWN(1)"),
             "'_xlfn.Sheet'!A1+SUMSQ_UNKNOWN(1)"
         );
+    }
+
+    #[test]
+    fn anchorarray_and_spill_hash_round_trip() {
+        assert_eq!(
+            strip_xlfn_prefixes("SUM(_xlfn.ANCHORARRAY(A1),_xlfn.ANCHORARRAY('Sheet 2'!$W$5))"),
+            "SUM(A1#,'Sheet 2'!$W$5#)"
+        );
+        let restored = add_xlfn_prefixes("SUM(A1#,'Sheet 2'!$W$5#)");
+        assert_eq!(
+            restored,
+            "SUM(_xlfn.ANCHORARRAY(A1),_xlfn.ANCHORARRAY('Sheet 2'!$W$5))"
+        );
+        assert_eq!(add_xlfn_prefixes(&restored), restored);
+        assert_eq!(add_xlfn_prefixes("IFERROR(#N/A,0)"), "IFERROR(#N/A,0)");
     }
 
     #[test]

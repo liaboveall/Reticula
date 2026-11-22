@@ -9,31 +9,95 @@ use crate::util::{self, Cmd, Flags, Result, cargo, node, pnpm, tool};
 const WASM_TARGET: &str = "wasm32-unknown-unknown";
 
 pub fn diff(flags: &Flags) -> Result {
+    let engine = flags.get("engine").unwrap_or("rust");
     let count = flags.get("count").unwrap_or("10000");
-    let out = flags
-        .get("out")
-        .map_or_else(|| "target/qa/diff-report.json".to_owned(), str::to_owned);
+    let quota_per_fn = flags.get("quota-per-fn").unwrap_or("250");
+    let seed = flags.get("seed");
+    let commit = git_output(&["rev-parse", "--short", "HEAD"]);
+    let date = flags
+        .get("date")
+        .map_or_else(current_utc_date, str::to_owned);
+    let default_out = match engine {
+        "rust" => String::from("target/qa/diff-report.json"),
+        "libreoffice" | "all" => String::from("target/qa/libreoffice-diff-report.json"),
+        other => {
+            return Err(format!(
+                "unknown --engine `{other}` (expected rust, libreoffice, or all)"
+            ));
+        }
+    };
+    let out = if flags.has("archive") && flags.get("out").is_none() {
+        format!("bench/results/{date}-{commit}-diff.json")
+    } else {
+        flags.get("out").map_or(default_out, str::to_owned)
+    };
+
+    if matches!(engine, "libreoffice" | "all") && !flags.has("skip-image") {
+        let image = flags.get("image").unwrap_or("reticula-libreoffice:26.8.2");
+        let inspect = Command::new("docker")
+            .args(["image", "inspect", image])
+            .output()
+            .map_err(|e| format!("failed to run docker image inspect {image}: {e}"))?;
+        if !inspect.status.success() {
+            util::step(&format!("building LibreOffice container `{image}`"));
+            Cmd::new("docker")
+                .args(["build", "-t", image, "infra/libreoffice"])
+                .run()?;
+        }
+    }
 
     util::step(&format!(
-        "differential evaluation ({count} formulas vs ironcalc_base & formualizer-eval)"
+        "differential evaluation (engine={engine}, count={count}, quota-per-fn={quota_per_fn})"
     ));
-    cargo()
-        .args([
-            "run",
-            "--locked",
-            "--release",
-            "--package",
-            "reticula-kernel-bench",
-            "--bin",
-            "runner",
-            "--",
-            "diff",
-            "--count",
-            count,
-            "--out",
-            &out,
-        ])
-        .run()
+    let mut cmd = cargo().args([
+        "run",
+        "--locked",
+        "--release",
+        "--package",
+        "reticula-kernel-bench",
+        "--bin",
+        "runner",
+        "--",
+        "diff",
+        "--engine",
+        engine,
+        "--count",
+        count,
+        "--quota-per-fn",
+        quota_per_fn,
+        "--commit",
+        &commit,
+        "--date",
+        &date,
+        "--out",
+        &out,
+    ]);
+    if let Some(s) = seed {
+        cmd = cmd.args(["--seed", s]);
+    }
+    if let Some(image) = flags.get("image") {
+        cmd = cmd.args(["--image", image]);
+    }
+    if flags.has("skip-image") {
+        cmd = cmd.arg("--skip-image");
+    }
+    if let Some(dump) = flags.get("dump-xlsx") {
+        cmd = cmd.args(["--dump-xlsx", dump]);
+    }
+    cmd.run()?;
+
+    if flags.has("archive") && flags.get("out").is_some() {
+        let archive_path = util::root()
+            .join("bench/results")
+            .join(format!("{date}-{commit}-diff.json"));
+        if let Some(parent) = archive_path.parent() {
+            fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+        }
+        fs::copy(util::root().join(&out), &archive_path)
+            .map_err(|e| format!("archive diff report to {}: {e}", archive_path.display()))?;
+        println!("archived differential report to {}", archive_path.display());
+    }
+    Ok(())
 }
 
 pub fn fuzz(flags: &Flags) -> Result {

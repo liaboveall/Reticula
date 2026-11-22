@@ -211,3 +211,28 @@ pub fn patch_snapshot_to_xlsx(
         .map_err(|e| XlsxError::Snapshot(format!("{e:?}")))?;
     patch::patch_workbook_xlsx(orig_xlsx, &wb, None, changed_cells)
 }
+
+/// Cached scalar values keyed by 0-based `(row, col)` coordinates for one worksheet.
+pub type SheetCachedValues =
+    std::collections::BTreeMap<(u32, u32), reticula_core::ops::ScalarValue>;
+
+/// Cached worksheet cell values keyed by worksheet display name.
+pub type WorkbookCachedValues = std::collections::BTreeMap<String, SheetCachedValues>;
+
+/// Extracts cached scalar cell values directly from OOXML worksheet XML without
+/// instantiating a formula engine (`17-m3a.md` §8.1).
+pub fn read_xlsx_cached_values(bytes: &[u8]) -> Result<WorkbookCachedValues, XlsxError> {
+    xml_scan::validate_zip_limits(bytes)?;
+    let scanned = xml_scan::scan_workbook_xml(bytes)?;
+    let mut out = std::collections::BTreeMap::new();
+    for sheet in scanned.sheets {
+        let mut cells = std::collections::BTreeMap::new();
+        for meta in sheet.cell_metas {
+            if let Some(val) = meta.cached_value {
+                cells.insert((meta.row, meta.col), val);
+            }
+        }
+        out.insert(sheet.name, cells);
+    }
+    Ok(out)
+}

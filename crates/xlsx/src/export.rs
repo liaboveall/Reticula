@@ -277,6 +277,9 @@ fn is_dynamic_array_fn_name(name: &str) -> bool {
             | "SORT"
             | "SORTBY"
             | "UNIQUE"
+            | "TRANSPOSE"
+            | "FREQUENCY"
+            | "TEXTSPLIT"
             | "RANDARRAY"
             | "HSTACK"
             | "VSTACK"
@@ -450,8 +453,7 @@ pub fn export_workbook_with_options(
                         ws.write_dynamic_array_formula(r_pos, col_u16, last_r, last_c_u16, f_obj)
                             .map_err(|e| XlsxError::Write(e.to_string()))?;
                     }
-                } else if spills.is_none()
-                    && formula.mode == FormulaMode::Dynamic
+                } else if formula.mode == FormulaMode::Dynamic
                     && expr_uses_dynamic_array_fn(&formula.root)
                 {
                     if has_fmt {
@@ -716,7 +718,7 @@ pub(crate) fn strip_formula_cached_values(xml: &str) -> Result<String, XlsxError
     String::from_utf8(writer.into_inner()).map_err(|e| XlsxError::Xml(e.to_string()))
 }
 
-/// Ensures `<calcPr ... fullCalcOnLoad="1"/>` is set in `xl/workbook.xml`.
+/// Ensures `<calcPr calcId="191029" fullCalcOnLoad="1"/>` is set in `xl/workbook.xml`.
 pub(crate) fn ensure_full_calc_on_load(xml: &str) -> Result<String, XlsxError> {
     let mut reader = Reader::from_str(xml);
     let mut writer = Writer::new(Vec::with_capacity(xml.len().saturating_add(64)));
@@ -728,10 +730,11 @@ pub(crate) fn ensure_full_calc_on_load(xml: &str) -> Result<String, XlsxError> {
                 saw_calc_pr = true;
                 let mut rebuilt = BytesStart::new("calcPr");
                 for attr in e.attributes().flatten() {
-                    if attr.key.as_ref() != "fullCalcOnLoad" {
+                    if attr.key.as_ref() != "fullCalcOnLoad" && attr.key.as_ref() != "calcId" {
                         rebuilt.push_attribute(attr);
                     }
                 }
+                rebuilt.push_attribute(("calcId", "191029"));
                 rebuilt.push_attribute(("fullCalcOnLoad", "1"));
                 writer
                     .write_event(Event::Start(rebuilt))
@@ -741,10 +744,11 @@ pub(crate) fn ensure_full_calc_on_load(xml: &str) -> Result<String, XlsxError> {
                 saw_calc_pr = true;
                 let mut rebuilt = BytesStart::new("calcPr");
                 for attr in e.attributes().flatten() {
-                    if attr.key.as_ref() != "fullCalcOnLoad" {
+                    if attr.key.as_ref() != "fullCalcOnLoad" && attr.key.as_ref() != "calcId" {
                         rebuilt.push_attribute(attr);
                     }
                 }
+                rebuilt.push_attribute(("calcId", "191029"));
                 rebuilt.push_attribute(("fullCalcOnLoad", "1"));
                 writer
                     .write_event(Event::Empty(rebuilt))
@@ -753,6 +757,7 @@ pub(crate) fn ensure_full_calc_on_load(xml: &str) -> Result<String, XlsxError> {
             Ok(Event::End(e)) if e.local_name().as_ref() == "workbook" => {
                 if !saw_calc_pr {
                     let mut calc_pr = BytesStart::new("calcPr");
+                    calc_pr.push_attribute(("calcId", "191029"));
                     calc_pr.push_attribute(("fullCalcOnLoad", "1"));
                     writer
                         .write_event(Event::Empty(calc_pr))

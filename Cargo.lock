@@ -2535,8 +2535,10 @@ dependencies = [
  "reticula-sync",
  "reticula-wasm",
  "reticula-wire",
+ "reticula-xlsx",
  "serde",
  "serde_json",
+ "zip",
 ]
 
 [[package]]
