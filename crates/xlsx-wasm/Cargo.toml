@@ -1,0 +1,21 @@
+[package]
+name = "reticula-xlsx-wasm"
+description = "On-demand WebAssembly bindings for XLSX import, export, and streaming workbook patching."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[lints]
+workspace = true
+
+[dependencies]
+reticula-xlsx = { workspace = true }
+serde = { workspace = true, features = ["std"] }
+tsify = { workspace = true }
+wasm-bindgen = { workspace = true }

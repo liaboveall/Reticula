@@ -1286,7 +1286,16 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
               break;
             }
             case "fileExported": {
-              downloadArrayBuffer(message.filename, message.bytes);
+              if (message.format === "xlsxSnapshot") {
+                void import("./xlsx/xlsxBridge.ts")
+                  .then((m) => m.exportSnapshotBytesToXlsx(new Uint8Array(message.bytes)))
+                  .then((res) => downloadArrayBuffer(message.filename, res.bytes))
+                  .catch((err) =>
+                    setRejectedReason(err instanceof Error ? err.message : String(err)),
+                  );
+              } else {
+                downloadArrayBuffer(message.filename, message.bytes);
+              }
               break;
             }
             case "closedForUpdate": {
@@ -3476,6 +3485,8 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
             onExportCsv={() =>
               clientRef.current?.sendHost({ kind: "exportCsv", sheet: activeSheetRef.current })
             }
+            onExportXlsx={() => clientRef.current?.sendHost({ kind: "exportXlsxSnapshot" })}
+            onImportNotice={(msg) => setQuotaBanner(msg)}
             onImportRtcl={(title, bytes) => {
               const newId = makeFreshDocId();
               notePersistenceMutation();

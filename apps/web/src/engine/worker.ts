@@ -1576,7 +1576,9 @@ async function handleHostCommand(cmd: HostCommand): Promise<void> {
       }
       break;
     }
-    case "exportRtcl": {
+    case "exportRtcl":
+    case "exportXlsxSnapshot": {
+      const isXlsx = cmd.kind === "exportXlsxSnapshot";
       const snap = engine.encodeSnapshotFull(true);
       const safeName = (activeCollab?.title() ?? activeDoc?.title ?? "workbook")
         .replace(/[^a-zA-Z0-9._-]+/g, "-")
@@ -1586,8 +1588,8 @@ async function handleHostCommand(cmd: HostCommand): Promise<void> {
       scope.postMessage(
         {
           kind: "fileExported",
-          format: "rtcl",
-          filename: `${safeName || "workbook"}.rtcl`,
+          format: isXlsx ? "xlsxSnapshot" : "rtcl",
+          filename: `${safeName || "workbook"}.${isXlsx ? "xlsx" : "rtcl"}`,
           bytes: copy.buffer,
         },
         [copy.buffer],
@@ -1779,6 +1781,7 @@ const COLLAB_ALLOWED_HOST_COMMANDS = new Set<HostCommand["kind"]>([
   "createDoc",
   "listDocs",
   "exportRtcl",
+  "exportXlsxSnapshot",
   "exportCsv",
   "flushAndCloseForUpdate",
   "historySeek",

@@ -9,6 +9,8 @@
     "./collab-api": "./src/generated/collab-api.ts",
     "./wasm": "./pkg/reticula_wasm_bg.wasm",
     "./sim": "./src/sim.ts",
-    "./sim-wasm": "./sim-pkg/reticula_sim_wasm_bg.wasm"
+    "./sim-wasm": "./sim-pkg/reticula_sim_wasm_bg.wasm",
+    "./xlsx": "./src/xlsx.ts",
+    "./xlsx-wasm": "./xlsx-pkg/reticula_xlsx_wasm_bg.wasm"
   }
 }

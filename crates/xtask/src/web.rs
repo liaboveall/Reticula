@@ -15,6 +15,8 @@ const DIST: &str = "apps/web/dist";
 const MAX_CORE_WASM_BROTLI_BYTES: u64 = 1_200_000;
 /// Hard upper bound on brotli-compressed on-demand simulator `.wasm` module (`800 KB`, `16-m2b.md`).
 const MAX_SIM_WASM_BROTLI_BYTES: u64 = 800_000;
+/// Hard upper bound on brotli-compressed on-demand XLSX `.wasm` module (`900 KB`, `17-m3a.md` 8.2).
+const MAX_XLSX_WASM_BROTLI_BYTES: u64 = 900_000;
 /// Upper bound on brotli-compressed first-screen critical-path JS (`165 KB`, `14-m1b.md` 8.3).
 const MAX_FIRST_SCREEN_JS_BROTLI_BYTES: u64 = 165_000;
 /// Upper bound on brotli-compressed total JS including lazy chunks & service worker (`220 KB`, `14-m1b.md` 8.3).
@@ -164,7 +166,11 @@ fn inject_sw_manifest(dist_dir: &Path) -> Result {
         let Some(name) = name.to_str() else {
             continue;
         };
-        if name.ends_with(".br") || name.ends_with(".gz") || name.starts_with("reticula_sim_wasm") {
+        if name.ends_with(".br")
+            || name.ends_with(".gz")
+            || name.starts_with("reticula_sim_wasm")
+            || name.starts_with("reticula_xlsx_wasm")
+        {
             continue;
         }
         asset_names.push(name.to_owned());
@@ -239,6 +245,7 @@ fn check_budgets(dist_dir: &Path) -> Result {
     let assets_dir = dist_dir.join("assets");
     let mut core_wasm_br: u64 = 0;
     let mut sim_wasm_br: u64 = 0;
+    let mut xlsx_wasm_br: u64 = 0;
     let mut first_screen_js_br: u64 = 0;
     let mut total_js_br: u64 = 0;
 
@@ -257,6 +264,8 @@ fn check_budgets(dist_dir: &Path) -> Result {
         if name.ends_with(".wasm.br") {
             if name.starts_with("reticula_sim_wasm") {
                 sim_wasm_br = sim_wasm_br.saturating_add(len);
+            } else if name.starts_with("reticula_xlsx_wasm") {
+                xlsx_wasm_br = xlsx_wasm_br.saturating_add(len);
             } else {
                 core_wasm_br = core_wasm_br.saturating_add(len);
             }
@@ -288,6 +297,12 @@ fn check_budgets(dist_dir: &Path) -> Result {
         (sim_wasm_br as f64 / MAX_SIM_WASM_BROTLI_BYTES as f64) * 100.0
     );
     println!(
+        "  xlsx WASM (brotli):        {:>8} / {:>8} bytes ({:.1}%)",
+        xlsx_wasm_br,
+        MAX_XLSX_WASM_BROTLI_BYTES,
+        (xlsx_wasm_br as f64 / MAX_XLSX_WASM_BROTLI_BYTES as f64) * 100.0
+    );
+    println!(
         "  first-screen JS (brotli):  {:>8} / {:>8} bytes ({:.1}%)",
         first_screen_js_br,
         MAX_FIRST_SCREEN_JS_BROTLI_BYTES,
@@ -308,6 +323,11 @@ fn check_budgets(dist_dir: &Path) -> Result {
     if sim_wasm_br == 0 || sim_wasm_br > MAX_SIM_WASM_BROTLI_BYTES {
         return Err(format!(
             "sim WASM brotli size ({sim_wasm_br} B) out of budget (1..={MAX_SIM_WASM_BROTLI_BYTES} B)"
+        ));
+    }
+    if xlsx_wasm_br == 0 || xlsx_wasm_br > MAX_XLSX_WASM_BROTLI_BYTES {
+        return Err(format!(
+            "xlsx WASM brotli size ({xlsx_wasm_br} B) out of budget (1..={MAX_XLSX_WASM_BROTLI_BYTES} B)"
         ));
     }
     if first_screen_js_br > MAX_FIRST_SCREEN_JS_BROTLI_BYTES {

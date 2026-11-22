@@ -50,7 +50,7 @@ export type HostEvent =
   | { readonly kind: "csvImportProgress"; readonly rowsParsed: number; readonly percent: number }
   | {
       readonly kind: "fileExported";
-      readonly format: "rtcl" | "csv";
+      readonly format: "rtcl" | "csv" | "xlsxSnapshot";
       readonly filename: string;
       readonly bytes: ArrayBuffer;
     }
@@ -114,6 +114,7 @@ export type HostCommand =
         | { readonly type: "skipTail"; readonly skipCount: number; readonly salvageMid: boolean };
     }
   | { readonly kind: "exportRtcl" }
+  | { readonly kind: "exportXlsxSnapshot" }
   | {
       readonly kind: "importRtcl";
       readonly docId: string;

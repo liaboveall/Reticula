@@ -1,6 +1,6 @@
 //! Checks and tests of the Rust workspace.
 
-use crate::util::{self, Cmd, Result, cargo, tool};
+use crate::util::{self, Cmd, Result, cargo, node, tool};
 
 const WASM_TARGET: &str = "wasm32-unknown-unknown";
 
@@ -12,8 +12,22 @@ const NO_STD_TARGET: &str = "wasm32v1-none";
 /// Crates that make up the engine kernel, by directory name under `crates/`.
 const KERNEL_CRATES: [&str; 4] = ["core", "formula", "wire", "sync"];
 
-/// Packages that are compiled to WebAssembly.
-const WASM_PACKAGES: [&str; 6] = [
+/// All workspace packages compiled & linted against `wasm32-unknown-unknown`.
+const WASM_CLIPPY_PACKAGES: [&str; 8] = [
+    "reticula-core",
+    "reticula-formula",
+    "reticula-wire",
+    "reticula-sync",
+    "reticula-wasm",
+    "reticula-sim-wasm",
+    "reticula-xlsx",
+    "reticula-xlsx-wasm",
+];
+
+/// Packages whose unit/integration tests run under `wasm-bindgen-test-runner`.
+/// (`reticula-xlsx` / `reticula-xlsx-wasm` are verified in Node below because
+/// `wasm-bindgen-test-runner` unescapes `\x` inside Windows `\crates\xlsx\` paths.)
+const WASM_TEST_PACKAGES: [&str; 6] = [
     "reticula-core",
     "reticula-formula",
     "reticula-wire",
@@ -47,7 +61,7 @@ pub fn check() -> Result {
         "--target",
         WASM_TARGET,
     ]);
-    for package in WASM_PACKAGES {
+    for package in WASM_CLIPPY_PACKAGES {
         clippy = clippy.args(["--package", package]);
     }
     clippy.args(["--", "-D", "warnings"]).run()?;
@@ -102,18 +116,83 @@ pub fn test_server() -> Result {
         .run()
 }
 
-/// Runs the kernel tests again as WebAssembly, in Node.
+/// Runs the kernel tests again as WebAssembly in Node, plus the on-demand
+/// `reticula-xlsx-wasm` round-trip/patch smoke verification.
 pub fn test_wasm() -> Result {
     util::step("kernel tests (wasm32)");
     let mut test = cargo().args(["test", "--locked", "--target", WASM_TARGET]);
-    for package in WASM_PACKAGES {
+    for package in WASM_TEST_PACKAGES {
         test = test.args(["--package", package]);
     }
     test.env(
         "CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER",
         tool("wasm-bindgen-test-runner"),
     )
-    .run()
+    .run()?;
+
+    test_xlsx_wasm_in_node()
+}
+
+fn test_xlsx_wasm_in_node() -> Result {
+    util::step("xlsx-wasm smoke test (wasm32 + Node)");
+    cargo()
+        .args([
+            "build",
+            "--locked",
+            "--package",
+            "reticula-xlsx-wasm",
+            "--target",
+            WASM_TARGET,
+        ])
+        .run()?;
+    Cmd::new(tool("wasm-bindgen"))
+        .args([
+            "--target",
+            "web",
+            "--out-dir",
+            "target/wasm-xlsx-smoke",
+            "--debug",
+            "target/wasm32-unknown-unknown/debug/reticula_xlsx_wasm.wasm",
+        ])
+        .run()?;
+
+    const SCRIPT: &str = "\
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
+import { pathToFileURL } from 'node:url';
+
+const pkgUrl = pathToFileURL(path.resolve('target/wasm-xlsx-smoke/reticula_xlsx_wasm.js')).href;
+const mod = await import(pkgUrl);
+mod.initSync({ module: fs.readFileSync('target/wasm-xlsx-smoke/reticula_xlsx_wasm_bg.wasm') });
+
+const snap = fs.readFileSync('tests/compat/v3/base.rtclsnap');
+const exp1 = mod.exportXlsxSnapshot(snap);
+const xlsx = exp1.takeBytes();
+assert.equal(xlsx[0], 0x50);
+assert.equal(xlsx[1], 0x4b);
+assert.equal(xlsx[2], 0x03);
+assert.equal(xlsx[3], 0x04);
+exp1.free();
+
+const imp1 = mod.importXlsx(xlsx);
+const report1 = imp1.report();
+assert.ok(report1.sheetCount >= 1);
+const importedSnap = imp1.takeSnapshot();
+assert.ok(importedSnap.byteLength > 32);
+imp1.free();
+
+const patched = mod.patchXlsxSnapshot(xlsx, importedSnap, [{ sheetName: 'Sheet1', row: 0, col: 0 }]);
+const patchedXlsx = patched.takeBytes();
+patched.free();
+
+const imp2 = mod.importXlsx(patchedXlsx);
+const report2 = imp2.report();
+assert.equal(report2.sheetCount, report1.sheetCount);
+imp2.free();
+console.log('xlsx-wasm Node smoke passed:', { sheets: report1.sheetCount, formulas: report1.formulaCount, cells: report1.cellCount });
+";
+    node().args(["--input-type=module", "--eval", SCRIPT]).run()
 }
 
 pub fn deny() -> Result {

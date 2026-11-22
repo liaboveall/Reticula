@@ -881,6 +881,20 @@ pub fn decode_snapshot_any(bytes: &[u8]) -> Result<DecodedSnapshot, SnapshotErro
     decode_snapshot_any_with_limits(bytes, usize::MAX, MAX_WORKBOOK_BYTES)
 }
 
+/// Decodes and validates a full `RTCLSNAP` v0 or v1 snapshot directly into a
+/// raw [`Workbook`] without instantiating [`FormulaEngine`], rejecting
+/// `SeedOrigin` stub snapshots with [`SnapshotError::UnsupportedVersion`].
+pub fn decode_snapshot_workbook_only(
+    bytes: &[u8],
+) -> Result<Workbook<BoundFormula>, SnapshotError> {
+    let (payload, _, _, _, _) =
+        decode_snapshot_raw_with_limits(bytes, usize::MAX, MAX_WORKBOOK_BYTES)?;
+    match payload {
+        RawSnapshotPayload::Workbook(wb) => Ok(wb),
+        RawSnapshotPayload::SeedStub(_) => Err(SnapshotError::UnsupportedVersion),
+    }
+}
+
 /// Decodes and validates a snapshot for collaborative import, enforcing cell
 /// and estimated memory limits before allocating or expanding `SeedOrigin` stubs.
 pub fn decode_snapshot_for_collab(
@@ -891,15 +905,58 @@ pub fn decode_snapshot_for_collab(
     decode_snapshot_any_with_limits(bytes, max_cells, max_bytes.min(MAX_WORKBOOK_BYTES))
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "sequential snapshot container validation and pre-allocation checks"
-)]
+enum RawSnapshotPayload {
+    Workbook(Workbook<BoundFormula>),
+    SeedStub(WireSeedOriginV1),
+}
+
 fn decode_snapshot_any_with_limits(
     bytes: &[u8],
     max_cells: usize,
     max_bytes: usize,
 ) -> Result<DecodedSnapshot, SnapshotError> {
+    let (payload, kernel_version, format_version, watermarks, permutes) =
+        decode_snapshot_raw_with_limits(bytes, max_cells, max_bytes)?;
+    let engine = match payload {
+        RawSnapshotPayload::Workbook(wb) => FormulaEngine::from_workbook_clean(wb),
+        RawSnapshotPayload::SeedStub(wire_origin) => {
+            let engine = FormulaEngine::open_sample(wire_origin.seed, wire_origin.rows);
+            if engine.workbook().populated_cell_count() > max_cells as u64
+                || engine.workbook().estimated_bytes() > max_bytes
+            {
+                return Err(SnapshotError::Validation);
+            }
+            engine
+        }
+    };
+    Ok(DecodedSnapshot {
+        engine,
+        kernel_version,
+        format_version,
+        watermarks,
+        permutes,
+    })
+}
+
+#[expect(
+    clippy::too_many_lines,
+    clippy::type_complexity,
+    reason = "sequential snapshot container validation and pre-allocation checks"
+)]
+fn decode_snapshot_raw_with_limits(
+    bytes: &[u8],
+    max_cells: usize,
+    max_bytes: usize,
+) -> Result<
+    (
+        RawSnapshotPayload,
+        String,
+        u32,
+        Vec<WireReplicaWatermarkV1>,
+        Vec<WireCommittedPermuteV3>,
+    ),
+    SnapshotError,
+> {
     let section_cap = max_bytes
         .saturating_mul(2)
         .clamp(1024 * 1024, MAX_SECTION_UNCOMPRESSED);
@@ -916,13 +973,13 @@ fn decode_snapshot_any_with_limits(
         if wb.populated_cell_count() > max_cells as u64 || wb.estimated_bytes() > max_bytes {
             return Err(SnapshotError::Validation);
         }
-        return Ok(DecodedSnapshot {
-            engine: FormulaEngine::from_workbook_clean(wb),
+        return Ok((
+            RawSnapshotPayload::Workbook(wb),
             kernel_version,
-            format_version: SNAPSHOT_VERSION_V0,
-            watermarks: Vec::new(),
-            permutes: Vec::new(),
-        });
+            SNAPSHOT_VERSION_V0,
+            Vec::new(),
+            Vec::new(),
+        ));
     }
     if version != SNAPSHOT_VERSION_V1 {
         return Err(SnapshotError::UnsupportedVersion);
@@ -991,19 +1048,13 @@ fn decode_snapshot_any_with_limits(
         if min_rows.saturating_mul(18) > max_cells || min_rows.saturating_mul(160) > max_bytes {
             return Err(SnapshotError::Validation);
         }
-        let engine = FormulaEngine::open_sample(wire_origin.seed, wire_origin.rows);
-        if engine.workbook().populated_cell_count() > max_cells as u64
-            || engine.workbook().estimated_bytes() > max_bytes
-        {
-            return Err(SnapshotError::Validation);
-        }
-        return Ok(DecodedSnapshot {
-            engine,
+        return Ok((
+            RawSnapshotPayload::SeedStub(wire_origin),
             kernel_version,
-            format_version: SNAPSHOT_VERSION_V1,
+            SNAPSHOT_VERSION_V1,
             watermarks,
-            permutes: Vec::new(),
-        });
+            Vec::new(),
+        ));
     }
 
     let strings_sec: WireStringsSectionV1 = decode_compressed_section(
@@ -1316,13 +1367,13 @@ fn decode_snapshot_any_with_limits(
         return Err(SnapshotError::Validation);
     }
 
-    Ok(DecodedSnapshot {
-        engine: FormulaEngine::from_workbook_clean(workbook),
+    Ok((
+        RawSnapshotPayload::Workbook(workbook),
         kernel_version,
-        format_version: SNAPSHOT_VERSION_V1,
+        SNAPSHOT_VERSION_V1,
         watermarks,
         permutes,
-    })
+    ))
 }
 
 // ------------------------------------------------------------ internal helpers

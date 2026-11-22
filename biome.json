@@ -11,6 +11,7 @@
       "!**/dist-spikes",
       "!**/pkg",
       "!**/sim-pkg",
+      "!**/xlsx-pkg",
       "!**/generated"
     ]
   },

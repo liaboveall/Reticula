@@ -10,6 +10,8 @@ members = [
     "crates/sync",
     "crates/wasm",
     "crates/wire",
+    "crates/xlsx",
+    "crates/xlsx-wasm",
     "crates/xtask",
     "spikes/determinism",
 ]
@@ -28,6 +30,7 @@ reticula-formula = { path = "crates/formula" }
 reticula-sim = { path = "crates/sim" }
 reticula-sync = { path = "crates/sync" }
 reticula-wire = { path = "crates/wire" }
+reticula-xlsx = { path = "crates/xlsx" }
 
 # Pinned exactly: results of the math functions are part of the engine's
 # observable behaviour, so an upgrade is a deliberate, reviewed change.

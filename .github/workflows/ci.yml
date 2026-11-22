@@ -100,6 +100,7 @@ jobs:
           path: |
             packages/protocol/pkg
             packages/protocol/sim-pkg
+            packages/protocol/xlsx-pkg
           if-no-files-found: error
 
   web:

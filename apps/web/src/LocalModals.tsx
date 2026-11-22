@@ -21,8 +21,10 @@ export interface LocalModalsProps {
   readonly onDeleteDoc: (docId: string) => void;
   readonly onExportRtcl: () => void;
   readonly onExportCsv: () => void;
+  readonly onExportXlsx: () => void;
   readonly onImportRtcl: (title: string, bytes: ArrayBuffer) => void;
   readonly onImportCsv: (title: string, sheetName: string, bytes: ArrayBuffer) => void;
+  readonly onImportNotice?: (message: string) => void;
   readonly onImportRejected: (reason: string) => void;
   readonly onSafeModeOpenFrozen: (docId: string) => void;
   readonly onSafeModeSkipTail: (docId: string, skipCount: number, salvageMid: boolean) => void;
@@ -169,8 +171,10 @@ export default function LocalModals({
   onDeleteDoc,
   onExportRtcl,
   onExportCsv,
+  onExportXlsx,
   onImportRtcl,
   onImportCsv,
+  onImportNotice,
   onImportRejected,
   onSafeModeOpenFrozen,
   onSafeModeSkipTail,
@@ -348,10 +352,30 @@ export default function LocalModals({
 
   const handleFilePicked = async (file: File) => {
     const lower = file.name.toLowerCase();
-    const baseTitle = file.name.replace(/\.(rtcl|rtclsnap|csv|tsv|txt)$/i, "") || "Imported";
+    const baseTitle = file.name.replace(/\.(rtcl|rtclsnap|csv|tsv|txt|xlsx)$/i, "") || "Imported";
     if (lower.endsWith(".rtcl") || lower.endsWith(".rtclsnap")) {
       const buf = await file.arrayBuffer();
       onImportRtcl(baseTitle, buf);
+      return;
+    }
+    if (lower.endsWith(".xlsx")) {
+      try {
+        const { importXlsxBytes } = await import("./xlsx/xlsxBridge.ts");
+        const buf = await file.arrayBuffer();
+        const result = await importXlsxBytes(new Uint8Array(buf));
+        if (result.report.unsupported.length > 0 || result.report.preservedFormulaCount > 0) {
+          const items = result.report.unsupported.map((u) => u.detail);
+          if (result.report.preservedFormulaCount > 0) {
+            items.push(
+              `${result.report.preservedFormulaCount} external/unknown formula(s) preserved with cached values`,
+            );
+          }
+          onImportNotice?.(`Imported with Excel compatibility notes: ${items.join("; ")}`);
+        }
+        onImportRtcl(baseTitle, result.snapshot);
+      } catch (err) {
+        onImportRejected(err instanceof Error ? err.message : String(err));
+      }
       return;
     }
     if (file.size > MAX_CSV_RAW_BYTES) {
@@ -408,12 +432,12 @@ export default function LocalModals({
             data-testid="import-file-btn"
             onClick={() => fileInputRef.current?.click()}
           >
-            Import .rtcl / .csv
+            Import .rtcl / .csv / .xlsx
           </button>
           <input
             ref={fileInputRef}
             type="file"
-            accept=".rtcl,.rtclsnap,.csv,.tsv,.txt"
+            accept=".rtcl,.rtclsnap,.csv,.tsv,.txt,.xlsx"
             data-testid="import-file-input"
             style={{ display: "none" }}
             onChange={(e) => {
@@ -440,6 +464,14 @@ export default function LocalModals({
             onClick={onExportCsv}
           >
             Export .csv
+          </button>
+          <button
+            type="button"
+            className="toolbar-btn"
+            data-testid="drawer-export-xlsx"
+            onClick={onExportXlsx}
+          >
+            Export .xlsx
           </button>
         </div>
 

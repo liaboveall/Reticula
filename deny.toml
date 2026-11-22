@@ -24,6 +24,8 @@ confidence-threshold = 0.93
 exceptions = [
     # SQLx's hashlink dependency uses this hasher through hashbrown 0.16.
     { crate = "foldhash@=0.2.0", allow = ["Zlib"] },
+    # Pure-Rust zlib backend pulled in by zip/deflate in `crates/xlsx`.
+    { crate = "zlib-rs@=0.6.8", allow = ["Zlib"] },
 ]
 
 [bans]

@@ -9,6 +9,8 @@ const CORE_OUT_DIR: &str = "packages/protocol/pkg";
 const CORE_MODULE: &str = "packages/protocol/pkg/reticula_wasm_bg.wasm";
 const SIM_OUT_DIR: &str = "packages/protocol/sim-pkg";
 const SIM_MODULE: &str = "packages/protocol/sim-pkg/reticula_sim_wasm_bg.wasm";
+const XLSX_OUT_DIR: &str = "packages/protocol/xlsx-pkg";
+const XLSX_MODULE: &str = "packages/protocol/xlsx-pkg/reticula_xlsx_wasm_bg.wasm";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Profile {
@@ -36,9 +38,20 @@ pub fn build(profile: Profile) -> Result {
         SIM_MODULE,
         profile,
     )?;
+    build_package(
+        "reticula-xlsx-wasm",
+        "reticula_xlsx_wasm.wasm",
+        XLSX_OUT_DIR,
+        XLSX_MODULE,
+        profile,
+    )?;
 
     if profile == Profile::Release {
-        report_sizes(&[Path::new(CORE_MODULE), Path::new(SIM_MODULE)])?;
+        report_sizes(&[
+            Path::new(CORE_MODULE),
+            Path::new(SIM_MODULE),
+            Path::new(XLSX_MODULE),
+        ])?;
     }
     Ok(())
 }
