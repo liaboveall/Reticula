@@ -7,6 +7,7 @@ const LazyWorkbooksPage = lazy(() => import("./pages/WorkbooksPage.tsx"));
 const LazyAccountPage = lazy(() => import("./pages/AccountPage.tsx"));
 const LazyPrivacyPage = lazy(() => import("./pages/PrivacyPage.tsx"));
 const LazySimLabPage = lazy(() => import("./sim/SimLabPage.tsx"));
+const LazyBenchmarksPage = lazy(() => import("./pages/BenchmarksPage.tsx"));
 
 export function App() {
   const [route, setRoute] = useState<AppRoute>(() => normalizeAppRoute(window.location.pathname));
@@ -62,6 +63,13 @@ export function App() {
     return (
       <Suspense fallback={<div className="page-loading">Loading…</div>}>
         <LazySimLabPage onNavigate={navigate} />
+      </Suspense>
+    );
+  }
+  if (route === "benchmarks") {
+    return (
+      <Suspense fallback={<div className="page-loading">Loading…</div>}>
+        <LazyBenchmarksPage onNavigate={navigate} />
       </Suspense>
     );
   }

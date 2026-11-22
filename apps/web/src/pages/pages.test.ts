@@ -10,6 +10,8 @@ describe("M2b shell helpers", () => {
     expect(normalizeAppRoute("/account")).toBe("account");
     expect(normalizeAppRoute("/privacy")).toBe("privacy");
     expect(normalizeAppRoute("/sim")).toBe("sim");
+    expect(normalizeAppRoute("/benchmarks")).toBe("benchmarks");
+    expect(normalizeAppRoute("/benchmarks/")).toBe("benchmarks");
   });
 
   it("picks nearest base snapshot seq <= targetSeq", () => {

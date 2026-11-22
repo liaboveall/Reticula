@@ -420,8 +420,8 @@ export class Grid {
   }
 
   #applySheetConfig(sheet: SheetConfig): void {
-    if (sheet.filter !== undefined) {
-      this.#applyFilterState(sheet.filter, sheet.totalRows ?? sheet.rows);
+    if ("filter" in sheet) {
+      this.#applyFilterState(sheet.filter ?? null, sheet.totalRows ?? sheet.rows);
     }
     if (sheet.frozenRows !== undefined) {
       this.#frozenRows = sheet.frozenRows;

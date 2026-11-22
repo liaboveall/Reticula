@@ -1,0 +1,581 @@
+{
+  "engineRuns": [
+    {
+      "browser": "chrome 158.0.8127.36",
+      "commit": "9cbf93f",
+      "cpu": "13th Gen Intel(R) Core(TM) i9-13980HX",
+      "date": "2026-11-18",
+      "native": {
+        "b11ProbeP95Ms": null,
+        "b11Save20mMs": null,
+        "b12Load50mMs": null,
+        "b12PeakWasmMiB": null,
+        "b12Recalc100kMs": null,
+        "b12Save50mMs": null,
+        "b1Load20mMs": null,
+        "b2Sum1mMs": 1.65,
+        "b3FullRecalc1mMs": 548.16,
+        "b4Incremental100kP50Ms": 24.71,
+        "b4Incremental100kP95Ms": 29.61,
+        "b5Chain1mMs": 623.32,
+        "b7aInsertCrossP50Ms": 1.56,
+        "b7aInsertTopUs": 2.0
+      },
+      "suite": "m1a-engine",
+      "wasmChrome": {
+        "b11ProbeP95Ms": null,
+        "b11Save20mMs": null,
+        "b12Load50mMs": null,
+        "b12PeakWasmMiB": null,
+        "b12Recalc100kMs": null,
+        "b12Save50mMs": null,
+        "b1Load20mMs": null,
+        "b2Sum1mMs": 2.04,
+        "b3FullRecalc1mMs": 456.27,
+        "b4Incremental100kP50Ms": 24.18,
+        "b4Incremental100kP95Ms": 31.96,
+        "b5Chain1mMs": 608.96,
+        "b7aInsertCrossP50Ms": 2.13,
+        "b7aInsertTopUs": 1.7
+      }
+    },
+    {
+      "browser": "chrome 158.0.8127.36",
+      "commit": "2fe2ae4",
+      "cpu": "13th Gen Intel(R) Core(TM) i9-13980HX",
+      "date": "2026-11-19",
+      "native": {
+        "b11ProbeP95Ms": null,
+        "b11Save20mMs": 365.84,
+        "b12Load50mMs": 319.59,
+        "b12PeakWasmMiB": null,
+        "b12Recalc100kMs": 35.83,
+        "b12Save50mMs": 399.74,
+        "b1Load20mMs": 752.97,
+        "b2Sum1mMs": 1.56,
+        "b3FullRecalc1mMs": 503.17,
+        "b4Incremental100kP50Ms": 23.79,
+        "b4Incremental100kP95Ms": 27.73,
+        "b5Chain1mMs": 542.28,
+        "b7aInsertCrossP50Ms": 1.6,
+        "b7aInsertTopUs": 1.0
+      },
+      "suite": "m1b-engine",
+      "wasmChrome": {
+        "b11ProbeP95Ms": 4.75,
+        "b11Save20mMs": 420.01,
+        "b12Load50mMs": 407.19,
+        "b12PeakWasmMiB": 605.25,
+        "b12Recalc100kMs": 31.72,
+        "b12Save50mMs": 613.4,
+        "b1Load20mMs": 747.67,
+        "b2Sum1mMs": 1.97,
+        "b3FullRecalc1mMs": 405.07,
+        "b4Incremental100kP50Ms": 23.34,
+        "b4Incremental100kP95Ms": 30.59,
+        "b5Chain1mMs": 581.09,
+        "b7aInsertCrossP50Ms": 1.84,
+        "b7aInsertTopUs": 1.9
+      }
+    }
+  ],
+  "latestDiff": {
+    "agreementRatio": 0.9965268292682928,
+    "byFamily": [
+      {
+        "agreementRatio": 1.0,
+        "family": "aggregation",
+        "matches": 1500,
+        "nonError": 1500,
+        "total": 1500,
+        "unclassified": 0
+      },
+      {
+        "agreementRatio": 1.0,
+        "family": "compound_expr",
+        "matches": 2500,
+        "nonError": 2250,
+        "total": 2500,
+        "unclassified": 0
+      },
+      {
+        "agreementRatio": 1.0,
+        "family": "criteria_agg",
+        "matches": 3000,
+        "nonError": 3000,
+        "total": 3000,
+        "unclassified": 0
+      },
+      {
+        "agreementRatio": 0.992,
+        "family": "datetime",
+        "matches": 5208,
+        "nonError": 5250,
+        "total": 5250,
+        "unclassified": 0
+      },
+      {
+        "agreementRatio": 0.9971428571428572,
+        "family": "dynamic_array",
+        "matches": 3490,
+        "nonError": 3500,
+        "total": 3500,
+        "unclassified": 0
+      },
+      {
+        "agreementRatio": 1.0,
+        "family": "financial",
+        "matches": 2000,
+        "nonError": 2000,
+        "total": 2000,
+        "unclassified": 0
+      },
+      {
+        "agreementRatio": 0.9866666666666668,
+        "family": "logic_info",
+        "matches": 5920,
+        "nonError": 5948,
+        "total": 6000,
+        "unclassified": 0
+      },
+      {
+        "agreementRatio": 1.0,
+        "family": "lookup",
+        "matches": 4000,
+        "nonError": 3798,
+        "total": 4000,
+        "unclassified": 0
+      },
+      {
+        "agreementRatio": 0.9984,
+        "family": "math_trig",
+        "matches": 9984,
+        "nonError": 9964,
+        "total": 10000,
+        "unclassified": 0
+      },
+      {
+        "agreementRatio": 0.9961904761904762,
+        "family": "stats",
+        "matches": 5230,
+        "nonError": 5230,
+        "total": 5250,
+        "unclassified": 0
+      },
+      {
+        "agreementRatio": 0.9987878787878788,
+        "family": "text_conv",
+        "matches": 8240,
+        "nonError": 7745,
+        "total": 8250,
+        "unclassified": 0
+      }
+    ],
+    "clusters": [
+      {
+        "category": "DATE",
+        "count": 12,
+        "disposition": "excel_1900_calendar_rule",
+        "family": "datetime",
+        "libreofficeResult": "61",
+        "reason": "Excel 1900 leap-year compatibility (1900-02-29 = serial 60, Jan-Feb 1900 +1 offset) vs proleptic Gregorian in LibreOffice",
+        "referenceEngine": "libreoffice-calc",
+        "reticulaResult": "60",
+        "sampleFormula": "=DATE(1900,2,29)"
+      },
+      {
+        "category": "DATEDIF",
+        "count": 22,
+        "disposition": "datedif_yd_leap_year_anchor",
+        "family": "datetime",
+        "libreofficeResult": "122",
+        "reason": "DATEDIF \"YD\" spanning leap year 2024 (start-year vs end-year anchor) differs by 1 day across spreadsheet engines",
+        "referenceEngine": "libreoffice-calc",
+        "reticulaResult": "123",
+        "sampleFormula": "=DATEDIF(Data!K2,Data!K5,\"YD\")"
+      },
+      {
+        "category": "DAY",
+        "count": 8,
+        "disposition": "excel_1900_calendar_rule",
+        "family": "datetime",
+        "libreofficeResult": "28",
+        "reason": "Excel 1900 leap-year compatibility (1900-02-29 = serial 60, Jan-Feb 1900 +1 offset) vs proleptic Gregorian in LibreOffice",
+        "referenceEngine": "libreoffice-calc",
+        "reticulaResult": "29",
+        "sampleFormula": "=DAY(Data!K9)"
+      },
+      {
+        "category": "ISFORMULA",
+        "count": 10,
+        "disposition": "libreoffice_boolean_cell_as_formula",
+        "family": "logic_info",
+        "libreofficeResult": "TRUE",
+        "reason": "LibreOffice serializes boolean constants as TRUE()/FALSE() formulas, making ISFORMULA(TRUE) return TRUE",
+        "referenceEngine": "libreoffice-calc",
+        "reticulaResult": "FALSE",
+        "sampleFormula": "=ISFORMULA(Data!F1)"
+      },
+      {
+        "category": "ISNUMBER",
+        "count": 10,
+        "disposition": "libreoffice_boolean_is_number",
+        "family": "logic_info",
+        "libreofficeResult": "TRUE",
+        "reason": "LibreOffice evaluates ISNUMBER(TRUE/FALSE) as TRUE vs FALSE in Excel/Reticula",
+        "referenceEngine": "libreoffice-calc",
+        "reticulaResult": "FALSE",
+        "sampleFormula": "=ISNUMBER(Data!F1)"
+      },
+      {
+        "category": "LN",
+        "count": 8,
+        "disposition": "libreoffice_err502_domain_value_error",
+        "family": "math_trig",
+        "libreofficeResult": "#VALUE!",
+        "reason": "LibreOffice exports Err:502 negative real domain errors on LN/SQRT as #VALUE! vs #NUM! in Excel/Reticula",
+        "referenceEngine": "libreoffice-calc",
+        "reticulaResult": "#NUM!",
+        "sampleFormula": "=LN(-1)"
+      },
+      {
+        "category": "MODE",
+        "count": 10,
+        "disposition": "libreoffice_mode_no_dup_error",
+        "family": "stats",
+        "libreofficeResult": "#VALUE!",
+        "reason": "MODE with no duplicate values returns #N/A in Excel/Reticula vs #VALUE! in LibreOffice Calc",
+        "referenceEngine": "libreoffice-calc",
+        "reticulaResult": "#N/A",
+        "sampleFormula": "=MODE(Data!B1:B16)"
+      },
+      {
+        "category": "MODE.SNGL",
+        "count": 10,
+        "disposition": "libreoffice_mode_no_dup_error",
+        "family": "stats",
+        "libreofficeResult": "#VALUE!",
+        "reason": "MODE with no duplicate values returns #N/A in Excel/Reticula vs #VALUE! in LibreOffice Calc",
+        "referenceEngine": "libreoffice-calc",
+        "reticulaResult": "#N/A",
+        "sampleFormula": "=MODE.SNGL(Data!B1:B16)"
+      },
+      {
+        "category": "NUMBERVALUE",
+        "count": 10,
+        "disposition": "libreoffice_odf_numbervalue_optional_arg",
+        "family": "text_conv",
+        "libreofficeResult": "#VALUE!",
+        "reason": "1-arg NUMBERVALUE defaults decimal separator in Excel OOXML but requires 2nd arg in LibreOffice Calc",
+        "referenceEngine": "libreoffice-calc",
+        "reticulaResult": "-42.25",
+        "sampleFormula": "=NUMBERVALUE(\"-42.25\")"
+      },
+      {
+        "category": "SQRT",
+        "count": 8,
+        "disposition": "libreoffice_err502_domain_value_error",
+        "family": "math_trig",
+        "libreofficeResult": "#VALUE!",
+        "reason": "LibreOffice exports Err:502 negative real domain errors on LN/SQRT as #VALUE! vs #NUM! in Excel/Reticula",
+        "referenceEngine": "libreoffice-calc",
+        "reticulaResult": "#NUM!",
+        "sampleFormula": "=SQRT(-4)"
+      },
+      {
+        "category": "TYPE",
+        "count": 10,
+        "disposition": "libreoffice_boolean_cell_as_formula",
+        "family": "logic_info",
+        "libreofficeResult": "8",
+        "reason": "LibreOffice evaluates TYPE() on stored boolean TRUE()/FALSE() cells as 8 (Formula) vs 4 (Logical) in Excel",
+        "referenceEngine": "libreoffice-calc",
+        "reticulaResult": "4",
+        "sampleFormula": "=TYPE(Data!F1)"
+      },
+      {
+        "category": "TYPE",
+        "count": 10,
+        "disposition": "libreoffice_type_array_arg",
+        "family": "logic_info",
+        "libreofficeResult": "#VALUE!",
+        "reason": "TYPE(range) returns 64 (Array) in Excel 365/Reticula vs #VALUE! in LibreOffice non-array call",
+        "referenceEngine": "libreoffice-calc",
+        "reticulaResult": "64",
+        "sampleFormula": "=TYPE(Data!N1:Q2)"
+      },
+      {
+        "category": "TYPE",
+        "count": 40,
+        "disposition": "libreoffice_type_formula_return_8",
+        "family": "logic_info",
+        "libreofficeResult": "8",
+        "reason": "LibreOffice TYPE(formula_cell) returns 8 (Formula) per ODF whereas Excel returns the evaluated value type (1)",
+        "referenceEngine": "libreoffice-calc",
+        "reticulaResult": "1",
+        "sampleFormula": "=TYPE(Data!W1)"
+      },
+      {
+        "category": "UNIQUE",
+        "count": 10,
+        "disposition": "libreoffice_array_bool_number_serialization",
+        "family": "dynamic_array",
+        "libreofficeResult": "1",
+        "reason": "LibreOffice serializes boolean array spill elements as numeric 1/0 without t=\"b\"",
+        "referenceEngine": "libreoffice-calc",
+        "reticulaResult": "TRUE",
+        "sampleFormula": "=UNIQUE(Data!F1:F6)"
+      }
+    ],
+    "commit": "76dcc45",
+    "containerImage": "reticula-libreoffice:26.8.2",
+    "date": "2026-11-22",
+    "deterministicFunctionsCovered": 195,
+    "libreofficeVersion": "LibreOffice 26.8.2.2 680(Build:2)",
+    "matches": 51072,
+    "minSamplesPerFunction": 250,
+    "nonErrorCount": 50185,
+    "nonErrorRatio": 0.979219512195122,
+    "rustReference": {
+      "clusters": [
+        {
+          "category": "ADD_SUB_CANCEL",
+          "count": 99,
+          "disposition": "excel_15_digit_rule",
+          "referenceEngine": "formualizer-eval",
+          "referenceResult": "-0.0000000000000000555111512312578",
+          "reticulaResult": "0",
+          "sampleFormula": "=A3-(A1+A2)"
+        },
+        {
+          "category": "CMP_NUM",
+          "count": 17,
+          "disposition": "excel_15_digit_rule",
+          "referenceEngine": "formualizer-eval",
+          "referenceResult": "TRUE",
+          "reticulaResult": "FALSE",
+          "sampleFormula": "=(A1+A2)>A3"
+        },
+        {
+          "category": "DATE",
+          "count": 31,
+          "disposition": "excel_1900_calendar_rule",
+          "referenceEngine": "formualizer-eval",
+          "referenceResult": "61",
+          "reticulaResult": "60",
+          "sampleFormula": "=DATE(1900,2,29)"
+        },
+        {
+          "category": "EDATE",
+          "count": 5,
+          "disposition": "excel_1900_calendar_rule",
+          "referenceEngine": "formualizer-eval",
+          "referenceResult": "-91",
+          "reticulaResult": "#NUM!",
+          "sampleFormula": "=EDATE(M2,-5)"
+        },
+        {
+          "category": "EOMONTH",
+          "count": 7,
+          "disposition": "excel_1900_calendar_rule",
+          "referenceEngine": "formualizer-eval",
+          "referenceResult": "-153",
+          "reticulaResult": "#NUM!",
+          "sampleFormula": "=EOMONTH(M2,-8)"
+        },
+        {
+          "category": "FLOOR",
+          "count": 44,
+          "disposition": "excel_15_digit_rule",
+          "referenceEngine": "formualizer-eval",
+          "referenceResult": "1.1",
+          "reticulaResult": "1.2",
+          "sampleFormula": "=FLOOR(1.2,0.1)"
+        },
+        {
+          "category": "FLOOR",
+          "count": 25,
+          "disposition": "excel_negative_floor_rule",
+          "referenceEngine": "formualizer-eval",
+          "referenceResult": "-3",
+          "reticulaResult": "-2",
+          "sampleFormula": "=FLOOR(-2.5,-1)"
+        },
+        {
+          "category": "ADD_SUB_CANCEL",
+          "count": 99,
+          "disposition": "excel_15_digit_rule",
+          "referenceEngine": "ironcalc_base",
+          "referenceResult": "-0.0000000000000000555111512312578",
+          "reticulaResult": "0",
+          "sampleFormula": "=A3-(A1+A2)"
+        },
+        {
+          "category": "DATE",
+          "count": 31,
+          "disposition": "excel_1900_calendar_rule",
+          "referenceEngine": "ironcalc_base",
+          "referenceResult": "61",
+          "reticulaResult": "60",
+          "sampleFormula": "=DATE(1900,2,29)"
+        },
+        {
+          "category": "DAY",
+          "count": 18,
+          "disposition": "excel_1900_calendar_rule",
+          "referenceEngine": "ironcalc_base",
+          "referenceResult": "28",
+          "reticulaResult": "29",
+          "sampleFormula": "=DAY(M1)"
+        },
+        {
+          "category": "EDATE",
+          "count": 2,
+          "disposition": "excel_1900_calendar_rule",
+          "referenceEngine": "ironcalc_base",
+          "referenceResult": "33",
+          "reticulaResult": "32",
+          "sampleFormula": "=EDATE(M2,-1)"
+        },
+        {
+          "category": "EOMONTH",
+          "count": 4,
+          "disposition": "excel_1900_calendar_rule",
+          "referenceEngine": "ironcalc_base",
+          "referenceResult": "32",
+          "reticulaResult": "31",
+          "sampleFormula": "=EOMONTH(M2,-2)"
+        },
+        {
+          "category": "TEXT",
+          "count": 9,
+          "disposition": "excel_half_away_rounding",
+          "referenceEngine": "ironcalc_base",
+          "referenceResult": "\"42\"",
+          "reticulaResult": "\"43\"",
+          "sampleFormula": "=TEXT(A7,\"0\")"
+        }
+      ],
+      "formualizerMatches": 9772,
+      "ironcalcMatches": 9837,
+      "nonErrorCount": 9741,
+      "nonErrorRatio": 0.9741,
+      "totalFormulas": 10000
+    },
+    "totalCellsCompared": 76510,
+    "totalFormulas": 51250,
+    "unclassifiedCount": 0,
+    "uniqueFunctionsCovered": 188
+  },
+  "loadRuns": [
+    {
+      "achievedTxnsPerSec": 100.0,
+      "allDigestsMatch": true,
+      "clients": 50,
+      "commit": "8a858fd",
+      "date": "2026-11-21",
+      "digestMismatches": 0,
+      "loopbackP50Ms": 10.04,
+      "loopbackP95Ms": 35.95,
+      "lostTxns": 0,
+      "populatedCells": 1977000,
+      "postgresPeakMiB": 72.27,
+      "rtt50P50Ms": 60.04,
+      "rtt50P95Ms": 85.95,
+      "serverPeakMiB": 320.2,
+      "suite": "m2b-load",
+      "targetTxnsPerSec": 100.0
+    }
+  ],
+  "qualitySummary": {
+    "builtInFunctions": 193,
+    "catalogEntries": 200,
+    "compatGenerations": [
+      "v1",
+      "v2",
+      "v3"
+    ],
+    "deterministicFunctions": 195,
+    "simCiSeeds": 5000,
+    "simNightlySeeds": 100000
+  },
+  "renderRuns": [
+    {
+      "browser": "chrome 158.0.8127.36",
+      "chromeMargin2P99Ms": 0.93,
+      "commit": "7096d6e",
+      "date": "2026-11-18",
+      "firefoxJumpP99Ms": 6.14,
+      "scrollWorkP99Ms": 0.93,
+      "suite": "m1a-render"
+    },
+    {
+      "browser": "chrome 158.0.8127.36",
+      "chromeMargin2P99Ms": 1.01,
+      "commit": "2fe2ae4",
+      "date": "2026-11-19",
+      "firefoxJumpP99Ms": null,
+      "scrollWorkP99Ms": 1.01,
+      "suite": "m1b-render"
+    }
+  ],
+  "startupRuns": [
+    {
+      "commit": "7096d6e",
+      "date": "2026-11-18",
+      "firstScreenP50Ms": 765.2,
+      "networkLabel": "20 Mbps / 50 ms RTT",
+      "shellP50Ms": 370.1,
+      "suite": "s9"
+    },
+    {
+      "commit": "2fe2ae4",
+      "date": "2026-11-19",
+      "firstScreenP50Ms": 877.8,
+      "networkLabel": "20 Mbps / 50 ms RTT",
+      "shellP50Ms": 474.7,
+      "suite": "s9"
+    }
+  ],
+  "syncRuns": [
+    {
+      "commit": "c515330",
+      "date": "2026-11-21",
+      "nativeB9aFrameP50Ms": 178.9,
+      "nativeB9aTotalP50Ms": 480.03,
+      "nativeB9bTotalP50Ms": 526.72,
+      "stage": "M2a clone",
+      "suite": "m2a-sync",
+      "wasmB9aFrameP50Ms": 80.19,
+      "wasmB9aTotalP50Ms": 981.71,
+      "wasmB9aTotalP95Ms": 1107.82,
+      "wasmB9bTotalP50Ms": 1060.87
+    },
+    {
+      "commit": "0429bfd",
+      "date": "2026-11-21",
+      "nativeB9aFrameP50Ms": 111.61,
+      "nativeB9aTotalP50Ms": 417.88,
+      "nativeB9bTotalP50Ms": 453.63,
+      "stage": "M2a in-place",
+      "suite": "m2a-sync",
+      "wasmB9aFrameP50Ms": 54.55,
+      "wasmB9aTotalP50Ms": 991.29,
+      "wasmB9aTotalP95Ms": 1078.72,
+      "wasmB9bTotalP50Ms": 1043.72
+    },
+    {
+      "commit": "9eb1390",
+      "date": "2026-11-21",
+      "nativeB9aFrameP50Ms": 2.4,
+      "nativeB9aTotalP50Ms": 4.83,
+      "nativeB9bTotalP50Ms": 128.0,
+      "stage": "M2b worker incremental",
+      "suite": "m2b-sync",
+      "wasmB9aFrameP50Ms": 2.44,
+      "wasmB9aTotalP50Ms": 4.95,
+      "wasmB9aTotalP95Ms": 6.19,
+      "wasmB9bTotalP50Ms": 135.53
+    }
+  ]
+}

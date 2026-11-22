@@ -1,6 +1,13 @@
 import { ApiError } from "@reticula/protocol/collab-api";
 
-export type AppRoute = "landing" | "app" | "workbooks" | "account" | "privacy" | "sim";
+export type AppRoute =
+  | "landing"
+  | "app"
+  | "workbooks"
+  | "account"
+  | "privacy"
+  | "sim"
+  | "benchmarks";
 
 export function normalizeAppRoute(pathname: string): AppRoute {
   if (pathname === "/app" || pathname.startsWith("/app/") || pathname.startsWith("/join/")) {
@@ -17,6 +24,9 @@ export function normalizeAppRoute(pathname: string): AppRoute {
   }
   if (pathname === "/sim" || pathname.startsWith("/sim/")) {
     return "sim";
+  }
+  if (pathname === "/benchmarks" || pathname.startsWith("/benchmarks/")) {
+    return "benchmarks";
   }
   return "landing";
 }

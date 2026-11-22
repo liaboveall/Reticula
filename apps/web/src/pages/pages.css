@@ -127,3 +127,119 @@
   text-align: center;
   color: var(--shell-muted, #64748b);
 }
+
+.bench-kpi-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(175px, 1fr));
+  gap: 10px;
+}
+
+.bench-kpi {
+  padding: 10px 12px;
+  border: 1px solid var(--shell-line, #e2e8f0);
+  border-radius: 6px;
+  background: var(--shell-background, #f6f7f9);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.bench-kpi-label {
+  font-size: 11px;
+  color: var(--shell-muted, #64748b);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.bench-kpi-value {
+  font-size: 18px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+.bench-kpi-sub {
+  font-size: 11px;
+  color: var(--shell-muted, #64748b);
+}
+
+.bench-charts-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  gap: 14px;
+}
+
+.bench-chart-card {
+  border: 1px solid var(--shell-line, #e2e8f0);
+  border-radius: 6px;
+  padding: 12px;
+  background: var(--shell-surface, #ffffff);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.bench-chart-card h3 {
+  margin: 0;
+  font-size: 13px;
+}
+
+.bench-svg {
+  width: 100%;
+  height: auto;
+  display: block;
+}
+
+.bench-note {
+  margin: 0;
+  padding: 8px 12px;
+  border-left: 3px solid var(--shell-accent, #0f766e);
+  background: var(--shell-background, #f6f7f9);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.bench-filters {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.bench-table-wrap {
+  overflow-x: auto;
+}
+
+.bench-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.bench-table th,
+.bench-table td {
+  padding: 7px 10px;
+  border-bottom: 1px solid var(--shell-line, #e2e8f0);
+  text-align: left;
+  vertical-align: top;
+}
+
+.bench-table th {
+  font-weight: 600;
+  color: var(--shell-muted, #64748b);
+  white-space: nowrap;
+}
+
+.bench-num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.bench-badge {
+  display: inline-block;
+  padding: 2px 7px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  border: 1px solid var(--shell-line, #e2e8f0);
+  background: var(--shell-background, #f6f7f9);
+}

@@ -45,6 +45,17 @@ export function LandingPage({ onNavigate }: LandingPageProps) {
             Sync Simulator
           </a>
           <a
+            href="/benchmarks"
+            className="landing-link"
+            data-testid="nav-benchmarks"
+            onClick={(event) => {
+              event.preventDefault();
+              onNavigate("/benchmarks");
+            }}
+          >
+            Benchmarks
+          </a>
+          <a
             href="https://github.com/liaboveall/Reticula"
             target="_blank"
             rel="noreferrer"
@@ -74,7 +85,7 @@ export function LandingPage({ onNavigate }: LandingPageProps) {
           </h1>
           <p className="landing-lead">
             Reticula runs its entire calculation engine inside a dedicated Web Worker: run-encoded
-            64-bit row and column axes, Copy-on-Write 8-byte NaN-boxed columnar blocks, 69
+            64-bit row and column axes, Copy-on-Write 8-byte NaN-boxed columnar blocks, 193
             Excel-compatible functions with 15-significant-digit arithmetic, OPFS crash-safe local
             persistence with offline Service Worker support, and a custom Canvas2D grid that never
             touches the DOM per cell.

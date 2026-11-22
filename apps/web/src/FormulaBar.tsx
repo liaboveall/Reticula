@@ -27,6 +27,7 @@ export interface FormulaBarProps {
   readonly placeholder: string;
   readonly disabled: boolean;
   readonly isEditing: boolean;
+  readonly isSpillShadow?: boolean;
   readonly analysis: WireFormulaAnalysis | null;
   readonly analysisSource?: string | null;
   readonly getEditSource: () => string | null;
@@ -51,6 +52,7 @@ export function FormulaBar({
   placeholder,
   disabled,
   isEditing,
+  isSpillShadow,
   analysis,
   analysisSource,
   getEditSource,
@@ -278,6 +280,15 @@ export function FormulaBar({
         <output className="name-box" data-testid="name-box" aria-label="Selected cell or range">
           {nameBoxText}
         </output>
+        {isSpillShadow && (
+          <span
+            className="spill-badge"
+            data-testid="spill-badge"
+            title="Spilled from dynamic array formula"
+          >
+            SPILL
+          </span>
+        )}
         <span
           className={value.startsWith("=") ? "fx-badge fx-active" : "fx-badge"}
           aria-hidden="true"

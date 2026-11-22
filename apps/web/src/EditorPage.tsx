@@ -12,6 +12,7 @@ import {
 } from "@reticula/grid";
 import type {
   CollabEvent,
+  EngineCommand,
   EngineInfo,
   SheetInfo,
   SheetTabInfo,
@@ -20,6 +21,7 @@ import type {
   WireFormatPatch,
   WireFormulaAnalysis,
   WireHorizontalAlign,
+  WireSearchMatch,
   WireStylePatch,
 } from "@reticula/protocol";
 import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
@@ -42,10 +44,12 @@ import {
   type SnapshotSaveResult,
 } from "./hooks.ts";
 import type { LocalModalMode } from "./LocalModals.tsx";
+import type { M3aModalEvent, M3aToolMode } from "./M3aToolsModal.tsx";
 import { createSwClient, type SwClientHandle } from "./sw-client.ts";
 
 const LazyLocalModals = lazy(() => import("./LocalModals.tsx"));
 const LazyCollabShell = lazy(() => import("./collab/CollabShell.tsx"));
+const LazyM3aToolsModal = lazy(() => import("./M3aToolsModal.tsx"));
 
 type EngineState =
   | { status: "starting" }
@@ -78,6 +82,7 @@ interface InspectedState {
   readonly error: string | null;
   readonly formatCode: string;
   readonly style: WireCellStyle;
+  readonly isSpillShadow: boolean;
 }
 
 interface ActiveEditSession {
@@ -404,6 +409,7 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
   const analysisRef = useRef<WireFormulaAnalysis | null>(null);
   const lastCopiedRef = useRef<CopiedSnapshot | null>(null);
   const pendingActionVerbRef = useRef<string>("updated");
+  const pendingJumpRef = useRef<{ sheet: number; row: number; col: number } | null>(null);
 
   const [engine, setEngine] = useState<EngineState>({ status: "starting" });
   const [docId, setDocId] = useState<string>(initialRoute.current.docId);
@@ -411,6 +417,8 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
   const [catalogDocs, setCatalogDocs] = useState<readonly WorkbookCatalogEntry[]>([]);
   const [lockOverlay, setLockOverlay] = useState<LockOverlayState | null>(null);
   const [modalMode, setModalMode] = useState<LocalModalMode | null>(null);
+  const [m3aTool, setM3aTool] = useState<M3aToolMode | null>(null);
+  const [m3aEvent, setM3aEvent] = useState<M3aModalEvent | null>(null);
   const [quotaBanner, setQuotaBanner] = useState<string | null>(null);
   const [swUpdateReady, setSwUpdateReady] = useState(false);
   const [swUpdating, setSwUpdating] = useState(false);
@@ -551,6 +559,39 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
       window.removeEventListener("keydown", onKey);
     };
   }, [contextMenu, colorPopover]);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && !e.altKey) {
+        const k = e.key.toLowerCase();
+        if (k === "f" || k === "h") {
+          e.preventDefault();
+          setM3aTool({ kind: "find", replace: k === "h" });
+        }
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+
+  const handleM3aSend = useCallback((cmd: EngineCommand) => {
+    clientRef.current?.send(cmd);
+  }, []);
+
+  const handleCloseM3aTool = useCallback(() => setM3aTool(null), []);
+
+  const handleJumpMatch = useCallback((m: WireSearchMatch) => {
+    const grid = gridRef.current;
+    if (!grid) {
+      return;
+    }
+    if (m.sheet === activeSheetRef.current) {
+      grid.jumpTo(m.row, m.col, false);
+    } else {
+      pendingJumpRef.current = { sheet: m.sheet, row: m.row, col: m.col };
+      clientRef.current?.send({ kind: "switchSheet", sheet: m.sheet });
+    }
+  }, []);
 
   const syncGridFormulaRefs = useCallback(
     (grid: Grid, analysis: WireFormulaAnalysis | null, sheetId: number) => {
@@ -842,6 +883,7 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
         });
         return true;
       },
+      onFilterButtonClick: (col) => setM3aTool({ kind: "filter", col }),
       onContextMenu: (target) => {
         setColorPopover(null);
         setContextMenu({ kind: "grid", target });
@@ -1373,6 +1415,12 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
               } else {
                 grid.updateSheet(message.sheet);
               }
+              grid.setFilterState(message.sheet.filter ?? null, message.sheet.totalRows);
+              const pendingJump = pendingJumpRef.current;
+              if (pendingJump && pendingJump.sheet === message.sheet.sheet) {
+                pendingJumpRef.current = null;
+                grid.jumpTo(pendingJump.row, pendingJump.col, false);
+              }
               syncGridFormulaRefs(grid, analysisRef.current, message.sheet.sheet);
               setEngine((prev) =>
                 prev.status === "ready" ? { ...prev, sheet: message.sheet } : prev,
@@ -1415,6 +1463,7 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
                 error: message.error ?? null,
                 formatCode: message.formatCode,
                 style: message.style,
+                isSpillShadow: message.isSpillShadow,
               };
               inspectedRef.current = info;
               setInspected(info);
@@ -1578,6 +1627,35 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
               } else {
                 setRecalcMessage(`updated cell in ${milliseconds.format(message.elapsedMs)} ms`);
               }
+              requestInspect(grid.selectionDetails(), true);
+              refreshStorageEstimate();
+              break;
+            case "filterValues":
+            case "searchResults":
+            case "namedRangesListed":
+              setM3aEvent(message);
+              break;
+            case "searchNavigated":
+              setM3aEvent(message);
+              if (message.found) {
+                const m = message.found;
+                if (m.sheet === activeSheetRef.current) {
+                  grid.jumpTo(m.row, m.col, false);
+                } else {
+                  pendingJumpRef.current = { sheet: m.sheet, row: m.row, col: m.col };
+                  client.send({ kind: "switchSheet", sheet: m.sheet });
+                }
+              }
+              break;
+            case "replaceCompleted":
+              walSeqRef.current = message.sheet.walSeq;
+              grid.updateSheet(message.sheet);
+              grid.setFilterState(message.sheet.filter ?? null, message.sheet.totalRows);
+              setEngine((prev) =>
+                prev.status === "ready" ? { ...prev, sheet: message.sheet } : prev,
+              );
+              setM3aEvent(message);
+              setRecalcMessage(`replaced ${integer.format(message.replacedCells)} cell(s)`);
               requestInspect(grid.selectionDetails(), true);
               refreshStorageEstimate();
               break;
@@ -2822,6 +2900,70 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
         >
           − Col
         </button>
+        <span className="fmt-divider" />
+        <button
+          type="button"
+          className="fmt-btn"
+          data-testid="m3a-sort-btn"
+          disabled={!readySheet || effectiveReadOnly}
+          onClick={() => setM3aTool({ kind: "sort" })}
+        >
+          Sort
+        </button>
+        <button
+          type="button"
+          className={readySheet?.filter ? "fmt-btn active" : "fmt-btn"}
+          data-testid="m3a-filter-btn"
+          disabled={!readySheet}
+          onClick={() => {
+            if (!readySheet) {
+              return;
+            }
+            if (readySheet.filter) {
+              clientRef.current?.send({ kind: "clearFilter", sheet: readySheet.sheet });
+              return;
+            }
+            const r = selection?.range;
+            const headerRow = r ? r.firstRow : 0;
+            const lastRow =
+              r && r.endRow - r.firstRow > 1
+                ? r.endRow - 1
+                : Math.min(readySheet.rows - 1, headerRow + 10_000);
+            const firstCol = r ? r.firstCol : 0;
+            const lastCol =
+              r && r.endCol - r.firstCol > 1
+                ? r.endCol - 1
+                : Math.min(readySheet.cols - 1, Math.max(firstCol, 25));
+            clientRef.current?.send({
+              kind: "setFilterTable",
+              sheet: readySheet.sheet,
+              headerRow,
+              lastRow,
+              firstCol,
+              lastCol,
+            });
+          }}
+        >
+          Filter
+        </button>
+        <button
+          type="button"
+          className="fmt-btn"
+          data-testid="m3a-find-btn"
+          disabled={!readySheet}
+          onClick={() => setM3aTool({ kind: "find", replace: false })}
+        >
+          Find
+        </button>
+        <button
+          type="button"
+          className="fmt-btn"
+          data-testid="m3a-names-btn"
+          disabled={!readySheet}
+          onClick={() => setM3aTool({ kind: "names" })}
+        >
+          Names
+        </button>
       </div>
 
       {quotaBanner && (
@@ -2939,6 +3081,7 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
           (selection === null && !editSessionRef.current)
         }
         isEditing={editingText !== null}
+        isSpillShadow={matchingInspected?.isSpillShadow === true}
         analysis={formulaAnalysis?.analysis ?? null}
         analysisSource={formulaAnalysis?.source ?? null}
         getEditSource={getEditSource}
@@ -3523,6 +3666,22 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
                 mode: { type: "skipTail", skipCount, salvageMid },
               });
             }}
+          />
+        </Suspense>
+      )}
+
+      {m3aTool && readySheet && (
+        <Suspense fallback={null}>
+          <LazyM3aToolsModal
+            mode={m3aTool}
+            sheet={readySheet}
+            selection={selection}
+            readOnly={effectiveReadOnly}
+            lastEvent={m3aEvent}
+            onSend={handleM3aSend}
+            onMutate={notePersistenceMutation}
+            onJumpMatch={handleJumpMatch}
+            onClose={handleCloseM3aTool}
           />
         </Suspense>
       )}

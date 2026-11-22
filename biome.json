@@ -12,7 +12,8 @@
       "!**/pkg",
       "!**/sim-pkg",
       "!**/xlsx-pkg",
-      "!**/generated"
+      "!**/generated",
+      "!**/public/data"
     ]
   },
   "formatter": {

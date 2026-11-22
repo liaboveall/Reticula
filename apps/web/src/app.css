@@ -1282,3 +1282,79 @@ body {
   font-size: 12px;
   cursor: pointer;
 }
+
+.spill-badge {
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  background: var(--shell-accent-soft);
+  color: var(--shell-accent);
+  border: 1px solid var(--shell-accent);
+  white-space: nowrap;
+}
+
+.m3a-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.m3a-field {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 12px;
+}
+
+.m3a-field input,
+.m3a-field select {
+  padding: 4px 7px;
+  border: 1px solid var(--shell-line);
+  border-radius: 4px;
+  background: var(--shell-background);
+  color: var(--shell-text);
+  font: inherit;
+  font-size: 12px;
+}
+
+.m3a-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 210px;
+  overflow-y: auto;
+  padding: 4px;
+  border: 1px solid var(--shell-line);
+  border-radius: 6px;
+  background: var(--shell-background);
+}
+
+.m3a-match {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 5px 8px;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: var(--shell-surface);
+  color: var(--shell-text);
+  font: inherit;
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.m3a-match:hover {
+  border-color: var(--shell-accent);
+}
+
+.m3a-status {
+  margin: 0;
+  font-size: 12px;
+  color: var(--shell-muted);
+}
