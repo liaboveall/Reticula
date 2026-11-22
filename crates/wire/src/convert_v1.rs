@@ -857,7 +857,8 @@ fn bound_expr_to_wire(expr: &BoundExpr) -> Result<WireBoundExprV1, WireConvertEr
         BoundExpr::ScopedName { .. }
         | BoundExpr::SpillRef(_)
         | BoundExpr::Opaque { .. }
-        | BoundExpr::PreservedCached { .. } => Err(WireConvertError::UnsupportedInV1),
+        | BoundExpr::PreservedCached { .. }
+        | BoundExpr::MissingArg => Err(WireConvertError::UnsupportedInV1),
     }
 }
 
@@ -1159,7 +1160,8 @@ fn template_expr_to_wire(expr: &TemplateExpr) -> Result<WireTemplateExprV1, Wire
         TemplateExpr::ScopedName { .. }
         | TemplateExpr::SpillRef(_)
         | TemplateExpr::Opaque { .. }
-        | TemplateExpr::PreservedCached { .. } => Err(WireConvertError::UnsupportedInV1),
+        | TemplateExpr::PreservedCached { .. }
+        | TemplateExpr::MissingArg => Err(WireConvertError::UnsupportedInV1),
     }
 }
 

@@ -842,7 +842,8 @@ fn collect_refs(
         BoundExpr::Literal(_)
         | BoundExpr::ArrayLiteral { .. }
         | BoundExpr::Opaque { .. }
-        | BoundExpr::PreservedCached { .. } => {}
+        | BoundExpr::PreservedCached { .. }
+        | BoundExpr::MissingArg => {}
         BoundExpr::Name(s) => {
             let canon = s.to_ascii_lowercase();
             let names = &mut reg.extra_mut().names;

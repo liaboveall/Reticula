@@ -1,10 +1,15 @@
-//! Built-in Layer-0 (39) and Layer-1 (30) spreadsheet functions (`13-m1a.md`
-//! 5.5 & `14-m1b.md` 5.3 — 69 functions total).
+//! Built-in spreadsheet functions (`17-m3a.md` 5.1 — 193 unique functions,
+//! 200 catalog entries including aliases).
 
 pub mod catalog;
 pub mod criteria;
 pub mod datetime;
+pub mod dynamic_array;
+pub mod financial;
+pub mod logic_info;
 pub mod lookup;
+pub mod math_trig;
+pub mod stats;
 pub mod text_conv;
 pub mod wildcard;
 
@@ -14,7 +19,7 @@ use alloc::vec::Vec;
 use reticula_core::decimal15::{
     RoundingMode, excel_int, excel_mod, round_decimal, snap_cancelled_zero,
 };
-use reticula_core::id::{ColId, IdRun, RowId};
+use reticula_core::id::{ColId, IdRun, RowId, SheetId};
 use reticula_core::num;
 use reticula_core::ops::{MAX_CELL_TEXT_UTF16, Workbook};
 use reticula_core::rng::Rng;
@@ -29,7 +34,8 @@ use crate::value_eval::{
     coerce_for_scalar_op,
 };
 
-pub use lookup::combine_choose;
+pub use logic_info::{combine_ifs_array, finalize_branch_value, switch_scalar_eq};
+pub use lookup::{IndirectTarget, combine_choose, eval_offset, resolve_indirect};
 
 /// Default deterministic date serial (`2026-01-01 00:00:00` = `46_023.0`) used
 /// by [`EvalEnv::default`] when no host clock has been injected (`14-m1b.md` 5.3).
@@ -65,9 +71,10 @@ impl EvalEnv {
     }
 }
 
-/// Evaluates an eager (non-short-circuiting) Layer-0 or Layer-1 function `name`
-/// on already-evaluated `args`. (`IF`, `IFERROR`, `IFNA`, and `CHOOSE` are
-/// handled directly in `FormulaEngine` so unchosen branches are never evaluated.)
+/// Evaluates an eager (non-short-circuiting) built-in function `name` on
+/// already-evaluated `args`. (`IF`, `IFERROR`, `IFNA`, `IFS`, `SWITCH`, `CHOOSE`,
+/// `OFFSET`, and `INDIRECT` are handled directly in `FormulaEngine`.)
+#[expect(clippy::too_many_lines, reason = "central 192-arm built-in dispatcher")]
 pub fn eval_eager_function(
     name: &str,
     args: Vec<EvalValue>,
@@ -75,6 +82,7 @@ pub fn eval_eager_function(
     spills: &SpillRegistry,
     caller: CallerContext,
     env: &mut EvalEnv,
+    is_row_hidden: Option<&dyn Fn(SheetId, RowId) -> bool>,
 ) -> EvalValue {
     match name {
         // --- Layer 0: Aggregations ---
@@ -85,9 +93,10 @@ pub fn eval_eager_function(
         "MIN" => EvalValue::Scalar(eval_min_max(&args, workbook, spills, true)),
         "MAX" => EvalValue::Scalar(eval_min_max(&args, workbook, spills, false)),
 
-        // --- Layer 0: Logic & constants ---
+        // --- Layer 0 & M3a: Logic & Type Information ---
         "AND" => EvalValue::Scalar(eval_and_or(&args, workbook, spills, true)),
         "OR" => EvalValue::Scalar(eval_and_or(&args, workbook, spills, false)),
+        "XOR" => logic_info::eval_xor(&args, workbook, spills),
         "NOT" => lift_unary(args, workbook, spills, caller, |x| {
             x.to_bool()
                 .map_or_else(EvalScalar::Error, |b| EvalScalar::Bool(!b))
@@ -113,8 +122,17 @@ pub fn eval_eager_function(
                 EvalValue::Scalar(EvalScalar::Error(CalcError::Value))
             }
         }
+        "ISERR" => logic_info::eval_iserr(args, workbook, spills, caller),
+        "ISNA" => logic_info::eval_isna(args, workbook, spills, caller),
+        "ISNONTEXT" => logic_info::eval_isnontext(args, workbook, spills, caller),
+        "ISFORMULA" => logic_info::eval_isformula(&args, workbook, caller),
+        "ISREF" => logic_info::eval_isref(&args),
+        "ISEVEN" => logic_info::eval_iseven_or_isodd(args, workbook, spills, caller, true),
+        "ISODD" => logic_info::eval_iseven_or_isodd(args, workbook, spills, caller, false),
+        "ERROR.TYPE" => logic_info::eval_error_type(args, workbook, spills, caller),
+        "TYPE" => logic_info::eval_type(&args, workbook, spills),
 
-        // --- Layer 0 & Layer 1: Math, Rounding & Volatiles ---
+        // --- Layer 0, Layer 1 & M3a: Math, Trig & Volatiles ---
         "ABS" => lift_unary(args, workbook, spills, caller, |x| {
             x.to_number()
                 .map_or_else(EvalScalar::Error, |n| EvalScalar::number(n.abs()))
@@ -171,12 +189,41 @@ pub fn eval_eager_function(
             }
             EvalScalar::number(num::pow(x, y))
         }),
+        "SIGN" => math_trig::eval_sign(args, workbook, spills, caller),
+        "EVEN" => math_trig::eval_even(args, workbook, spills, caller),
+        "ODD" => math_trig::eval_odd(args, workbook, spills, caller),
+        "MROUND" => math_trig::eval_mround(args, workbook, spills, caller),
+        "QUOTIENT" => math_trig::eval_quotient(args, workbook, spills, caller),
+        "FACT" => math_trig::eval_fact(args, workbook, spills, caller),
+        "COMBIN" => math_trig::eval_combin(args, workbook, spills, caller),
+        "PERMUT" => math_trig::eval_permut(args, workbook, spills, caller),
+        "GCD" => math_trig::eval_gcd(&args, workbook, spills),
+        "LCM" => math_trig::eval_lcm(&args, workbook, spills),
+        "PI" => math_trig::eval_pi(&args),
+        "RADIANS" => math_trig::eval_radians(args, workbook, spills, caller),
+        "DEGREES" => math_trig::eval_degrees(args, workbook, spills, caller),
+        "EXP" => math_trig::eval_exp(args, workbook, spills, caller),
+        "LN" => math_trig::eval_ln(args, workbook, spills, caller),
+        "LOG" => math_trig::eval_log(args, workbook, spills, caller),
+        "LOG10" => math_trig::eval_log10(args, workbook, spills, caller),
+        "SIN" => math_trig::eval_sin(args, workbook, spills, caller),
+        "COS" => math_trig::eval_cos(args, workbook, spills, caller),
+        "TAN" => math_trig::eval_tan(args, workbook, spills, caller),
+        "ASIN" => math_trig::eval_asin(args, workbook, spills, caller),
+        "ACOS" => math_trig::eval_acos(args, workbook, spills, caller),
+        "ATAN" => math_trig::eval_atan(args, workbook, spills, caller),
+        "ATAN2" => math_trig::eval_atan2(args, workbook, spills, caller),
+        "SINH" => math_trig::eval_sinh(args, workbook, spills, caller),
+        "COSH" => math_trig::eval_cosh(args, workbook, spills, caller),
+        "TANH" => math_trig::eval_tanh(args, workbook, spills, caller),
+        "PRODUCT" => math_trig::eval_product(&args, workbook, spills),
+        "SUMSQ" => math_trig::eval_sumsq(&args, workbook, spills),
         "TODAY" => text_conv::eval_today_or_now(&args, env, false),
         "NOW" => text_conv::eval_today_or_now(&args, env, true),
         "RAND" => text_conv::eval_rand(&args, env),
         "RANDBETWEEN" => text_conv::eval_randbetween(args, workbook, spills, caller, env),
 
-        // --- Layer 0 & Layer 1: Text & Conversion ---
+        // --- Layer 0, Layer 1 & M3a: Text & Conversion ---
         "LEN" => lift_unary(args, workbook, spills, caller, |x| match x.to_text() {
             Ok(s) => {
                 #[expect(
@@ -204,6 +251,24 @@ pub fn eval_eager_function(
         "RIGHT" => eval_left_or_right(args, workbook, spills, caller, false),
         "MID" => eval_mid(args, workbook, spills, caller),
         "CONCAT" => EvalValue::Scalar(eval_concat(&args, workbook, spills)),
+        "CONCATENATE" => text_conv::eval_concatenate(args, workbook, spills, caller),
+        "TEXTJOIN" => text_conv::eval_textjoin(args, workbook, spills, caller),
+        "TEXTBEFORE" => text_conv::eval_text_before_or_after(args, workbook, spills, caller, false),
+        "TEXTAFTER" => text_conv::eval_text_before_or_after(args, workbook, spills, caller, true),
+        "TEXTSPLIT" => text_conv::eval_textsplit(args, workbook, spills, caller),
+        "EXACT" => text_conv::eval_exact(args, workbook, spills, caller),
+        "PROPER" => text_conv::eval_proper(args, workbook, spills, caller),
+        "REPT" => text_conv::eval_rept(args, workbook, spills, caller),
+        "CHAR" => text_conv::eval_char(args, workbook, spills, caller),
+        "CODE" => text_conv::eval_code(args, workbook, spills, caller),
+        "UNICHAR" => text_conv::eval_unichar(args, workbook, spills, caller),
+        "UNICODE" => text_conv::eval_unicode(args, workbook, spills, caller),
+        "CLEAN" => text_conv::eval_clean(args, workbook, spills, caller),
+        "T" => text_conv::eval_t(args, workbook, spills, caller),
+        "N" => text_conv::eval_n(args, workbook, spills, caller),
+        "FIXED" => text_conv::eval_fixed(args, workbook, spills, caller),
+        "DOLLAR" => text_conv::eval_dollar(args, workbook, spills, caller),
+        "NUMBERVALUE" => text_conv::eval_numbervalue(args, workbook, spills, caller),
         "FIND" => text_conv::eval_find_or_search(args, workbook, spills, caller, true),
         "SEARCH" => text_conv::eval_find_or_search(args, workbook, spills, caller, false),
         "SUBSTITUTE" => text_conv::eval_substitute(args, workbook, spills, caller),
@@ -211,7 +276,7 @@ pub fn eval_eager_function(
         "VALUE" => text_conv::eval_value(args, workbook, spills, caller),
         "TEXT" => text_conv::eval_text(args, workbook, spills, caller),
 
-        // --- Layer 0: Type predicates ---
+        // --- Layer 0: Basic type predicates ---
         "ISBLANK" => lift_unary(args, workbook, spills, caller, |x| {
             EvalScalar::Bool(matches!(x, EvalScalar::Empty))
         }),
@@ -228,7 +293,7 @@ pub fn eval_eager_function(
             EvalScalar::Bool(matches!(x, EvalScalar::Error(_)))
         }),
 
-        // --- Layer 0 & Layer 1: Structural & Lookup ---
+        // --- Layer 0, Layer 1 & M3a: Lookup & Dynamic Arrays ---
         "ROW" => EvalValue::Scalar(eval_row_or_col(&args, workbook, caller, true)),
         "COLUMN" => EvalValue::Scalar(eval_row_or_col(&args, workbook, caller, false)),
         "ROWS" => lookup::eval_rows_or_columns(&args, workbook, true),
@@ -237,14 +302,78 @@ pub fn eval_eager_function(
         "MATCH" => lookup::eval_match(args, workbook, spills, caller),
         "VLOOKUP" => lookup::eval_vlookup_or_hlookup(args, workbook, spills, caller, true),
         "HLOOKUP" => lookup::eval_vlookup_or_hlookup(args, workbook, spills, caller, false),
+        "XLOOKUP" => lookup::eval_xlookup(args, workbook, spills, caller),
+        "XMATCH" => lookup::eval_xmatch(args, workbook, spills, caller),
+        "LOOKUP" => lookup::eval_lookup(args, workbook, spills, caller),
+        "ADDRESS" => lookup::eval_address(args, workbook, spills, caller),
+        "AREAS" => lookup::eval_areas(&args),
+        "TRANSPOSE" => dynamic_array::eval_transpose(args, workbook, spills),
+        "FILTER" => dynamic_array::eval_filter(args, workbook, spills),
+        "SORT" => dynamic_array::eval_sort(args, workbook, spills, caller),
+        "SORTBY" => dynamic_array::eval_sortby(args, workbook, spills, caller),
+        "UNIQUE" => dynamic_array::eval_unique(args, workbook, spills, caller),
+        "SEQUENCE" => dynamic_array::eval_sequence(args, workbook, spills, caller),
+        "RANDARRAY" => dynamic_array::eval_randarray(args, workbook, spills, caller, env),
+        "CHOOSECOLS" => dynamic_array::eval_choose_slice(args, workbook, spills, caller, false),
+        "CHOOSEROWS" => dynamic_array::eval_choose_slice(args, workbook, spills, caller, true),
+        "TAKE" => dynamic_array::eval_take_or_drop(args, workbook, spills, caller, false),
+        "DROP" => dynamic_array::eval_take_or_drop(args, workbook, spills, caller, true),
+        "HSTACK" => dynamic_array::eval_stack(args, workbook, spills, true),
+        "VSTACK" => dynamic_array::eval_stack(args, workbook, spills, false),
 
-        // --- Layer 1: Conditional aggregation ---
+        // --- Layer 1 & M3a: Conditional Aggregation ---
         "COUNTBLANK" => criteria::eval_countblank(&args, workbook, spills),
         "COUNTIF" => criteria::eval_countif(args, workbook, spills, caller),
         "SUMIF" => criteria::eval_sumif_or_averageif(args, workbook, spills, caller, false),
         "AVERAGEIF" => criteria::eval_sumif_or_averageif(args, workbook, spills, caller, true),
+        "COUNTIFS" => criteria::eval_multi_ifs(
+            args,
+            workbook,
+            spills,
+            caller,
+            criteria::MultiIfsKind::Count,
+        ),
+        "SUMIFS" => {
+            criteria::eval_multi_ifs(args, workbook, spills, caller, criteria::MultiIfsKind::Sum)
+        }
+        "AVERAGEIFS" => criteria::eval_multi_ifs(
+            args,
+            workbook,
+            spills,
+            caller,
+            criteria::MultiIfsKind::Average,
+        ),
+        "MAXIFS" => {
+            criteria::eval_multi_ifs(args, workbook, spills, caller, criteria::MultiIfsKind::Max)
+        }
+        "MINIFS" => {
+            criteria::eval_multi_ifs(args, workbook, spills, caller, criteria::MultiIfsKind::Min)
+        }
+        "SUMPRODUCT" => criteria::eval_sumproduct(args, workbook, spills),
+        "SUBTOTAL" => criteria::eval_subtotal(args, workbook, spills, caller, is_row_hidden),
+        "AGGREGATE" => criteria::eval_aggregate(args, workbook, spills, caller, is_row_hidden),
 
-        // --- Layer 1: Date basics ---
+        // --- M3a: Statistical & Distribution (16 + 6 aliases) ---
+        "MEDIAN" => stats::eval_median(&args, workbook, spills),
+        "MODE.SNGL" | "MODE" => stats::eval_mode_sngl(&args, workbook, spills),
+        "LARGE" => stats::eval_large_or_small(args, workbook, spills, caller, true),
+        "SMALL" => stats::eval_large_or_small(args, workbook, spills, caller, false),
+        "RANK.EQ" | "RANK" => stats::eval_rank(args, workbook, spills, caller, false),
+        "RANK.AVG" => stats::eval_rank(args, workbook, spills, caller, true),
+        "PERCENTILE.INC" | "PERCENTILE" => {
+            stats::eval_percentile(args, workbook, spills, caller, false)
+        }
+        "PERCENTILE.EXC" => stats::eval_percentile(args, workbook, spills, caller, true),
+        "QUARTILE.INC" | "QUARTILE" => stats::eval_quartile(args, workbook, spills, caller, false),
+        "QUARTILE.EXC" => stats::eval_quartile(args, workbook, spills, caller, true),
+        "STDEV.S" | "STDEV" => stats::eval_var_or_stdev(&args, workbook, spills, true, true),
+        "STDEV.P" => stats::eval_var_or_stdev(&args, workbook, spills, false, true),
+        "VAR.S" | "VAR" => stats::eval_var_or_stdev(&args, workbook, spills, true, false),
+        "VAR.P" => stats::eval_var_or_stdev(&args, workbook, spills, false, false),
+        "CORREL" => stats::eval_correl(&args, workbook, spills),
+        "FREQUENCY" => stats::eval_frequency(&args, workbook, spills),
+
+        // --- Layer 1 & M3a: Date & Time ---
         "DATE" => datetime::eval_date(args, workbook, spills, caller),
         "YEAR" => datetime::eval_date_part(args, workbook, spills, caller, 0),
         "MONTH" => datetime::eval_date_part(args, workbook, spills, caller, 1),
@@ -252,6 +381,30 @@ pub fn eval_eager_function(
         "EDATE" => datetime::eval_edate_or_eomonth(args, workbook, spills, caller, false),
         "EOMONTH" => datetime::eval_edate_or_eomonth(args, workbook, spills, caller, true),
         "DAYS" => datetime::eval_days(args, workbook, spills, caller),
+        "TIME" => datetime::eval_time(args, workbook, spills, caller),
+        "HOUR" => datetime::eval_time_part(args, workbook, spills, caller, 0),
+        "MINUTE" => datetime::eval_time_part(args, workbook, spills, caller, 1),
+        "SECOND" => datetime::eval_time_part(args, workbook, spills, caller, 2),
+        "DATEVALUE" => datetime::eval_datevalue(args, workbook, spills, caller),
+        "TIMEVALUE" => datetime::eval_timevalue(args, workbook, spills, caller),
+        "WEEKDAY" => datetime::eval_weekday(args, workbook, spills, caller),
+        "WEEKNUM" => datetime::eval_weeknum(args, workbook, spills, caller),
+        "ISOWEEKNUM" => datetime::eval_isoweeknum(args, workbook, spills, caller),
+        "DATEDIF" => datetime::eval_datedif(args, workbook, spills, caller),
+        "DAYS360" => datetime::eval_days360(args, workbook, spills, caller),
+        "NETWORKDAYS" => datetime::eval_networkdays(args, workbook, spills, caller),
+        "WORKDAY" => datetime::eval_workday(args, workbook, spills, caller),
+        "YEARFRAC" => datetime::eval_yearfrac(args, workbook, spills, caller),
+
+        // --- M3a: Financial ---
+        "PMT" => financial::eval_pmt(args, workbook, spills, caller),
+        "PV" => financial::eval_pv(args, workbook, spills, caller),
+        "FV" => financial::eval_fv(args, workbook, spills, caller),
+        "NPER" => financial::eval_nper(args, workbook, spills, caller),
+        "RATE" => financial::eval_rate(args, workbook, spills, caller),
+        "NPV" => financial::eval_npv(args, workbook, spills, caller),
+        "IRR" => financial::eval_irr(args, workbook, spills, caller),
+        "SLN" => financial::eval_sln(args, workbook, spills, caller),
 
         _ => EvalValue::Scalar(EvalScalar::Error(CalcError::Name)),
     }
@@ -539,6 +692,7 @@ fn visit_numeric_arg(
     mut f: impl FnMut(f64) -> Result<(), CalcError>,
 ) -> Result<(), CalcError> {
     match arg {
+        EvalValue::Missing => Ok(()),
         EvalValue::Scalar(s) => match s {
             EvalScalar::Empty => Ok(()),
             _ => f(s.to_number()?),
@@ -581,6 +735,7 @@ fn eval_count(
     let mut count: u64 = 0;
     for arg in args {
         match arg {
+            EvalValue::Missing => {}
             EvalValue::Scalar(s) => {
                 if !matches!(s, EvalScalar::Empty | EvalScalar::Error(_)) && s.to_number().is_ok() {
                     count = count.saturating_add(1);
@@ -622,6 +777,7 @@ fn eval_counta(
     let mut count: u64 = 0;
     for arg in args {
         match arg {
+            EvalValue::Missing => {}
             EvalValue::Scalar(s) => {
                 if !matches!(s, EvalScalar::Empty) {
                     count = count.saturating_add(1);
@@ -886,15 +1042,13 @@ fn eval_and_or(
 
     for arg in args {
         match arg {
-            EvalValue::Scalar(s) => match s {
-                EvalScalar::Empty => {}
-                _ => match s.to_bool() {
-                    Ok(b) => {
-                        seen_any = true;
-                        acc = if is_and { acc && b } else { acc || b };
-                    }
-                    Err(e) => return EvalScalar::Error(e),
-                },
+            EvalValue::Missing | EvalValue::Scalar(EvalScalar::Empty) => {}
+            EvalValue::Scalar(s) => match s.to_bool() {
+                Ok(b) => {
+                    seen_any = true;
+                    acc = if is_and { acc && b } else { acc || b };
+                }
+                Err(e) => return EvalScalar::Error(e),
             },
             EvalValue::Array(arr) => {
                 for item in &arr.values {
@@ -1128,6 +1282,7 @@ fn eval_concat(
 
     for arg in args {
         match arg {
+            EvalValue::Missing => {}
             EvalValue::Scalar(s) => match s.to_text() {
                 Ok(t) => {
                     if let Err(e) = append(&t) {

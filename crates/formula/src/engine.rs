@@ -1343,6 +1343,7 @@ impl FormulaEngine {
 
         let top = match val {
             EvalValue::Scalar(s) => TopLevelResult::Scalar(s),
+            EvalValue::Missing => TopLevelResult::Scalar(EvalScalar::Number(0.0)),
             EvalValue::Array(arr) => TopLevelResult::Array(arr),
             EvalValue::Reference(r) => {
                 match materialise_reference(&r, &self.workbook, &self.spills) {
@@ -2588,6 +2589,7 @@ impl FormulaEngine {
                 };
                 ExprOutcome::Ready(EvalValue::Scalar(scalar))
             }
+            BoundExpr::MissingArg => ExprOutcome::Ready(EvalValue::Missing),
             // Explicit parentheses suppress outermost `Add`/`Sub` tail-zeroing!
             BoundExpr::Paren(inner) => self.eval_expr(inner, caller, false, next_depth),
             BoundExpr::Unary { op, expr: inner } => {
@@ -2881,9 +2883,509 @@ impl FormulaEngine {
             ));
         }
 
-        // 2. Coordinate/shape-only functions (`ROW`, `COLUMN`, `ROWS`, `COLUMNS`)
-        // do NOT dereference cell values inside their reference argument!
-        let deref_args = !matches!(name, "ROW" | "COLUMN" | "ROWS" | "COLUMNS");
+        if name == "IFS" {
+            if args.is_empty() || !args.len().is_multiple_of(2) {
+                return ExprOutcome::Ready(EvalValue::Scalar(EvalScalar::Error(CalcError::Value)));
+            }
+            let pair_count = args.len() / 2;
+            let mut conds_so_far = Vec::with_capacity(pair_count);
+            let mut array_mode = false;
+            for pair_idx in 0..pair_count {
+                let Some(cond_expr) = args.get(pair_idx.saturating_mul(2)) else {
+                    break;
+                };
+                let cond_raw = match self.eval_expr(cond_expr, caller, false, depth) {
+                    ExprOutcome::Ready(v) => v,
+                    other => return other,
+                };
+                if let Err(wait) = self.ensure_value_ready(&cond_raw) {
+                    return wait;
+                }
+                let cond_sa =
+                    match coerce_for_scalar_op(cond_raw, &self.workbook, &self.spills, caller) {
+                        Ok(sa) => sa,
+                        Err(e) => {
+                            return ExprOutcome::Ready(EvalValue::Scalar(EvalScalar::Error(e)));
+                        }
+                    };
+                match &cond_sa {
+                    crate::value_eval::ScalarOrArray::Scalar(sc) if !array_mode => {
+                        match sc.to_bool() {
+                            Err(e) => {
+                                return ExprOutcome::Ready(EvalValue::Scalar(EvalScalar::Error(e)));
+                            }
+                            Ok(true) => {
+                                let Some(val_expr) =
+                                    args.get(pair_idx.saturating_mul(2).saturating_add(1))
+                                else {
+                                    return ExprOutcome::Ready(EvalValue::Scalar(
+                                        EvalScalar::Error(CalcError::Value),
+                                    ));
+                                };
+                                let v = match self.eval_expr(val_expr, caller, false, depth) {
+                                    ExprOutcome::Ready(v) => v,
+                                    other => return other,
+                                };
+                                if let Err(wait) = self.ensure_value_ready(&v) {
+                                    return wait;
+                                }
+                                return ExprOutcome::Ready(
+                                    crate::functions::finalize_branch_value(
+                                        v,
+                                        &self.workbook,
+                                        &self.spills,
+                                        caller,
+                                    ),
+                                );
+                            }
+                            Ok(false) => {
+                                conds_so_far.push(cond_sa);
+                            }
+                        }
+                    }
+                    _ => {
+                        array_mode = true;
+                        conds_so_far.push(cond_sa);
+                    }
+                }
+            }
+            if !array_mode {
+                return ExprOutcome::Ready(EvalValue::Scalar(EvalScalar::Error(CalcError::Na)));
+            }
+            let mut branch_vals = Vec::with_capacity(pair_count);
+            let mut blocked: SmallVec<[u32; 4]> = SmallVec::new();
+            for pair_idx in 0..pair_count {
+                let Some(cond_sa) = conds_so_far.get(pair_idx) else {
+                    branch_vals.push(None);
+                    continue;
+                };
+                let needed = match cond_sa {
+                    crate::value_eval::ScalarOrArray::Scalar(s) => matches!(s.to_bool(), Ok(true)),
+                    crate::value_eval::ScalarOrArray::Array(arr) => {
+                        arr.values.iter().any(|s| matches!(s.to_bool(), Ok(true)))
+                    }
+                };
+                if !needed {
+                    branch_vals.push(None);
+                    continue;
+                }
+                let Some(val_expr) = args.get(pair_idx.saturating_mul(2).saturating_add(1)) else {
+                    branch_vals.push(None);
+                    continue;
+                };
+                let val = match self.eval_expr(val_expr, caller, false, depth) {
+                    ExprOutcome::Ready(v) => v,
+                    ExprOutcome::Cycle(c) => return ExprOutcome::Cycle(c),
+                    ExprOutcome::Blocked(b) => {
+                        merge_blocked(&mut blocked, b);
+                        branch_vals.push(None);
+                        continue;
+                    }
+                };
+                if let Err(wait) = self.ensure_value_ready(&val) {
+                    match wait {
+                        ExprOutcome::Cycle(c) => return ExprOutcome::Cycle(c),
+                        ExprOutcome::Blocked(b) => merge_blocked(&mut blocked, b),
+                        ExprOutcome::Ready(_) => {}
+                    }
+                }
+                branch_vals.push(Some(val));
+            }
+            if !blocked.is_empty() {
+                return ExprOutcome::Blocked(blocked);
+            }
+            return ExprOutcome::Ready(crate::functions::combine_ifs_array(
+                &conds_so_far,
+                branch_vals,
+                &self.workbook,
+                &self.spills,
+                caller,
+            ));
+        }
+
+        if name == "SWITCH" {
+            if args.len() < 3 {
+                return ExprOutcome::Ready(EvalValue::Scalar(EvalScalar::Error(CalcError::Value)));
+            }
+            let Some(expr_ast) = args.first() else {
+                return ExprOutcome::Ready(EvalValue::Scalar(EvalScalar::Error(CalcError::Value)));
+            };
+            let target_raw = match self.eval_expr(expr_ast, caller, false, depth) {
+                ExprOutcome::Ready(v) => v,
+                other => return other,
+            };
+            if let Err(wait) = self.ensure_value_ready(&target_raw) {
+                return wait;
+            }
+            let target_sa =
+                match coerce_for_scalar_op(target_raw, &self.workbook, &self.spills, caller) {
+                    Ok(sa) => sa,
+                    Err(e) => return ExprOutcome::Ready(EvalValue::Scalar(EvalScalar::Error(e))),
+                };
+            let rest = args.get(1..).unwrap_or(&[]);
+            let pair_count = rest.len() / 2;
+            let default_expr = if rest.len() % 2 == 1 {
+                rest.last()
+            } else {
+                None
+            };
+            if let crate::value_eval::ScalarOrArray::Scalar(ref target_sc) = target_sa {
+                if let EvalScalar::Error(e) = target_sc {
+                    return ExprOutcome::Ready(EvalValue::Scalar(EvalScalar::Error(*e)));
+                }
+                for p in 0..pair_count {
+                    let (Some(cand_expr), Some(res_expr)) = (
+                        rest.get(p.saturating_mul(2)),
+                        rest.get(p.saturating_mul(2).saturating_add(1)),
+                    ) else {
+                        continue;
+                    };
+                    let cand_raw = match self.eval_expr(cand_expr, caller, false, depth) {
+                        ExprOutcome::Ready(v) => v,
+                        other => return other,
+                    };
+                    if let Err(wait) = self.ensure_value_ready(&cand_raw) {
+                        return wait;
+                    }
+                    let cand_sa = match coerce_for_scalar_op(
+                        cand_raw,
+                        &self.workbook,
+                        &self.spills,
+                        caller,
+                    ) {
+                        Ok(sa) => sa,
+                        Err(e) => {
+                            return ExprOutcome::Ready(EvalValue::Scalar(EvalScalar::Error(e)));
+                        }
+                    };
+                    let crate::value_eval::ScalarOrArray::Scalar(cand_sc) = cand_sa else {
+                        return ExprOutcome::Ready(EvalValue::Scalar(EvalScalar::Error(
+                            CalcError::Value,
+                        )));
+                    };
+                    match crate::functions::switch_scalar_eq(target_sc, &cand_sc) {
+                        Ok(true) => {
+                            let v = match self.eval_expr(res_expr, caller, false, depth) {
+                                ExprOutcome::Ready(v) => v,
+                                other => return other,
+                            };
+                            if let Err(wait) = self.ensure_value_ready(&v) {
+                                return wait;
+                            }
+                            return ExprOutcome::Ready(crate::functions::finalize_branch_value(
+                                v,
+                                &self.workbook,
+                                &self.spills,
+                                caller,
+                            ));
+                        }
+                        Ok(false) => {}
+                        Err(e) => {
+                            return ExprOutcome::Ready(EvalValue::Scalar(EvalScalar::Error(e)));
+                        }
+                    }
+                }
+                if let Some(def_e) = default_expr {
+                    let v = match self.eval_expr(def_e, caller, false, depth) {
+                        ExprOutcome::Ready(v) => v,
+                        other => return other,
+                    };
+                    if let Err(wait) = self.ensure_value_ready(&v) {
+                        return wait;
+                    }
+                    return ExprOutcome::Ready(crate::functions::finalize_branch_value(
+                        v,
+                        &self.workbook,
+                        &self.spills,
+                        caller,
+                    ));
+                }
+                return ExprOutcome::Ready(EvalValue::Scalar(EvalScalar::Error(CalcError::Na)));
+            }
+            // Array target fallback: evaluate arguments and match elementwise.
+            let mut evaled_cands = Vec::with_capacity(pair_count);
+            let mut evaled_res = Vec::with_capacity(pair_count);
+            for p in 0..pair_count {
+                let (Some(cand_e), Some(res_e)) = (
+                    rest.get(p.saturating_mul(2)),
+                    rest.get(p.saturating_mul(2).saturating_add(1)),
+                ) else {
+                    continue;
+                };
+                let cv = match self.eval_expr(cand_e, caller, false, depth) {
+                    ExprOutcome::Ready(v) => v,
+                    other => return other,
+                };
+                if let Err(wait) = self.ensure_value_ready(&cv) {
+                    return wait;
+                }
+                let rv = match self.eval_expr(res_e, caller, false, depth) {
+                    ExprOutcome::Ready(v) => v,
+                    other => return other,
+                };
+                if let Err(wait) = self.ensure_value_ready(&rv) {
+                    return wait;
+                }
+                evaled_cands.push(cv);
+                evaled_res.push(rv);
+            }
+            let evaled_def = match default_expr {
+                None => None,
+                Some(def_e) => {
+                    let dv = match self.eval_expr(def_e, caller, false, depth) {
+                        ExprOutcome::Ready(v) => v,
+                        other => return other,
+                    };
+                    if let Err(wait) = self.ensure_value_ready(&dv) {
+                        return wait;
+                    }
+                    Some(dv)
+                }
+            };
+            let crate::value_eval::ScalarOrArray::Array(arr) = target_sa else {
+                return ExprOutcome::Ready(EvalValue::Scalar(EvalScalar::Error(CalcError::Value)));
+            };
+            let mut out = Vec::with_capacity(arr.values.len());
+            for tsc in &arr.values {
+                if let EvalScalar::Error(e) = tsc {
+                    out.push(EvalScalar::Error(*e));
+                    continue;
+                }
+                let mut hit: Option<EvalScalar> = None;
+                for (cv, rv) in evaled_cands.iter().zip(evaled_res.iter()) {
+                    let cs = match coerce_for_scalar_op(
+                        cv.clone(),
+                        &self.workbook,
+                        &self.spills,
+                        caller,
+                    ) {
+                        Ok(crate::value_eval::ScalarOrArray::Scalar(s)) => s,
+                        Ok(_) => {
+                            hit = Some(EvalScalar::Error(CalcError::Value));
+                            break;
+                        }
+                        Err(e) => {
+                            hit = Some(EvalScalar::Error(e));
+                            break;
+                        }
+                    };
+                    match crate::functions::switch_scalar_eq(tsc, &cs) {
+                        Ok(true) => {
+                            let rs = match coerce_for_scalar_op(
+                                rv.clone(),
+                                &self.workbook,
+                                &self.spills,
+                                caller,
+                            ) {
+                                Ok(crate::value_eval::ScalarOrArray::Scalar(s)) => s,
+                                Ok(_) => EvalScalar::Error(CalcError::Value),
+                                Err(e) => EvalScalar::Error(e),
+                            };
+                            hit = Some(rs);
+                            break;
+                        }
+                        Ok(false) => {}
+                        Err(e) => {
+                            hit = Some(EvalScalar::Error(e));
+                            break;
+                        }
+                    }
+                }
+                let final_cell = match hit {
+                    Some(s) => s,
+                    None => match &evaled_def {
+                        None => EvalScalar::Error(CalcError::Na),
+                        Some(dv) => match coerce_for_scalar_op(
+                            dv.clone(),
+                            &self.workbook,
+                            &self.spills,
+                            caller,
+                        ) {
+                            Ok(crate::value_eval::ScalarOrArray::Scalar(s)) => s,
+                            Ok(_) => EvalScalar::Error(CalcError::Value),
+                            Err(e) => EvalScalar::Error(e),
+                        },
+                    },
+                };
+                out.push(final_cell);
+            }
+            return ExprOutcome::Ready(
+                crate::value_eval::Array2D::new(arr.rows, arr.cols, out).map_or_else(
+                    |e| EvalValue::Scalar(EvalScalar::Error(e)),
+                    EvalValue::Array,
+                ),
+            );
+        }
+
+        if name == "OFFSET" {
+            if !(3..=5).contains(&args.len()) {
+                return ExprOutcome::Ready(EvalValue::Scalar(EvalScalar::Error(CalcError::Value)));
+            }
+            let Some(ref_expr) = args.first() else {
+                return ExprOutcome::Ready(EvalValue::Scalar(EvalScalar::Error(CalcError::Value)));
+            };
+            // Arg 0 MUST NOT be dereferenced!
+            let base_ref = match self.eval_expr(ref_expr, caller, false, depth) {
+                ExprOutcome::Ready(v) => v,
+                other => return other,
+            };
+            let mut evaled = Vec::with_capacity(args.len());
+            evaled.push(base_ref.clone());
+            let mut blocked: SmallVec<[u32; 4]> = SmallVec::new();
+            for arg in args.get(1..).unwrap_or(&[]) {
+                let v = match self.eval_expr(arg, caller, false, depth) {
+                    ExprOutcome::Ready(v) => v,
+                    ExprOutcome::Cycle(c) => return ExprOutcome::Cycle(c),
+                    ExprOutcome::Blocked(b) => {
+                        merge_blocked(&mut blocked, b);
+                        continue;
+                    }
+                };
+                if let Err(wait) = self.ensure_value_ready(&v) {
+                    match wait {
+                        ExprOutcome::Cycle(c) => return ExprOutcome::Cycle(c),
+                        ExprOutcome::Blocked(b) => merge_blocked(&mut blocked, b),
+                        ExprOutcome::Ready(_) => {}
+                    }
+                }
+                evaled.push(v);
+            }
+            if !blocked.is_empty() {
+                return ExprOutcome::Blocked(blocked);
+            }
+            let out_ref = crate::functions::eval_offset(
+                base_ref,
+                &evaled,
+                &self.workbook,
+                &self.spills,
+                caller,
+            );
+            if let Err(wait) = self.ensure_value_ready(&out_ref) {
+                return wait;
+            }
+            return ExprOutcome::Ready(out_ref);
+        }
+
+        if name == "INDIRECT" {
+            if !(1..=2).contains(&args.len()) {
+                return ExprOutcome::Ready(EvalValue::Scalar(EvalScalar::Error(CalcError::Value)));
+            }
+            let Some(txt_expr) = args.first() else {
+                return ExprOutcome::Ready(EvalValue::Scalar(EvalScalar::Error(CalcError::Value)));
+            };
+            let txt_raw = match self.eval_expr(txt_expr, caller, false, depth) {
+                ExprOutcome::Ready(v) => v,
+                other => return other,
+            };
+            if let Err(wait) = self.ensure_value_ready(&txt_raw) {
+                return wait;
+            }
+            let txt_sa = match coerce_for_scalar_op(txt_raw, &self.workbook, &self.spills, caller) {
+                Ok(sa) => sa,
+                Err(e) => return ExprOutcome::Ready(EvalValue::Scalar(EvalScalar::Error(e))),
+            };
+            let a1_style = match args.get(1) {
+                None => true,
+                Some(a1_expr) => {
+                    let av = match self.eval_expr(a1_expr, caller, false, depth) {
+                        ExprOutcome::Ready(v) => v,
+                        other => return other,
+                    };
+                    if let Err(wait) = self.ensure_value_ready(&av) {
+                        return wait;
+                    }
+                    if matches!(av, EvalValue::Missing) {
+                        true
+                    } else {
+                        match coerce_for_scalar_op(av, &self.workbook, &self.spills, caller) {
+                            Ok(crate::value_eval::ScalarOrArray::Scalar(sc)) => {
+                                match sc.to_bool() {
+                                    Ok(b) => b,
+                                    Err(e) => {
+                                        return ExprOutcome::Ready(EvalValue::Scalar(
+                                            EvalScalar::Error(e),
+                                        ));
+                                    }
+                                }
+                            }
+                            Ok(_) => {
+                                return ExprOutcome::Ready(EvalValue::Scalar(EvalScalar::Error(
+                                    CalcError::Value,
+                                )));
+                            }
+                            Err(e) => {
+                                return ExprOutcome::Ready(EvalValue::Scalar(EvalScalar::Error(e)));
+                            }
+                        }
+                    }
+                }
+            };
+            let crate::value_eval::ScalarOrArray::Scalar(txt_sc) = txt_sa else {
+                return ExprOutcome::Ready(EvalValue::Scalar(EvalScalar::Error(CalcError::Value)));
+            };
+            let ref_str = match txt_sc.to_text() {
+                Ok(s) => s,
+                Err(e) => return ExprOutcome::Ready(EvalValue::Scalar(EvalScalar::Error(e))),
+            };
+            match crate::functions::resolve_indirect(&ref_str, a1_style, &self.workbook, caller) {
+                Err(e) => return ExprOutcome::Ready(EvalValue::Scalar(EvalScalar::Error(e))),
+                Ok(crate::functions::IndirectTarget::Ref(r)) => {
+                    let val = EvalValue::Reference(r);
+                    if let Err(wait) = self.ensure_value_ready(&val) {
+                        return wait;
+                    }
+                    return ExprOutcome::Ready(val);
+                }
+                Ok(crate::functions::IndirectTarget::NamedRange { scope_sheet, name }) => {
+                    let res = self.eval_named_range(scope_sheet, &name, caller, depth);
+                    if let ExprOutcome::Ready(ref val) = res
+                        && let Err(wait) = self.ensure_value_ready(val)
+                    {
+                        return wait;
+                    }
+                    return res;
+                }
+                Ok(crate::functions::IndirectTarget::SpillAnchor { sheet, row, col }) => {
+                    let cell_val = EvalValue::Reference(ResolvedRef::Cell { sheet, row, col });
+                    if let Err(wait) = self.ensure_value_ready(&cell_val) {
+                        return wait;
+                    }
+                    let Some(entry) = self.spills.active_spill((sheet, row, col)) else {
+                        return ExprOutcome::Ready(EvalValue::Scalar(EvalScalar::Error(
+                            CalcError::Ref,
+                        )));
+                    };
+                    let (Some(&fr), Some(&lr), Some(&fc), Some(&lc)) = (
+                        entry.rows.first(),
+                        entry.rows.last(),
+                        entry.cols.first(),
+                        entry.cols.last(),
+                    ) else {
+                        return ExprOutcome::Ready(EvalValue::Scalar(EvalScalar::Error(
+                            CalcError::Ref,
+                        )));
+                    };
+                    let out = EvalValue::Reference(ResolvedRef::Area {
+                        sheet,
+                        first_row: RowId(fr.0),
+                        last_row: RowId(lr.0),
+                        first_col: ColId(fc.0),
+                        last_col: ColId(lc.0),
+                    });
+                    if let Err(wait) = self.ensure_value_ready(&out) {
+                        return wait;
+                    }
+                    return ExprOutcome::Ready(out);
+                }
+            }
+        }
+
+        // 2. Coordinate/shape/metadata-only functions (`ROW`, `COLUMN`, `ROWS`,
+        // `COLUMNS`, `ISREF`, `ISFORMULA`, `AREAS`) do NOT dereference cell values!
+        let deref_args = !matches!(
+            name,
+            "ROW" | "COLUMN" | "ROWS" | "COLUMNS" | "ISREF" | "ISFORMULA" | "AREAS"
+        );
 
         let mut evaluated_args = Vec::with_capacity(args.len());
         let mut all_blocked: SmallVec<[u32; 4]> = SmallVec::new();
@@ -2916,6 +3418,7 @@ impl FormulaEngine {
             &self.spills,
             caller,
             &mut self.env,
+            None,
         ))
     }
 

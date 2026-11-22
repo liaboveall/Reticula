@@ -1523,7 +1523,8 @@ fn validate_and_normalize_direct_expr(
         BoundExpr::ScopedName { .. }
         | BoundExpr::SpillRef(_)
         | BoundExpr::Opaque { .. }
-        | BoundExpr::PreservedCached { .. } => Err(SnapshotError::Codec),
+        | BoundExpr::PreservedCached { .. }
+        | BoundExpr::MissingArg => Err(SnapshotError::Codec),
         BoundExpr::Paren(inner) | BoundExpr::Unary { expr: inner, .. } => {
             validate_and_normalize_direct_expr(inner, next)
         }

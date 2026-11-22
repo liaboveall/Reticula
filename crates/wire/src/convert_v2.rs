@@ -596,6 +596,7 @@ mod tests {
                 raw: String::from("=FUTURE()"),
                 cached: ScalarValue::Number(7.0),
             },
+            BoundExpr::MissingArg,
         ];
         for expr in m3a_bound_exprs {
             let bf = BoundFormula {
@@ -644,6 +645,7 @@ mod tests {
                 raw: String::from("=FUTURE()"),
                 cached: ScalarValue::Bool(true),
             },
+            TemplateExpr::MissingArg,
         ];
         for expr in m3a_template_exprs {
             let tf = TemplateFormula {

@@ -129,6 +129,12 @@ impl SpillRegistry {
         self.anchors.get(&anchor)
     }
 
+    /// Returns whether `anchor` is currently blocked (`#SPILL!`).
+    #[must_use]
+    pub fn is_blocked_anchor(&self, anchor: WorkbookCellKey) -> bool {
+        self.blocked_anchors.contains_key(&anchor)
+    }
+
     /// Returns the `(rows, cols)` dimensions of an active spill anchored at `anchor`.
     #[must_use]
     pub fn spill_shape(&self, anchor: WorkbookCellKey) -> Option<(u32, u32)> {

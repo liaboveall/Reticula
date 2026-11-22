@@ -1,6 +1,5 @@
-//! Structured formula conformance test runner covering all 69 Layer-0 and
-//! Layer-1 built-in functions on both native and `wasm32-unknown-unknown`
-//! (`14-m1b.md` 8.1 & 9, reference oracle: Excel 16.0 build 20711).
+//! Structured formula conformance test runner covering all 193 unique built-in
+//! functions (200 catalog entries) on both native and `wasm32-unknown-unknown`.
 
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen_test::wasm_bindgen_test as test;
@@ -34,6 +33,30 @@ const SUITES: &[(&str, &str)] = &[
     (
         "rounding_text_volatile.tsv",
         include_str!("../../../tests/conformance/rounding_text_volatile.tsv"),
+    ),
+    (
+        "m3a_math_trig.tsv",
+        include_str!("../../../tests/conformance/m3a_math_trig.tsv"),
+    ),
+    (
+        "m3a_text.tsv",
+        include_str!("../../../tests/conformance/m3a_text.tsv"),
+    ),
+    (
+        "m3a_datetime.tsv",
+        include_str!("../../../tests/conformance/m3a_datetime.tsv"),
+    ),
+    (
+        "m3a_stats_financial.tsv",
+        include_str!("../../../tests/conformance/m3a_stats_financial.tsv"),
+    ),
+    (
+        "m3a_lookup_logic.tsv",
+        include_str!("../../../tests/conformance/m3a_lookup_logic.tsv"),
+    ),
+    (
+        "m3a_criteria_dynamic.tsv",
+        include_str!("../../../tests/conformance/m3a_criteria_dynamic.tsv"),
     ),
 ];
 
@@ -158,7 +181,7 @@ fn build_fixture_engine() -> FormulaEngine {
 }
 
 #[test]
-fn all_69_functions_pass_excel_conformance_suites() {
+fn all_200_functions_pass_excel_conformance_suites() {
     let mut eng = build_fixture_engine();
     let s0 = SheetId(0);
     let test_col = ColId(15); // Column P
@@ -261,8 +284,8 @@ fn all_69_functions_pass_excel_conformance_suites() {
         }
     }
 
-    // Enforce that every one of the 69 catalogued functions has >= 2 conformance cases!
-    assert_eq!(FUNCTION_CATALOG.len(), 69);
+    // Enforce that every one of the 200 catalogued function entries has >= 2 conformance cases!
+    assert_eq!(FUNCTION_CATALOG.len(), 200);
     for meta in &FUNCTION_CATALOG {
         let count = per_fn_counts.get(meta.name).copied().unwrap_or(0);
         assert!(
@@ -271,4 +294,63 @@ fn all_69_functions_pass_excel_conformance_suites() {
             meta.name
         );
     }
+}
+
+#[test]
+fn dynamic_spills_nested_subtotal_and_cross_references_match_excel() {
+    let mut eng = build_fixture_engine();
+    let s0 = SheetId(0);
+
+    // 1. Dynamic array spill from SEQUENCE & TEXTSPLIT & spill `#` consumer.
+    eng.edit_cell_raw(s0, RowId(10), ColId(0), "=SEQUENCE(3, 2, 10, 5)")
+        .unwrap(); // A11:B13 -> [10,15; 20,25; 30,35]
+    eng.edit_cell_raw(
+        s0,
+        RowId(10),
+        ColId(4),
+        "=TEXTSPLIT(\"x,y;z\", \",\", \";\")",
+    )
+    .unwrap(); // E11:F12 -> [x,y; z,#N/A]
+    eng.edit_cell_raw(s0, RowId(14), ColId(0), "=SUM(A11#)")
+        .unwrap(); // A15 -> 135
+
+    // 2. SUBTOTAL excludes nested SUBTOTAL while summing plain ranges.
+    eng.edit_cell_raw(s0, RowId(20), ColId(0), "10").unwrap();
+    eng.edit_cell_raw(s0, RowId(21), ColId(0), "20").unwrap();
+    eng.edit_cell_raw(s0, RowId(22), ColId(0), "=SUBTOTAL(9, A21:A22)")
+        .unwrap(); // 30
+    eng.edit_cell_raw(s0, RowId(23), ColId(0), "=SUBTOTAL(9, A21:A23)")
+        .unwrap(); // 30 (skips A23 nested SUBTOTAL!)
+
+    // 3. ISFORMULA array spill over mixed cells & INIDRECT dynamic recalc.
+    eng.edit_cell_raw(s0, RowId(25), ColId(0), "=ISFORMULA(C5:C6)")
+        .unwrap(); // A26:A27 -> [FALSE; TRUE]
+    eng.edit_cell_raw(s0, RowId(25), ColId(2), "C1").unwrap();
+    eng.edit_cell_raw(s0, RowId(26), ColId(2), "=INDIRECT(C26)")
+        .unwrap();
+
+    eng.recalc_all();
+
+    assert_eq!(eng.spill_range((s0, RowId(10), ColId(0))), Some((3, 2)));
+    let s = eng.workbook().sheet(s0).unwrap();
+    assert_eq!(s.value_by_id(RowId(14), ColId(0)), Value::Number(135.0));
+    assert_eq!(s.value_by_id(RowId(22), ColId(0)), Value::Number(30.0));
+    assert_eq!(s.value_by_id(RowId(23), ColId(0)), Value::Number(30.0));
+
+    let e11 = eng.inspect_cell(s0, RowId(10), ColId(4)).unwrap();
+    let f12 = eng.inspect_cell(s0, RowId(11), ColId(5)).unwrap();
+    assert_eq!(e11.display, "x");
+    assert_eq!(f12.display, "#N/A");
+    assert_eq!(f12.error.as_deref(), Some("#N/A"));
+
+    let a27 = eng.inspect_cell(s0, RowId(26), ColId(0)).unwrap();
+    assert_eq!(a27.display, "TRUE");
+    let c27 = eng.inspect_cell(s0, RowId(26), ColId(2)).unwrap();
+    assert_eq!(c27.display, "Hello");
+
+    // Mutate C26 -> volatile INDIRECT updates automatically.
+    eng.edit_cell_raw(s0, RowId(25), ColId(2), "G2").unwrap();
+    eng.recalc_all();
+    let c27_new = eng.inspect_cell(s0, RowId(26), ColId(2)).unwrap();
+    assert_eq!(c27_new.display, "20");
 }

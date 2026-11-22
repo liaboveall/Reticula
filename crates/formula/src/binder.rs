@@ -175,6 +175,8 @@ pub enum BoundExpr {
         /// Cached scalar evaluation imported from storage.
         cached: ScalarValue,
     },
+    /// Omitted optional argument in a function call (`XLOOKUP(A1,B1:B5,C1:C5,,0)`).
+    MissingArg,
 }
 
 /// Complete bound formula stored in a workbook cell.
@@ -361,6 +363,8 @@ pub enum TemplateExpr {
         /// Cached scalar value.
         cached: ScalarValue,
     },
+    /// Omitted optional argument in a function call.
+    MissingArg,
 }
 
 /// Compact formula template carried by [`Op::FillFormula`] (`14-m1b.md` 5.2).
@@ -608,7 +612,8 @@ fn remap_bound_expr(
         | BoundExpr::ArrayLiteral { .. }
         | BoundExpr::Name(_)
         | BoundExpr::Opaque { .. }
-        | BoundExpr::PreservedCached { .. } => {}
+        | BoundExpr::PreservedCached { .. }
+        | BoundExpr::MissingArg => {}
         BoundExpr::ScopedName { sheet, .. } => {
             remap_opt_sheet(sheet, sheets);
         }
@@ -684,7 +689,8 @@ fn remap_template_expr(
         | TemplateExpr::ArrayLiteral { .. }
         | TemplateExpr::Name(_)
         | TemplateExpr::Opaque { .. }
-        | TemplateExpr::PreservedCached { .. } => {}
+        | TemplateExpr::PreservedCached { .. }
+        | TemplateExpr::MissingArg => {}
         TemplateExpr::ScopedName { sheet, .. } => {
             remap_opt_sheet(sheet, sheets);
         }
@@ -871,6 +877,7 @@ pub fn bind_expr(ast: &Expr, workbook: &Workbook<BoundFormula>, host_sheet: Shee
                 .map(|arg| bind_expr(arg, workbook, host_sheet))
                 .collect(),
         },
+        Expr::MissingArg => BoundExpr::MissingArg,
     }
 }
 
@@ -944,6 +951,7 @@ fn bind_expr_single_sheet(ast: &Expr, sheet: &Sheet) -> BoundExpr {
                 .map(|arg| bind_expr_single_sheet(arg, sheet))
                 .collect(),
         },
+        Expr::MissingArg => BoundExpr::MissingArg,
     }
 }
 
@@ -1223,6 +1231,7 @@ fn unparse_expr(
         BoundExpr::Opaque { raw } | BoundExpr::PreservedCached { raw, .. } => {
             out.push_str(raw.strip_prefix('=').unwrap_or(raw));
         }
+        BoundExpr::MissingArg => {}
         BoundExpr::Paren(inner) => {
             out.push('(');
             unparse_expr(inner, workbook, host_sheet, out, None);
@@ -1328,6 +1337,7 @@ fn unparse_expr_single_sheet(
         BoundExpr::Opaque { raw } | BoundExpr::PreservedCached { raw, .. } => {
             out.push_str(raw.strip_prefix('=').unwrap_or(raw));
         }
+        BoundExpr::MissingArg => {}
         BoundExpr::Paren(inner) => {
             out.push('(');
             unparse_expr_single_sheet(inner, sheet, out, None);
@@ -1646,7 +1656,8 @@ fn expr_is_structure_sensitive(expr: &BoundExpr) -> bool {
         | BoundExpr::Name(_)
         | BoundExpr::ScopedName { .. }
         | BoundExpr::Opaque { .. }
-        | BoundExpr::PreservedCached { .. } => false,
+        | BoundExpr::PreservedCached { .. }
+        | BoundExpr::MissingArg => false,
         BoundExpr::Paren(inner)
         | BoundExpr::Unary { expr: inner, .. }
         | BoundExpr::SpillRef(inner) => expr_is_structure_sensitive(inner),
@@ -1667,7 +1678,8 @@ fn expr_is_volatile(expr: &BoundExpr) -> bool {
         | BoundExpr::Name(_)
         | BoundExpr::ScopedName { .. }
         | BoundExpr::Opaque { .. }
-        | BoundExpr::PreservedCached { .. } => false,
+        | BoundExpr::PreservedCached { .. }
+        | BoundExpr::MissingArg => false,
         BoundExpr::Paren(inner)
         | BoundExpr::Unary { expr: inner, .. }
         | BoundExpr::SpillRef(inner) => expr_is_volatile(inner),
@@ -1699,7 +1711,7 @@ fn expr_bytes(expr: &BoundExpr) -> usize {
             };
             base.saturating_add(raw.capacity()).saturating_add(text_cap)
         }
-        BoundExpr::Literal(_) | BoundExpr::Reference(_) => base,
+        BoundExpr::Literal(_) | BoundExpr::Reference(_) | BoundExpr::MissingArg => base,
         BoundExpr::ArrayLiteral { elements, .. } => {
             base.saturating_add(elements.capacity().saturating_mul(size_of::<Literal>()))
         }
@@ -1731,7 +1743,8 @@ fn validate_bound_expr(expr: &BoundExpr, depth: usize) -> Result<(), OpError> {
         BoundExpr::Literal(_)
         | BoundExpr::Reference(_)
         | BoundExpr::Name(_)
-        | BoundExpr::ScopedName { .. } => Ok(()),
+        | BoundExpr::ScopedName { .. }
+        | BoundExpr::MissingArg => Ok(()),
         BoundExpr::Opaque { raw } => {
             if raw.chars().count() > MAX_FORMULA_CHARS {
                 Err(OpError::FormulaTooLong)
@@ -1901,6 +1914,7 @@ fn write_expr_digest(expr: &BoundExpr, d: &mut Digest64) {
                 }
             }
         }
+        BoundExpr::MissingArg => d.write_bytes(&[13]),
     }
 }
 
@@ -2008,7 +2022,8 @@ fn validate_template_expr(expr: &TemplateExpr, depth: usize) -> Result<(), OpErr
         TemplateExpr::Literal(_)
         | TemplateExpr::Reference(_)
         | TemplateExpr::Name(_)
-        | TemplateExpr::ScopedName { .. } => Ok(()),
+        | TemplateExpr::ScopedName { .. }
+        | TemplateExpr::MissingArg => Ok(()),
         TemplateExpr::Opaque { raw } => {
             if raw.chars().count() > MAX_FORMULA_CHARS {
                 Err(OpError::FormulaTooLong)
@@ -2086,7 +2101,7 @@ fn template_expanded_bytes(expr: &TemplateExpr) -> usize {
             };
             base.saturating_add(raw.len()).saturating_add(text_len)
         }
-        TemplateExpr::Literal(_) | TemplateExpr::Reference(_) => base,
+        TemplateExpr::Literal(_) | TemplateExpr::Reference(_) | TemplateExpr::MissingArg => base,
         TemplateExpr::ArrayLiteral { elements, .. } => {
             base.saturating_add(elements.len().saturating_mul(size_of::<Literal>()))
         }
@@ -2137,6 +2152,7 @@ fn expand_template_expr(expr: &TemplateExpr, self_row: RowId, self_col: ColId) -
             raw: raw.clone(),
             cached: cached.clone(),
         },
+        TemplateExpr::MissingArg => BoundExpr::MissingArg,
         TemplateExpr::Paren(inner) => {
             BoundExpr::Paren(Box::new(expand_template_expr(inner, self_row, self_col)))
         }
@@ -2247,7 +2263,8 @@ fn collect_expr_range_endpoints(
         | BoundExpr::Name(_)
         | BoundExpr::ScopedName { .. }
         | BoundExpr::Opaque { .. }
-        | BoundExpr::PreservedCached { .. } => {}
+        | BoundExpr::PreservedCached { .. }
+        | BoundExpr::MissingArg => {}
         BoundExpr::Reference(r) => match r {
             BoundRef::Area {
                 sheet,
@@ -2417,7 +2434,8 @@ fn handoff_expr_rows(
         | BoundExpr::Name(_)
         | BoundExpr::ScopedName { .. }
         | BoundExpr::Opaque { .. }
-        | BoundExpr::PreservedCached { .. } => false,
+        | BoundExpr::PreservedCached { .. }
+        | BoundExpr::MissingArg => false,
         BoundExpr::Reference(r) => match r {
             BoundRef::Area {
                 sheet,
@@ -2482,7 +2500,8 @@ fn handoff_expr_cols(
         | BoundExpr::Name(_)
         | BoundExpr::ScopedName { .. }
         | BoundExpr::Opaque { .. }
-        | BoundExpr::PreservedCached { .. } => false,
+        | BoundExpr::PreservedCached { .. }
+        | BoundExpr::MissingArg => false,
         BoundExpr::Reference(r) => match r {
             BoundRef::Area {
                 sheet,
@@ -2556,7 +2575,8 @@ fn finalize_expr_tombstones(expr: &mut BoundExpr, host_sheet: SheetId, sheets: &
         | BoundExpr::ArrayLiteral { .. }
         | BoundExpr::Name(_)
         | BoundExpr::Opaque { .. }
-        | BoundExpr::PreservedCached { .. } => false,
+        | BoundExpr::PreservedCached { .. }
+        | BoundExpr::MissingArg => false,
         BoundExpr::ScopedName {
             sheet,
             missing_sheet,
@@ -2792,6 +2812,7 @@ fn shift_bound_expr_with<'a>(
             raw: raw.clone(),
             cached: cached.clone(),
         },
+        BoundExpr::MissingArg => BoundExpr::MissingArg,
         BoundExpr::Paren(inner) => BoundExpr::Paren(Box::new(shift_bound_expr_with(
             inner, find_sheet, src_sheet, dst_sheet, dr, dc,
         ))),
@@ -3061,7 +3082,8 @@ fn rewrite_bound_expr_for_move_cells(
         | BoundExpr::Name(_)
         | BoundExpr::ScopedName { .. }
         | BoundExpr::Opaque { .. }
-        | BoundExpr::PreservedCached { .. } => false,
+        | BoundExpr::PreservedCached { .. }
+        | BoundExpr::MissingArg => false,
         BoundExpr::Reference(r) => {
             rewrite_bound_ref_for_move_cells(r, host_sheet_before, is_moved_formula, plan)
         }
@@ -3353,6 +3375,7 @@ fn templatize_expr(expr: &BoundExpr, self_row: RowId, self_col: ColId) -> Templa
             raw: raw.clone(),
             cached: cached.clone(),
         },
+        BoundExpr::MissingArg => TemplateExpr::MissingArg,
         BoundExpr::Paren(inner) => {
             TemplateExpr::Paren(Box::new(templatize_expr(inner, self_row, self_col)))
         }
@@ -3692,7 +3715,8 @@ fn collect_ref_splits(
         | BoundExpr::Name(_)
         | BoundExpr::ScopedName { .. }
         | BoundExpr::Opaque { .. }
-        | BoundExpr::PreservedCached { .. } => {}
+        | BoundExpr::PreservedCached { .. }
+        | BoundExpr::MissingArg => {}
         BoundExpr::Paren(inner)
         | BoundExpr::Unary { expr: inner, .. }
         | BoundExpr::SpillRef(inner) => collect_ref_splits(

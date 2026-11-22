@@ -186,6 +186,8 @@ pub enum Expr {
         /// Positional argument expressions.
         args: Vec<Self>,
     },
+    /// Omitted optional argument in a function call (`XLOOKUP(A1,B1:B5,C1:C5,,0)`).
+    MissingArg,
 }
 
 impl Expr {
@@ -350,6 +352,7 @@ impl Expr {
                 }
                 out.push(')');
             }
+            Self::MissingArg => {}
         }
     }
 }

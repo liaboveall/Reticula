@@ -6,11 +6,14 @@
 //! `+0.0`) per S3b Excel 16.0.20711 verification (310/310 cases), and matches
 //! strings case-insensitively with `*` / `?` / `~` wildcards.
 
+use alloc::format;
+use alloc::string::String;
 use alloc::vec::Vec;
 use core::cmp::Ordering;
 
+use reticula_core::axis::{MAX_COL_AXIS_LEN, MAX_ROW_AXIS_LEN};
 use reticula_core::decimal15::cmp_excel_f64;
-use reticula_core::id::{ColId, IdRun, RowId};
+use reticula_core::id::{ColId, IdRun, RowId, SheetId};
 use reticula_core::num;
 use reticula_core::ops::Workbook;
 use reticula_core::sheet::Sheet;
@@ -20,11 +23,13 @@ use reticula_core::value::{CalcError, Value};
 use super::criteria::ref_live_origin_and_size;
 use super::wildcard::{WildToken, compile_wildcard, wildcard_matches_full};
 use super::{empty_to_zero, get_sa, shape_of, trunc_to_isize};
-use crate::binder::BoundFormula;
+use crate::address::{write_col_letters, write_sheet_prefix};
+use crate::binder::{BoundExpr, BoundFormula, bind_expr};
+use crate::parser::parse_formula;
 use crate::spill::SpillRegistry;
 use crate::value_eval::{
     Array2D, CallerContext, EvalScalar, EvalValue, MAX_ARRAY_CELLS, ResolvedRef, ScalarOrArray,
-    coerce_for_scalar_op, read_sheet_cell_effective,
+    coerce_for_scalar_op, read_sheet_cell_effective, resolve_bound_ref,
 };
 
 /// Evaluates `ROWS(array)` (`is_rows == true`) or `COLUMNS(array)` (`is_rows == false`).
@@ -53,6 +58,7 @@ pub fn eval_rows_or_columns(
         }
         EvalValue::Scalar(EvalScalar::Error(e)) => EvalValue::Scalar(EvalScalar::Error(*e)),
         EvalValue::Scalar(_) => EvalValue::Scalar(EvalScalar::Number(1.0)),
+        EvalValue::Missing => EvalValue::Scalar(EvalScalar::Error(CalcError::Value)),
     }
 }
 
@@ -188,6 +194,7 @@ pub fn eval_index(
         EvalValue::Reference(r) => index_into_ref(&r, r_u32, c_u32, two_arg, workbook),
         EvalValue::Array(arr) => index_into_array(&arr, r_u32, c_u32, two_arg),
         EvalValue::Scalar(EvalScalar::Error(e)) => EvalValue::Scalar(EvalScalar::Error(e)),
+        EvalValue::Missing => EvalValue::Scalar(EvalScalar::Error(CalcError::Value)),
         EvalValue::Scalar(s) => {
             if r_u32 <= 1 && c_u32 <= 1 {
                 EvalValue::Scalar(empty_to_zero(s))
@@ -429,7 +436,7 @@ fn match_one(
             )
         }
         EvalValue::Scalar(EvalScalar::Error(e)) => EvalScalar::Error(*e),
-        EvalValue::Scalar(_) => EvalScalar::Error(CalcError::Na),
+        EvalValue::Scalar(_) | EvalValue::Missing => EvalScalar::Error(CalcError::Na),
     }
 }
 
@@ -637,7 +644,7 @@ fn vh_lookup_one(
             }
         }
         EvalValue::Scalar(EvalScalar::Error(e)) => EvalScalar::Error(*e),
-        EvalValue::Scalar(_) => EvalScalar::Error(CalcError::Na),
+        EvalValue::Scalar(_) | EvalValue::Missing => EvalScalar::Error(CalcError::Na),
     }
 }
 
@@ -989,5 +996,1104 @@ fn cmp_same_kind(a: &EvalScalar, b: &EvalScalar) -> Option<Ordering> {
         (EvalScalar::Text(x), EvalScalar::Text(y)) => Some(x.to_lowercase().cmp(&y.to_lowercase())),
         (EvalScalar::Bool(x), EvalScalar::Bool(y)) => Some(x.cmp(y)),
         _ => None,
+    }
+}
+
+// ------------------------------------------------ XLOOKUP / XMATCH / LOOKUP
+
+fn scalar_exact_literal(a: &EvalScalar, b: &EvalScalar) -> bool {
+    match (a, b) {
+        (EvalScalar::Empty, EvalScalar::Empty) => false,
+        (EvalScalar::Number(x), EvalScalar::Number(y)) => {
+            let cx = if *x == 0.0 { 0.0 } else { *x };
+            let cy = if *y == 0.0 { 0.0 } else { *y };
+            cx.to_bits() == cy.to_bits()
+        }
+        (EvalScalar::Bool(x), EvalScalar::Bool(y)) => *x == *y,
+        (EvalScalar::Text(x), EvalScalar::Text(y)) => {
+            if x.is_ascii() && y.is_ascii() {
+                x.eq_ignore_ascii_case(y)
+            } else {
+                x.to_lowercase() == y.to_lowercase()
+            }
+        }
+        _ => false,
+    }
+}
+
+enum VectorSource<'a> {
+    RefCol {
+        sheet: &'a Sheet,
+        col_id: u64,
+        r0: u32,
+        len: u32,
+    },
+    RefRow {
+        sheet: &'a Sheet,
+        row_id: u64,
+        c0: u32,
+        len: u32,
+    },
+    Slice {
+        vals: Vec<EvalScalar>,
+    },
+}
+
+impl<'a> VectorSource<'a> {
+    fn from_value(
+        val: &EvalValue,
+        workbook: &'a Workbook<BoundFormula>,
+    ) -> Result<(Self, bool, u32), CalcError> {
+        // Returns `(source, is_col_vector, length)`.
+        match val {
+            EvalValue::Reference(r) => {
+                let (sid, r0, rows, c0, cols) = ref_live_origin_and_size(r, workbook)?;
+                if rows > 1 && cols > 1 {
+                    return Err(CalcError::Value);
+                }
+                let sheet = workbook.sheet(sid).ok_or(CalcError::Ref)?;
+                if cols == 1 {
+                    let cid = sheet.col_axis().pos_to_id(c0).ok_or(CalcError::Ref)?;
+                    Ok((
+                        Self::RefCol {
+                            sheet,
+                            col_id: cid,
+                            r0,
+                            len: rows,
+                        },
+                        true,
+                        rows,
+                    ))
+                } else {
+                    let rid = sheet.row_axis().pos_to_id(r0).ok_or(CalcError::Ref)?;
+                    Ok((
+                        Self::RefRow {
+                            sheet,
+                            row_id: rid,
+                            c0,
+                            len: cols,
+                        },
+                        false,
+                        cols,
+                    ))
+                }
+            }
+            EvalValue::Array(arr) => {
+                if arr.rows > 1 && arr.cols > 1 {
+                    return Err(CalcError::Value);
+                }
+                let is_col = arr.cols == 1 && arr.rows >= 1;
+                let len = if is_col { arr.rows } else { arr.cols };
+                Ok((
+                    Self::Slice {
+                        vals: arr.values.clone(),
+                    },
+                    is_col,
+                    len,
+                ))
+            }
+            EvalValue::Scalar(s) => Ok((
+                Self::Slice {
+                    vals: alloc::vec![s.clone()],
+                },
+                true,
+                1,
+            )),
+            EvalValue::Missing => Err(CalcError::Value),
+        }
+    }
+
+    fn read_at(&self, idx: u32, spills: &SpillRegistry) -> Option<EvalScalar> {
+        match self {
+            Self::RefCol {
+                sheet,
+                col_id,
+                r0,
+                len,
+            } => {
+                if idx >= *len {
+                    return None;
+                }
+                let rid = sheet.row_axis().pos_to_id(r0.saturating_add(idx))?;
+                Some(read_sheet_cell_effective(
+                    sheet,
+                    spills,
+                    RowId(rid),
+                    ColId(*col_id),
+                ))
+            }
+            Self::RefRow {
+                sheet,
+                row_id,
+                c0,
+                len,
+            } => {
+                if idx >= *len {
+                    return None;
+                }
+                let cid = sheet.col_axis().pos_to_id(c0.saturating_add(idx))?;
+                Some(read_sheet_cell_effective(
+                    sheet,
+                    spills,
+                    RowId(*row_id),
+                    ColId(cid),
+                ))
+            }
+            Self::Slice { vals } => vals.get(idx as usize).cloned(),
+        }
+    }
+}
+
+fn x_search_index(
+    src: &VectorSource<'_>,
+    len: u32,
+    needle: &EvalScalar,
+    match_mode: isize,
+    search_mode: isize,
+    spills: &SpillRegistry,
+) -> Option<u32> {
+    if len == 0 {
+        return None;
+    }
+    if let EvalScalar::Error(_) = needle {
+        return None;
+    }
+    let norm_needle = match needle {
+        EvalScalar::Empty => EvalScalar::Number(0.0),
+        other => other.clone(),
+    };
+
+    // Binary searches (`search_mode == 2` ascending, `-2` descending).
+    if search_mode == 2 || search_mode == -2 {
+        let asc = search_mode == 2;
+        let mut same_type: Vec<(u32, EvalScalar)> = Vec::new();
+        for i in 0..len {
+            if let Some(v) = src.read_at(i, spills)
+                && same_value_kind(&v, &norm_needle)
+            {
+                same_type.push((i, v));
+            }
+        }
+        if same_type.is_empty() {
+            return None;
+        }
+        let mut low = 0_usize;
+        let mut high = same_type.len().saturating_sub(1);
+        let mut eq_idx: Option<usize> = None;
+        let mut best_smaller: Option<usize> = None;
+        let mut best_larger: Option<usize> = None;
+
+        while low <= high {
+            let mid = low.saturating_add(high.saturating_sub(low) / 2);
+            let Some((_, mv)) = same_type.get(mid) else {
+                break;
+            };
+            let ord = cmp_same_kind(mv, &norm_needle)?;
+            match ord {
+                Ordering::Equal => {
+                    eq_idx = Some(mid);
+                    break;
+                }
+                Ordering::Less => {
+                    best_smaller = Some(mid);
+                    if asc {
+                        low = mid.saturating_add(1);
+                    } else {
+                        if mid == 0 {
+                            break;
+                        }
+                        high = mid.saturating_sub(1);
+                    }
+                }
+                Ordering::Greater => {
+                    best_larger = Some(mid);
+                    if asc {
+                        if mid == 0 {
+                            break;
+                        }
+                        high = mid.saturating_sub(1);
+                    } else {
+                        low = mid.saturating_add(1);
+                    }
+                }
+            }
+        }
+        let picked = match match_mode {
+            0 => eq_idx,
+            -1 => eq_idx.or(best_smaller),
+            1 => eq_idx.or(best_larger),
+            _ => None,
+        };
+        return picked.and_then(|pos| same_type.get(pos).map(|&(orig, _)| orig));
+    }
+
+    let reverse = search_mode == -1;
+    if match_mode == 0 {
+        for step in 0..len {
+            let idx = if reverse {
+                len.saturating_sub(1).saturating_sub(step)
+            } else {
+                step
+            };
+            if let Some(v) = src.read_at(idx, spills)
+                && scalar_exact_literal(&v, &norm_needle)
+            {
+                return Some(idx);
+            }
+        }
+        return None;
+    }
+
+    if match_mode == 2 {
+        let matcher = ExactMatcher::from_needle(&norm_needle)?;
+        for step in 0..len {
+            let idx = if reverse {
+                len.saturating_sub(1).saturating_sub(step)
+            } else {
+                step
+            };
+            if let Some(v) = src.read_at(idx, spills)
+                && matcher.matches_scalar(&v)
+            {
+                return Some(idx);
+            }
+        }
+        return None;
+    }
+
+    // `match_mode == -1` (exact or next smaller) or `1` (exact or next larger).
+    let mut best: Option<(u32, EvalScalar)> = None;
+    for step in 0..len {
+        let idx = if reverse {
+            len.saturating_sub(1).saturating_sub(step)
+        } else {
+            step
+        };
+        let Some(v) = src.read_at(idx, spills) else {
+            continue;
+        };
+        if !same_value_kind(&v, &norm_needle) {
+            continue;
+        }
+        let Some(ord) = cmp_same_kind(&v, &norm_needle) else {
+            continue;
+        };
+        if ord == Ordering::Equal {
+            return Some(idx);
+        }
+        let candidate = if match_mode == -1 {
+            ord == Ordering::Less
+        } else {
+            ord == Ordering::Greater
+        };
+        if candidate {
+            let better = match &best {
+                None => true,
+                Some((_, cur_best)) => {
+                    let Some(c_ord) = cmp_same_kind(&v, cur_best) else {
+                        continue;
+                    };
+                    if match_mode == -1 {
+                        c_ord == Ordering::Greater
+                    } else {
+                        c_ord == Ordering::Less
+                    }
+                }
+            };
+            if better {
+                best = Some((idx, v));
+            }
+        }
+    }
+    best.map(|(i, _)| i)
+}
+
+fn slice_return_at_offset(
+    ret_arg: &EvalValue,
+    idx: u32,
+    lookup_is_col: bool,
+    lookup_len: u32,
+    workbook: &Workbook<BoundFormula>,
+) -> Result<EvalValue, CalcError> {
+    match ret_arg {
+        EvalValue::Reference(r) => {
+            let (sid, r0, rows, c0, cols) = ref_live_origin_and_size(r, workbook)?;
+            let sheet = workbook.sheet(sid).ok_or(CalcError::Ref)?;
+            if lookup_is_col {
+                if rows != lookup_len {
+                    return Err(CalcError::Value);
+                }
+                let rid = sheet
+                    .row_axis()
+                    .pos_to_id(r0.saturating_add(idx))
+                    .ok_or(CalcError::Ref)?;
+                if cols == 1 {
+                    let cid = sheet.col_axis().pos_to_id(c0).ok_or(CalcError::Ref)?;
+                    Ok(EvalValue::Reference(ResolvedRef::Cell {
+                        sheet: sid,
+                        row: RowId(rid),
+                        col: ColId(cid),
+                    }))
+                } else {
+                    let fc = sheet.col_axis().pos_to_id(c0).ok_or(CalcError::Ref)?;
+                    let lc = sheet
+                        .col_axis()
+                        .pos_to_id(c0.saturating_add(cols.saturating_sub(1)))
+                        .ok_or(CalcError::Ref)?;
+                    Ok(EvalValue::Reference(ResolvedRef::Area {
+                        sheet: sid,
+                        first_row: RowId(rid),
+                        last_row: RowId(rid),
+                        first_col: ColId(fc),
+                        last_col: ColId(lc),
+                    }))
+                }
+            } else {
+                if cols != lookup_len {
+                    return Err(CalcError::Value);
+                }
+                let cid = sheet
+                    .col_axis()
+                    .pos_to_id(c0.saturating_add(idx))
+                    .ok_or(CalcError::Ref)?;
+                if rows == 1 {
+                    let rid = sheet.row_axis().pos_to_id(r0).ok_or(CalcError::Ref)?;
+                    Ok(EvalValue::Reference(ResolvedRef::Cell {
+                        sheet: sid,
+                        row: RowId(rid),
+                        col: ColId(cid),
+                    }))
+                } else {
+                    let fr = sheet.row_axis().pos_to_id(r0).ok_or(CalcError::Ref)?;
+                    let lr = sheet
+                        .row_axis()
+                        .pos_to_id(r0.saturating_add(rows.saturating_sub(1)))
+                        .ok_or(CalcError::Ref)?;
+                    Ok(EvalValue::Reference(ResolvedRef::Area {
+                        sheet: sid,
+                        first_row: RowId(fr),
+                        last_row: RowId(lr),
+                        first_col: ColId(cid),
+                        last_col: ColId(cid),
+                    }))
+                }
+            }
+        }
+        EvalValue::Array(arr) => {
+            if lookup_is_col {
+                if arr.rows != lookup_len {
+                    return Err(CalcError::Value);
+                }
+                if arr.cols == 1 {
+                    Ok(EvalValue::Scalar(empty_to_zero(arr.get_at(idx, 0))))
+                } else {
+                    let vals = (0..arr.cols)
+                        .map(|c| empty_to_zero(arr.get_at(idx, c)))
+                        .collect();
+                    Ok(EvalValue::Array(Array2D::new(1, arr.cols, vals)?))
+                }
+            } else {
+                if arr.cols != lookup_len {
+                    return Err(CalcError::Value);
+                }
+                if arr.rows == 1 {
+                    Ok(EvalValue::Scalar(empty_to_zero(arr.get_at(0, idx))))
+                } else {
+                    let vals = (0..arr.rows)
+                        .map(|r| empty_to_zero(arr.get_at(r, idx)))
+                        .collect();
+                    Ok(EvalValue::Array(Array2D::new(arr.rows, 1, vals)?))
+                }
+            }
+        }
+        EvalValue::Scalar(s) => {
+            if lookup_len == 1 {
+                Ok(EvalValue::Scalar(s.clone()))
+            } else {
+                Err(CalcError::Value)
+            }
+        }
+        EvalValue::Missing => Err(CalcError::Value),
+    }
+}
+
+fn read_opt_isize_lookup(
+    opt: Option<EvalValue>,
+    default: isize,
+    workbook: &Workbook<BoundFormula>,
+    spills: &SpillRegistry,
+    caller: CallerContext,
+) -> Result<isize, CalcError> {
+    match opt {
+        None | Some(EvalValue::Missing) => Ok(default),
+        Some(v) => {
+            let sa = coerce_for_scalar_op(v, workbook, spills, caller)?;
+            let ScalarOrArray::Scalar(sc) = sa else {
+                return Err(CalcError::Value);
+            };
+            sc.to_number().and_then(trunc_to_isize)
+        }
+    }
+}
+
+/// Evaluates `XLOOKUP(lookup_value, lookup_array, return_array, [if_not_found], [match_mode], [search_mode])`.
+pub fn eval_xlookup(
+    args: Vec<EvalValue>,
+    workbook: &Workbook<BoundFormula>,
+    spills: &SpillRegistry,
+    caller: CallerContext,
+) -> EvalValue {
+    if !(3..=6).contains(&args.len()) {
+        return EvalValue::Scalar(EvalScalar::Error(CalcError::Value));
+    }
+    let mut it = args.into_iter();
+    let (Some(lookup_arg), Some(lu_arr_arg), Some(ret_arr_arg)) = (it.next(), it.next(), it.next())
+    else {
+        return EvalValue::Scalar(EvalScalar::Error(CalcError::Value));
+    };
+    let not_found = it.next().filter(|v| !matches!(v, EvalValue::Missing));
+    let match_mode = match read_opt_isize_lookup(it.next(), 0, workbook, spills, caller) {
+        Ok(v @ -1..=2) => v,
+        Ok(_) => return EvalValue::Scalar(EvalScalar::Error(CalcError::Value)),
+        Err(e) => return EvalValue::Scalar(EvalScalar::Error(e)),
+    };
+    let search_mode = match read_opt_isize_lookup(it.next(), 1, workbook, spills, caller) {
+        Ok(v) if matches!(v, 1 | -1 | 2 | -2) => v,
+        Ok(_) => return EvalValue::Scalar(EvalScalar::Error(CalcError::Value)),
+        Err(e) => return EvalValue::Scalar(EvalScalar::Error(e)),
+    };
+    if match_mode == 2 && (search_mode == 2 || search_mode == -2) {
+        return EvalValue::Scalar(EvalScalar::Error(CalcError::Value));
+    }
+
+    let (src, is_col, len) = match VectorSource::from_value(&lu_arr_arg, workbook) {
+        Ok(v) => v,
+        Err(e) => return EvalValue::Scalar(EvalScalar::Error(e)),
+    };
+    // Validate `return_array` axis length upfront even if not found.
+    let check_dim = slice_return_at_offset(&ret_arr_arg, 0, is_col, len, workbook);
+    if len > 0
+        && let Err(e) = check_dim
+    {
+        return EvalValue::Scalar(EvalScalar::Error(e));
+    }
+
+    let lu_sa = match coerce_for_scalar_op(lookup_arg, workbook, spills, caller) {
+        Ok(v) => v,
+        Err(e) => return EvalValue::Scalar(EvalScalar::Error(e)),
+    };
+    match lu_sa {
+        ScalarOrArray::Scalar(needle) => {
+            if let EvalScalar::Error(e) = needle {
+                return EvalValue::Scalar(EvalScalar::Error(e));
+            }
+            if let Some(hit) = x_search_index(&src, len, &needle, match_mode, search_mode, spills) {
+                match slice_return_at_offset(&ret_arr_arg, hit, is_col, len, workbook) {
+                    Ok(v) => v,
+                    Err(e) => EvalValue::Scalar(EvalScalar::Error(e)),
+                }
+            } else {
+                not_found.unwrap_or(EvalValue::Scalar(EvalScalar::Error(CalcError::Na)))
+            }
+        }
+        ScalarOrArray::Array(arr) => {
+            let nf_scalar = match not_found {
+                None => EvalScalar::Error(CalcError::Na),
+                Some(v) => match coerce_for_scalar_op(v, workbook, spills, caller) {
+                    Ok(ScalarOrArray::Scalar(s)) => empty_to_zero(s),
+                    Ok(ScalarOrArray::Array(a)) => a
+                        .values
+                        .first()
+                        .cloned()
+                        .map_or(EvalScalar::Error(CalcError::Na), empty_to_zero),
+                    Err(e) => EvalScalar::Error(e),
+                },
+            };
+            let mut out = Vec::with_capacity(arr.values.len());
+            for needle in &arr.values {
+                if let EvalScalar::Error(e) = needle {
+                    out.push(EvalScalar::Error(*e));
+                    continue;
+                }
+                let cell = if let Some(hit) =
+                    x_search_index(&src, len, needle, match_mode, search_mode, spills)
+                {
+                    match slice_return_at_offset(&ret_arr_arg, hit, is_col, len, workbook) {
+                        Ok(v) => match coerce_for_scalar_op(v, workbook, spills, caller) {
+                            Ok(ScalarOrArray::Scalar(s)) => empty_to_zero(s),
+                            Ok(ScalarOrArray::Array(a)) => a
+                                .values
+                                .first()
+                                .cloned()
+                                .map_or(EvalScalar::Error(CalcError::Value), empty_to_zero),
+                            Err(e) => EvalScalar::Error(e),
+                        },
+                        Err(e) => EvalScalar::Error(e),
+                    }
+                } else {
+                    nf_scalar.clone()
+                };
+                out.push(cell);
+            }
+            match Array2D::new(arr.rows, arr.cols, out) {
+                Ok(res) => EvalValue::Array(res),
+                Err(e) => EvalValue::Scalar(EvalScalar::Error(e)),
+            }
+        }
+    }
+}
+
+/// Evaluates `XMATCH(lookup_value, lookup_array, [match_mode], [search_mode])`.
+pub fn eval_xmatch(
+    args: Vec<EvalValue>,
+    workbook: &Workbook<BoundFormula>,
+    spills: &SpillRegistry,
+    caller: CallerContext,
+) -> EvalValue {
+    if !(2..=4).contains(&args.len()) {
+        return EvalValue::Scalar(EvalScalar::Error(CalcError::Value));
+    }
+    let mut it = args.into_iter();
+    let (Some(lookup_arg), Some(lu_arr_arg)) = (it.next(), it.next()) else {
+        return EvalValue::Scalar(EvalScalar::Error(CalcError::Value));
+    };
+    let match_mode = match read_opt_isize_lookup(it.next(), 0, workbook, spills, caller) {
+        Ok(v @ -1..=2) => v,
+        Ok(_) => return EvalValue::Scalar(EvalScalar::Error(CalcError::Value)),
+        Err(e) => return EvalValue::Scalar(EvalScalar::Error(e)),
+    };
+    let search_mode = match read_opt_isize_lookup(it.next(), 1, workbook, spills, caller) {
+        Ok(v) if matches!(v, 1 | -1 | 2 | -2) => v,
+        Ok(_) => return EvalValue::Scalar(EvalScalar::Error(CalcError::Value)),
+        Err(e) => return EvalValue::Scalar(EvalScalar::Error(e)),
+    };
+    if match_mode == 2 && (search_mode == 2 || search_mode == -2) {
+        return EvalValue::Scalar(EvalScalar::Error(CalcError::Value));
+    }
+
+    let (src, _, len) = match VectorSource::from_value(&lu_arr_arg, workbook) {
+        Ok(v) => v,
+        Err(e) => return EvalValue::Scalar(EvalScalar::Error(e)),
+    };
+    let lu_sa = match coerce_for_scalar_op(lookup_arg, workbook, spills, caller) {
+        Ok(v) => v,
+        Err(e) => return EvalValue::Scalar(EvalScalar::Error(e)),
+    };
+    let find_one = |needle: &EvalScalar| -> EvalScalar {
+        if let EvalScalar::Error(e) = needle {
+            return EvalScalar::Error(*e);
+        }
+        x_search_index(&src, len, needle, match_mode, search_mode, spills)
+            .map_or(EvalScalar::Error(CalcError::Na), |idx0| {
+                EvalScalar::Number(f64::from(idx0.saturating_add(1)))
+            })
+    };
+    match lu_sa {
+        ScalarOrArray::Scalar(needle) => EvalValue::Scalar(find_one(&needle)),
+        ScalarOrArray::Array(arr) => {
+            let vals = arr.values.iter().map(find_one).collect();
+            EvalValue::Array(Array2D {
+                rows: arr.rows,
+                cols: arr.cols,
+                values: vals,
+            })
+        }
+    }
+}
+
+/// Evaluates `LOOKUP(lookup_value, lookup_vector_or_array, [result_vector])`.
+pub fn eval_lookup(
+    args: Vec<EvalValue>,
+    workbook: &Workbook<BoundFormula>,
+    spills: &SpillRegistry,
+    caller: CallerContext,
+) -> EvalValue {
+    if !(2..=3).contains(&args.len()) {
+        return EvalValue::Scalar(EvalScalar::Error(CalcError::Value));
+    }
+    let mut it = args.into_iter();
+    let (Some(lookup_arg), Some(vec_arg)) = (it.next(), it.next()) else {
+        return EvalValue::Scalar(EvalScalar::Error(CalcError::Value));
+    };
+    let res_opt = it.next().filter(|v| !matches!(v, EvalValue::Missing));
+
+    let lu_sa = match coerce_for_scalar_op(lookup_arg, workbook, spills, caller) {
+        Ok(v) => v,
+        Err(e) => return EvalValue::Scalar(EvalScalar::Error(e)),
+    };
+    let lookup_scalar = |needle: &EvalScalar,
+                         vec_a: &EvalValue,
+                         res_a: Option<&EvalValue>|
+     -> EvalScalar {
+        if let EvalScalar::Error(e) = needle {
+            return EvalScalar::Error(*e);
+        }
+        let norm_needle = match needle {
+            EvalScalar::Empty => EvalScalar::Number(0.0),
+            other => other.clone(),
+        };
+        if let Some(ra) = res_a {
+            let (l_src, _, l_len) = match VectorSource::from_value(vec_a, workbook) {
+                Ok(v) => v,
+                Err(e) => return EvalScalar::Error(e),
+            };
+            let (r_src, _, r_len) = match VectorSource::from_value(ra, workbook) {
+                Ok(v) => v,
+                Err(e) => return EvalScalar::Error(e),
+            };
+            if l_len != r_len {
+                return EvalScalar::Error(CalcError::Na);
+            }
+            let Some(hit) = x_search_index(&l_src, l_len, &norm_needle, -1, 2, spills) else {
+                return EvalScalar::Error(CalcError::Na);
+            };
+            r_src
+                .read_at(hit, spills)
+                .map_or(EvalScalar::Error(CalcError::Na), empty_to_zero)
+        } else {
+            let arr = match super::dynamic_array::value_to_array2d(vec_a.clone(), workbook, spills)
+            {
+                Ok(a) => a,
+                Err(e) => return EvalScalar::Error(e),
+            };
+            if arr.cols > arr.rows {
+                let first_row: Vec<EvalScalar> = (0..arr.cols).map(|c| arr.get_at(0, c)).collect();
+                let Some(hit) = search_scalar_slice(&first_row, &norm_needle, 1) else {
+                    return EvalScalar::Error(CalcError::Na);
+                };
+                empty_to_zero(
+                    arr.get_at(arr.rows.saturating_sub(1), u32::try_from(hit).unwrap_or(0)),
+                )
+            } else {
+                let first_col: Vec<EvalScalar> = (0..arr.rows).map(|r| arr.get_at(r, 0)).collect();
+                let Some(hit) = search_scalar_slice(&first_col, &norm_needle, 1) else {
+                    return EvalScalar::Error(CalcError::Na);
+                };
+                empty_to_zero(
+                    arr.get_at(u32::try_from(hit).unwrap_or(0), arr.cols.saturating_sub(1)),
+                )
+            }
+        }
+    };
+
+    match lu_sa {
+        ScalarOrArray::Scalar(needle) => {
+            EvalValue::Scalar(lookup_scalar(&needle, &vec_arg, res_opt.as_ref()))
+        }
+        ScalarOrArray::Array(arr) => {
+            let vals = arr
+                .values
+                .iter()
+                .map(|n| lookup_scalar(n, &vec_arg, res_opt.as_ref()))
+                .collect();
+            EvalValue::Array(Array2D {
+                rows: arr.rows,
+                cols: arr.cols,
+                values: vals,
+            })
+        }
+    }
+}
+
+/// Evaluates `ADDRESS(row_num, column_num, [abs_num], [a1], [sheet_text])`.
+pub fn eval_address(
+    args: Vec<EvalValue>,
+    workbook: &Workbook<BoundFormula>,
+    spills: &SpillRegistry,
+    caller: CallerContext,
+) -> EvalValue {
+    if !(2..=5).contains(&args.len()) {
+        return EvalValue::Scalar(EvalScalar::Error(CalcError::Value));
+    }
+    let mut it = args.into_iter();
+    let (Some(r_arg), Some(c_arg)) = (it.next(), it.next()) else {
+        return EvalValue::Scalar(EvalScalar::Error(CalcError::Value));
+    };
+    let r_sa = match coerce_for_scalar_op(r_arg, workbook, spills, caller) {
+        Ok(v) => v,
+        Err(e) => return EvalValue::Scalar(EvalScalar::Error(e)),
+    };
+    let c_sa = match coerce_for_scalar_op(c_arg, workbook, spills, caller) {
+        Ok(v) => v,
+        Err(e) => return EvalValue::Scalar(EvalScalar::Error(e)),
+    };
+    let (ScalarOrArray::Scalar(r_sc), ScalarOrArray::Scalar(c_sc)) = (r_sa, c_sa) else {
+        return EvalValue::Scalar(EvalScalar::Error(CalcError::Value));
+    };
+    let row_num = match r_sc.to_number().and_then(trunc_to_isize) {
+        Ok(v) if (1..=1_048_576).contains(&v) => u32::try_from(v).unwrap_or(1),
+        Ok(_) => return EvalValue::Scalar(EvalScalar::Error(CalcError::Value)),
+        Err(e) => return EvalValue::Scalar(EvalScalar::Error(e)),
+    };
+    let col_num = match c_sc.to_number().and_then(trunc_to_isize) {
+        Ok(v) if (1..=16_384).contains(&v) => u32::try_from(v).unwrap_or(1),
+        Ok(_) => return EvalValue::Scalar(EvalScalar::Error(CalcError::Value)),
+        Err(e) => return EvalValue::Scalar(EvalScalar::Error(e)),
+    };
+    let abs_num = match read_opt_isize_lookup(it.next(), 1, workbook, spills, caller) {
+        Ok(v) if (1..=4).contains(&v) => v,
+        Ok(_) => return EvalValue::Scalar(EvalScalar::Error(CalcError::Value)),
+        Err(e) => return EvalValue::Scalar(EvalScalar::Error(e)),
+    };
+    let a1 = match it.next() {
+        None | Some(EvalValue::Missing) => true,
+        Some(v) => {
+            let sa = match coerce_for_scalar_op(v, workbook, spills, caller) {
+                Ok(s) => s,
+                Err(e) => return EvalValue::Scalar(EvalScalar::Error(e)),
+            };
+            let ScalarOrArray::Scalar(sc) = sa else {
+                return EvalValue::Scalar(EvalScalar::Error(CalcError::Value));
+            };
+            match sc.to_bool() {
+                Ok(b) => b,
+                Err(e) => return EvalValue::Scalar(EvalScalar::Error(e)),
+            }
+        }
+    };
+    let sheet_opt: Option<String> = match it.next() {
+        None | Some(EvalValue::Missing) => None,
+        Some(v) => {
+            let sa = match coerce_for_scalar_op(v, workbook, spills, caller) {
+                Ok(s) => s,
+                Err(e) => return EvalValue::Scalar(EvalScalar::Error(e)),
+            };
+            let ScalarOrArray::Scalar(sc) = sa else {
+                return EvalValue::Scalar(EvalScalar::Error(CalcError::Value));
+            };
+            match sc.to_text() {
+                Ok(s) if s.is_empty() => None,
+                Ok(s) => Some(s),
+                Err(e) => return EvalValue::Scalar(EvalScalar::Error(e)),
+            }
+        }
+    };
+
+    let mut out = String::new();
+    if let Some(ref s) = sheet_opt {
+        write_sheet_prefix(Some(s), &mut out);
+    }
+    if a1 {
+        let abs_col = matches!(abs_num, 1 | 3);
+        let abs_row = matches!(abs_num, 1 | 2);
+        if abs_col {
+            out.push('$');
+        }
+        write_col_letters(col_num.saturating_sub(1), &mut out);
+        if abs_row {
+            out.push('$');
+        }
+        out.push_str(&format!("{row_num}"));
+    } else {
+        match abs_num {
+            1 => out.push_str(&format!("R{row_num}C{col_num}")),
+            2 => out.push_str(&format!("R{row_num}C[{col_num}]")),
+            3 => out.push_str(&format!("R[{row_num}]C{col_num}")),
+            _ => out.push_str(&format!("R[{row_num}]C[{col_num}]")),
+        }
+    }
+    EvalValue::Scalar(EvalScalar::Text(out))
+}
+
+/// Evaluates `AREAS(reference)` (non-dereferenced).
+pub fn eval_areas(args: &[EvalValue]) -> EvalValue {
+    if args.len() != 1 {
+        return EvalValue::Scalar(EvalScalar::Error(CalcError::Value));
+    }
+    match args.first() {
+        Some(EvalValue::Reference(ResolvedRef::Invalid(e))) => {
+            EvalValue::Scalar(EvalScalar::Error(*e))
+        }
+        Some(EvalValue::Reference(_)) => EvalValue::Scalar(EvalScalar::Number(1.0)),
+        _ => EvalValue::Scalar(EvalScalar::Error(CalcError::Value)),
+    }
+}
+
+/// Computes `OFFSET(reference, rows, cols, [height], [width])` without
+/// dereferencing `reference`.
+pub fn eval_offset(
+    base_ref: EvalValue,
+    args: &[EvalValue],
+    workbook: &Workbook<BoundFormula>,
+    spills: &SpillRegistry,
+    caller: CallerContext,
+) -> EvalValue {
+    let EvalValue::Reference(r) = base_ref else {
+        return EvalValue::Scalar(EvalScalar::Error(CalcError::Value));
+    };
+    let (sheet_id, r0, orig_rows, c0, orig_cols) = match ref_live_origin_and_size(&r, workbook) {
+        Ok(v) => v,
+        Err(e) => return EvalValue::Scalar(EvalScalar::Error(e)),
+    };
+    let (Some(dr_arg), Some(dc_arg)) = (args.get(1), args.get(2)) else {
+        return EvalValue::Scalar(EvalScalar::Error(CalcError::Value));
+    };
+    let read_int = |arg: &EvalValue| -> Result<i64, CalcError> {
+        let sa = coerce_for_scalar_op(arg.clone(), workbook, spills, caller)?;
+        let ScalarOrArray::Scalar(sc) = sa else {
+            return Err(CalcError::Value);
+        };
+        let n = sc.to_number()?;
+        if !n.is_finite() {
+            return Err(CalcError::Num);
+        }
+        let t = num::trunc(n);
+        if !(-10_000_000.0..=10_000_000.0).contains(&t) {
+            return Err(CalcError::Ref);
+        }
+        #[expect(clippy::cast_possible_truncation, reason = "bounded to +-10M")]
+        Ok(t as i64)
+    };
+    let dr = match read_int(dr_arg) {
+        Ok(v) => v,
+        Err(e) => return EvalValue::Scalar(EvalScalar::Error(e)),
+    };
+    let dc = match read_int(dc_arg) {
+        Ok(v) => v,
+        Err(e) => return EvalValue::Scalar(EvalScalar::Error(e)),
+    };
+    let height = match args.get(3) {
+        None | Some(EvalValue::Missing) => i64::from(orig_rows),
+        Some(a) => match read_int(a) {
+            Ok(v) => v,
+            Err(e) => return EvalValue::Scalar(EvalScalar::Error(e)),
+        },
+    };
+    let width = match args.get(4) {
+        None | Some(EvalValue::Missing) => i64::from(orig_cols),
+        Some(a) => match read_int(a) {
+            Ok(v) => v,
+            Err(e) => return EvalValue::Scalar(EvalScalar::Error(e)),
+        },
+    };
+    if height <= 0 || width <= 0 {
+        return EvalValue::Scalar(EvalScalar::Error(CalcError::Ref));
+    }
+
+    let Some(sheet) = workbook.sheet(sheet_id) else {
+        return EvalValue::Scalar(EvalScalar::Error(CalcError::Ref));
+    };
+    let live_r = i64::from(sheet.row_axis().live_len());
+    let live_c = i64::from(sheet.col_axis().live_len());
+    let nr0 = i64::from(r0).saturating_add(dr);
+    let nc0 = i64::from(c0).saturating_add(dc);
+    let nr1 = nr0.saturating_add(height).saturating_sub(1);
+    let nc1 = nc0.saturating_add(width).saturating_sub(1);
+    if nr0 < 0 || nc0 < 0 || nr1 >= live_r || nc1 >= live_c {
+        return EvalValue::Scalar(EvalScalar::Error(CalcError::Ref));
+    }
+    let (Ok(fr_pos), Ok(lr_pos), Ok(fc_pos), Ok(lc_pos)) = (
+        u32::try_from(nr0),
+        u32::try_from(nr1),
+        u32::try_from(nc0),
+        u32::try_from(nc1),
+    ) else {
+        return EvalValue::Scalar(EvalScalar::Error(CalcError::Ref));
+    };
+    let (Some(fr), Some(lr), Some(fc), Some(lc)) = (
+        sheet.row_axis().pos_to_id(fr_pos),
+        sheet.row_axis().pos_to_id(lr_pos),
+        sheet.col_axis().pos_to_id(fc_pos),
+        sheet.col_axis().pos_to_id(lc_pos),
+    ) else {
+        return EvalValue::Scalar(EvalScalar::Error(CalcError::Ref));
+    };
+    if fr_pos == lr_pos && fc_pos == lc_pos {
+        EvalValue::Reference(ResolvedRef::Cell {
+            sheet: sheet_id,
+            row: RowId(fr),
+            col: ColId(fc),
+        })
+    } else {
+        EvalValue::Reference(ResolvedRef::Area {
+            sheet: sheet_id,
+            first_row: RowId(fr),
+            last_row: RowId(lr),
+            first_col: ColId(fc),
+            last_col: ColId(lc),
+        })
+    }
+}
+
+/// Resolution result for `INDIRECT`.
+pub enum IndirectTarget {
+    /// Direct cell/range reference.
+    Ref(ResolvedRef),
+    /// Named range that needs evaluation in the engine.
+    NamedRange {
+        /// Effective scope worksheet ID.
+        scope_sheet: SheetId,
+        /// Named range spelling.
+        name: String,
+    },
+    /// Spill reference anchor (`A1#`).
+    SpillAnchor {
+        /// Sheet ID of the anchor.
+        sheet: SheetId,
+        /// Row ID of the anchor.
+        row: RowId,
+        /// Col ID of the anchor.
+        col: ColId,
+    },
+}
+
+/// Parses and resolves `INDIRECT(ref_text, [a1])`.
+pub fn resolve_indirect(
+    ref_text: &str,
+    a1: bool,
+    workbook: &Workbook<BoundFormula>,
+    caller: CallerContext,
+) -> Result<IndirectTarget, CalcError> {
+    let trimmed = ref_text.trim();
+    if trimmed.is_empty() {
+        return Err(CalcError::Ref);
+    }
+    if a1 {
+        let src = format!("={trimmed}");
+        let expr = parse_formula(&src).map_err(|_| CalcError::Ref)?;
+        let bound = bind_expr(&expr, workbook, caller.sheet);
+        return match bound {
+            BoundExpr::Reference(r) => {
+                let res = resolve_bound_ref(&r, workbook, caller.sheet);
+                if matches!(res, ResolvedRef::Invalid(_)) {
+                    Err(CalcError::Ref)
+                } else {
+                    Ok(IndirectTarget::Ref(res))
+                }
+            }
+            BoundExpr::Name(name) => Ok(IndirectTarget::NamedRange {
+                scope_sheet: caller.sheet,
+                name,
+            }),
+            BoundExpr::ScopedName {
+                sheet,
+                missing_sheet,
+                name,
+            } => {
+                if missing_sheet.is_some() {
+                    return Err(CalcError::Ref);
+                }
+                let sid = sheet.ok_or(CalcError::Ref)?;
+                if workbook.live_sheet(sid).is_none() {
+                    return Err(CalcError::Ref);
+                }
+                Ok(IndirectTarget::NamedRange {
+                    scope_sheet: sid,
+                    name,
+                })
+            }
+            BoundExpr::SpillRef(inner) => {
+                if let BoundExpr::Reference(r) = *inner
+                    && let ResolvedRef::Cell { sheet, row, col } =
+                        resolve_bound_ref(&r, workbook, caller.sheet)
+                {
+                    return Ok(IndirectTarget::SpillAnchor { sheet, row, col });
+                }
+                Err(CalcError::Ref)
+            }
+            _ => Err(CalcError::Ref),
+        };
+    }
+
+    // R1C1 parser (`[Sheet!]R[r]C[c]` or `R1C1:R2C2`).
+    let (sheet_id, rest) = if let Some(excl) = trimmed.rfind('!') {
+        let raw_sh = trimmed.get(..excl).ok_or(CalcError::Ref)?;
+        let sh_name = if raw_sh.starts_with('\'') && raw_sh.ends_with('\'') && raw_sh.len() >= 2 {
+            raw_sh
+                .get(1..raw_sh.len().saturating_sub(1))
+                .ok_or(CalcError::Ref)?
+                .replace("''", "'")
+        } else {
+            String::from(raw_sh)
+        };
+        let sid = workbook
+            .live_sheets()
+            .find(|s| s.name().eq_ignore_ascii_case(&sh_name))
+            .map(Sheet::id)
+            .ok_or(CalcError::Ref)?;
+        (
+            sid,
+            trimmed
+                .get(excl.saturating_add(1)..)
+                .ok_or(CalcError::Ref)?,
+        )
+    } else {
+        (caller.sheet, trimmed)
+    };
+
+    let caller_sheet = workbook.sheet(caller.sheet).ok_or(CalcError::Ref)?;
+    let target_sheet = workbook.sheet(sheet_id).ok_or(CalcError::Ref)?;
+    let caller_r = caller_sheet
+        .row_axis()
+        .id_to_pos(caller.row.0)
+        .ok_or(CalcError::Ref)?;
+    let caller_c = caller_sheet
+        .col_axis()
+        .id_to_pos(caller.col.0)
+        .ok_or(CalcError::Ref)?;
+
+    if let Some((lhs, rhs)) = rest.split_once(':') {
+        let (r1, c1) = parse_r1c1_cell(lhs.trim(), caller_r, caller_c).ok_or(CalcError::Ref)?;
+        let (r2, c2) = parse_r1c1_cell(rhs.trim(), caller_r, caller_c).ok_or(CalcError::Ref)?;
+        let (fr_p, lr_p) = if r1 <= r2 { (r1, r2) } else { (r2, r1) };
+        let (fc_p, lc_p) = if c1 <= c2 { (c1, c2) } else { (c2, c1) };
+        let (Some(fr), Some(lr), Some(fc), Some(lc)) = (
+            target_sheet.row_axis().pos_to_id(fr_p),
+            target_sheet.row_axis().pos_to_id(lr_p),
+            target_sheet.col_axis().pos_to_id(fc_p),
+            target_sheet.col_axis().pos_to_id(lc_p),
+        ) else {
+            return Err(CalcError::Ref);
+        };
+        Ok(IndirectTarget::Ref(ResolvedRef::Area {
+            sheet: sheet_id,
+            first_row: RowId(fr),
+            last_row: RowId(lr),
+            first_col: ColId(fc),
+            last_col: ColId(lc),
+        }))
+    } else {
+        let (r_p, c_p) = parse_r1c1_cell(rest.trim(), caller_r, caller_c).ok_or(CalcError::Ref)?;
+        let (Some(rid), Some(cid)) = (
+            target_sheet.row_axis().pos_to_id(r_p),
+            target_sheet.col_axis().pos_to_id(c_p),
+        ) else {
+            return Err(CalcError::Ref);
+        };
+        Ok(IndirectTarget::Ref(ResolvedRef::Cell {
+            sheet: sheet_id,
+            row: RowId(rid),
+            col: ColId(cid),
+        }))
+    }
+}
+
+fn parse_r1c1_cell(token: &str, base_r: u32, base_c: u32) -> Option<(u32, u32)> {
+    let bytes = token.as_bytes();
+    if !matches!(bytes.first(), Some(b'R' | b'r')) {
+        return None;
+    }
+    let after_r = token.get(1..)?;
+    let c_idx = after_r.find(['C', 'c'])?;
+    let r_spec = after_r.get(..c_idx)?;
+    let c_spec = after_r.get(c_idx.saturating_add(1)..)?;
+    let row = parse_r1c1_coord(r_spec, base_r, MAX_ROW_AXIS_LEN)?;
+    let col = parse_r1c1_coord(c_spec, base_c, MAX_COL_AXIS_LEN)?;
+    Some((row, col))
+}
+
+fn parse_r1c1_coord(spec: &str, base: u32, limit: u32) -> Option<u32> {
+    if spec.is_empty() {
+        return (base < limit).then_some(base);
+    }
+    if let Some(inner) = spec.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+        let off: i64 = inner.parse().ok()?;
+        let pos = i64::from(base).checked_add(off)?;
+        let u = u32::try_from(pos).ok()?;
+        (u < limit).then_some(u)
+    } else {
+        let one_based: u32 = spec.parse().ok()?;
+        let zero_based = one_based.checked_sub(1)?;
+        (zero_based < limit).then_some(zero_based)
     }
 }

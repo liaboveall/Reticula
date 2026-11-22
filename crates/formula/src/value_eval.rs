@@ -159,6 +159,18 @@ impl Array2D {
         Ok(Self { rows, cols, values })
     }
 
+    /// Non-broadcast element lookup at `(r, c)`.
+    #[must_use]
+    pub fn get_at(&self, r: u32, c: u32) -> EvalScalar {
+        let idx = (r as usize)
+            .saturating_mul(self.cols as usize)
+            .saturating_add(c as usize);
+        self.values
+            .get(idx)
+            .cloned()
+            .unwrap_or(EvalScalar::Error(CalcError::Na))
+    }
+
     /// Broadcast lookup at `(r, c)` following Excel dynamic-array rules: a
     /// dimension of length `1` repeats across any target size, while out-of-range
     /// indices on dimensions `> 1` yield `#N/A`.
@@ -244,6 +256,8 @@ pub enum EvalValue {
     Array(Array2D),
     /// Lazy cell/range reference.
     Reference(ResolvedRef),
+    /// Omitted optional argument passed to a function (`FN(a,,b)`).
+    Missing,
 }
 
 /// Coordinates of the cell whose formula is currently being evaluated (used by
@@ -366,6 +380,7 @@ pub fn implicit_intersect(
 ) -> EvalScalar {
     match value {
         EvalValue::Scalar(s) => s,
+        EvalValue::Missing => EvalScalar::Empty,
         EvalValue::Array(arr) => {
             if arr.rows == 1 && arr.cols == 1 {
                 arr.values
@@ -510,6 +525,7 @@ pub fn coerce_for_scalar_op(
     }
     match value {
         EvalValue::Scalar(s) => Ok(ScalarOrArray::Scalar(s)),
+        EvalValue::Missing => Ok(ScalarOrArray::Scalar(EvalScalar::Empty)),
         EvalValue::Array(arr) => {
             if arr.rows == 1 && arr.cols == 1 {
                 Ok(ScalarOrArray::Scalar(
@@ -1019,6 +1035,7 @@ pub fn finalize_top_level(
     }
     match value {
         EvalValue::Scalar(s) => s,
+        EvalValue::Missing => EvalScalar::Number(0.0),
         EvalValue::Array(arr) => {
             if arr.rows == 1 && arr.cols == 1 {
                 arr.values

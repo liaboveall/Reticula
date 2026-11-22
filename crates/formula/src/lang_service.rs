@@ -1136,7 +1136,6 @@ struct CallFrame {
     close_tok_idx: Option<usize>,
     comma_offsets_utf16: Vec<u32>,
     has_non_comma_token: bool,
-    trailing_empty_arg: bool,
 }
 
 fn analyze_calls_and_parens(
@@ -1164,7 +1163,6 @@ fn analyze_calls_and_parens(
                     close_tok_idx: None,
                     comma_offsets_utf16: Vec::new(),
                     has_non_comma_token: false,
-                    trailing_empty_arg: false,
                 });
                 stack.push(frame_idx);
             }
@@ -1185,21 +1183,7 @@ fn analyze_calls_and_parens(
                 if let Some(&top_idx) = stack.last()
                     && let Some(frame) = frames.get_mut(top_idx)
                 {
-                    if !frame.has_non_comma_token && frame.comma_offsets_utf16.is_empty() {
-                        diagnostics.push(FormulaDiagnostic {
-                            start_utf16: tok.start_utf16,
-                            end_utf16: tok.end_utf16,
-                            message: String::from("Missing argument before ','."),
-                        });
-                    } else if frame.trailing_empty_arg {
-                        diagnostics.push(FormulaDiagnostic {
-                            start_utf16: tok.start_utf16,
-                            end_utf16: tok.end_utf16,
-                            message: String::from("Empty argument between commas."),
-                        });
-                    }
                     frame.comma_offsets_utf16.push(tok.start_utf16);
-                    frame.trailing_empty_arg = true;
                 }
             }
             _ => {
@@ -1207,7 +1191,6 @@ fn analyze_calls_and_parens(
                     && let Some(frame) = frames.get_mut(top_idx)
                 {
                     frame.has_non_comma_token = true;
-                    frame.trailing_empty_arg = false;
                 }
             }
         }
@@ -1280,13 +1263,6 @@ fn analyze_calls_and_parens(
 
         let close_tok = frame.close_tok_idx.and_then(|ci| raw_tokens.get(ci));
         if let Some(ct) = close_tok {
-            if frame.trailing_empty_arg {
-                diagnostics.push(FormulaDiagnostic {
-                    start_utf16: ct.start_utf16,
-                    end_utf16: ct.end_utf16,
-                    message: String::from("Missing argument before ')'."),
-                });
-            }
             if arg_count < meta.min_args || arg_count > meta.max_args {
                 let msg = format_arity_error(meta, arg_count);
                 diagnostics.push(FormulaDiagnostic {

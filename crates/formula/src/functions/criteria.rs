@@ -60,7 +60,9 @@ pub fn eval_countblank(
             EvalValue::Scalar(EvalScalar::Number(cnt as f64))
         }
         EvalValue::Scalar(EvalScalar::Error(e)) => EvalValue::Scalar(EvalScalar::Error(*e)),
-        EvalValue::Scalar(_) => EvalValue::Scalar(EvalScalar::Error(CalcError::Value)),
+        EvalValue::Scalar(_) | EvalValue::Missing => {
+            EvalValue::Scalar(EvalScalar::Error(CalcError::Value))
+        }
     }
 }
 
@@ -214,7 +216,7 @@ fn countif_one(
             EvalScalar::Number(count as f64)
         }
         EvalValue::Scalar(EvalScalar::Error(e)) => EvalScalar::Error(*e),
-        EvalValue::Scalar(_) => EvalScalar::Error(CalcError::Value),
+        EvalValue::Scalar(_) | EvalValue::Missing => EvalScalar::Error(CalcError::Value),
     }
 }
 
@@ -866,4 +868,656 @@ impl CompiledCriterion {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Multi-criteria aggregation: COUNTIFS / SUMIFS / AVERAGEIFS / MAXIFS / MINIFS
+// ---------------------------------------------------------------------------
+
+/// Multi-criteria aggregation kind.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum MultiIfsKind {
+    /// `COUNTIFS`
+    Count,
+    /// `SUMIFS`
+    Sum,
+    /// `AVERAGEIFS`
+    Average,
+    /// `MAXIFS`
+    Max,
+    /// `MINIFS`
+    Min,
+}
+
+enum IfsSource<'a> {
+    Ref {
+        sheet: &'a Sheet,
+        r0: u32,
+        row_ids: Vec<u64>,
+        col_ids: Vec<u64>,
+    },
+    Arr(&'a crate::value_eval::Array2D),
+}
+
+impl<'a> IfsSource<'a> {
+    fn from_arg(
+        arg: &'a EvalValue,
+        workbook: &'a Workbook<BoundFormula>,
+    ) -> Result<(Self, u32, u32), CalcError> {
+        match arg {
+            EvalValue::Reference(r) => {
+                let (sid, r0, rows, c0, cols) = ref_live_origin_and_size(r, workbook)?;
+                let sheet = workbook.sheet(sid).ok_or(CalcError::Ref)?;
+                let mut col_ids = Vec::with_capacity(cols as usize);
+                sheet
+                    .col_axis()
+                    .for_each_live_positions(c0, cols, |run| col_ids.extend(run.iter()));
+                let mut row_ids = Vec::new();
+                // Defer materializing 1M rows for full columns unless needed.
+                if rows <= 65_536 {
+                    row_ids.reserve(rows as usize);
+                    sheet
+                        .row_axis()
+                        .for_each_live_positions(r0, rows, |run| row_ids.extend(run.iter()));
+                }
+                Ok((
+                    Self::Ref {
+                        sheet,
+                        r0,
+                        row_ids,
+                        col_ids,
+                    },
+                    rows,
+                    cols,
+                ))
+            }
+            EvalValue::Array(arr) => Ok((Self::Arr(arr), arr.rows, arr.cols)),
+            EvalValue::Scalar(_) | EvalValue::Missing => Err(CalcError::Value),
+        }
+    }
+
+    fn read(&self, r: u32, c: u32, spills: &SpillRegistry) -> EvalScalar {
+        match self {
+            Self::Ref {
+                sheet,
+                r0,
+                row_ids,
+                col_ids,
+                ..
+            } => {
+                let rid_opt = if !row_ids.is_empty() {
+                    row_ids.get(r as usize).copied()
+                } else {
+                    sheet.row_axis().pos_to_id(r0.saturating_add(r))
+                };
+                let Some(rid) = rid_opt else {
+                    return EvalScalar::Error(CalcError::Ref);
+                };
+                let Some(&cid) = col_ids.get(c as usize) else {
+                    return EvalScalar::Error(CalcError::Ref);
+                };
+                read_sheet_cell_effective(sheet, spills, RowId(rid), ColId(cid))
+            }
+            Self::Arr(arr) => arr.get_at(r, c),
+        }
+    }
+}
+
+/// Evaluates `COUNTIFS`, `SUMIFS`, `AVERAGEIFS`, `MAXIFS`, or `MINIFS`.
+pub fn eval_multi_ifs(
+    args: Vec<EvalValue>,
+    workbook: &Workbook<BoundFormula>,
+    spills: &SpillRegistry,
+    caller: CallerContext,
+    kind: MultiIfsKind,
+) -> EvalValue {
+    let min_args = if kind == MultiIfsKind::Count { 2 } else { 3 };
+    let pair_rem = if kind == MultiIfsKind::Count { 0 } else { 1 };
+    if args.len() < min_args || args.len() % 2 != pair_rem {
+        return EvalValue::Scalar(EvalScalar::Error(CalcError::Value));
+    }
+    let mut it = args.into_iter();
+    let target_arg = if kind == MultiIfsKind::Count {
+        None
+    } else {
+        it.next()
+    };
+
+    let mut pairs = Vec::new();
+    while let (Some(r_arg), Some(c_arg)) = (it.next(), it.next()) {
+        let crit_sa = match coerce_for_scalar_op(c_arg, workbook, spills, caller) {
+            Ok(v) => v,
+            Err(e) => return EvalValue::Scalar(EvalScalar::Error(e)),
+        };
+        let ScalarOrArray::Scalar(crit_sc) = crit_sa else {
+            return EvalValue::Scalar(EvalScalar::Error(CalcError::Value));
+        };
+        let pred = CompiledCriterion::compile(&crit_sc);
+        pairs.push((r_arg, pred));
+    }
+
+    let target_src = match target_arg.as_ref() {
+        None => None,
+        Some(a) => match IfsSource::from_arg(a, workbook) {
+            Ok(src) => Some(src),
+            Err(e) => return EvalValue::Scalar(EvalScalar::Error(e)),
+        },
+    };
+    let mut crit_srcs = Vec::with_capacity(pairs.len());
+    for (r_arg, pred) in &pairs {
+        match IfsSource::from_arg(r_arg, workbook) {
+            Ok((src, rr, cc)) => crit_srcs.push((src, rr, cc, pred)),
+            Err(e) => return EvalValue::Scalar(EvalScalar::Error(e)),
+        }
+    }
+
+    let (rows, cols) = if let Some((_, tr, tc)) = &target_src {
+        (*tr, *tc)
+    } else if let Some((_, cr, cc, _)) = crit_srcs.first() {
+        (*cr, *cc)
+    } else {
+        return EvalValue::Scalar(EvalScalar::Error(CalcError::Value));
+    };
+
+    for (_, cr, cc, _) in &crit_srcs {
+        if *cr != rows || *cc != cols {
+            return EvalValue::Scalar(EvalScalar::Error(CalcError::Value));
+        }
+    }
+
+    // Fast skip tail rows for full-column references when any criterion rejects blank.
+    let any_rejects_empty = crit_srcs
+        .iter()
+        .any(|(_, _, _, p)| !p.matches(&EvalScalar::Empty));
+    let mut scan_rows = rows;
+    if rows > 65_536 && any_rejects_empty {
+        let mut max_pop_row: u32 = 0;
+        let check_src = |src: &IfsSource<'_>, bound: &mut u32| {
+            if let IfsSource::Ref { sheet, col_ids, .. } = src {
+                let base_blocks_rows = sheet.row_slots().base_len();
+                for &cid in col_ids {
+                    if let Some(cs) = sheet.col_slots().get(cid)
+                        && let Some(col) = sheet.raw_columns().get(cs as usize)
+                    {
+                        let populated_slots = u32::try_from(col.blocks().len())
+                            .unwrap_or(u32::MAX)
+                            .saturating_mul(BLOCK_ROWS)
+                            .min(base_blocks_rows);
+                        if populated_slots > *bound {
+                            *bound = populated_slots;
+                        }
+                    }
+                    if spills.has_shadows_in_col(sheet.id(), ColId(cid)) {
+                        *bound = rows;
+                    }
+                }
+                if sheet.row_slots().base_len() < sheet.row_axis().live_len() {
+                    *bound = rows;
+                }
+            }
+        };
+        if let Some((ref t_s, _, _)) = target_src {
+            check_src(t_s, &mut max_pop_row);
+        }
+        for (c_s, _, _, _) in &crit_srcs {
+            check_src(c_s, &mut max_pop_row);
+        }
+        scan_rows = rows.min(max_pop_row);
+    }
+
+    let mut sum = 0.0_f64;
+    let mut count: u64 = 0;
+    let mut best: Option<f64> = None;
+
+    for r in 0..scan_rows {
+        for c in 0..cols {
+            let matched = crit_srcs
+                .iter()
+                .all(|(src, _, _, pred)| pred.matches(&src.read(r, c, spills)));
+            if !matched {
+                continue;
+            }
+            if kind == MultiIfsKind::Count {
+                count = count.saturating_add(1);
+                continue;
+            }
+            let Some((ref t_src, _, _)) = target_src else {
+                continue;
+            };
+            match t_src.read(r, c, spills) {
+                EvalScalar::Error(e) => return EvalValue::Scalar(EvalScalar::Error(e)),
+                EvalScalar::Number(n) => {
+                    count = count.saturating_add(1);
+                    match kind {
+                        MultiIfsKind::Sum | MultiIfsKind::Average => {
+                            sum += n;
+                            if !sum.is_finite() {
+                                return EvalValue::Scalar(EvalScalar::Error(CalcError::Num));
+                            }
+                        }
+                        MultiIfsKind::Max => {
+                            best = Some(best.map_or(n, |cur| cur.max(n)));
+                        }
+                        MultiIfsKind::Min => {
+                            best = Some(best.map_or(n, |cur| cur.min(n)));
+                        }
+                        MultiIfsKind::Count => {}
+                    }
+                }
+                EvalScalar::Empty | EvalScalar::Text(_) | EvalScalar::Bool(_) => {}
+            }
+        }
+    }
+
+    let scalar = match kind {
+        MultiIfsKind::Count =>
+        {
+            #[expect(clippy::cast_precision_loss, reason = "cell count fits in f64")]
+            EvalScalar::Number(count as f64)
+        }
+        MultiIfsKind::Sum => EvalScalar::number(sum),
+        MultiIfsKind::Average => {
+            if count == 0 {
+                EvalScalar::Error(CalcError::Div0)
+            } else {
+                #[expect(clippy::cast_precision_loss, reason = "cell count fits in f64")]
+                EvalScalar::number(sum / (count as f64))
+            }
+        }
+        MultiIfsKind::Max | MultiIfsKind::Min => EvalScalar::number(best.unwrap_or(0.0)),
+    };
+    EvalValue::Scalar(scalar)
+}
+
+// ---------------------------------------------------------------- SUMPRODUCT
+
+/// Evaluates `SUMPRODUCT(array1, [array2], ...)`.
+/// Per `17-m3a.md` & D-027, does not apply outermost Add/Sub tail-zeroing.
+pub fn eval_sumproduct(
+    args: Vec<EvalValue>,
+    workbook: &Workbook<BoundFormula>,
+    spills: &SpillRegistry,
+) -> EvalValue {
+    if args.is_empty() {
+        return EvalValue::Scalar(EvalScalar::Error(CalcError::Value));
+    }
+    let mut arrays = Vec::with_capacity(args.len());
+    for arg in args {
+        match super::dynamic_array::value_to_array2d(arg, workbook, spills) {
+            Ok(a) => arrays.push(a),
+            Err(e) => return EvalValue::Scalar(EvalScalar::Error(e)),
+        }
+    }
+    let Some(first) = arrays.first() else {
+        return EvalValue::Scalar(EvalScalar::Error(CalcError::Value));
+    };
+    let (rows, cols) = (first.rows, first.cols);
+    for a in &arrays {
+        if a.rows != rows || a.cols != cols {
+            return EvalValue::Scalar(EvalScalar::Error(CalcError::Value));
+        }
+    }
+    let total_len = first.values.len();
+    let mut sum = 0.0_f64;
+    for i in 0..total_len {
+        let mut prod = 1.0_f64;
+        for a in &arrays {
+            let Some(v) = a.values.get(i) else {
+                return EvalValue::Scalar(EvalScalar::Error(CalcError::Value));
+            };
+            let factor = match v {
+                EvalScalar::Error(e) => return EvalValue::Scalar(EvalScalar::Error(*e)),
+                EvalScalar::Number(n) => *n,
+                EvalScalar::Empty | EvalScalar::Text(_) | EvalScalar::Bool(_) => 0.0,
+            };
+            prod *= factor;
+            if !prod.is_finite() {
+                return EvalValue::Scalar(EvalScalar::Error(CalcError::Num));
+            }
+        }
+        sum += prod;
+        if !sum.is_finite() {
+            return EvalValue::Scalar(EvalScalar::Error(CalcError::Num));
+        }
+    }
+    EvalValue::Scalar(EvalScalar::number(sum))
+}
+
+// ----------------------------------------------------- SUBTOTAL & AGGREGATE
+
+fn contains_nested_subtotal_or_aggregate(
+    expr: &crate::binder::BoundExpr,
+    include_aggregate: bool,
+) -> bool {
+    use crate::binder::BoundExpr;
+    match expr {
+        BoundExpr::Call { name, args } => {
+            if name == "SUBTOTAL" || (include_aggregate && name == "AGGREGATE") {
+                return true;
+            }
+            args.iter()
+                .any(|a| contains_nested_subtotal_or_aggregate(a, include_aggregate))
+        }
+        BoundExpr::Paren(inner)
+        | BoundExpr::Unary { expr: inner, .. }
+        | BoundExpr::SpillRef(inner) => {
+            contains_nested_subtotal_or_aggregate(inner, include_aggregate)
+        }
+        BoundExpr::Binary { left, right, .. } => {
+            contains_nested_subtotal_or_aggregate(left, include_aggregate)
+                || contains_nested_subtotal_or_aggregate(right, include_aggregate)
+        }
+        BoundExpr::Literal(_)
+        | BoundExpr::ArrayLiteral { .. }
+        | BoundExpr::Reference(_)
+        | BoundExpr::Name(_)
+        | BoundExpr::ScopedName { .. }
+        | BoundExpr::Opaque { .. }
+        | BoundExpr::PreservedCached { .. }
+        | BoundExpr::MissingArg => false,
+    }
+}
+
+#[derive(Clone, Copy)]
+struct SubtotalFlags {
+    ignore_hidden: bool,
+    ignore_nested: bool,
+    include_aggregate_nested: bool,
+    ignore_errors: bool,
+    collect_counta_only: bool,
+}
+
+fn collect_subtotal_cells(
+    refs: &[EvalValue],
+    workbook: &Workbook<BoundFormula>,
+    spills: &SpillRegistry,
+    flags: SubtotalFlags,
+    is_row_hidden: Option<&dyn Fn(reticula_core::id::SheetId, RowId) -> bool>,
+) -> Result<(Vec<f64>, u64), CalcError> {
+    let mut nums = Vec::new();
+    let mut counta: u64 = 0;
+
+    fn visit_sub_scalar(
+        s: &EvalScalar,
+        ignore_errors: bool,
+        nums: &mut Vec<f64>,
+        counta: &mut u64,
+    ) -> Result<(), CalcError> {
+        match s {
+            EvalScalar::Error(e) => {
+                if !ignore_errors {
+                    return Err(*e);
+                }
+            }
+            EvalScalar::Number(n) => {
+                *counta = counta.saturating_add(1);
+                nums.push(*n);
+            }
+            EvalScalar::Bool(_) | EvalScalar::Text(_) => {
+                *counta = counta.saturating_add(1);
+            }
+            EvalScalar::Empty => {}
+        }
+        Ok(())
+    }
+
+    for arg in refs {
+        match arg {
+            EvalValue::Missing => {}
+            EvalValue::Scalar(s) => {
+                if flags.collect_counta_only {
+                    if !matches!(s, EvalScalar::Empty) {
+                        counta = counta.saturating_add(1);
+                    }
+                } else if matches!(s, EvalScalar::Error(_)) && !flags.ignore_errors {
+                    if let EvalScalar::Error(e) = s {
+                        return Err(*e);
+                    }
+                } else if !matches!(s, EvalScalar::Empty | EvalScalar::Error(_)) {
+                    let n = s.to_number()?;
+                    counta = counta.saturating_add(1);
+                    nums.push(n);
+                }
+            }
+            EvalValue::Array(arr) => {
+                for item in &arr.values {
+                    visit_sub_scalar(item, flags.ignore_errors, &mut nums, &mut counta)?;
+                }
+            }
+            EvalValue::Reference(r) => {
+                let (sid, r0, rows, c0, cols) = ref_live_origin_and_size(r, workbook)?;
+                let sheet = workbook.sheet(sid).ok_or(CalcError::Ref)?;
+                let mut col_ids = Vec::with_capacity(cols as usize);
+                sheet
+                    .col_axis()
+                    .for_each_live_positions(c0, cols, |run| col_ids.extend(run.iter()));
+                let mut row_ids = Vec::with_capacity((rows as usize).min(4096));
+                sheet
+                    .row_axis()
+                    .for_each_live_positions(r0, rows, |run| row_ids.extend(run.iter()));
+                for rid_raw in row_ids {
+                    let rid = RowId(rid_raw);
+                    if flags.ignore_hidden && is_row_hidden.is_some_and(|f| f(sid, rid)) {
+                        continue;
+                    }
+                    for &cid_raw in &col_ids {
+                        let cid = ColId(cid_raw);
+                        if flags.ignore_nested
+                            && let Some(formula) = workbook.formula(sid, rid, cid)
+                            && contains_nested_subtotal_or_aggregate(
+                                &formula.root,
+                                flags.include_aggregate_nested,
+                            )
+                        {
+                            continue;
+                        }
+                        let sc = read_sheet_cell_effective(sheet, spills, rid, cid);
+                        visit_sub_scalar(&sc, flags.ignore_errors, &mut nums, &mut counta)?;
+                    }
+                }
+            }
+        }
+    }
+    Ok((nums, counta))
+}
+
+fn eval_basic_sub_agg_code(
+    code: isize,
+    nums: &[f64],
+    counta: u64,
+    k_opt: Option<f64>,
+) -> EvalScalar {
+    match code {
+        1 => {
+            if nums.is_empty() {
+                return EvalScalar::Error(CalcError::Div0);
+            }
+            let mut acc = super::SumAcc::new();
+            for &n in nums {
+                if let Err(e) = acc.push(n) {
+                    return EvalScalar::Error(e);
+                }
+            }
+            #[expect(clippy::cast_precision_loss, reason = "cell count fits in f64")]
+            let denom = acc.count as f64;
+            EvalScalar::number(acc.finish() / denom)
+        }
+        2 =>
+        {
+            #[expect(clippy::cast_precision_loss, reason = "cell count fits in f64")]
+            EvalScalar::Number(nums.len() as f64)
+        }
+        3 =>
+        {
+            #[expect(clippy::cast_precision_loss, reason = "cell count fits in f64")]
+            EvalScalar::Number(counta as f64)
+        }
+        4 => {
+            let best = nums.iter().copied().reduce(f64::max).unwrap_or(0.0);
+            EvalScalar::number(best)
+        }
+        5 => {
+            let best = nums.iter().copied().reduce(f64::min).unwrap_or(0.0);
+            EvalScalar::number(best)
+        }
+        6 => {
+            if nums.is_empty() {
+                return EvalScalar::Number(0.0);
+            }
+            let mut prod = 1.0_f64;
+            for &n in nums {
+                prod *= n;
+                if !prod.is_finite() {
+                    return EvalScalar::Error(CalcError::Num);
+                }
+            }
+            EvalScalar::number(prod)
+        }
+        9 => {
+            let mut acc = super::SumAcc::new();
+            for &n in nums {
+                if let Err(e) = acc.push(n) {
+                    return EvalScalar::Error(e);
+                }
+            }
+            EvalScalar::number(acc.finish())
+        }
+        7 | 8 | 10..=19 => super::stats::aggregate_stat_code(code, nums, k_opt),
+        _ => EvalScalar::Error(CalcError::Value),
+    }
+}
+
+/// Evaluates `SUBTOTAL(function_num, ref1, [ref2], ...)`.
+pub fn eval_subtotal(
+    args: Vec<EvalValue>,
+    workbook: &Workbook<BoundFormula>,
+    spills: &SpillRegistry,
+    caller: CallerContext,
+    is_row_hidden: Option<&dyn Fn(reticula_core::id::SheetId, RowId) -> bool>,
+) -> EvalValue {
+    if args.len() < 2 {
+        return EvalValue::Scalar(EvalScalar::Error(CalcError::Value));
+    }
+    let mut it = args.into_iter();
+    let Some(fn_arg) = it.next() else {
+        return EvalValue::Scalar(EvalScalar::Error(CalcError::Value));
+    };
+    let fn_sa = match coerce_for_scalar_op(fn_arg, workbook, spills, caller) {
+        Ok(v) => v,
+        Err(e) => return EvalValue::Scalar(EvalScalar::Error(e)),
+    };
+    let ScalarOrArray::Scalar(fn_sc) = fn_sa else {
+        return EvalValue::Scalar(EvalScalar::Error(CalcError::Value));
+    };
+    let Ok(fn_num) = fn_sc.to_number().and_then(super::trunc_to_isize) else {
+        return EvalValue::Scalar(EvalScalar::Error(CalcError::Value));
+    };
+    let code = if (1..=11).contains(&fn_num) {
+        fn_num
+    } else if (101..=111).contains(&fn_num) {
+        fn_num.saturating_sub(100)
+    } else {
+        return EvalValue::Scalar(EvalScalar::Error(CalcError::Value));
+    };
+
+    let refs: Vec<EvalValue> = it.collect();
+    let (nums, counta) = match collect_subtotal_cells(
+        &refs,
+        workbook,
+        spills,
+        SubtotalFlags {
+            ignore_hidden: true,
+            ignore_nested: true,
+            include_aggregate_nested: false,
+            ignore_errors: false,
+            collect_counta_only: code == 3,
+        },
+        is_row_hidden,
+    ) {
+        Ok(v) => v,
+        Err(e) => return EvalValue::Scalar(EvalScalar::Error(e)),
+    };
+    EvalValue::Scalar(eval_basic_sub_agg_code(code, &nums, counta, None))
+}
+
+/// Evaluates `AGGREGATE(function_num, options, ref1, [ref2_or_k], ...)`.
+pub fn eval_aggregate(
+    args: Vec<EvalValue>,
+    workbook: &Workbook<BoundFormula>,
+    spills: &SpillRegistry,
+    caller: CallerContext,
+    is_row_hidden: Option<&dyn Fn(reticula_core::id::SheetId, RowId) -> bool>,
+) -> EvalValue {
+    if args.len() < 3 {
+        return EvalValue::Scalar(EvalScalar::Error(CalcError::Value));
+    }
+    let mut it = args.into_iter();
+    let (Some(fn_arg), Some(opt_arg)) = (it.next(), it.next()) else {
+        return EvalValue::Scalar(EvalScalar::Error(CalcError::Value));
+    };
+    let fn_sa = match coerce_for_scalar_op(fn_arg, workbook, spills, caller) {
+        Ok(v) => v,
+        Err(e) => return EvalValue::Scalar(EvalScalar::Error(e)),
+    };
+    let opt_sa = match coerce_for_scalar_op(opt_arg, workbook, spills, caller) {
+        Ok(v) => v,
+        Err(e) => return EvalValue::Scalar(EvalScalar::Error(e)),
+    };
+    let (ScalarOrArray::Scalar(fn_sc), ScalarOrArray::Scalar(opt_sc)) = (fn_sa, opt_sa) else {
+        return EvalValue::Scalar(EvalScalar::Error(CalcError::Value));
+    };
+    let Ok(fn_num) = fn_sc.to_number().and_then(super::trunc_to_isize) else {
+        return EvalValue::Scalar(EvalScalar::Error(CalcError::Value));
+    };
+    let Ok(options) = opt_sc.to_number().and_then(super::trunc_to_isize) else {
+        return EvalValue::Scalar(EvalScalar::Error(CalcError::Value));
+    };
+    if !(1..=19).contains(&fn_num) || !(0..=7).contains(&options) {
+        return EvalValue::Scalar(EvalScalar::Error(CalcError::Value));
+    }
+
+    let ignore_nested = options <= 3;
+    let ignore_hidden = matches!(options, 1 | 3 | 5 | 7);
+    let ignore_errors = matches!(options, 2 | 3 | 6 | 7);
+
+    let mut rest: Vec<EvalValue> = it.collect();
+    let k_opt = if fn_num >= 14 {
+        if rest.len() != 2 {
+            return EvalValue::Scalar(EvalScalar::Error(CalcError::Value));
+        }
+        let Some(k_arg) = rest.pop() else {
+            return EvalValue::Scalar(EvalScalar::Error(CalcError::Value));
+        };
+        let k_sa = match coerce_for_scalar_op(k_arg, workbook, spills, caller) {
+            Ok(v) => v,
+            Err(e) => return EvalValue::Scalar(EvalScalar::Error(e)),
+        };
+        let ScalarOrArray::Scalar(k_sc) = k_sa else {
+            return EvalValue::Scalar(EvalScalar::Error(CalcError::Value));
+        };
+        match k_sc.to_number() {
+            Ok(v) => Some(v),
+            Err(e) => return EvalValue::Scalar(EvalScalar::Error(e)),
+        }
+    } else {
+        None
+    };
+
+    let (nums, counta) = match collect_subtotal_cells(
+        &rest,
+        workbook,
+        spills,
+        SubtotalFlags {
+            ignore_hidden,
+            ignore_nested,
+            include_aggregate_nested: true,
+            ignore_errors,
+            collect_counta_only: fn_num == 3,
+        },
+        is_row_hidden,
+    ) {
+        Ok(v) => v,
+        Err(e) => return EvalValue::Scalar(EvalScalar::Error(e)),
+    };
+    EvalValue::Scalar(eval_basic_sub_agg_code(fn_num, &nums, counta, k_opt))
 }

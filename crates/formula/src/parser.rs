@@ -375,12 +375,25 @@ impl Parser<'_> {
             if args.len() >= MAX_FUNCTION_ARGS {
                 return Err(ParseError::TooManyArguments);
             }
-            let arg = self.parse_bp(0, depth)?;
-            args.push(arg);
-            match self.bump() {
-                Some(Token::Comma) => {}
-                Some(Token::RParen) => break,
-                _ => return Err(ParseError::UnexpectedToken),
+            match self.peek() {
+                Some(Token::Comma) => {
+                    let _ = self.bump();
+                    args.push(Expr::MissingArg);
+                }
+                Some(Token::RParen) => {
+                    let _ = self.bump();
+                    args.push(Expr::MissingArg);
+                    break;
+                }
+                _ => {
+                    let arg = self.parse_bp(0, depth)?;
+                    args.push(arg);
+                    match self.bump() {
+                        Some(Token::Comma) => {}
+                        Some(Token::RParen) => break,
+                        _ => return Err(ParseError::UnexpectedToken),
+                    }
+                }
             }
         }
         Ok(Expr::Call {
@@ -600,5 +613,22 @@ mod tests {
             parse_formula("={1,2;3}"),
             Err(ParseError::InvalidArrayLiteral)
         );
+    }
+
+    #[test]
+    fn omitted_optional_function_arguments_parse_and_print_cleanly() {
+        for sample in [
+            "=XLOOKUP(A1,B1:B5,C1:C5,,0)",
+            "=TAKE(A1:C3,,2)",
+            "=IF(TRUE,1,)",
+            "=SUBSTITUTE(A1,\"a\",\"b\",)",
+            "=IF(,1,2)",
+            "=ADDRESS(,)",
+        ] {
+            let ast = parse_formula(sample).unwrap();
+            let printed = ast.to_formula_string();
+            assert_eq!(printed, sample);
+            assert_eq!(parse_formula(&printed).unwrap(), ast);
+        }
     }
 }
