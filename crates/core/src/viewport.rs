@@ -22,7 +22,7 @@ use smallvec::SmallVec;
 use crate::id::{ColId, RowId};
 use crate::sheet::Sheet;
 use crate::style::HorizontalAlign;
-use crate::value::Value;
+use crate::value::{CalcError, Value};
 
 /// Version of the viewport page binary layout (`14-m1b.md` 6.2).
 pub const VERSION: u32 = 2;
@@ -93,6 +93,8 @@ pub const FLAG_ERROR: u16 = 4;
 pub const FLAG_FORMULA: u16 = 8;
 /// Cell flag: display text was clipped at [`MAX_CELL_DISPLAY_UTF16`] UTF-16 units.
 pub const FLAG_TRUNCATED: u16 = 16;
+/// Cell flag: cell value comes from a dynamic array spill shadow (not an anchor).
+pub const FLAG_SPILL: u16 = 32;
 
 /// Maximum UTF-16 code units written into a viewport page for a single cell.
 pub const MAX_CELL_DISPLAY_UTF16: u16 = 512;
@@ -347,10 +349,48 @@ pub fn prepare_page_styles(sheet: &mut Sheet, page: Page) {
     sheet.prepare_viewport_styles(&row_ids, &col_ids);
 }
 
-/// Encodes one v2 page of `sheet`, without formula flags.
+/// Borrowed value override for a single viewport cell (used so spilled values,
+/// including spilled strings, render without mutating [`Sheet::strings`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum OverlayValue<'a> {
+    /// Numeric value formatted with the cell's resolved number format.
+    Number(f64),
+    /// Boolean value (`TRUE` / `FALSE`).
+    Bool(bool),
+    /// Formula error value (`#SPILL!`, `#DIV/0!`, ...).
+    Error(CalcError),
+    /// Borrowed string slice.
+    Text(&'a str),
+    /// Explicit empty cell override.
+    Empty,
+}
+
+impl OverlayValue<'_> {
+    const fn is_empty(self) -> bool {
+        matches!(self, Self::Empty)
+    }
+
+    const fn is_text(self) -> bool {
+        matches!(self, Self::Text(_))
+    }
+}
+
+/// Cell overlay supplied when encoding a viewport page (e.g., formula flags
+/// and materialized dynamic-array spill shadow values).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ViewportCellOverlay<'a> {
+    /// Optional value override (used for spill shadow cells whose sheet slot is `Empty`).
+    pub value: Option<OverlayValue<'a>>,
+    /// Additional bit flags (`FLAG_FORMULA`, `FLAG_SPILL`) ORed into the cell's flags.
+    pub extra_flags: u16,
+}
+
+/// Encodes one v2 page of `sheet`, without formula flags or spill overlays.
 #[must_use]
 pub fn encode_page(sheet: &Sheet, page: Page, epoch: u32, text: &mut String) -> Vec<u8> {
-    encode_page_with_formulas(sheet, page, epoch, text, |_, _| false)
+    encode_page_with_overlay(sheet, page, epoch, text, |_, _| {
+        ViewportCellOverlay::default()
+    })
 }
 
 /// Encodes one v2 page of `sheet`, marking cells where `is_formula` returns
@@ -366,6 +406,72 @@ pub fn encode_page_with_formulas<F>(
 ) -> Vec<u8>
 where
     F: FnMut(RowId, ColId) -> bool,
+{
+    encode_page_with_overlay(sheet, page, epoch, text, |r, c| ViewportCellOverlay {
+        value: None,
+        extra_flags: if is_formula(r, c) { FLAG_FORMULA } else { 0 },
+    })
+}
+
+fn format_overlay_or_sheet_value(
+    sheet: &Sheet,
+    row_id: RowId,
+    col_id: ColId,
+    override_val: Option<OverlayValue<'_>>,
+    text: &mut String,
+) -> (u16, bool, bool) {
+    match override_val {
+        Some(OverlayValue::Empty) => (0, true, false),
+        Some(OverlayValue::Number(n)) => {
+            let v = Value::number(n);
+            sheet.format_value(v, row_id, col_id, text);
+            let f = if matches!(v, Value::Number(_)) {
+                FLAG_NUMBER
+            } else {
+                FLAG_ERROR
+            };
+            (f, false, false)
+        }
+        Some(OverlayValue::Bool(b)) => {
+            sheet.format_value(Value::Bool(b), row_id, col_id, text);
+            (FLAG_BOOL, false, false)
+        }
+        Some(OverlayValue::Error(e)) => {
+            text.push_str(e.as_str());
+            (FLAG_ERROR, false, false)
+        }
+        Some(OverlayValue::Text(s)) => {
+            text.push_str(s);
+            (0, false, true)
+        }
+        None => {
+            let val = sheet.value_by_id(row_id, col_id);
+            sheet.format_value(val, row_id, col_id, text);
+            let flags = match val {
+                Value::Number(_) => FLAG_NUMBER,
+                Value::Bool(_) => FLAG_BOOL,
+                Value::Error(_) | Value::Array(_) => FLAG_ERROR,
+                Value::Empty | Value::Text(_) => 0,
+            };
+            (flags, val == Value::Empty, matches!(val, Value::Text(_)))
+        }
+    }
+}
+
+/// Encodes one v2 page of `sheet` with per-cell value/flag overlays (e.g.
+/// [`FLAG_FORMULA`] and materialized [`FLAG_SPILL`] shadow values), recording
+/// each cell's `StyleId` and appending left-overflow text candidates when
+/// `first_col > 0` (`14-m1b.md` 6.2, `17-m3a.md`).
+#[must_use]
+pub fn encode_page_with_overlay<'a, F>(
+    sheet: &Sheet,
+    page: Page,
+    epoch: u32,
+    text: &mut String,
+    mut overlay: F,
+) -> Vec<u8>
+where
+    F: FnMut(RowId, ColId) -> ViewportCellOverlay<'a>,
 {
     let first_row = page.row.saturating_mul(PAGE_ROWS);
     let first_col = page.col.saturating_mul(PAGE_COLS);
@@ -416,18 +522,11 @@ where
     for &row_id in &row_ids {
         for &col_id in &col_ids {
             let start = text.len();
-            let val = sheet.value_by_id(row_id, col_id);
-            sheet.format_value(val, row_id, col_id, text);
+            let cell_overlay = overlay(row_id, col_id);
+            let (mut flags, _, _) =
+                format_overlay_or_sheet_value(sheet, row_id, col_id, cell_overlay.value, text);
             let (units, truncated) = clip_to_record(text, start);
-            let mut flags: u16 = match val {
-                Value::Number(_) => FLAG_NUMBER,
-                Value::Bool(_) => FLAG_BOOL,
-                Value::Error(_) | Value::Array(_) => FLAG_ERROR,
-                Value::Empty | Value::Text(_) => 0,
-            };
-            if is_formula(row_id, col_id) {
-                flags |= FLAG_FORMULA;
-            }
+            flags |= cell_overlay.extra_flags;
             if truncated {
                 flags |= FLAG_TRUNCATED;
             }
@@ -455,25 +554,38 @@ where
         }
 
         for (r_idx, &row_id) in row_ids.iter().enumerate() {
-            if sheet.value_by_id(row_id, first_page_col_id) != Value::Empty {
+            let first_is_empty = overlay(row_id, first_page_col_id).value.map_or_else(
+                || sheet.value_by_id(row_id, first_page_col_id) == Value::Empty,
+                OverlayValue::is_empty,
+            );
+            if !first_is_empty {
                 continue;
             }
             for &(origin_col_pos, origin_col_id) in &lookback_col_ids {
-                let val = sheet.value_by_id(row_id, origin_col_id);
-                if val == Value::Empty {
+                let ov_val = overlay(row_id, origin_col_id).value;
+                let (is_empty, is_text) = match ov_val {
+                    Some(ov) => (ov.is_empty(), ov.is_text()),
+                    None => {
+                        let v = sheet.value_by_id(row_id, origin_col_id);
+                        (v == Value::Empty, matches!(v, Value::Text(_)))
+                    }
+                };
+                if is_empty {
                     continue;
                 }
                 let eff_style = sheet.effective_style_by_id(row_id, origin_col_id);
-                let is_left_text = match val {
-                    Value::Text(_) => matches!(
+                let is_left_text = if is_text {
+                    matches!(
                         eff_style.align,
                         HorizontalAlign::Auto | HorizontalAlign::Left
-                    ),
-                    _ => eff_style.align == HorizontalAlign::Left,
+                    )
+                } else {
+                    eff_style.align == HorizontalAlign::Left
                 };
                 if is_left_text {
                     let start = text.len();
-                    sheet.format_value(val, row_id, origin_col_id, text);
+                    let _ =
+                        format_overlay_or_sheet_value(sheet, row_id, origin_col_id, ov_val, text);
                     let (units, _) = clip_to_record(text, start);
                     if units > 0
                         && let (Ok(r_off), Ok(orig_c)) =
@@ -905,6 +1017,56 @@ mod tests {
                 10 + MAX_SUBSCRIBED_PAGE_ROWS - 1,
                 MAX_SUBSCRIBED_PAGE_COLS - 1
             ))
+        );
+    }
+
+    #[test]
+    fn overlay_renders_spilled_numbers_text_and_errors_without_sheet_mutation() {
+        let mut sheet = Sheet::with_axes(SheetId(0), String::from("S1"), 3, 20);
+        assert!(sheet.set_value_by_id(RowId(0), ColId(0), Value::Number(10.0)));
+        let mut scratch = String::new();
+        let bytes = encode_page_with_overlay(
+            &sheet,
+            Page { row: 0, col: 0 },
+            1,
+            &mut scratch,
+            |r, c| match (r.0, c.0) {
+                (0, 0) => ViewportCellOverlay {
+                    value: None,
+                    extra_flags: FLAG_FORMULA,
+                },
+                (0, 1) => ViewportCellOverlay {
+                    value: Some(OverlayValue::Number(20.0)),
+                    extra_flags: FLAG_SPILL,
+                },
+                (1, 0) => ViewportCellOverlay {
+                    value: Some(OverlayValue::Text("spilled text")),
+                    extra_flags: FLAG_SPILL,
+                },
+                (1, 1) => ViewportCellOverlay {
+                    value: Some(OverlayValue::Error(CalcError::Div0)),
+                    extra_flags: FLAG_SPILL,
+                },
+                _ => ViewportCellOverlay::default(),
+            },
+        );
+        let decoded = decode(&bytes);
+        assert_eq!(
+            decoded.cells[0],
+            (String::from("10"), 0, FLAG_NUMBER | FLAG_FORMULA)
+        );
+        assert_eq!(
+            decoded.cells[1],
+            (String::from("20"), 0, FLAG_NUMBER | FLAG_SPILL)
+        );
+        assert_eq!(decoded.cols, 16);
+        assert_eq!(
+            decoded.cells[decoded.cols],
+            (String::from("spilled text"), 0, FLAG_SPILL)
+        );
+        assert_eq!(
+            decoded.cells[decoded.cols + 1],
+            (String::from("#DIV/0!"), 0, FLAG_ERROR | FLAG_SPILL)
         );
     }
 }

@@ -13,6 +13,7 @@ use reticula_core::value::CalcError;
 
 use super::{lift_binary, lift_ternary, lift_unary, text_conv::coerce_date_or_number};
 use crate::binder::BoundFormula;
+use crate::spill::SpillRegistry;
 use crate::value_eval::{CallerContext, EvalScalar, EvalValue};
 
 /// Maximum valid Excel 1900-system date serial (`9999-12-31`).
@@ -22,9 +23,10 @@ const MAX_DATE_SERIAL: i64 = 2_958_465;
 pub fn eval_date(
     args: Vec<EvalValue>,
     workbook: &Workbook<BoundFormula>,
+    spills: &SpillRegistry,
     caller: CallerContext,
 ) -> EvalValue {
-    lift_ternary(args, workbook, caller, |y_arg, m_arg, d_arg| {
+    lift_ternary(args, workbook, spills, caller, |y_arg, m_arg, d_arg| {
         let y_raw = match coerce_date_or_number(y_arg).and_then(trunc_i64) {
             Ok(v) => v,
             Err(e) => return EvalScalar::Error(e),
@@ -78,10 +80,11 @@ pub fn eval_date(
 pub fn eval_date_part(
     args: Vec<EvalValue>,
     workbook: &Workbook<BoundFormula>,
+    spills: &SpillRegistry,
     caller: CallerContext,
     part: u8,
 ) -> EvalValue {
-    lift_unary(args, workbook, caller, |arg| {
+    lift_unary(args, workbook, spills, caller, |arg| {
         let serial = match coerce_date_or_number(arg) {
             Ok(v) => v,
             Err(e) => return EvalScalar::Error(e),
@@ -102,10 +105,11 @@ pub fn eval_date_part(
 pub fn eval_edate_or_eomonth(
     args: Vec<EvalValue>,
     workbook: &Workbook<BoundFormula>,
+    spills: &SpillRegistry,
     caller: CallerContext,
     end_of_month: bool,
 ) -> EvalValue {
-    lift_binary(args, workbook, caller, |start_arg, months_arg| {
+    lift_binary(args, workbook, spills, caller, |start_arg, months_arg| {
         let start = match coerce_date_or_number(start_arg) {
             Ok(v) => v,
             Err(e) => return EvalScalar::Error(e),
@@ -148,9 +152,10 @@ pub fn eval_edate_or_eomonth(
 pub fn eval_days(
     args: Vec<EvalValue>,
     workbook: &Workbook<BoundFormula>,
+    spills: &SpillRegistry,
     caller: CallerContext,
 ) -> EvalValue {
-    lift_binary(args, workbook, caller, |end_arg, start_arg| {
+    lift_binary(args, workbook, spills, caller, |end_arg, start_arg| {
         let end_num = match coerce_date_or_number(end_arg) {
             Ok(v) => v,
             Err(e) => return EvalScalar::Error(e),

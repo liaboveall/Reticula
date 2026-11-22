@@ -17,15 +17,21 @@ use reticula_core::store::{BLOCK_ROWS, Block};
 use reticula_core::value::{CalcError, Value};
 
 use super::text_conv::parse_excel_value_str;
-use super::visit_reference_words;
 use super::wildcard::{WildToken, compile_wildcard, wildcard_matches_full};
+use super::{RefCellVal, visit_reference_cells};
 use crate::binder::BoundFormula;
+use crate::spill::SpillRegistry;
 use crate::value_eval::{
     CallerContext, EvalScalar, EvalValue, ResolvedRef, ScalarOrArray, coerce_for_scalar_op,
+    read_sheet_cell_effective,
 };
 
 /// Evaluates `COUNTBLANK(range)`.
-pub fn eval_countblank(args: &[EvalValue], workbook: &Workbook<BoundFormula>) -> EvalValue {
+pub fn eval_countblank(
+    args: &[EvalValue],
+    workbook: &Workbook<BoundFormula>,
+    spills: &SpillRegistry,
+) -> EvalValue {
     if args.len() != 1 {
         return EvalValue::Scalar(EvalScalar::Error(CalcError::Value));
     }
@@ -33,7 +39,7 @@ pub fn eval_countblank(args: &[EvalValue], workbook: &Workbook<BoundFormula>) ->
         return EvalValue::Scalar(EvalScalar::Error(CalcError::Value));
     };
     match arg0 {
-        EvalValue::Reference(r) => match count_blanks_in_ref(r, workbook) {
+        EvalValue::Reference(r) => match count_blanks_in_ref(r, workbook, spills) {
             Ok(cnt) =>
             {
                 #[expect(clippy::cast_precision_loss, reason = "cell count fits in f64")]
@@ -61,6 +67,7 @@ pub fn eval_countblank(args: &[EvalValue], workbook: &Workbook<BoundFormula>) ->
 fn count_blanks_in_ref(
     r: &ResolvedRef,
     workbook: &Workbook<BoundFormula>,
+    spills: &SpillRegistry,
 ) -> Result<u64, CalcError> {
     let target_sheet = match r {
         ResolvedRef::Invalid(e) => return Err(*e),
@@ -88,6 +95,14 @@ fn count_blanks_in_ref(
             Ok(())
         },
     )?;
+    if spills.has_spills_on_sheet(target_sheet.id()) {
+        visit_shadows_in_ref(r, workbook, spills, |s| {
+            if !matches!(s, EvalScalar::Empty) && !matches!(s, EvalScalar::Text(t) if t.is_empty())
+            {
+                empty_blanks = empty_blanks.saturating_sub(1);
+            }
+        });
+    }
     Ok(empty_blanks.saturating_add(text_blanks))
 }
 
@@ -95,6 +110,7 @@ fn count_blanks_in_ref(
 pub fn eval_countif(
     mut args: Vec<EvalValue>,
     workbook: &Workbook<BoundFormula>,
+    spills: &SpillRegistry,
     caller: CallerContext,
 ) -> EvalValue {
     if args.len() != 2 {
@@ -107,17 +123,19 @@ pub fn eval_countif(
         return EvalValue::Scalar(EvalScalar::Error(CalcError::Value));
     };
 
-    let crit_sa = match coerce_for_scalar_op(crit_val, workbook, caller) {
+    let crit_sa = match coerce_for_scalar_op(crit_val, workbook, spills, caller) {
         Ok(sa) => sa,
         Err(e) => return EvalValue::Scalar(EvalScalar::Error(e)),
     };
     match crit_sa {
-        ScalarOrArray::Scalar(c) => EvalValue::Scalar(countif_one(&range_val, &c, workbook)),
+        ScalarOrArray::Scalar(c) => {
+            EvalValue::Scalar(countif_one(&range_val, &c, workbook, spills))
+        }
         ScalarOrArray::Array(arr) => {
             let values = arr
                 .values
                 .iter()
-                .map(|c| countif_one(&range_val, c, workbook))
+                .map(|c| countif_one(&range_val, c, workbook, spills))
                 .collect();
             EvalValue::Array(crate::value_eval::Array2D {
                 rows: arr.rows,
@@ -132,6 +150,7 @@ fn countif_one(
     range_val: &EvalValue,
     crit_scalar: &EvalScalar,
     workbook: &Workbook<BoundFormula>,
+    spills: &SpillRegistry,
 ) -> EvalScalar {
     let pred = CompiledCriterion::compile(crit_scalar);
     match range_val {
@@ -167,6 +186,18 @@ fn countif_one(
                     Ok(())
                 },
             );
+            if res.is_ok() && spills.has_spills_on_sheet(sheet.id()) {
+                visit_shadows_in_ref(r, workbook, spills, |s| {
+                    if !matches!(s, EvalScalar::Empty) {
+                        if matches_empty {
+                            empty_matches = empty_matches.saturating_sub(1);
+                        }
+                        if pred.matches(s) {
+                            non_empty_matches = non_empty_matches.saturating_add(1);
+                        }
+                    }
+                });
+            }
             let count = empty_matches.saturating_add(non_empty_matches);
             match res {
                 Ok(()) =>
@@ -192,6 +223,7 @@ fn countif_one(
 pub fn eval_sumif_or_averageif(
     args: Vec<EvalValue>,
     workbook: &Workbook<BoundFormula>,
+    spills: &SpillRegistry,
     caller: CallerContext,
     is_average: bool,
 ) -> EvalValue {
@@ -204,7 +236,7 @@ pub fn eval_sumif_or_averageif(
     };
     let val_range = it.next();
 
-    let crit_sa = match coerce_for_scalar_op(crit_val, workbook, caller) {
+    let crit_sa = match coerce_for_scalar_op(crit_val, workbook, spills, caller) {
         Ok(sa) => sa,
         Err(e) => return EvalValue::Scalar(EvalScalar::Error(e)),
     };
@@ -215,13 +247,23 @@ pub fn eval_sumif_or_averageif(
             &c,
             val_range.as_ref(),
             workbook,
+            spills,
             is_average,
         )),
         ScalarOrArray::Array(arr) => {
             let values = arr
                 .values
                 .iter()
-                .map(|c| sumif_one(&range_val, c, val_range.as_ref(), workbook, is_average))
+                .map(|c| {
+                    sumif_one(
+                        &range_val,
+                        c,
+                        val_range.as_ref(),
+                        workbook,
+                        spills,
+                        is_average,
+                    )
+                })
                 .collect();
             EvalValue::Array(crate::value_eval::Array2D {
                 rows: arr.rows,
@@ -237,6 +279,7 @@ fn sumif_one(
     crit_scalar: &EvalScalar,
     val_range_opt: Option<&EvalValue>,
     workbook: &Workbook<BoundFormula>,
+    spills: &SpillRegistry,
     is_average: bool,
 ) -> EvalScalar {
     let pred = CompiledCriterion::compile(crit_scalar);
@@ -247,21 +290,13 @@ fn sumif_one(
 
     match (range_val, val_range_opt) {
         (EvalValue::Reference(crit_ref), None) => {
-            let sheet = match crit_ref {
-                ResolvedRef::Invalid(e) => return EvalScalar::Error(*e),
-                ResolvedRef::Cell { sheet, .. }
-                | ResolvedRef::Area { sheet, .. }
-                | ResolvedRef::FullCols { sheet, .. }
-                | ResolvedRef::FullRows { sheet, .. } => {
-                    let Some(s) = workbook.sheet(*sheet) else {
-                        return EvalScalar::Error(CalcError::Ref);
-                    };
-                    s
-                }
-            };
-            let res = visit_reference_words(crit_ref, workbook, |bits| {
-                let raw_val = Value::unpack(bits);
-                let cell_s = EvalScalar::from_sheet_value(sheet, raw_val);
+            let res = visit_reference_cells(crit_ref, workbook, spills, |sheet, cell| {
+                let cell_s = match cell {
+                    RefCellVal::Word(bits) => {
+                        EvalScalar::from_sheet_value(sheet, Value::unpack(bits))
+                    }
+                    RefCellVal::Shadow(s) => s.clone(),
+                };
                 if pred.matches(&cell_s)
                     && let EvalScalar::Number(n) = cell_s
                 {
@@ -278,9 +313,9 @@ fn sumif_one(
             }
         }
         (EvalValue::Reference(crit_ref), Some(EvalValue::Reference(sum_ref))) => {
-            if let Err(e) =
-                sumif_paired_refs(crit_ref, sum_ref, &pred, workbook, &mut sum, &mut count)
-            {
+            if let Err(e) = sumif_paired_refs(
+                crit_ref, sum_ref, &pred, workbook, spills, &mut sum, &mut count,
+            ) {
                 return EvalScalar::Error(e);
             }
         }
@@ -325,6 +360,7 @@ fn sumif_paired_refs(
     sum_ref: &ResolvedRef,
     pred: &CompiledCriterion,
     workbook: &Workbook<BoundFormula>,
+    spills: &SpillRegistry,
     sum: &mut f64,
     count: &mut u64,
 ) -> Result<(), CalcError> {
@@ -355,10 +391,8 @@ fn sumif_paired_refs(
     for (r_idx, &crit_r_raw) in crit_row_ids.iter().enumerate() {
         let sum_r_opt = sum_row_ids.get(r_idx).copied();
         for (c_idx, &crit_c_raw) in crit_col_ids.iter().enumerate() {
-            let crit_val = EvalScalar::from_sheet_value(
-                crit_sheet,
-                crit_sheet.value_by_id(RowId(crit_r_raw), ColId(crit_c_raw)),
-            );
+            let crit_val =
+                read_sheet_cell_effective(crit_sheet, spills, RowId(crit_r_raw), ColId(crit_c_raw));
             if pred.matches(&crit_val) {
                 let Some(sr) = sum_r_opt else {
                     continue;
@@ -366,22 +400,46 @@ fn sumif_paired_refs(
                 let Some(&sc) = sum_col_ids.get(c_idx) else {
                     continue;
                 };
-                match sum_sheet.value_by_id(RowId(sr), ColId(sc)) {
-                    Value::Error(e) => return Err(e),
-                    Value::Array(_) => return Err(CalcError::Spill),
-                    Value::Number(n) => {
+                match read_sheet_cell_effective(sum_sheet, spills, RowId(sr), ColId(sc)) {
+                    EvalScalar::Error(e) => return Err(e),
+                    EvalScalar::Number(n) => {
                         *sum += n;
                         if !sum.is_finite() {
                             return Err(CalcError::Num);
                         }
                         *count = count.saturating_add(1);
                     }
-                    Value::Empty | Value::Text(_) | Value::Bool(_) => {}
+                    EvalScalar::Empty | EvalScalar::Text(_) | EvalScalar::Bool(_) => {}
                 }
             }
         }
     }
     Ok(())
+}
+
+fn visit_shadows_in_ref(
+    r: &ResolvedRef,
+    workbook: &Workbook<BoundFormula>,
+    spills: &SpillRegistry,
+    mut emit: impl FnMut(&EvalScalar),
+) {
+    let Ok((sheet_id, r0, rows, c0, cols)) = ref_live_origin_and_size(r, workbook) else {
+        return;
+    };
+    if rows == 0 || cols == 0 || !spills.has_spills_on_sheet(sheet_id) {
+        return;
+    }
+    let Some(sheet) = workbook.sheet(sheet_id) else {
+        return;
+    };
+    let r2_ord = r0.saturating_add(rows.saturating_sub(1));
+    sheet.col_axis().for_each_live_positions(c0, cols, |c_run| {
+        for cid in c_run.iter() {
+            spills.for_each_shadow_in_col_span(sheet, ColId(cid), r0, r2_ord, |_, scalar| {
+                emit(scalar);
+            });
+        }
+    });
 }
 
 pub(crate) fn ref_live_origin_and_size(

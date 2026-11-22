@@ -13,6 +13,7 @@
 
 use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::hash::BuildHasherDefault;
@@ -124,10 +125,21 @@ struct RangeRegistrations {
 /// Reverse edges registered by one formula, kept so removal is fast without
 /// scanning the entire graph.
 #[derive(Clone, Debug, Default)]
+struct ExtraDeps {
+    names: Vec<String>,
+    spill_anchors: Vec<WorkbookCellKey>,
+    scoped_sheets: Vec<SheetId>,
+}
+
+/// Compact per-formula reverse-dependency handles retained so unregistering
+/// or replacing a formula touches only the edges it actually created without
+/// scanning the entire graph.
+#[derive(Clone, Debug, Default)]
 pub struct FormulaRegistration {
     single_cells: SmallVec<[WorkbookCellKey; 3]>,
     ranges: Option<Box<RangeRegistrations>>,
     structural_sheet: Option<SheetId>,
+    extra: Option<Box<ExtraDeps>>,
 }
 
 impl FormulaRegistration {
@@ -136,10 +148,21 @@ impl FormulaRegistration {
             .get_or_insert_with(|| Box::new(RangeRegistrations::default()))
     }
 
+    fn extra_mut(&mut self) -> &mut ExtraDeps {
+        self.extra
+            .get_or_insert_with(|| Box::new(ExtraDeps::default()))
+    }
+
     /// Whether this formula statically subscribes to any cell or range on `target`.
     #[must_use]
     pub fn references_sheet(&self, target: SheetId) -> bool {
         if self.single_cells.iter().any(|&(s, _, _)| s == target) {
+            return true;
+        }
+        if let Some(extra) = self.extra.as_deref()
+            && (extra.scoped_sheets.contains(&target)
+                || extra.spill_anchors.iter().any(|&(s, _, _)| s == target))
+        {
             return true;
         }
         let Some(ranges) = self.ranges.as_deref() else {
@@ -162,6 +185,8 @@ pub struct DepGraph {
     full_col_deps: BTreeMap<SheetId, Vec<ColSpanSub>>,
     full_row_deps: BTreeMap<SheetId, Vec<RowSpanSub>>,
     structural_set: BTreeMap<SheetId, BTreeSet<u32>>,
+    name_deps: BTreeMap<String, Vec<u32>>,
+    spill_deps: BTreeMap<WorkbookCellKey, Vec<u32>>,
 }
 
 impl DepGraph {
@@ -278,6 +303,14 @@ impl DepGraph {
                 .or_default()
                 .insert(fid);
         }
+        if let Some(extra) = reg.extra.as_deref() {
+            for name in &extra.names {
+                self.name_deps.entry(name.clone()).or_default().push(fid);
+            }
+            for &anchor in &extra.spill_anchors {
+                self.spill_deps.entry(anchor).or_default().push(fid);
+            }
+        }
         (reg, flags.volatile)
     }
 
@@ -335,6 +368,47 @@ impl DepGraph {
             && let Some(set) = self.structural_set.get_mut(&sheet)
         {
             set.remove(&fid);
+        }
+        if let Some(extra) = reg.extra.as_deref() {
+            for name in &extra.names {
+                if let Some(list) = self.name_deps.get_mut(name) {
+                    if let Some(idx) = list.iter().position(|&x| x == fid) {
+                        list.swap_remove(idx);
+                    }
+                    if list.is_empty() {
+                        self.name_deps.remove(name);
+                    }
+                }
+            }
+            for &anchor in &extra.spill_anchors {
+                if let Some(list) = self.spill_deps.get_mut(&anchor) {
+                    if let Some(idx) = list.iter().position(|&x| x == fid) {
+                        list.swap_remove(idx);
+                    }
+                    if list.is_empty() {
+                        self.spill_deps.remove(&anchor);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Calls `emit(fid)` for every registered consumer referencing `canonical_name`
+    /// (case-folded with `.to_ascii_lowercase()`, either unqualified or sheet-scoped).
+    pub fn for_each_name_dependent(&self, canonical_name: &str, mut emit: impl FnMut(u32)) {
+        if let Some(list) = self.name_deps.get(canonical_name) {
+            for &fid in list {
+                emit(fid);
+            }
+        }
+    }
+
+    /// Calls `emit(fid)` for every formula referencing `anchor#`.
+    pub fn for_each_spill_dependent(&self, anchor: WorkbookCellKey, mut emit: impl FnMut(u32)) {
+        if let Some(list) = self.spill_deps.get(&anchor) {
+            for &fid in list {
+                emit(fid);
+            }
         }
     }
 
@@ -765,7 +839,46 @@ fn collect_refs(
     flags: &mut WalkFlags,
 ) {
     match expr {
-        BoundExpr::Literal(_) | BoundExpr::ArrayLiteral { .. } | BoundExpr::Name(_) => {}
+        BoundExpr::Literal(_)
+        | BoundExpr::ArrayLiteral { .. }
+        | BoundExpr::Opaque { .. }
+        | BoundExpr::PreservedCached { .. } => {}
+        BoundExpr::Name(s) => {
+            let canon = s.to_ascii_lowercase();
+            let names = &mut reg.extra_mut().names;
+            if !names.contains(&canon) {
+                names.push(canon);
+            }
+        }
+        BoundExpr::ScopedName { sheet, name, .. } => {
+            let canon = name.to_ascii_lowercase();
+            let extra = reg.extra_mut();
+            if !extra.names.contains(&canon) {
+                extra.names.push(canon);
+            }
+            if let Some(sid) = *sheet
+                && !extra.scoped_sheets.contains(&sid)
+            {
+                extra.scoped_sheets.push(sid);
+            }
+        }
+        BoundExpr::SpillRef(inner) => {
+            let mut cur = inner.as_ref();
+            while let BoundExpr::Paren(p) = cur {
+                cur = p;
+            }
+            if let BoundExpr::Reference(BoundRef::Cell {
+                sheet, row, col, ..
+            }) = cur
+            {
+                let anchor = (sheet.unwrap_or(host_sheet), *row, *col);
+                let anchors = &mut reg.extra_mut().spill_anchors;
+                if !anchors.contains(&anchor) {
+                    anchors.push(anchor);
+                }
+            }
+            collect_refs(inner, host_sheet, fid, reg, flags);
+        }
         BoundExpr::Reference(r) => match r {
             BoundRef::Invalid { .. } => {}
             BoundRef::Cell {

@@ -149,8 +149,17 @@ pub enum Expr {
         /// Whether `last_row` had `$`.
         abs_last: bool,
     },
-    /// Unresolved identifier (evaluates to `#NAME?` in Excel).
+    /// Unresolved or workbook/sheet-local named identifier.
     Name(String),
+    /// Worksheet-qualified identifier (`Sheet2!TaxRate`).
+    QualifiedName {
+        /// Qualifier worksheet name.
+        sheet: String,
+        /// Identifier name.
+        name: String,
+    },
+    /// Dynamic-array spill-range operator (`A1#`, `Sheet2!Data#`).
+    SpillRef(Box<Self>),
     /// Explicit parenthesised sub-expression `(expr)` — preserved so both
     /// pretty-print round-trips and D-027 outermost `=(A1-B1)` suppression hold.
     Paren(Box<Self>),
@@ -265,6 +274,21 @@ impl Expr {
                 let _ = write!(out, "{r2}");
             }
             Self::Name(ident) => out.push_str(ident),
+            Self::QualifiedName { sheet, name } => {
+                write_sheet_prefix(Some(sheet.as_str()), out);
+                out.push_str(name);
+            }
+            Self::SpillRef(inner) => {
+                let wrap = parent_prec.is_some_and(|(p, _)| 90 < p);
+                if wrap {
+                    out.push('(');
+                }
+                inner.write_expr(out, Some((90, false)));
+                out.push('#');
+                if wrap {
+                    out.push(')');
+                }
+            }
             Self::Paren(inner) => {
                 out.push('(');
                 inner.write_expr(out, None);

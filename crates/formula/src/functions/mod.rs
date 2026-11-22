@@ -14,7 +14,7 @@ use alloc::vec::Vec;
 use reticula_core::decimal15::{
     RoundingMode, excel_int, excel_mod, round_decimal, snap_cancelled_zero,
 };
-use reticula_core::id::IdRun;
+use reticula_core::id::{ColId, IdRun, RowId};
 use reticula_core::num;
 use reticula_core::ops::{MAX_CELL_TEXT_UTF16, Workbook};
 use reticula_core::rng::Rng;
@@ -23,6 +23,7 @@ use reticula_core::store::{BLOCK_ROWS, Block};
 use reticula_core::value::{CalcError, Value};
 
 use crate::binder::{BoundFormula, live_span_positions};
+use crate::spill::SpillRegistry;
 use crate::value_eval::{
     Array2D, CallerContext, EvalScalar, EvalValue, MAX_ARRAY_CELLS, ResolvedRef, ScalarOrArray,
     coerce_for_scalar_op,
@@ -71,22 +72,23 @@ pub fn eval_eager_function(
     name: &str,
     args: Vec<EvalValue>,
     workbook: &Workbook<BoundFormula>,
+    spills: &SpillRegistry,
     caller: CallerContext,
     env: &mut EvalEnv,
 ) -> EvalValue {
     match name {
         // --- Layer 0: Aggregations ---
-        "SUM" => EvalValue::Scalar(eval_sum(&args, workbook)),
-        "AVERAGE" => EvalValue::Scalar(eval_average(&args, workbook)),
-        "COUNT" => EvalValue::Scalar(eval_count(&args, workbook)),
-        "COUNTA" => EvalValue::Scalar(eval_counta(&args, workbook)),
-        "MIN" => EvalValue::Scalar(eval_min_max(&args, workbook, true)),
-        "MAX" => EvalValue::Scalar(eval_min_max(&args, workbook, false)),
+        "SUM" => EvalValue::Scalar(eval_sum(&args, workbook, spills)),
+        "AVERAGE" => EvalValue::Scalar(eval_average(&args, workbook, spills)),
+        "COUNT" => EvalValue::Scalar(eval_count(&args, workbook, spills)),
+        "COUNTA" => EvalValue::Scalar(eval_counta(&args, workbook, spills)),
+        "MIN" => EvalValue::Scalar(eval_min_max(&args, workbook, spills, true)),
+        "MAX" => EvalValue::Scalar(eval_min_max(&args, workbook, spills, false)),
 
         // --- Layer 0: Logic & constants ---
-        "AND" => EvalValue::Scalar(eval_and_or(&args, workbook, true)),
-        "OR" => EvalValue::Scalar(eval_and_or(&args, workbook, false)),
-        "NOT" => lift_unary(args, workbook, caller, |x| {
+        "AND" => EvalValue::Scalar(eval_and_or(&args, workbook, spills, true)),
+        "OR" => EvalValue::Scalar(eval_and_or(&args, workbook, spills, false)),
+        "NOT" => lift_unary(args, workbook, spills, caller, |x| {
             x.to_bool()
                 .map_or_else(EvalScalar::Error, |b| EvalScalar::Bool(!b))
         }),
@@ -113,32 +115,32 @@ pub fn eval_eager_function(
         }
 
         // --- Layer 0 & Layer 1: Math, Rounding & Volatiles ---
-        "ABS" => lift_unary(args, workbook, caller, |x| {
+        "ABS" => lift_unary(args, workbook, spills, caller, |x| {
             x.to_number()
                 .map_or_else(EvalScalar::Error, |n| EvalScalar::number(n.abs()))
         }),
-        "INT" => lift_unary(args, workbook, caller, |x| match x.to_number() {
+        "INT" => lift_unary(args, workbook, spills, caller, |x| match x.to_number() {
             Ok(n) => excel_int(n).map_or(EvalScalar::Error(CalcError::Num), EvalScalar::number),
             Err(e) => EvalScalar::Error(e),
         }),
-        "SQRT" => lift_unary(args, workbook, caller, |x| match x.to_number() {
+        "SQRT" => lift_unary(args, workbook, spills, caller, |x| match x.to_number() {
             Ok(n) if n < 0.0 => EvalScalar::Error(CalcError::Num),
             Ok(n) => EvalScalar::number(num::sqrt(n)),
             Err(e) => EvalScalar::Error(e),
         }),
-        "ROUND" => lift_binary(args, workbook, caller, |x, d| {
+        "ROUND" => lift_binary(args, workbook, spills, caller, |x, d| {
             eval_round_scalar(x, d, RoundingMode::HalfAwayFromZero)
         }),
-        "ROUNDDOWN" => lift_binary(args, workbook, caller, |x, d| {
+        "ROUNDDOWN" => lift_binary(args, workbook, spills, caller, |x, d| {
             eval_round_scalar(x, d, RoundingMode::TowardZero)
         }),
-        "ROUNDUP" => lift_binary(args, workbook, caller, |x, d| {
+        "ROUNDUP" => lift_binary(args, workbook, spills, caller, |x, d| {
             eval_round_scalar(x, d, RoundingMode::AwayFromZero)
         }),
-        "TRUNC" => eval_trunc(args, workbook, caller),
-        "FLOOR" => text_conv::eval_floor_or_ceiling(args, workbook, caller, true),
-        "CEILING" => text_conv::eval_floor_or_ceiling(args, workbook, caller, false),
-        "MOD" => lift_binary(args, workbook, caller, |a, b| {
+        "TRUNC" => eval_trunc(args, workbook, spills, caller),
+        "FLOOR" => text_conv::eval_floor_or_ceiling(args, workbook, spills, caller, true),
+        "CEILING" => text_conv::eval_floor_or_ceiling(args, workbook, spills, caller, false),
+        "MOD" => lift_binary(args, workbook, spills, caller, |a, b| {
             let x = match a.to_number() {
                 Ok(v) => v,
                 Err(e) => return EvalScalar::Error(e),
@@ -152,7 +154,7 @@ pub fn eval_eager_function(
             }
             excel_mod(x, y).map_or(EvalScalar::Error(CalcError::Num), EvalScalar::number)
         }),
-        "POWER" => lift_binary(args, workbook, caller, |a, b| {
+        "POWER" => lift_binary(args, workbook, spills, caller, |a, b| {
             let x = match a.to_number() {
                 Ok(v) => v,
                 Err(e) => return EvalScalar::Error(e),
@@ -172,10 +174,10 @@ pub fn eval_eager_function(
         "TODAY" => text_conv::eval_today_or_now(&args, env, false),
         "NOW" => text_conv::eval_today_or_now(&args, env, true),
         "RAND" => text_conv::eval_rand(&args, env),
-        "RANDBETWEEN" => text_conv::eval_randbetween(args, workbook, caller, env),
+        "RANDBETWEEN" => text_conv::eval_randbetween(args, workbook, spills, caller, env),
 
         // --- Layer 0 & Layer 1: Text & Conversion ---
-        "LEN" => lift_unary(args, workbook, caller, |x| match x.to_text() {
+        "LEN" => lift_unary(args, workbook, spills, caller, |x| match x.to_text() {
             Ok(s) => {
                 #[expect(
                     clippy::cast_precision_loss,
@@ -186,43 +188,43 @@ pub fn eval_eager_function(
             }
             Err(e) => EvalScalar::Error(e),
         }),
-        "LOWER" => lift_unary(args, workbook, caller, |x| match x.to_text() {
+        "LOWER" => lift_unary(args, workbook, spills, caller, |x| match x.to_text() {
             Ok(s) => checked_text(s.to_lowercase()),
             Err(e) => EvalScalar::Error(e),
         }),
-        "UPPER" => lift_unary(args, workbook, caller, |x| match x.to_text() {
+        "UPPER" => lift_unary(args, workbook, spills, caller, |x| match x.to_text() {
             Ok(s) => checked_text(s.to_uppercase()),
             Err(e) => EvalScalar::Error(e),
         }),
-        "TRIM" => lift_unary(args, workbook, caller, |x| match x.to_text() {
+        "TRIM" => lift_unary(args, workbook, spills, caller, |x| match x.to_text() {
             Ok(s) => EvalScalar::Text(excel_trim(&s)),
             Err(e) => EvalScalar::Error(e),
         }),
-        "LEFT" => eval_left_or_right(args, workbook, caller, true),
-        "RIGHT" => eval_left_or_right(args, workbook, caller, false),
-        "MID" => eval_mid(args, workbook, caller),
-        "CONCAT" => EvalValue::Scalar(eval_concat(&args, workbook)),
-        "FIND" => text_conv::eval_find_or_search(args, workbook, caller, true),
-        "SEARCH" => text_conv::eval_find_or_search(args, workbook, caller, false),
-        "SUBSTITUTE" => text_conv::eval_substitute(args, workbook, caller),
-        "REPLACE" => text_conv::eval_replace(args, workbook, caller),
-        "VALUE" => text_conv::eval_value(args, workbook, caller),
-        "TEXT" => text_conv::eval_text(args, workbook, caller),
+        "LEFT" => eval_left_or_right(args, workbook, spills, caller, true),
+        "RIGHT" => eval_left_or_right(args, workbook, spills, caller, false),
+        "MID" => eval_mid(args, workbook, spills, caller),
+        "CONCAT" => EvalValue::Scalar(eval_concat(&args, workbook, spills)),
+        "FIND" => text_conv::eval_find_or_search(args, workbook, spills, caller, true),
+        "SEARCH" => text_conv::eval_find_or_search(args, workbook, spills, caller, false),
+        "SUBSTITUTE" => text_conv::eval_substitute(args, workbook, spills, caller),
+        "REPLACE" => text_conv::eval_replace(args, workbook, spills, caller),
+        "VALUE" => text_conv::eval_value(args, workbook, spills, caller),
+        "TEXT" => text_conv::eval_text(args, workbook, spills, caller),
 
         // --- Layer 0: Type predicates ---
-        "ISBLANK" => lift_unary(args, workbook, caller, |x| {
+        "ISBLANK" => lift_unary(args, workbook, spills, caller, |x| {
             EvalScalar::Bool(matches!(x, EvalScalar::Empty))
         }),
-        "ISNUMBER" => lift_unary(args, workbook, caller, |x| {
+        "ISNUMBER" => lift_unary(args, workbook, spills, caller, |x| {
             EvalScalar::Bool(matches!(x, EvalScalar::Number(_)))
         }),
-        "ISTEXT" => lift_unary(args, workbook, caller, |x| {
+        "ISTEXT" => lift_unary(args, workbook, spills, caller, |x| {
             EvalScalar::Bool(matches!(x, EvalScalar::Text(_)))
         }),
-        "ISLOGICAL" => lift_unary(args, workbook, caller, |x| {
+        "ISLOGICAL" => lift_unary(args, workbook, spills, caller, |x| {
             EvalScalar::Bool(matches!(x, EvalScalar::Bool(_)))
         }),
-        "ISERROR" => lift_unary(args, workbook, caller, |x| {
+        "ISERROR" => lift_unary(args, workbook, spills, caller, |x| {
             EvalScalar::Bool(matches!(x, EvalScalar::Error(_)))
         }),
 
@@ -231,25 +233,25 @@ pub fn eval_eager_function(
         "COLUMN" => EvalValue::Scalar(eval_row_or_col(&args, workbook, caller, false)),
         "ROWS" => lookup::eval_rows_or_columns(&args, workbook, true),
         "COLUMNS" => lookup::eval_rows_or_columns(&args, workbook, false),
-        "INDEX" => lookup::eval_index(args, workbook, caller),
-        "MATCH" => lookup::eval_match(args, workbook, caller),
-        "VLOOKUP" => lookup::eval_vlookup_or_hlookup(args, workbook, caller, true),
-        "HLOOKUP" => lookup::eval_vlookup_or_hlookup(args, workbook, caller, false),
+        "INDEX" => lookup::eval_index(args, workbook, spills, caller),
+        "MATCH" => lookup::eval_match(args, workbook, spills, caller),
+        "VLOOKUP" => lookup::eval_vlookup_or_hlookup(args, workbook, spills, caller, true),
+        "HLOOKUP" => lookup::eval_vlookup_or_hlookup(args, workbook, spills, caller, false),
 
         // --- Layer 1: Conditional aggregation ---
-        "COUNTBLANK" => criteria::eval_countblank(&args, workbook),
-        "COUNTIF" => criteria::eval_countif(args, workbook, caller),
-        "SUMIF" => criteria::eval_sumif_or_averageif(args, workbook, caller, false),
-        "AVERAGEIF" => criteria::eval_sumif_or_averageif(args, workbook, caller, true),
+        "COUNTBLANK" => criteria::eval_countblank(&args, workbook, spills),
+        "COUNTIF" => criteria::eval_countif(args, workbook, spills, caller),
+        "SUMIF" => criteria::eval_sumif_or_averageif(args, workbook, spills, caller, false),
+        "AVERAGEIF" => criteria::eval_sumif_or_averageif(args, workbook, spills, caller, true),
 
         // --- Layer 1: Date basics ---
-        "DATE" => datetime::eval_date(args, workbook, caller),
-        "YEAR" => datetime::eval_date_part(args, workbook, caller, 0),
-        "MONTH" => datetime::eval_date_part(args, workbook, caller, 1),
-        "DAY" => datetime::eval_date_part(args, workbook, caller, 2),
-        "EDATE" => datetime::eval_edate_or_eomonth(args, workbook, caller, false),
-        "EOMONTH" => datetime::eval_edate_or_eomonth(args, workbook, caller, true),
-        "DAYS" => datetime::eval_days(args, workbook, caller),
+        "DATE" => datetime::eval_date(args, workbook, spills, caller),
+        "YEAR" => datetime::eval_date_part(args, workbook, spills, caller, 0),
+        "MONTH" => datetime::eval_date_part(args, workbook, spills, caller, 1),
+        "DAY" => datetime::eval_date_part(args, workbook, spills, caller, 2),
+        "EDATE" => datetime::eval_edate_or_eomonth(args, workbook, spills, caller, false),
+        "EOMONTH" => datetime::eval_edate_or_eomonth(args, workbook, spills, caller, true),
+        "DAYS" => datetime::eval_days(args, workbook, spills, caller),
 
         _ => EvalValue::Scalar(EvalScalar::Error(CalcError::Name)),
     }
@@ -263,6 +265,7 @@ pub fn combine_if(
     when_false: Option<EvalValue>,
     has_third_arg: bool,
     workbook: &Workbook<BoundFormula>,
+    spills: &SpillRegistry,
     caller: CallerContext,
 ) -> EvalValue {
     if let ScalarOrArray::Scalar(c) = cond {
@@ -280,7 +283,7 @@ pub fn combine_if(
     }
 
     let t_branch = match when_true {
-        Some(v) => match coerce_for_scalar_op(v, workbook, caller) {
+        Some(v) => match coerce_for_scalar_op(v, workbook, spills, caller) {
             Ok(sa) => sa,
             Err(e) => return EvalValue::Scalar(EvalScalar::Error(e)),
         },
@@ -288,7 +291,7 @@ pub fn combine_if(
     };
     let f_branch = if has_third_arg {
         match when_false {
-            Some(v) => match coerce_for_scalar_op(v, workbook, caller) {
+            Some(v) => match coerce_for_scalar_op(v, workbook, spills, caller) {
                 Ok(sa) => sa,
                 Err(e) => return EvalValue::Scalar(EvalScalar::Error(e)),
             },
@@ -337,6 +340,7 @@ pub fn combine_iferror(
     fallback: Option<EvalValue>,
     only_na: bool,
     workbook: &Workbook<BoundFormula>,
+    spills: &SpillRegistry,
     caller: CallerContext,
 ) -> EvalValue {
     let catches = |err: CalcError| !only_na || err == CalcError::Na;
@@ -351,7 +355,7 @@ pub fn combine_iferror(
     }
 
     let fb = match fallback {
-        Some(v) => match coerce_for_scalar_op(v, workbook, caller) {
+        Some(v) => match coerce_for_scalar_op(v, workbook, spills, caller) {
             Ok(sa) => sa,
             Err(e) => return EvalValue::Scalar(EvalScalar::Error(e)),
         },
@@ -449,26 +453,39 @@ impl SumAcc {
     }
 }
 
-fn eval_sum(args: &[EvalValue], workbook: &Workbook<BoundFormula>) -> EvalScalar {
+pub(crate) enum RefCellVal<'a> {
+    Word(u64),
+    Shadow(&'a EvalScalar),
+}
+
+fn eval_sum(
+    args: &[EvalValue],
+    workbook: &Workbook<BoundFormula>,
+    spills: &SpillRegistry,
+) -> EvalScalar {
     if args.is_empty() {
         return EvalScalar::Error(CalcError::Value);
     }
     let mut acc = SumAcc::new();
     for arg in args {
-        if let Err(e) = visit_numeric_arg(arg, workbook, |n| acc.push(n)) {
+        if let Err(e) = visit_numeric_arg(arg, workbook, spills, |n| acc.push(n)) {
             return EvalScalar::Error(e);
         }
     }
     EvalScalar::number(acc.finish())
 }
 
-fn eval_average(args: &[EvalValue], workbook: &Workbook<BoundFormula>) -> EvalScalar {
+fn eval_average(
+    args: &[EvalValue],
+    workbook: &Workbook<BoundFormula>,
+    spills: &SpillRegistry,
+) -> EvalScalar {
     if args.is_empty() {
         return EvalScalar::Error(CalcError::Value);
     }
     let mut acc = SumAcc::new();
     for arg in args {
-        if let Err(e) = visit_numeric_arg(arg, workbook, |n| acc.push(n)) {
+        if let Err(e) = visit_numeric_arg(arg, workbook, spills, |n| acc.push(n)) {
             return EvalScalar::Error(e);
         }
     }
@@ -484,13 +501,18 @@ fn eval_average(args: &[EvalValue], workbook: &Workbook<BoundFormula>) -> EvalSc
     EvalScalar::number(total / denom)
 }
 
-fn eval_min_max(args: &[EvalValue], workbook: &Workbook<BoundFormula>, is_min: bool) -> EvalScalar {
+fn eval_min_max(
+    args: &[EvalValue],
+    workbook: &Workbook<BoundFormula>,
+    spills: &SpillRegistry,
+    is_min: bool,
+) -> EvalScalar {
     if args.is_empty() {
         return EvalScalar::Error(CalcError::Value);
     }
     let mut best: Option<f64> = None;
     for arg in args {
-        let res = visit_numeric_arg(arg, workbook, |n| {
+        let res = visit_numeric_arg(arg, workbook, spills, |n| {
             best = Some(match best {
                 None => n,
                 Some(cur) => {
@@ -513,6 +535,7 @@ fn eval_min_max(args: &[EvalValue], workbook: &Workbook<BoundFormula>, is_min: b
 fn visit_numeric_arg(
     arg: &EvalValue,
     workbook: &Workbook<BoundFormula>,
+    spills: &SpillRegistry,
     mut f: impl FnMut(f64) -> Result<(), CalcError>,
 ) -> Result<(), CalcError> {
     match arg {
@@ -531,16 +554,27 @@ fn visit_numeric_arg(
             Ok(())
         }
         EvalValue::Reference(r) => {
-            visit_reference_words(r, workbook, |bits| match Value::unpack(bits) {
-                Value::Error(e) => Err(e),
-                Value::Number(n) => f(n),
-                Value::Empty | Value::Text(_) | Value::Bool(_) | Value::Array(_) => Ok(()),
+            visit_reference_cells(r, workbook, spills, |_sheet, cell| match cell {
+                RefCellVal::Word(bits) => match Value::unpack(bits) {
+                    Value::Error(e) => Err(e),
+                    Value::Number(n) => f(n),
+                    Value::Empty | Value::Text(_) | Value::Bool(_) | Value::Array(_) => Ok(()),
+                },
+                RefCellVal::Shadow(s) => match s {
+                    EvalScalar::Error(e) => Err(*e),
+                    EvalScalar::Number(n) => f(*n),
+                    EvalScalar::Empty | EvalScalar::Text(_) | EvalScalar::Bool(_) => Ok(()),
+                },
             })
         }
     }
 }
 
-fn eval_count(args: &[EvalValue], workbook: &Workbook<BoundFormula>) -> EvalScalar {
+fn eval_count(
+    args: &[EvalValue],
+    workbook: &Workbook<BoundFormula>,
+    spills: &SpillRegistry,
+) -> EvalScalar {
     if args.is_empty() {
         return EvalScalar::Error(CalcError::Value);
     }
@@ -560,8 +594,12 @@ fn eval_count(args: &[EvalValue], workbook: &Workbook<BoundFormula>) -> EvalScal
                 }
             }
             EvalValue::Reference(r) => {
-                let _ = visit_reference_words(r, workbook, |bits| {
-                    if matches!(Value::unpack(bits), Value::Number(_)) {
+                let _ = visit_reference_cells(r, workbook, spills, |_sheet, cell| {
+                    let is_num = match cell {
+                        RefCellVal::Word(bits) => matches!(Value::unpack(bits), Value::Number(_)),
+                        RefCellVal::Shadow(s) => matches!(s, EvalScalar::Number(_)),
+                    };
+                    if is_num {
                         count = count.saturating_add(1);
                     }
                     Ok(())
@@ -573,7 +611,11 @@ fn eval_count(args: &[EvalValue], workbook: &Workbook<BoundFormula>) -> EvalScal
     EvalScalar::Number(count as f64)
 }
 
-fn eval_counta(args: &[EvalValue], workbook: &Workbook<BoundFormula>) -> EvalScalar {
+fn eval_counta(
+    args: &[EvalValue],
+    workbook: &Workbook<BoundFormula>,
+    spills: &SpillRegistry,
+) -> EvalScalar {
     if args.is_empty() {
         return EvalScalar::Error(CalcError::Value);
     }
@@ -596,8 +638,12 @@ fn eval_counta(args: &[EvalValue], workbook: &Workbook<BoundFormula>) -> EvalSca
                 if matches!(r, ResolvedRef::Invalid(_)) {
                     count = count.saturating_add(1);
                 } else {
-                    let _ = visit_reference_words(r, workbook, |bits| {
-                        if bits != Value::EMPTY_BITS {
+                    let _ = visit_reference_cells(r, workbook, spills, |_sheet, cell| {
+                        let non_empty = match cell {
+                            RefCellVal::Word(bits) => bits != Value::EMPTY_BITS,
+                            RefCellVal::Shadow(s) => !matches!(s, EvalScalar::Empty),
+                        };
+                        if non_empty {
                             count = count.saturating_add(1);
                         }
                         Ok(())
@@ -610,16 +656,24 @@ fn eval_counta(args: &[EvalValue], workbook: &Workbook<BoundFormula>) -> EvalSca
     EvalScalar::Number(count as f64)
 }
 
-pub(crate) fn visit_reference_words(
+pub(crate) fn visit_reference_cells(
     r: &ResolvedRef,
     workbook: &Workbook<BoundFormula>,
-    mut visit: impl FnMut(u64) -> Result<(), CalcError>,
+    spills: &SpillRegistry,
+    mut visit: impl FnMut(&Sheet, RefCellVal<'_>) -> Result<(), CalcError>,
 ) -> Result<(), CalcError> {
     match r {
         ResolvedRef::Invalid(e) => Err(*e),
         ResolvedRef::Cell { sheet, row, col } => {
             let target = workbook.sheet(*sheet).ok_or(CalcError::Ref)?;
-            visit(target.value_by_id(*row, *col).pack())
+            let bits = target.value_by_id(*row, *col).pack();
+            if bits != Value::EMPTY_BITS {
+                visit(target, RefCellVal::Word(bits))
+            } else if let Some(shadow) = spills.shadow_value(*sheet, *row, *col) {
+                visit(target, RefCellVal::Shadow(shadow))
+            } else {
+                visit(target, RefCellVal::Word(Value::EMPTY_BITS))
+            }
         }
         ResolvedRef::Area {
             sheet,
@@ -631,6 +685,7 @@ pub(crate) fn visit_reference_words(
             let target = workbook.sheet(*sheet).ok_or(CalcError::Ref)?;
             stream_spans(
                 target,
+                spills,
                 first_row.0,
                 last_row.0,
                 first_col.0,
@@ -652,7 +707,7 @@ pub(crate) fn visit_reference_words(
             ) else {
                 return Err(CalcError::Ref);
             };
-            stream_spans(target, r1, r2, first_col.0, last_col.0, &mut visit)
+            stream_spans(target, spills, r1, r2, first_col.0, last_col.0, &mut visit)
         }
         ResolvedRef::FullRows {
             sheet,
@@ -668,18 +723,19 @@ pub(crate) fn visit_reference_words(
             ) else {
                 return Err(CalcError::Ref);
             };
-            stream_spans(target, first_row.0, last_row.0, c1, c2, &mut visit)
+            stream_spans(target, spills, first_row.0, last_row.0, c1, c2, &mut visit)
         }
     }
 }
 
 fn stream_spans(
     sheet: &Sheet,
+    spills: &SpillRegistry,
     first_row: u64,
     last_row: u64,
     first_col: u64,
     last_col: u64,
-    visit: &mut impl FnMut(u64) -> Result<(), CalcError>,
+    visit: &mut impl FnMut(&Sheet, RefCellVal<'_>) -> Result<(), CalcError>,
 ) -> Result<(), CalcError> {
     let mut col_ids = Vec::new();
     let ok_c = sheet
@@ -701,13 +757,20 @@ fn stream_spans(
         return Err(CalcError::Ref);
     }
 
-    if col_ids.len() == 1
+    let sheet_id = sheet.id();
+    let any_shadows = spills.has_spills_on_sheet(sheet_id)
+        && col_ids
+            .iter()
+            .any(|&c| spills.has_shadows_in_col(sheet_id, ColId(c)));
+
+    if !any_shadows
+        && col_ids.len() == 1
         && let Some(&col_id) = col_ids.first()
     {
         let Some(col_slot) = sheet.col_slots().get(col_id) else {
             for run in &row_runs {
                 for _ in 0..run.len {
-                    visit(Value::EMPTY_BITS)?;
+                    visit(sheet, RefCellVal::Word(Value::EMPTY_BITS))?;
                 }
             }
             return Ok(());
@@ -715,25 +778,26 @@ fn stream_spans(
         let Some(column) = sheet.raw_columns().get(col_slot as usize) else {
             for run in &row_runs {
                 for _ in 0..run.len {
-                    visit(Value::EMPTY_BITS)?;
+                    visit(sheet, RefCellVal::Word(Value::EMPTY_BITS))?;
                 }
             }
             return Ok(());
         };
+        let mut word_visit = |bits: u64| visit(sheet, RefCellVal::Word(bits));
         let base_bound = u64::from(sheet.row_slots().base_len());
         for run in &row_runs {
             let end_excl = run.first_id.saturating_add(u64::from(run.len));
             if end_excl <= base_bound
                 && let Ok(start_slot) = u32::try_from(run.first_id)
             {
-                stream_contiguous_slots(column, start_slot, run.len, visit)?;
+                stream_contiguous_slots(column, start_slot, run.len, &mut word_visit)?;
             } else {
                 for row_id in run.iter() {
                     let bits = sheet
                         .row_slots()
                         .get(row_id)
                         .map_or(Value::EMPTY_BITS, |slot| column.get_packed(slot));
-                    visit(bits)?;
+                    word_visit(bits)?;
                 }
             }
         }
@@ -751,7 +815,15 @@ fn stream_spans(
                         .map_or(Value::EMPTY_BITS, |col| col.get_packed(rs)),
                     _ => Value::EMPTY_BITS,
                 };
-                visit(bits)?;
+                if bits == Value::EMPTY_BITS
+                    && any_shadows
+                    && let Some(shadow) =
+                        spills.shadow_value(sheet_id, RowId(row_id), ColId(col_id))
+                {
+                    visit(sheet, RefCellVal::Shadow(shadow))?;
+                } else {
+                    visit(sheet, RefCellVal::Word(bits))?;
+                }
             }
         }
     }
@@ -800,7 +872,12 @@ fn stream_contiguous_slots(
 
 // ------------------------------------------------------------ logic & math
 
-fn eval_and_or(args: &[EvalValue], workbook: &Workbook<BoundFormula>, is_and: bool) -> EvalScalar {
+fn eval_and_or(
+    args: &[EvalValue],
+    workbook: &Workbook<BoundFormula>,
+    spills: &SpillRegistry,
+    is_and: bool,
+) -> EvalScalar {
     if args.is_empty() {
         return EvalScalar::Error(CalcError::Value);
     }
@@ -837,20 +914,37 @@ fn eval_and_or(args: &[EvalValue], workbook: &Workbook<BoundFormula>, is_and: bo
                 }
             }
             EvalValue::Reference(r) => {
-                let res = visit_reference_words(r, workbook, |bits| match Value::unpack(bits) {
-                    Value::Error(e) => Err(e),
-                    Value::Bool(b) => {
-                        seen_any = true;
-                        acc = if is_and { acc && b } else { acc || b };
-                        Ok(())
-                    }
-                    Value::Number(n) => {
-                        seen_any = true;
-                        let b = n != 0.0;
-                        acc = if is_and { acc && b } else { acc || b };
-                        Ok(())
-                    }
-                    Value::Empty | Value::Text(_) | Value::Array(_) => Ok(()),
+                let res = visit_reference_cells(r, workbook, spills, |_sheet, cell| match cell {
+                    RefCellVal::Word(bits) => match Value::unpack(bits) {
+                        Value::Error(e) => Err(e),
+                        Value::Bool(b) => {
+                            seen_any = true;
+                            acc = if is_and { acc && b } else { acc || b };
+                            Ok(())
+                        }
+                        Value::Number(n) => {
+                            seen_any = true;
+                            let b = n != 0.0;
+                            acc = if is_and { acc && b } else { acc || b };
+                            Ok(())
+                        }
+                        Value::Empty | Value::Text(_) | Value::Array(_) => Ok(()),
+                    },
+                    RefCellVal::Shadow(s) => match s {
+                        EvalScalar::Error(e) => Err(*e),
+                        EvalScalar::Bool(b) => {
+                            seen_any = true;
+                            acc = if is_and { acc && *b } else { acc || *b };
+                            Ok(())
+                        }
+                        EvalScalar::Number(n) => {
+                            seen_any = true;
+                            let b = *n != 0.0;
+                            acc = if is_and { acc && b } else { acc || b };
+                            Ok(())
+                        }
+                        EvalScalar::Empty | EvalScalar::Text(_) => Ok(()),
+                    },
                 });
                 if let Err(e) = res {
                     return EvalScalar::Error(e);
@@ -881,12 +975,13 @@ fn eval_round_scalar(x: &EvalScalar, d: &EvalScalar, mode: RoundingMode) -> Eval
 fn eval_trunc(
     mut args: Vec<EvalValue>,
     workbook: &Workbook<BoundFormula>,
+    spills: &SpillRegistry,
     caller: CallerContext,
 ) -> EvalValue {
     if args.len() == 1 {
         args.push(EvalValue::Scalar(EvalScalar::Number(0.0)));
     }
-    lift_binary(args, workbook, caller, |x, d| {
+    lift_binary(args, workbook, spills, caller, |x, d| {
         eval_round_scalar(x, d, RoundingMode::TowardZero)
     })
 }
@@ -946,13 +1041,14 @@ fn excel_trim(input: &str) -> String {
 fn eval_left_or_right(
     mut args: Vec<EvalValue>,
     workbook: &Workbook<BoundFormula>,
+    spills: &SpillRegistry,
     caller: CallerContext,
     is_left: bool,
 ) -> EvalValue {
     if args.len() == 1 {
         args.push(EvalValue::Scalar(EvalScalar::Number(1.0)));
     }
-    lift_binary(args, workbook, caller, |text_arg, count_arg| {
+    lift_binary(args, workbook, spills, caller, |text_arg, count_arg| {
         let s = match text_arg.to_text() {
             Ok(v) => v,
             Err(e) => return EvalScalar::Error(e),
@@ -979,31 +1075,42 @@ fn eval_left_or_right(
 fn eval_mid(
     args: Vec<EvalValue>,
     workbook: &Workbook<BoundFormula>,
+    spills: &SpillRegistry,
     caller: CallerContext,
 ) -> EvalValue {
-    lift_ternary(args, workbook, caller, |text_arg, start_arg, len_arg| {
-        let s = match text_arg.to_text() {
-            Ok(v) => v,
-            Err(e) => return EvalScalar::Error(e),
-        };
-        let start = match start_arg.to_number().and_then(trunc_to_isize) {
-            Ok(v) => v,
-            Err(e) => return EvalScalar::Error(e),
-        };
-        let count = match len_arg.to_number().and_then(trunc_to_isize) {
-            Ok(v) => v,
-            Err(e) => return EvalScalar::Error(e),
-        };
-        if start < 1 || count < 0 {
-            return EvalScalar::Error(CalcError::Value);
-        }
-        #[expect(clippy::cast_sign_loss, reason = "`start >= 1` and `count >= 0`")]
-        let (skip, take) = ((start as usize).saturating_sub(1), count as usize);
-        EvalScalar::Text(s.chars().skip(skip).take(take).collect())
-    })
+    lift_ternary(
+        args,
+        workbook,
+        spills,
+        caller,
+        |text_arg, start_arg, len_arg| {
+            let s = match text_arg.to_text() {
+                Ok(v) => v,
+                Err(e) => return EvalScalar::Error(e),
+            };
+            let start = match start_arg.to_number().and_then(trunc_to_isize) {
+                Ok(v) => v,
+                Err(e) => return EvalScalar::Error(e),
+            };
+            let count = match len_arg.to_number().and_then(trunc_to_isize) {
+                Ok(v) => v,
+                Err(e) => return EvalScalar::Error(e),
+            };
+            if start < 1 || count < 0 {
+                return EvalScalar::Error(CalcError::Value);
+            }
+            #[expect(clippy::cast_sign_loss, reason = "`start >= 1` and `count >= 0`")]
+            let (skip, take) = ((start as usize).saturating_sub(1), count as usize);
+            EvalScalar::Text(s.chars().skip(skip).take(take).collect())
+        },
+    )
 }
 
-fn eval_concat(args: &[EvalValue], workbook: &Workbook<BoundFormula>) -> EvalScalar {
+fn eval_concat(
+    args: &[EvalValue],
+    workbook: &Workbook<BoundFormula>,
+    spills: &SpillRegistry,
+) -> EvalScalar {
     if args.is_empty() {
         return EvalScalar::Error(CalcError::Value);
     }
@@ -1042,20 +1149,16 @@ fn eval_concat(args: &[EvalValue], workbook: &Workbook<BoundFormula>) -> EvalSca
                 }
             }
             EvalValue::Reference(r) => {
-                let target_sheet: Option<&Sheet> = match r {
-                    ResolvedRef::Cell { sheet, .. }
-                    | ResolvedRef::Area { sheet, .. }
-                    | ResolvedRef::FullCols { sheet, .. }
-                    | ResolvedRef::FullRows { sheet, .. } => workbook.sheet(*sheet),
-                    ResolvedRef::Invalid(e) => return EvalScalar::Error(*e),
-                };
-                let Some(sheet) = target_sheet else {
-                    return EvalScalar::Error(CalcError::Ref);
-                };
-                let res = visit_reference_words(r, workbook, |bits| {
-                    let s = EvalScalar::from_sheet_value(sheet, Value::unpack(bits));
-                    let t = s.to_text()?;
-                    append(&t)
+                let res = visit_reference_cells(r, workbook, spills, |sheet, cell| match cell {
+                    RefCellVal::Word(bits) => {
+                        let s = EvalScalar::from_sheet_value(sheet, Value::unpack(bits));
+                        let t = s.to_text()?;
+                        append(&t)
+                    }
+                    RefCellVal::Shadow(s) => {
+                        let t = s.to_text()?;
+                        append(&t)
+                    }
                 });
                 if let Err(e) = res {
                     return EvalScalar::Error(e);
@@ -1171,6 +1274,7 @@ fn first_pos_of_ref(
 pub(crate) fn lift_unary(
     args: Vec<EvalValue>,
     workbook: &Workbook<BoundFormula>,
+    spills: &SpillRegistry,
     caller: CallerContext,
     f: impl Fn(&EvalScalar) -> EvalScalar,
 ) -> EvalValue {
@@ -1180,7 +1284,7 @@ pub(crate) fn lift_unary(
     let Some(arg0) = args.into_iter().next() else {
         return EvalValue::Scalar(EvalScalar::Error(CalcError::Value));
     };
-    let lifted = match coerce_for_scalar_op(arg0, workbook, caller) {
+    let lifted = match coerce_for_scalar_op(arg0, workbook, spills, caller) {
         Ok(v) => v,
         Err(e) => return EvalValue::Scalar(EvalScalar::Error(e)),
     };
@@ -1200,6 +1304,7 @@ pub(crate) fn lift_unary(
 pub(crate) fn lift_binary(
     args: Vec<EvalValue>,
     workbook: &Workbook<BoundFormula>,
+    spills: &SpillRegistry,
     caller: CallerContext,
     f: impl Fn(&EvalScalar, &EvalScalar) -> EvalScalar,
 ) -> EvalValue {
@@ -1210,11 +1315,11 @@ pub(crate) fn lift_binary(
     let (Some(a0), Some(a1)) = (it.next(), it.next()) else {
         return EvalValue::Scalar(EvalScalar::Error(CalcError::Value));
     };
-    let left = match coerce_for_scalar_op(a0, workbook, caller) {
+    let left = match coerce_for_scalar_op(a0, workbook, spills, caller) {
         Ok(v) => v,
         Err(e) => return EvalValue::Scalar(EvalScalar::Error(e)),
     };
-    let right = match coerce_for_scalar_op(a1, workbook, caller) {
+    let right = match coerce_for_scalar_op(a1, workbook, spills, caller) {
         Ok(v) => v,
         Err(e) => return EvalValue::Scalar(EvalScalar::Error(e)),
     };
@@ -1246,6 +1351,7 @@ pub(crate) fn lift_binary(
 pub(crate) fn lift_ternary(
     args: Vec<EvalValue>,
     workbook: &Workbook<BoundFormula>,
+    spills: &SpillRegistry,
     caller: CallerContext,
     f: impl Fn(&EvalScalar, &EvalScalar, &EvalScalar) -> EvalScalar,
 ) -> EvalValue {
@@ -1256,15 +1362,15 @@ pub(crate) fn lift_ternary(
     let (Some(a0), Some(a1), Some(a2)) = (it.next(), it.next(), it.next()) else {
         return EvalValue::Scalar(EvalScalar::Error(CalcError::Value));
     };
-    let s0 = match coerce_for_scalar_op(a0, workbook, caller) {
+    let s0 = match coerce_for_scalar_op(a0, workbook, spills, caller) {
         Ok(v) => v,
         Err(e) => return EvalValue::Scalar(EvalScalar::Error(e)),
     };
-    let s1 = match coerce_for_scalar_op(a1, workbook, caller) {
+    let s1 = match coerce_for_scalar_op(a1, workbook, spills, caller) {
         Ok(v) => v,
         Err(e) => return EvalValue::Scalar(EvalScalar::Error(e)),
     };
-    let s2 = match coerce_for_scalar_op(a2, workbook, caller) {
+    let s2 = match coerce_for_scalar_op(a2, workbook, spills, caller) {
         Ok(v) => v,
         Err(e) => return EvalValue::Scalar(EvalScalar::Error(e)),
     };

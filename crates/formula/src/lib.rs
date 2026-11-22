@@ -42,4 +42,5 @@ pub mod functions;
 pub mod lang_service;
 pub mod lexer;
 pub mod parser;
+pub mod spill;
 pub mod value_eval;

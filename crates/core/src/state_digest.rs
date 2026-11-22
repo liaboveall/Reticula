@@ -41,6 +41,7 @@ const TAG_ROW_STYLE: u64 = 10;
 const TAG_CELL_STYLE: u64 = 11;
 const TAG_SCALAR_CELL: u64 = 12;
 const TAG_FORMULA_CELL: u64 = 13;
+const TAG_NAMED_RANGE: u64 = 14;
 
 const LANE_LO_MASK: u64 = 0x517C_C1B7_2722_0A95;
 const LANE_HI_MASK: u64 = 0x94D0_49BB_1331_11EB;
@@ -413,6 +414,79 @@ pub fn hash_formula_cell<F: FormulaPayload>(
     hi.write_u64(row.0);
     hi.write_u64(col.0);
     formula.write_digest(&mut hi);
+
+    let l = lo.finish();
+    let h = mix64(hi.finish() ^ l.rotate_left(17));
+    (u128::from(h) << 64) | u128::from(l)
+}
+
+/// Computes the 128-bit hash of a defined named range (covering scope,
+/// canonical lowercase key, display spelling, formula payload, optional
+/// comment, and hidden flag).
+#[must_use]
+pub fn hash_named_range<F: FormulaPayload>(
+    scope: Option<SheetId>,
+    canonical_name: &str,
+    display_name: &str,
+    formula: &F,
+    comment: Option<&str>,
+    hidden: bool,
+) -> u128 {
+    fn feed<F: FormulaPayload>(
+        d: &mut Digest64,
+        scope: Option<SheetId>,
+        canonical_name: &str,
+        display_name: &str,
+        formula: &F,
+        comment: Option<&str>,
+        hidden: bool,
+    ) {
+        match scope {
+            None => d.write_bytes(&[0]),
+            Some(sid) => {
+                d.write_bytes(&[1]);
+                d.write_u32(sid.0);
+            }
+        }
+        d.write_u32(u32::try_from(canonical_name.len()).unwrap_or(u32::MAX));
+        d.write_bytes(canonical_name.as_bytes());
+        d.write_u32(u32::try_from(display_name.len()).unwrap_or(u32::MAX));
+        d.write_bytes(display_name.as_bytes());
+        formula.write_digest(d);
+        match comment {
+            None => d.write_bytes(&[0]),
+            Some(c) => {
+                d.write_bytes(&[1]);
+                d.write_u32(u32::try_from(c.len()).unwrap_or(u32::MAX));
+                d.write_bytes(c.as_bytes());
+            }
+        }
+        d.write_bytes(&[u8::from(hidden)]);
+    }
+
+    let mut lo = Digest64::new();
+    lo.write_u64(TAG_NAMED_RANGE ^ LANE_LO_MASK);
+    feed(
+        &mut lo,
+        scope,
+        canonical_name,
+        display_name,
+        formula,
+        comment,
+        hidden,
+    );
+
+    let mut hi = Digest64::new();
+    hi.write_u64(TAG_NAMED_RANGE.rotate_left(32) ^ LANE_HI_MASK);
+    feed(
+        &mut hi,
+        scope,
+        canonical_name,
+        display_name,
+        formula,
+        comment,
+        hidden,
+    );
 
     let l = lo.finish();
     let h = mix64(hi.finish() ^ l.rotate_left(17));

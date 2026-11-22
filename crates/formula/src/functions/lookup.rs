@@ -21,9 +21,10 @@ use super::criteria::ref_live_origin_and_size;
 use super::wildcard::{WildToken, compile_wildcard, wildcard_matches_full};
 use super::{empty_to_zero, get_sa, shape_of, trunc_to_isize};
 use crate::binder::BoundFormula;
+use crate::spill::SpillRegistry;
 use crate::value_eval::{
     Array2D, CallerContext, EvalScalar, EvalValue, MAX_ARRAY_CELLS, ResolvedRef, ScalarOrArray,
-    coerce_for_scalar_op,
+    coerce_for_scalar_op, read_sheet_cell_effective,
 };
 
 /// Evaluates `ROWS(array)` (`is_rows == true`) or `COLUMNS(array)` (`is_rows == false`).
@@ -62,6 +63,7 @@ pub fn combine_choose(
     index: ScalarOrArray,
     choices: Vec<Option<EvalValue>>,
     workbook: &Workbook<BoundFormula>,
+    spills: &SpillRegistry,
     caller: CallerContext,
 ) -> EvalValue {
     if choices.is_empty() {
@@ -92,7 +94,7 @@ pub fn combine_choose(
     for opt in choices {
         match opt {
             None => coerced_choices.push(None),
-            Some(v) => match coerce_for_scalar_op(v, workbook, caller) {
+            Some(v) => match coerce_for_scalar_op(v, workbook, spills, caller) {
                 Ok(sa) => {
                     let (r, c) = shape_of(&sa);
                     out_rows = out_rows.max(r);
@@ -140,6 +142,7 @@ pub fn combine_choose(
 pub fn eval_index(
     args: Vec<EvalValue>,
     workbook: &Workbook<BoundFormula>,
+    spills: &SpillRegistry,
     caller: CallerContext,
 ) -> EvalValue {
     if !(2..=3).contains(&args.len()) {
@@ -154,11 +157,11 @@ pub fn eval_index(
         .next()
         .unwrap_or(EvalValue::Scalar(EvalScalar::Number(0.0)));
 
-    let row_sa = match coerce_for_scalar_op(row_arg, workbook, caller) {
+    let row_sa = match coerce_for_scalar_op(row_arg, workbook, spills, caller) {
         Ok(sa) => sa,
         Err(e) => return EvalValue::Scalar(EvalScalar::Error(e)),
     };
-    let col_sa = match coerce_for_scalar_op(col_arg, workbook, caller) {
+    let col_sa = match coerce_for_scalar_op(col_arg, workbook, spills, caller) {
         Ok(sa) => sa,
         Err(e) => return EvalValue::Scalar(EvalScalar::Error(e)),
     };
@@ -317,6 +320,7 @@ fn index_into_array(arr: &Array2D, r_u32: u32, c_u32: u32, two_arg: bool) -> Eva
 pub fn eval_match(
     args: Vec<EvalValue>,
     workbook: &Workbook<BoundFormula>,
+    spills: &SpillRegistry,
     caller: CallerContext,
 ) -> EvalValue {
     if !(2..=3).contains(&args.len()) {
@@ -329,7 +333,7 @@ pub fn eval_match(
     let match_type: i32 = match it.next() {
         None => 1,
         Some(mt_arg) => {
-            let sa = match coerce_for_scalar_op(mt_arg, workbook, caller) {
+            let sa = match coerce_for_scalar_op(mt_arg, workbook, spills, caller) {
                 Ok(v) => v,
                 Err(e) => return EvalValue::Scalar(EvalScalar::Error(e)),
             };
@@ -352,19 +356,19 @@ pub fn eval_match(
         }
     };
 
-    let lookup_sa = match coerce_for_scalar_op(lookup_arg, workbook, caller) {
+    let lookup_sa = match coerce_for_scalar_op(lookup_arg, workbook, spills, caller) {
         Ok(sa) => sa,
         Err(e) => return EvalValue::Scalar(EvalScalar::Error(e)),
     };
     match lookup_sa {
         ScalarOrArray::Scalar(needle) => {
-            EvalValue::Scalar(match_one(&needle, &array_arg, match_type, workbook))
+            EvalValue::Scalar(match_one(&needle, &array_arg, match_type, workbook, spills))
         }
         ScalarOrArray::Array(arr) => {
             let values = arr
                 .values
                 .iter()
-                .map(|needle| match_one(needle, &array_arg, match_type, workbook))
+                .map(|needle| match_one(needle, &array_arg, match_type, workbook, spills))
                 .collect();
             EvalValue::Array(Array2D {
                 rows: arr.rows,
@@ -380,6 +384,7 @@ fn match_one(
     array_arg: &EvalValue,
     match_type: i32,
     workbook: &Workbook<BoundFormula>,
+    spills: &SpillRegistry,
 ) -> EvalScalar {
     if let EvalScalar::Error(e) = needle {
         return EvalScalar::Error(*e);
@@ -403,9 +408,9 @@ fn match_one(
                 return EvalScalar::Error(CalcError::Ref);
             };
             let found = if cols == 1 {
-                search_sheet_column(sheet, c0, r0, rows, &norm_needle, match_type)
+                search_sheet_column(sheet, c0, r0, rows, &norm_needle, match_type, spills)
             } else {
-                search_sheet_row(sheet, r0, c0, cols, &norm_needle, match_type)
+                search_sheet_row(sheet, r0, c0, cols, &norm_needle, match_type, spills)
             };
             found.map_or(EvalScalar::Error(CalcError::Na), |idx0| {
                 EvalScalar::Number(f64::from(idx0.saturating_add(1)))
@@ -434,6 +439,7 @@ fn match_one(
 pub fn eval_vlookup_or_hlookup(
     args: Vec<EvalValue>,
     workbook: &Workbook<BoundFormula>,
+    spills: &SpillRegistry,
     caller: CallerContext,
     is_vertical: bool,
 ) -> EvalValue {
@@ -448,7 +454,7 @@ pub fn eval_vlookup_or_hlookup(
     let approx_mode: bool = match it.next() {
         None => true,
         Some(rl_arg) => {
-            let sa = match coerce_for_scalar_op(rl_arg, workbook, caller) {
+            let sa = match coerce_for_scalar_op(rl_arg, workbook, spills, caller) {
                 Ok(v) => v,
                 Err(e) => return EvalValue::Scalar(EvalScalar::Error(e)),
             };
@@ -462,7 +468,7 @@ pub fn eval_vlookup_or_hlookup(
         }
     };
 
-    let idx_sa = match coerce_for_scalar_op(idx_arg, workbook, caller) {
+    let idx_sa = match coerce_for_scalar_op(idx_arg, workbook, spills, caller) {
         Ok(v) => v,
         Err(e) => return EvalValue::Scalar(EvalScalar::Error(e)),
     };
@@ -480,7 +486,7 @@ pub fn eval_vlookup_or_hlookup(
         return EvalValue::Scalar(EvalScalar::Error(CalcError::Ref));
     };
 
-    let lookup_sa = match coerce_for_scalar_op(lookup_arg, workbook, caller) {
+    let lookup_sa = match coerce_for_scalar_op(lookup_arg, workbook, spills, caller) {
         Ok(v) => v,
         Err(e) => return EvalValue::Scalar(EvalScalar::Error(e)),
     };
@@ -493,6 +499,7 @@ pub fn eval_vlookup_or_hlookup(
             match_type,
             is_vertical,
             workbook,
+            spills,
         )),
         ScalarOrArray::Array(arr) => {
             let values = arr
@@ -506,6 +513,7 @@ pub fn eval_vlookup_or_hlookup(
                         match_type,
                         is_vertical,
                         workbook,
+                        spills,
                     )
                 })
                 .collect();
@@ -525,6 +533,7 @@ fn vh_lookup_one(
     match_type: i32,
     is_vertical: bool,
     workbook: &Workbook<BoundFormula>,
+    spills: &SpillRegistry,
 ) -> EvalScalar {
     if let EvalScalar::Error(e) = needle {
         return EvalScalar::Error(*e);
@@ -548,7 +557,7 @@ fn vh_lookup_one(
             };
             if is_vertical {
                 let Some(row_offset) =
-                    search_sheet_column(sheet, c0, r0, rows, &norm_needle, match_type)
+                    search_sheet_column(sheet, c0, r0, rows, &norm_needle, match_type, spills)
                 else {
                     return EvalScalar::Error(CalcError::Na);
                 };
@@ -560,13 +569,15 @@ fn vh_lookup_one(
                 ) else {
                     return EvalScalar::Error(CalcError::Ref);
                 };
-                empty_to_zero(EvalScalar::from_sheet_value(
+                empty_to_zero(read_sheet_cell_effective(
                     sheet,
-                    sheet.value_by_id(RowId(rid), ColId(cid)),
+                    spills,
+                    RowId(rid),
+                    ColId(cid),
                 ))
             } else {
                 let Some(col_offset) =
-                    search_sheet_row(sheet, r0, c0, cols, &norm_needle, match_type)
+                    search_sheet_row(sheet, r0, c0, cols, &norm_needle, match_type, spills)
                 else {
                     return EvalScalar::Error(CalcError::Na);
                 };
@@ -578,9 +589,11 @@ fn vh_lookup_one(
                 ) else {
                     return EvalScalar::Error(CalcError::Ref);
                 };
-                empty_to_zero(EvalScalar::from_sheet_value(
+                empty_to_zero(read_sheet_cell_effective(
                     sheet,
-                    sheet.value_by_id(RowId(rid), ColId(cid)),
+                    spills,
+                    RowId(rid),
+                    ColId(cid),
                 ))
             }
         }
@@ -716,10 +729,32 @@ fn search_sheet_column(
     row_count: u32,
     needle: &EvalScalar,
     match_type: i32,
+    spills: &SpillRegistry,
 ) -> Option<u32> {
     let col_id = sheet.col_axis().pos_to_id(col_pos)?;
     if match_type == 0 {
         let matcher = ExactMatcher::from_needle(needle)?;
+        if spills.has_shadows_in_col(sheet.id(), ColId(col_id)) {
+            let mut offset_idx: u32 = 0;
+            let mut found: Option<u32> = None;
+            sheet
+                .row_axis()
+                .for_each_live_positions(first_row_pos, row_count, |run| {
+                    if found.is_some() {
+                        return;
+                    }
+                    for row_id in run.iter() {
+                        let scalar =
+                            read_sheet_cell_effective(sheet, spills, RowId(row_id), ColId(col_id));
+                        if matcher.matches_scalar(&scalar) {
+                            found = Some(offset_idx);
+                            return;
+                        }
+                        offset_idx = offset_idx.saturating_add(1);
+                    }
+                });
+            return found;
+        }
         let col_slot = sheet.col_slots().get(col_id)?;
         let column = sheet.raw_columns().get(col_slot as usize)?;
 
@@ -789,9 +824,11 @@ fn search_sheet_column(
         let rid = sheet
             .row_axis()
             .pos_to_id(first_row_pos.saturating_add(idx))?;
-        Some(EvalScalar::from_sheet_value(
+        Some(read_sheet_cell_effective(
             sheet,
-            sheet.value_by_id(RowId(rid), ColId(col_id)),
+            spills,
+            RowId(rid),
+            ColId(col_id),
         ))
     })
 }
@@ -803,10 +840,12 @@ fn search_sheet_row(
     col_count: u32,
     needle: &EvalScalar,
     match_type: i32,
+    spills: &SpillRegistry,
 ) -> Option<u32> {
     let row_id = sheet.row_axis().pos_to_id(row_pos)?;
     if match_type == 0 {
         let matcher = ExactMatcher::from_needle(needle)?;
+        let has_spills = spills.has_spills_on_sheet(sheet.id());
         let mut offset_idx: u32 = 0;
         let mut found: Option<u32> = None;
         sheet
@@ -816,8 +855,15 @@ fn search_sheet_row(
                     return;
                 }
                 for cid in c_run.iter() {
-                    let bits = sheet.value_by_id(RowId(row_id), ColId(cid)).pack();
-                    if matcher.matches_packed(sheet, bits) {
+                    let matched = if has_spills {
+                        let scalar =
+                            read_sheet_cell_effective(sheet, spills, RowId(row_id), ColId(cid));
+                        matcher.matches_scalar(&scalar)
+                    } else {
+                        let bits = sheet.value_by_id(RowId(row_id), ColId(cid)).pack();
+                        matcher.matches_packed(sheet, bits)
+                    };
+                    if matched {
                         found = Some(offset_idx);
                         return;
                     }
@@ -831,9 +877,11 @@ fn search_sheet_row(
         let cid = sheet
             .col_axis()
             .pos_to_id(first_col_pos.saturating_add(idx))?;
-        Some(EvalScalar::from_sheet_value(
+        Some(read_sheet_cell_effective(
             sheet,
-            sheet.value_by_id(RowId(row_id), ColId(cid)),
+            spills,
+            RowId(row_id),
+            ColId(cid),
         ))
     })
 }

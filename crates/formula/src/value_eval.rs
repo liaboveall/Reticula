@@ -16,6 +16,7 @@ use reticula_core::value::{CalcError, Value};
 
 use crate::ast::{BinaryOp, Literal, UnaryOp};
 use crate::binder::{BoundFormula, BoundRef, live_span_positions};
+use crate::spill::SpillRegistry;
 
 /// Maximum cells materialised in an in-memory dynamic array (`1,048,576`).
 pub const MAX_ARRAY_CELLS: usize = 1_048_576;
@@ -360,6 +361,7 @@ pub fn resolve_bound_ref(
 pub fn implicit_intersect(
     value: EvalValue,
     workbook: &Workbook<BoundFormula>,
+    spills: &SpillRegistry,
     caller: CallerContext,
 ) -> EvalScalar {
     match value {
@@ -374,18 +376,21 @@ pub fn implicit_intersect(
                 EvalScalar::Error(CalcError::Value)
             }
         }
-        EvalValue::Reference(r) => intersect_reference(&r, workbook, caller),
+        EvalValue::Reference(r) => intersect_reference(&r, workbook, spills, caller),
     }
 }
 
 fn intersect_reference(
     r: &ResolvedRef,
     workbook: &Workbook<BoundFormula>,
+    spills: &SpillRegistry,
     caller: CallerContext,
 ) -> EvalScalar {
     match r {
         ResolvedRef::Invalid(e) => EvalScalar::Error(*e),
-        ResolvedRef::Cell { sheet, row, col } => read_cell(workbook, *sheet, *row, *col),
+        ResolvedRef::Cell { sheet, row, col } => {
+            read_cell_effective(workbook, spills, *sheet, *row, *col)
+        }
         ResolvedRef::Area {
             sheet,
             first_row,
@@ -414,7 +419,7 @@ fn intersect_reference(
                 ) else {
                     return EvalScalar::Error(CalcError::Ref);
                 };
-                return read_cell(workbook, *sheet, RowId(rid), ColId(cid));
+                return read_cell_effective(workbook, spills, *sheet, RowId(rid), ColId(cid));
             }
             if c1 == c2
                 && let Some(caller_r) = host.row_axis().id_to_pos(caller.row.0)
@@ -424,7 +429,7 @@ fn intersect_reference(
                     target.col_axis().pos_to_id(c1),
                 )
             {
-                return read_cell(workbook, *sheet, RowId(rid), ColId(cid));
+                return read_cell_effective(workbook, spills, *sheet, RowId(rid), ColId(cid));
             }
             if r1 == r2
                 && let Some(caller_c) = host.col_axis().id_to_pos(caller.col.0)
@@ -434,7 +439,7 @@ fn intersect_reference(
                     target.col_axis().pos_to_id(caller_c),
                 )
             {
-                return read_cell(workbook, *sheet, RowId(rid), ColId(cid));
+                return read_cell_effective(workbook, spills, *sheet, RowId(rid), ColId(cid));
             }
             EvalScalar::Error(CalcError::Value)
         }
@@ -458,7 +463,7 @@ fn intersect_reference(
                     target.col_axis().pos_to_id(c1),
                 )
             {
-                return read_cell(workbook, *sheet, RowId(rid), ColId(cid));
+                return read_cell_effective(workbook, spills, *sheet, RowId(rid), ColId(cid));
             }
             EvalScalar::Error(CalcError::Value)
         }
@@ -482,7 +487,7 @@ fn intersect_reference(
                     target.col_axis().pos_to_id(caller_c),
                 )
             {
-                return read_cell(workbook, *sheet, RowId(rid), ColId(cid));
+                return read_cell_effective(workbook, spills, *sheet, RowId(rid), ColId(cid));
             }
             EvalScalar::Error(CalcError::Value)
         }
@@ -495,11 +500,12 @@ fn intersect_reference(
 pub fn coerce_for_scalar_op(
     value: EvalValue,
     workbook: &Workbook<BoundFormula>,
+    spills: &SpillRegistry,
     caller: CallerContext,
 ) -> Result<ScalarOrArray, CalcError> {
     if caller.mode == FormulaMode::Legacy {
         return Ok(ScalarOrArray::Scalar(implicit_intersect(
-            value, workbook, caller,
+            value, workbook, spills, caller,
         )));
     }
     match value {
@@ -516,7 +522,7 @@ pub fn coerce_for_scalar_op(
                 Ok(ScalarOrArray::Array(arr))
             }
         }
-        EvalValue::Reference(r) => materialise_reference(&r, workbook),
+        EvalValue::Reference(r) => materialise_reference(&r, workbook, spills),
     }
 }
 
@@ -549,11 +555,12 @@ impl ScalarOrArray {
 pub fn materialise_reference(
     r: &ResolvedRef,
     workbook: &Workbook<BoundFormula>,
+    spills: &SpillRegistry,
 ) -> Result<ScalarOrArray, CalcError> {
     match r {
         ResolvedRef::Invalid(e) => Ok(ScalarOrArray::Scalar(EvalScalar::Error(*e))),
-        ResolvedRef::Cell { sheet, row, col } => Ok(ScalarOrArray::Scalar(read_cell(
-            workbook, *sheet, *row, *col,
+        ResolvedRef::Cell { sheet, row, col } => Ok(ScalarOrArray::Scalar(read_cell_effective(
+            workbook, spills, *sheet, *row, *col,
         ))),
         ResolvedRef::Area {
             sheet,
@@ -563,7 +570,14 @@ pub fn materialise_reference(
             last_col,
         } => {
             let target = workbook.sheet(*sheet).ok_or(CalcError::Ref)?;
-            materialise_spans(target, first_row.0, last_row.0, first_col.0, last_col.0)
+            materialise_spans(
+                target,
+                spills,
+                first_row.0,
+                last_row.0,
+                first_col.0,
+                last_col.0,
+            )
         }
         ResolvedRef::FullCols {
             sheet,
@@ -579,7 +593,7 @@ pub fn materialise_reference(
             ) else {
                 return Err(CalcError::Ref);
             };
-            materialise_spans(target, r_start, r_end, first_col.0, last_col.0)
+            materialise_spans(target, spills, r_start, r_end, first_col.0, last_col.0)
         }
         ResolvedRef::FullRows {
             sheet,
@@ -595,13 +609,14 @@ pub fn materialise_reference(
             ) else {
                 return Err(CalcError::Ref);
             };
-            materialise_spans(target, first_row.0, last_row.0, c_start, c_end)
+            materialise_spans(target, spills, first_row.0, last_row.0, c_start, c_end)
         }
     }
 }
 
 fn materialise_spans(
     sheet: &Sheet,
+    spills: &SpillRegistry,
     first_row: u64,
     last_row: u64,
     first_col: u64,
@@ -648,23 +663,34 @@ fn materialise_spans(
     if total > MAX_ARRAY_CELLS {
         return Err(CalcError::Calc);
     }
+    let sheet_has_spills = spills.has_spills_on_sheet(sheet.id());
     if total == 1 {
         let (Some(&r), Some(&c)) = (row_ids.first(), col_ids.first()) else {
             return Err(CalcError::Ref);
         };
-        return Ok(ScalarOrArray::Scalar(EvalScalar::from_sheet_value(
-            sheet,
-            sheet.value_by_id(RowId(r), ColId(c)),
-        )));
+        let scalar = if sheet_has_spills {
+            read_sheet_cell_effective(sheet, spills, RowId(r), ColId(c))
+        } else {
+            EvalScalar::from_sheet_value(sheet, sheet.value_by_id(RowId(r), ColId(c)))
+        };
+        return Ok(ScalarOrArray::Scalar(scalar));
     }
 
     let mut values = Vec::with_capacity(total);
-    for &r in &row_ids {
-        for &c in &col_ids {
-            values.push(EvalScalar::from_sheet_value(
-                sheet,
-                sheet.value_by_id(RowId(r), ColId(c)),
-            ));
+    if sheet_has_spills {
+        for &r in &row_ids {
+            for &c in &col_ids {
+                values.push(read_sheet_cell_effective(sheet, spills, RowId(r), ColId(c)));
+            }
+        }
+    } else {
+        for &r in &row_ids {
+            for &c in &col_ids {
+                values.push(EvalScalar::from_sheet_value(
+                    sheet,
+                    sheet.value_by_id(RowId(r), ColId(c)),
+                ));
+            }
         }
     }
     let rows_u32 = u32::try_from(row_ids.len()).map_err(|_| CalcError::Calc)?;
@@ -676,8 +702,12 @@ fn materialise_spans(
     }))
 }
 
-fn read_cell(
+/// Reads the effective scalar value at `(sheet_id, row, col)` including any
+/// materialized dynamic-array spill shadow overlay.
+#[must_use]
+pub fn read_cell_effective(
     workbook: &Workbook<BoundFormula>,
+    spills: &SpillRegistry,
     sheet_id: SheetId,
     row: RowId,
     col: ColId,
@@ -685,7 +715,26 @@ fn read_cell(
     let Some(sheet) = workbook.sheet(sheet_id) else {
         return EvalScalar::Error(CalcError::Ref);
     };
-    EvalScalar::from_sheet_value(sheet, sheet.value_by_id(row, col))
+    read_sheet_cell_effective(sheet, spills, row, col)
+}
+
+/// Reads the effective scalar value at `(row, col)` on `sheet` including any
+/// materialized dynamic-array spill shadow overlay.
+#[must_use]
+pub fn read_sheet_cell_effective(
+    sheet: &Sheet,
+    spills: &SpillRegistry,
+    row: RowId,
+    col: ColId,
+) -> EvalScalar {
+    let val = sheet.value_by_id(row, col);
+    if val != Value::Empty {
+        return EvalScalar::from_sheet_value(sheet, val);
+    }
+    spills
+        .shadow_value(sheet.id(), row, col)
+        .cloned()
+        .unwrap_or(EvalScalar::Empty)
 }
 
 /// Evaluates a unary operator with D-028 dynamic-array lifting or `@`
@@ -695,12 +744,13 @@ pub fn eval_unary(
     op: UnaryOp,
     operand: EvalValue,
     workbook: &Workbook<BoundFormula>,
+    spills: &SpillRegistry,
     caller: CallerContext,
 ) -> EvalValue {
     if op == UnaryOp::ImplicitIntersection {
-        return EvalValue::Scalar(implicit_intersect(operand, workbook, caller));
+        return EvalValue::Scalar(implicit_intersect(operand, workbook, spills, caller));
     }
-    let lifted = match coerce_for_scalar_op(operand, workbook, caller) {
+    let lifted = match coerce_for_scalar_op(operand, workbook, spills, caller) {
         Ok(v) => v,
         Err(e) => return EvalValue::Scalar(EvalScalar::Error(e)),
     };
@@ -743,13 +793,14 @@ pub fn eval_binary(
     rhs: EvalValue,
     outermost_add_sub: bool,
     workbook: &Workbook<BoundFormula>,
+    spills: &SpillRegistry,
     caller: CallerContext,
 ) -> EvalValue {
-    let left = match coerce_for_scalar_op(lhs, workbook, caller) {
+    let left = match coerce_for_scalar_op(lhs, workbook, spills, caller) {
         Ok(v) => v,
         Err(e) => return EvalValue::Scalar(EvalScalar::Error(e)),
     };
-    let right = match coerce_for_scalar_op(rhs, workbook, caller) {
+    let right = match coerce_for_scalar_op(rhs, workbook, spills, caller) {
         Ok(v) => v,
         Err(e) => return EvalValue::Scalar(EvalScalar::Error(e)),
     };
@@ -959,10 +1010,11 @@ fn cmp_text_ci(a: &str, b: &str) -> Ordering {
 pub fn finalize_top_level(
     value: EvalValue,
     workbook: &Workbook<BoundFormula>,
+    spills: &SpillRegistry,
     caller: CallerContext,
 ) -> EvalScalar {
     if caller.mode == FormulaMode::Legacy {
-        let s = implicit_intersect(value, workbook, caller);
+        let s = implicit_intersect(value, workbook, spills, caller);
         return empty_ref_becomes_zero(s);
     }
     match value {
@@ -977,7 +1029,7 @@ pub fn finalize_top_level(
                 EvalScalar::Error(CalcError::Spill)
             }
         }
-        EvalValue::Reference(r) => match materialise_reference(&r, workbook) {
+        EvalValue::Reference(r) => match materialise_reference(&r, workbook, spills) {
             Ok(ScalarOrArray::Scalar(s)) => empty_ref_becomes_zero(s),
             Ok(ScalarOrArray::Array(_)) => EvalScalar::Error(CalcError::Spill),
             Err(e) => EvalScalar::Error(e),
@@ -1018,6 +1070,7 @@ mod tests {
     };
     use crate::ast::BinaryOp;
     use crate::binder::{BoundFormula, BoundRef};
+    use crate::spill::SpillRegistry;
 
     #[test]
     fn d027_comparisons_and_outermost_tail_zeroing_match_excel() {
@@ -1074,11 +1127,14 @@ mod tests {
         };
         let resolved = resolve_bound_ref(&area_ref, &wb, sheet);
 
+        let spills = SpillRegistry::new();
+
         // In Legacy mode (or `@A2:A3`), row 2 (`RowId(1)`) intersects `A2:A3` -> `10.0`,
         // while row 5 (`RowId(4)`) is outside `A2:A3` -> `#VALUE!`.
         let legacy_hit = implicit_intersect(
             EvalValue::Reference(resolved.clone()),
             &wb,
+            &spills,
             CallerContext {
                 sheet,
                 row: RowId(1),
@@ -1091,6 +1147,7 @@ mod tests {
         let legacy_miss = implicit_intersect(
             EvalValue::Reference(resolved.clone()),
             &wb,
+            &spills,
             CallerContext {
                 sheet,
                 row: RowId(4),
@@ -1114,6 +1171,7 @@ mod tests {
             EvalValue::Scalar(EvalScalar::Number(2.0)),
             false,
             &wb,
+            &spills,
             dyn_caller,
         );
         assert_eq!(
@@ -1125,7 +1183,7 @@ mod tests {
             })
         );
         assert_eq!(
-            finalize_top_level(multiplied, &wb, dyn_caller),
+            finalize_top_level(multiplied, &wb, &spills, dyn_caller),
             EvalScalar::Error(CalcError::Spill)
         );
     }

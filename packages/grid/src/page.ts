@@ -12,6 +12,7 @@ import {
   FLAG_ERROR,
   FLAG_FORMULA,
   FLAG_NUMBER,
+  FLAG_SPILL,
   FLAG_TRUNCATED,
   HEADER_LEN,
   ID_LEN,
@@ -98,6 +99,11 @@ export function isFormula(flags: number): boolean {
 /** Whether a cell's display text was truncated at the viewport cap. */
 export function isTruncated(flags: number): boolean {
   return (flags & FLAG_TRUNCATED) !== 0;
+}
+
+/** Whether a cell displays a materialized dynamic array spill shadow value. */
+export function isSpill(flags: number): boolean {
+  return (flags & FLAG_SPILL) !== 0;
 }
 
 const utf8 = new TextDecoder("utf-8");

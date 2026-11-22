@@ -17,6 +17,7 @@ use super::{
     EvalEnv, checked_text, get_sa, lift_binary, lift_ternary, lift_unary, shape_of, trunc_to_isize,
 };
 use crate::binder::BoundFormula;
+use crate::spill::SpillRegistry;
 use crate::value_eval::{
     Array2D, CallerContext, EvalScalar, EvalValue, MAX_ARRAY_CELLS, ScalarOrArray,
     coerce_for_scalar_op,
@@ -26,10 +27,11 @@ use crate::value_eval::{
 pub fn eval_floor_or_ceiling(
     args: Vec<EvalValue>,
     workbook: &Workbook<BoundFormula>,
+    spills: &SpillRegistry,
     caller: CallerContext,
     is_floor: bool,
 ) -> EvalValue {
-    lift_binary(args, workbook, caller, |num_arg, sig_arg| {
+    lift_binary(args, workbook, spills, caller, |num_arg, sig_arg| {
         let x = match num_arg.to_number() {
             Ok(v) => v,
             Err(e) => return EvalScalar::Error(e),
@@ -75,6 +77,7 @@ pub fn eval_rand(args: &[EvalValue], env: &mut EvalEnv) -> EvalValue {
 pub fn eval_randbetween(
     args: Vec<EvalValue>,
     workbook: &Workbook<BoundFormula>,
+    spills: &SpillRegistry,
     caller: CallerContext,
     env: &mut EvalEnv,
 ) -> EvalValue {
@@ -85,11 +88,11 @@ pub fn eval_randbetween(
     let (Some(a0), Some(a1)) = (it.next(), it.next()) else {
         return EvalValue::Scalar(EvalScalar::Error(CalcError::Value));
     };
-    let left = match coerce_for_scalar_op(a0, workbook, caller) {
+    let left = match coerce_for_scalar_op(a0, workbook, spills, caller) {
         Ok(v) => v,
         Err(e) => return EvalValue::Scalar(EvalScalar::Error(e)),
     };
-    let right = match coerce_for_scalar_op(a1, workbook, caller) {
+    let right = match coerce_for_scalar_op(a1, workbook, spills, caller) {
         Ok(v) => v,
         Err(e) => return EvalValue::Scalar(EvalScalar::Error(e)),
     };
@@ -161,45 +164,52 @@ pub fn eval_randbetween(
 pub fn eval_find_or_search(
     mut args: Vec<EvalValue>,
     workbook: &Workbook<BoundFormula>,
+    spills: &SpillRegistry,
     caller: CallerContext,
     case_sensitive: bool,
 ) -> EvalValue {
     if args.len() == 2 {
         args.push(EvalValue::Scalar(EvalScalar::Number(1.0)));
     }
-    lift_ternary(args, workbook, caller, |find_arg, within_arg, start_arg| {
-        let needle = match find_arg.to_text() {
-            Ok(v) => v,
-            Err(e) => return EvalScalar::Error(e),
-        };
-        let haystack = match within_arg.to_text() {
-            Ok(v) => v,
-            Err(e) => return EvalScalar::Error(e),
-        };
-        let start_1based = match start_arg.to_number().and_then(trunc_to_isize) {
-            Ok(v) => v,
-            Err(e) => return EvalScalar::Error(e),
-        };
-        if start_1based < 1 {
-            return EvalScalar::Error(CalcError::Value);
-        }
-        #[expect(clippy::cast_sign_loss, reason = "`start_1based >= 1`")]
-        let start_idx = (start_1based as usize).saturating_sub(1);
-
-        let found_0based = if case_sensitive {
-            find_literal_char_offset(&needle, &haystack, start_idx)
-        } else {
-            wildcard_search_substring(&needle, &haystack, start_idx)
-        };
-        match found_0based {
-            Some(pos) =>
-            {
-                #[expect(clippy::cast_precision_loss, reason = "`pos <= 32,768`")]
-                EvalScalar::Number(pos.saturating_add(1) as f64)
+    lift_ternary(
+        args,
+        workbook,
+        spills,
+        caller,
+        |find_arg, within_arg, start_arg| {
+            let needle = match find_arg.to_text() {
+                Ok(v) => v,
+                Err(e) => return EvalScalar::Error(e),
+            };
+            let haystack = match within_arg.to_text() {
+                Ok(v) => v,
+                Err(e) => return EvalScalar::Error(e),
+            };
+            let start_1based = match start_arg.to_number().and_then(trunc_to_isize) {
+                Ok(v) => v,
+                Err(e) => return EvalScalar::Error(e),
+            };
+            if start_1based < 1 {
+                return EvalScalar::Error(CalcError::Value);
             }
-            None => EvalScalar::Error(CalcError::Value),
-        }
-    })
+            #[expect(clippy::cast_sign_loss, reason = "`start_1based >= 1`")]
+            let start_idx = (start_1based as usize).saturating_sub(1);
+
+            let found_0based = if case_sensitive {
+                find_literal_char_offset(&needle, &haystack, start_idx)
+            } else {
+                wildcard_search_substring(&needle, &haystack, start_idx)
+            };
+            match found_0based {
+                Some(pos) =>
+                {
+                    #[expect(clippy::cast_precision_loss, reason = "`pos <= 32,768`")]
+                    EvalScalar::Number(pos.saturating_add(1) as f64)
+                }
+                None => EvalScalar::Error(CalcError::Value),
+            }
+        },
+    )
 }
 
 fn find_literal_char_offset(needle: &str, haystack: &str, start_char_idx: usize) -> Option<usize> {
@@ -224,6 +234,7 @@ fn find_literal_char_offset(needle: &str, haystack: &str, start_char_idx: usize)
 pub fn eval_substitute(
     args: Vec<EvalValue>,
     workbook: &Workbook<BoundFormula>,
+    spills: &SpillRegistry,
     caller: CallerContext,
 ) -> EvalValue {
     if !(3..=4).contains(&args.len()) {
@@ -241,6 +252,7 @@ pub fn eval_substitute(
     lift_4(
         [a0, a1, a2, a3],
         workbook,
+        spills,
         caller,
         |text_arg, old_arg, new_arg, inst_arg| {
             let text = match text_arg.to_text() {
@@ -310,6 +322,7 @@ pub fn eval_substitute(
 pub fn eval_replace(
     args: Vec<EvalValue>,
     workbook: &Workbook<BoundFormula>,
+    spills: &SpillRegistry,
     caller: CallerContext,
 ) -> EvalValue {
     if args.len() != 4 {
@@ -323,6 +336,7 @@ pub fn eval_replace(
     lift_4(
         [a0, a1, a2, a3],
         workbook,
+        spills,
         caller,
         |old_arg, start_arg, len_arg, new_arg| {
             let old_text = match old_arg.to_text() {
@@ -370,9 +384,10 @@ pub fn eval_replace(
 pub fn eval_value(
     args: Vec<EvalValue>,
     workbook: &Workbook<BoundFormula>,
+    spills: &SpillRegistry,
     caller: CallerContext,
 ) -> EvalValue {
-    lift_unary(args, workbook, caller, |arg| match arg {
+    lift_unary(args, workbook, spills, caller, |arg| match arg {
         EvalScalar::Error(e) => EvalScalar::Error(*e),
         EvalScalar::Empty => EvalScalar::Number(0.0),
         EvalScalar::Number(n) => EvalScalar::number(*n),
@@ -387,9 +402,10 @@ pub fn eval_value(
 pub fn eval_text(
     args: Vec<EvalValue>,
     workbook: &Workbook<BoundFormula>,
+    spills: &SpillRegistry,
     caller: CallerContext,
 ) -> EvalValue {
-    lift_binary(args, workbook, caller, |val_arg, fmt_arg| {
+    lift_binary(args, workbook, spills, caller, |val_arg, fmt_arg| {
         if let EvalScalar::Error(e) = val_arg {
             return EvalScalar::Error(*e);
         }
@@ -590,23 +606,24 @@ fn strip_valid_thousands_commas(s: &str) -> Option<String> {
 fn lift_4(
     args: [EvalValue; 4],
     workbook: &Workbook<BoundFormula>,
+    spills: &SpillRegistry,
     caller: CallerContext,
     f: impl Fn(&EvalScalar, &EvalScalar, &EvalScalar, &EvalScalar) -> EvalScalar,
 ) -> EvalValue {
     let [a0, a1, a2, a3] = args;
-    let s0 = match coerce_for_scalar_op(a0, workbook, caller) {
+    let s0 = match coerce_for_scalar_op(a0, workbook, spills, caller) {
         Ok(v) => v,
         Err(e) => return EvalValue::Scalar(EvalScalar::Error(e)),
     };
-    let s1 = match coerce_for_scalar_op(a1, workbook, caller) {
+    let s1 = match coerce_for_scalar_op(a1, workbook, spills, caller) {
         Ok(v) => v,
         Err(e) => return EvalValue::Scalar(EvalScalar::Error(e)),
     };
-    let s2 = match coerce_for_scalar_op(a2, workbook, caller) {
+    let s2 = match coerce_for_scalar_op(a2, workbook, spills, caller) {
         Ok(v) => v,
         Err(e) => return EvalValue::Scalar(EvalScalar::Error(e)),
     };
-    let s3 = match coerce_for_scalar_op(a3, workbook, caller) {
+    let s3 = match coerce_for_scalar_op(a3, workbook, spills, caller) {
         Ok(v) => v,
         Err(e) => return EvalValue::Scalar(EvalScalar::Error(e)),
     };

@@ -26,8 +26,8 @@ use crate::sheet::{
 use crate::state_digest::{
     AXIS_KIND_COL, AXIS_KIND_ROW, CanonicalScalar, StateDigest, axis_content_hash,
     compute_order_digest as compute_sheets_order_digest, hash_cell_format, hash_cell_style,
-    hash_col_format, hash_col_style, hash_col_width, hash_formula_cell, hash_row_format,
-    hash_row_height, hash_row_style, hash_scalar_cell, hash_sheet_meta,
+    hash_col_format, hash_col_style, hash_col_width, hash_formula_cell, hash_named_range,
+    hash_row_format, hash_row_height, hash_row_style, hash_scalar_cell, hash_sheet_meta,
     sheet_content_and_scalar_count,
 };
 use crate::style::StylePatch;
@@ -50,6 +50,190 @@ pub const MAX_BULK_CELLS_PER_OP: usize = 2_000_000;
 
 /// Maximum estimated heap footprint of a local workbook (`1 GiB`).
 pub const MAX_WORKBOOK_BYTES: usize = 1_073_741_824;
+
+/// Maximum defined named ranges in a workbook.
+pub const MAX_NAMED_RANGES: usize = 4_096;
+
+/// Maximum character length of a named range identifier.
+pub const MAX_NAMED_RANGE_CHARS: usize = 255;
+
+/// Maximum character length of a named range comment.
+pub const MAX_NAMED_RANGE_COMMENT_CHARS: usize = 512;
+
+/// Canonical lookup key for a defined named range (scope + case-folded name).
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct NamedRangeKey {
+    /// `None` for workbook-scoped names; `Some(sheet_id)` for worksheet-local names.
+    pub scope: Option<SheetId>,
+    /// ASCII-lowercased identifier used for case-insensitive lookup.
+    pub canonical_name: String,
+}
+
+impl NamedRangeKey {
+    /// Constructs a canonical key by ASCII-lowercasing `name`.
+    #[must_use]
+    pub fn new(scope: Option<SheetId>, name: &str) -> Self {
+        Self {
+            scope,
+            canonical_name: name.to_ascii_lowercase(),
+        }
+    }
+}
+
+/// Definition of a workbook-scoped or sheet-scoped defined name.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NamedRangeDef<F = RawFormula> {
+    /// Original display spelling preserved for the Name Manager and unparser.
+    pub name: String,
+    /// Formula payload (`RawFormula` or `BoundFormula`) evaluated in `2`-level scope.
+    pub formula: F,
+    /// Optional descriptive note shown in the Name Manager.
+    pub comment: Option<String>,
+    /// Whether the name is hidden from the Name Manager and autocomplete (`_xlnm.*`).
+    pub hidden: bool,
+}
+
+/// Validates an Excel defined-name identifier (`A1`/`R1C1`/`TRUE`/`FALSE`/`R`/`C`
+/// rejected; `_xlnm.*` and Unicode alphabetic starters accepted).
+#[must_use]
+pub fn is_valid_named_range_name(name: &str) -> bool {
+    if name.is_empty() || name.chars().count() > MAX_NAMED_RANGE_CHARS {
+        return false;
+    }
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first.is_alphabetic() || first == '_' || first == '\\') {
+        return false;
+    }
+    if !chars.all(|c| c.is_alphanumeric() || c == '_' || c == '.' || c == '\\') {
+        return false;
+    }
+    if name.eq_ignore_ascii_case("TRUE")
+        || name.eq_ignore_ascii_case("FALSE")
+        || name.eq_ignore_ascii_case("R")
+        || name.eq_ignore_ascii_case("C")
+    {
+        return false;
+    }
+    let bytes = name.as_bytes();
+    !(bytes.iter().all(u8::is_ascii_alphanumeric)
+        && (is_a1_cell_ref_bytes(bytes) || is_r1c1_like_bytes(bytes)))
+}
+
+fn is_a1_cell_ref_bytes(bytes: &[u8]) -> bool {
+    let mut i = 0usize;
+    while i < bytes.len() && bytes.get(i).is_some_and(u8::is_ascii_alphabetic) {
+        i = i.saturating_add(1);
+    }
+    if i == 0 || i > 3 || i >= bytes.len() {
+        return false;
+    }
+    let Some(letters) = bytes.get(..i) else {
+        return false;
+    };
+    let Some(digits) = bytes.get(i..) else {
+        return false;
+    };
+    if digits.first() == Some(&b'0') || !digits.iter().all(u8::is_ascii_digit) {
+        return false;
+    }
+    let mut col_one_based: u32 = 0;
+    for &b in letters {
+        let letter_val = u32::from(
+            b.to_ascii_uppercase()
+                .saturating_sub(b'A')
+                .saturating_add(1),
+        );
+        col_one_based = col_one_based.saturating_mul(26).saturating_add(letter_val);
+    }
+    if !(1..=16_384).contains(&col_one_based) {
+        return false;
+    }
+    let mut row_num: u32 = 0;
+    for &b in digits {
+        let Some(next) = row_num
+            .checked_mul(10)
+            .and_then(|v| v.checked_add(u32::from(b.saturating_sub(b'0'))))
+        else {
+            return false;
+        };
+        row_num = next;
+        if row_num > 1_048_576 {
+            return false;
+        }
+    }
+    (1..=1_048_576).contains(&row_num)
+}
+
+fn is_r1c1_like_bytes(bytes: &[u8]) -> bool {
+    let Some(&first) = bytes.first() else {
+        return false;
+    };
+    let rest = bytes.get(1..).unwrap_or(&[]);
+    if first == b'C' || first == b'c' {
+        return !rest.is_empty() && rest.iter().all(u8::is_ascii_digit);
+    }
+    if first == b'R' || first == b'r' {
+        let mut r_digits = 0usize;
+        while let Some(&b) = rest.get(r_digits) {
+            if b.is_ascii_digit() {
+                r_digits = r_digits.saturating_add(1);
+            } else {
+                break;
+            }
+        }
+        if r_digits == 0 {
+            return false;
+        }
+        if r_digits == rest.len() {
+            return true;
+        }
+        if let Some(&sep) = rest.get(r_digits)
+            && (sep == b'C' || sep == b'c')
+        {
+            let tail = rest.get(r_digits.saturating_add(1)..).unwrap_or(&[]);
+            return !tail.is_empty() && tail.iter().all(u8::is_ascii_digit);
+        }
+    }
+    false
+}
+
+/// Complete prior state of a cell (including explicit style patch) saved for
+/// [`InverseOp::RestorePermutedCells`] and [`InverseOp::RestoreMovedCells`].
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PermutedCellBackup<F = RawFormula> {
+    /// Target row identity.
+    pub row: RowId,
+    /// Target column identity.
+    pub col: ColId,
+    /// Previous cell input (empty, scalar, or formula + cached value).
+    pub input: CellInput<F>,
+    /// Previous explicit per-cell number format.
+    pub format: Option<NumberFormat>,
+    /// Previous explicit per-cell style patch.
+    pub style: StylePatch,
+}
+
+/// Read-only context passed to [`FormulaPayload::rewrite_for_move_cells`] so
+/// E14/E24 cut/paste rewrites run without extra permanent reverse-dependency RAM.
+pub struct MoveCellsRewriteCtx<'a> {
+    /// Workbook worksheets prior to cell mutation (axes remain unchanged).
+    pub sheets: &'a [Sheet],
+    /// Source worksheet identifier.
+    pub src_sheet: SheetId,
+    /// Contiguous ordered live source row IDs.
+    pub src_rows: &'a [RowId],
+    /// Contiguous ordered live source column IDs.
+    pub src_cols: &'a [ColId],
+    /// Destination worksheet identifier.
+    pub dst_sheet: SheetId,
+    /// Contiguous ordered live destination row IDs (same length as `src_rows`).
+    pub dst_rows: &'a [RowId],
+    /// Contiguous ordered live destination column IDs (same length as `src_cols`).
+    pub dst_cols: &'a [ColId],
+}
 
 /// Evaluation mode of a formula (D-028).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -135,6 +319,31 @@ pub trait FormulaPayload: Clone + PartialEq {
     /// deleted single-cell, all-deleted range, or deleted-sheet references turn
     /// into `#REF!`.
     fn finalize_purged_tombstones(&mut self, _host_sheet: SheetId, _sheets: &[Sheet]) -> bool {
+        false
+    }
+
+    /// Shifts relative row references for E15 [`Op::PermuteContent`] when a row
+    /// inside a sorted/permuted block moves from live position `src_row_pos`
+    /// to `dst_row_pos` on `_sheet`.
+    #[must_use]
+    fn shift_for_row_permutation(
+        &self,
+        _sheet: SheetId,
+        _src_row_pos: u32,
+        _dst_row_pos: u32,
+        _sheets: &[Sheet],
+    ) -> Self {
+        self.clone()
+    }
+
+    /// Rewrites references inside `self` for E14/E24 [`Op::MoveCells`]. Returns
+    /// `true` when any reference in `self` changed.
+    fn rewrite_for_move_cells(
+        &mut self,
+        _host_sheet_before: SheetId,
+        _is_moved_formula: bool,
+        _ctx: &MoveCellsRewriteCtx<'_>,
+    ) -> bool {
         false
     }
 }
@@ -526,6 +735,58 @@ pub enum Op<F: FormulaPayload = RawFormula> {
         /// Preceding worksheet (`None` moves to first tab).
         after: Option<SheetId>,
     },
+    /// Permutes cell contents, explicit formats, and explicit styles across rows
+    /// inside `rows × cols` without altering row axis identities (E15 sort).
+    /// `row_perm[dst_idx] = src_idx`: destination row `rows[dst_idx]` receives
+    /// the cell previously held at source row `rows[src_idx]` for each column
+    /// in `cols`.
+    PermuteContent {
+        /// Target worksheet.
+        sheet: SheetId,
+        /// Unique live row identities covering the permuted rows.
+        rows: Vec<RowId>,
+        /// Unique live column identities covering the permuted columns.
+        cols: Vec<ColId>,
+        /// Permutation over `0..rows.len()` mapping destination index -> source index.
+        row_perm: Vec<u32>,
+    },
+    /// Cuts and pastes a contiguous live rectangle of cells (with explicit
+    /// formats and styles) from `src` to `dst`, rewriting references under E14/E24.
+    MoveCells {
+        /// Source worksheet.
+        src_sheet: SheetId,
+        /// Ordered contiguous live source row identities.
+        src_rows: Vec<RowId>,
+        /// Ordered contiguous live source column identities.
+        src_cols: Vec<ColId>,
+        /// Destination worksheet.
+        dst_sheet: SheetId,
+        /// Ordered contiguous live destination row identities (`src_rows.len()`).
+        dst_rows: Vec<RowId>,
+        /// Ordered contiguous live destination column identities (`src_cols.len()`).
+        dst_cols: Vec<ColId>,
+    },
+    /// Defines or updates a workbook-scoped (`scope: None`) or sheet-scoped
+    /// (`scope: Some(sheet)`) named range / formula.
+    DefineNamedRange {
+        /// Workbook scope (`None`) or worksheet-local scope (`Some(sheet)`).
+        scope: Option<SheetId>,
+        /// Display identifier.
+        name: String,
+        /// Formula payload bound against the workbook.
+        formula: F,
+        /// Optional descriptive note.
+        comment: Option<String>,
+        /// Whether the name is hidden from the Name Manager / autocomplete.
+        hidden: bool,
+    },
+    /// Deletes an existing workbook-scoped or sheet-scoped named range.
+    DeleteNamedRange {
+        /// Workbook scope (`None`) or worksheet-local scope (`Some(sheet)`).
+        scope: Option<SheetId>,
+        /// Identifier to delete (matched ASCII-case-insensitively).
+        name: String,
+    },
 }
 
 impl<F: FormulaPayload> Op<F> {
@@ -624,6 +885,8 @@ pub enum InverseOp<F = RawFormula> {
         prior_runs: Vec<AxisRun>,
         /// `(cell_key, prior_formula)` entries rewritten during E25 handoff.
         rewritten: Vec<(WorkbookCellKey, F)>,
+        /// `(name_key, prior_formula)` named range entries rewritten during E25 handoff.
+        rewritten_names: Vec<(NamedRangeKey, F)>,
     },
     /// Restores column axis runs and any formulas rewritten by E25 anchor handoff.
     RestoreMovedCols {
@@ -633,6 +896,8 @@ pub enum InverseOp<F = RawFormula> {
         prior_runs: Vec<AxisRun>,
         /// `(cell_key, prior_formula)` entries rewritten during E25 handoff.
         rewritten: Vec<(WorkbookCellKey, F)>,
+        /// `(name_key, prior_formula)` named range entries rewritten during E25 handoff.
+        rewritten_names: Vec<(NamedRangeKey, F)>,
     },
     /// Restores custom row heights modified by [`Op::ResizeRows`].
     RestoreRowHeights {
@@ -696,6 +961,30 @@ pub enum InverseOp<F = RawFormula> {
         /// Ordered `SheetId` vector prior to [`Op::MoveSheet`].
         order: Vec<SheetId>,
     },
+    /// Restores cell inputs, formats, and styles displaced by [`Op::PermuteContent`].
+    RestorePermutedCells {
+        /// Target worksheet.
+        sheet: SheetId,
+        /// Full prior snapshots of every moved `(row, col)` cell.
+        prior: Vec<PermutedCellBackup<F>>,
+    },
+    /// Restores cell states, stationary formulas, and named ranges altered by [`Op::MoveCells`].
+    RestoreMovedCells {
+        /// Full prior snapshots of every cell in `src ∪ dst`.
+        prior_cells: Vec<(SheetId, PermutedCellBackup<F>)>,
+        /// Prior formulas for stationary cells outside `src ∪ dst` rewritten under E14/E24.
+        rewritten_formulas: Vec<(WorkbookCellKey, F)>,
+        /// Prior formulas for named ranges rewritten under E14/E24.
+        rewritten_names: Vec<(NamedRangeKey, F)>,
+    },
+    /// Restores a named range definition created, updated, or deleted by
+    /// [`Op::DefineNamedRange`] / [`Op::DeleteNamedRange`].
+    RestoreNamedRange {
+        /// Canonical key of the named range.
+        key: NamedRangeKey,
+        /// Previous definition (`None` removes the entry on undo).
+        prior: Option<NamedRangeDef<F>>,
+    },
 }
 
 /// Reason an operation or inverse operation was rejected.
@@ -741,6 +1030,14 @@ pub enum OpError {
     MemoryLimitExceeded,
     /// Workbook is opened in read-only mode.
     ReadOnly,
+    /// Named range identifier or comment failed validation.
+    InvalidNamedRange,
+    /// Workbook already holds [`MAX_NAMED_RANGES`] named ranges.
+    TooManyNamedRanges,
+    /// [`Op::PermuteContent`] received empty, duplicate, missing, or non-bijective inputs.
+    InvalidPermutation,
+    /// [`Op::MoveCells`] received mismatched, non-contiguous, deleted, or missing ranges.
+    InvalidMoveCells,
 }
 
 impl From<AxisError> for OpError {
@@ -771,6 +1068,8 @@ pub struct Workbook<F = RawFormula> {
     sheets: Vec<Sheet>,
     formulas: BTreeMap<WorkbookCellKey, F>,
     formulas_bytes: usize,
+    named_ranges: BTreeMap<NamedRangeKey, NamedRangeDef<F>>,
+    named_ranges_bytes: usize,
     /// Reverse lookup `(target_sheet, row_anchor) -> formula_keys` for `O(affected)`
     /// E25 anchor handoff on `MoveRows`.
     row_range_endpoints: BTreeMap<(SheetId, RowId), BTreeSet<WorkbookCellKey>>,
@@ -803,6 +1102,8 @@ impl<F: FormulaPayload> Workbook<F> {
             sheets: vec![sheet],
             formulas: BTreeMap::new(),
             formulas_bytes: 0,
+            named_ranges: BTreeMap::new(),
+            named_ranges_bytes: 0,
             row_range_endpoints: BTreeMap::new(),
             col_range_endpoints: BTreeMap::new(),
             allocator: IdAllocator::local(),
@@ -828,6 +1129,8 @@ impl<F: FormulaPayload> Workbook<F> {
             sheets: vec![sheet],
             formulas: BTreeMap::new(),
             formulas_bytes: 0,
+            named_ranges: BTreeMap::new(),
+            named_ranges_bytes: 0,
             row_range_endpoints: BTreeMap::new(),
             col_range_endpoints: BTreeMap::new(),
             allocator: IdAllocator::local(),
@@ -838,10 +1141,29 @@ impl<F: FormulaPayload> Workbook<F> {
         }
     }
 
-    /// Reconstructs a workbook from decoded snapshot parts.
+    /// Reconstructs a workbook from decoded snapshot parts (with no named ranges).
     pub fn from_parts(
         sheets: Vec<Sheet>,
         formulas: BTreeMap<WorkbookCellKey, F>,
+        allocator: IdAllocator,
+        next_sheet_id: u32,
+        seed_origin: Option<SeedOrigin>,
+    ) -> Result<Self, OpError> {
+        Self::from_parts_with_names(
+            sheets,
+            formulas,
+            BTreeMap::new(),
+            allocator,
+            next_sheet_id,
+            seed_origin,
+        )
+    }
+
+    /// Reconstructs a workbook from decoded snapshot parts including defined named ranges.
+    pub fn from_parts_with_names(
+        sheets: Vec<Sheet>,
+        formulas: BTreeMap<WorkbookCellKey, F>,
+        named_ranges: BTreeMap<NamedRangeKey, NamedRangeDef<F>>,
         allocator: IdAllocator,
         next_sheet_id: u32,
         seed_origin: Option<SeedOrigin>,
@@ -897,10 +1219,37 @@ impl<F: FormulaPayload> Workbook<F> {
             }
         }
 
+        let mut named_ranges_bytes = 0usize;
+        if named_ranges.len() > MAX_NAMED_RANGES {
+            return Err(OpError::TooManyNamedRanges);
+        }
+        for (nr_key, nr_def) in &named_ranges {
+            if !is_valid_named_range_name(&nr_def.name)
+                || nr_key.canonical_name != nr_def.name.to_ascii_lowercase()
+            {
+                return Err(OpError::InvalidNamedRange);
+            }
+            if let Some(sid) = nr_key.scope
+                && !sheets.iter().any(|s| s.id() == sid)
+            {
+                return Err(OpError::SheetNotFound);
+            }
+            if let Some(ref c) = nr_def.comment
+                && c.chars().count() > MAX_NAMED_RANGE_COMMENT_CHARS
+            {
+                return Err(OpError::InvalidNamedRange);
+            }
+            nr_def.formula.validate()?;
+            named_ranges_bytes =
+                named_ranges_bytes.saturating_add(named_range_entry_bytes(nr_key, nr_def));
+        }
+
         let mut wb = Self {
             sheets,
             formulas,
             formulas_bytes,
+            named_ranges,
+            named_ranges_bytes,
             row_range_endpoints,
             col_range_endpoints,
             allocator,
@@ -1026,6 +1375,16 @@ impl<F: FormulaPayload> Workbook<F> {
             digest = digest.wrapping_add(hash_formula_cell(sid, row, col, formula));
             count = count.saturating_add(1);
         }
+        for (nr_key, nr_def) in &self.named_ranges {
+            digest = digest.wrapping_add(hash_named_range(
+                nr_key.scope,
+                &nr_key.canonical_name,
+                &nr_def.name,
+                &nr_def.formula,
+                nr_def.comment.as_deref(),
+                nr_def.hidden,
+            ));
+        }
         (digest, count)
     }
 
@@ -1052,6 +1411,44 @@ impl<F: FormulaPayload> Workbook<F> {
     #[must_use]
     pub const fn formulas(&self) -> &BTreeMap<WorkbookCellKey, F> {
         &self.formulas
+    }
+
+    /// Stored defined named ranges across the workbook (workbook & sheet scoped).
+    #[must_use]
+    pub const fn named_ranges(&self) -> &BTreeMap<NamedRangeKey, NamedRangeDef<F>> {
+        &self.named_ranges
+    }
+
+    /// Looks up a defined named range by exact canonical key.
+    #[must_use]
+    pub fn named_range(&self, key: &NamedRangeKey) -> Option<&NamedRangeDef<F>> {
+        self.named_ranges.get(key)
+    }
+
+    /// Resolves `name` in `host_sheet` first (`scope = Some(host_sheet)`),
+    /// falling back to workbook scope (`scope = None`).
+    #[must_use]
+    pub fn resolve_named_range(
+        &self,
+        host_sheet: SheetId,
+        name: &str,
+    ) -> Option<(&NamedRangeKey, &NamedRangeDef<F>)> {
+        if self.named_ranges.is_empty() {
+            return None;
+        }
+        let canonical = name.to_ascii_lowercase();
+        let sheet_key = NamedRangeKey {
+            scope: Some(host_sheet),
+            canonical_name: canonical.clone(),
+        };
+        if let Some((k, v)) = self.named_ranges.get_key_value(&sheet_key) {
+            return Some((k, v));
+        }
+        let book_key = NamedRangeKey {
+            scope: None,
+            canonical_name: canonical,
+        };
+        self.named_ranges.get_key_value(&book_key)
     }
 
     /// Looks up the formula at `(sheet, row, col)`.
@@ -1147,7 +1544,9 @@ impl<F: FormulaPayload> Workbook<F> {
             .sheets
             .iter()
             .fold(0usize, |acc, s| acc.saturating_add(s.estimated_bytes()));
-        sheets_mem.saturating_add(self.formulas_bytes)
+        sheets_mem
+            .saturating_add(self.formulas_bytes)
+            .saturating_add(self.named_ranges_bytes)
     }
 
     /// Compacts unreferenced strings across all sheets (safe at any time without
@@ -1174,6 +1573,18 @@ impl<F: FormulaPayload> Workbook<F> {
                 self.put_formula(key, f);
             }
         }
+        let fallback_sheet = self.sheets.first().map_or(SheetId(0), Sheet::id);
+        let nr_keys: Vec<NamedRangeKey> = self.named_ranges.keys().cloned().collect();
+        for nr_key in nr_keys {
+            let host = nr_key.scope.unwrap_or(fallback_sheet);
+            if let Some(def) = self.named_ranges.get_mut(&nr_key)
+                && def
+                    .formula
+                    .finalize_purged_tombstones(host, &sheets_snapshot)
+            {
+                // `named_ranges_bytes` updated below after sheet purge.
+            }
+        }
 
         // 2. Remove tombstoned sheets and formulas residing on them.
         let dead_sheets: BTreeSet<SheetId> = self
@@ -1192,8 +1603,13 @@ impl<F: FormulaPayload> Workbook<F> {
             for k in dead_keys {
                 self.take_formula(k);
             }
+            self.named_ranges
+                .retain(|k, _| k.scope.is_none_or(|sid| !dead_sheets.contains(&sid)));
             self.sheets.retain(|s| !s.is_deleted());
         }
+        self.named_ranges_bytes = self.named_ranges.iter().fold(0usize, |acc, (k, d)| {
+            acc.saturating_add(named_range_entry_bytes(k, d))
+        });
 
         // 3. Purge axis tombstones on remaining live sheets and drop formulas
         // that lived on purged rows/cols.
@@ -1307,6 +1723,30 @@ impl<F: FormulaPayload> Workbook<F> {
             Op::DeleteSheet { sheet } => self.apply_delete_sheet(sheet),
             Op::UndeleteSheet { sheet } => self.apply_undelete_sheet(sheet),
             Op::MoveSheet { sheet, after } => self.apply_move_sheet(sheet, after),
+            Op::PermuteContent {
+                sheet,
+                rows,
+                cols,
+                row_perm,
+            } => self.apply_permute_content(sheet, &rows, &cols, &row_perm),
+            Op::MoveCells {
+                src_sheet,
+                src_rows,
+                src_cols,
+                dst_sheet,
+                dst_rows,
+                dst_cols,
+            } => self.apply_move_cells(
+                src_sheet, &src_rows, &src_cols, dst_sheet, &dst_rows, &dst_cols,
+            ),
+            Op::DefineNamedRange {
+                scope,
+                name,
+                formula,
+                comment,
+                hidden,
+            } => self.apply_define_named_range(scope, name, formula, comment, hidden),
+            Op::DeleteNamedRange { scope, name } => self.apply_delete_named_range(scope, &name),
         }
     }
 
@@ -1393,6 +1833,7 @@ impl<F: FormulaPayload> Workbook<F> {
                 sheet,
                 prior_runs,
                 rewritten,
+                rewritten_names,
             } => {
                 let target = self.sheet_mut(sheet).ok_or(OpError::SheetNotFound)?;
                 let old_ax = axis_content_hash(sheet, AXIS_KIND_ROW, target.row_axis());
@@ -1406,6 +1847,7 @@ impl<F: FormulaPayload> Workbook<F> {
                     delta = delta.wrapping_add(hash_formula_cell(key.0, key.1, key.2, &formula));
                     self.put_formula(key, formula);
                 }
+                delta = delta.wrapping_add(self.restore_rewritten_names(rewritten_names));
                 self.content_digest = self.content_digest.wrapping_add(delta);
                 Ok(())
             }
@@ -1413,6 +1855,7 @@ impl<F: FormulaPayload> Workbook<F> {
                 sheet,
                 prior_runs,
                 rewritten,
+                rewritten_names,
             } => {
                 let target = self.sheet_mut(sheet).ok_or(OpError::SheetNotFound)?;
                 let old_ax = axis_content_hash(sheet, AXIS_KIND_COL, target.col_axis());
@@ -1426,6 +1869,7 @@ impl<F: FormulaPayload> Workbook<F> {
                     delta = delta.wrapping_add(hash_formula_cell(key.0, key.1, key.2, &formula));
                     self.put_formula(key, formula);
                 }
+                delta = delta.wrapping_add(self.restore_rewritten_names(rewritten_names));
                 self.content_digest = self.content_digest.wrapping_add(delta);
                 Ok(())
             }
@@ -1644,6 +2088,15 @@ impl<F: FormulaPayload> Workbook<F> {
                 self.sheets = reordered;
                 Ok(())
             }
+            InverseOp::RestorePermutedCells { sheet, prior } => {
+                self.restore_permuted_cells(sheet, prior)
+            }
+            InverseOp::RestoreMovedCells {
+                prior_cells,
+                rewritten_formulas,
+                rewritten_names,
+            } => self.restore_moved_cells(prior_cells, rewritten_formulas, rewritten_names),
+            InverseOp::RestoreNamedRange { key, prior } => self.restore_named_range(key, prior),
         }
     }
 
@@ -1757,6 +2210,31 @@ impl<F: FormulaPayload> Workbook<F> {
             d.write_u64(row.0);
             d.write_u64(col.0);
             formula.write_digest(&mut d);
+        }
+        // Only include named ranges when non-empty so v1/v2 compat digests stay bit-identical.
+        if !self.named_ranges.is_empty() {
+            d.write_u32(u32::try_from(self.named_ranges.len()).unwrap_or(u32::MAX));
+            for (nr_key, nr_def) in &self.named_ranges {
+                match nr_key.scope {
+                    None => d.write_bytes(&[0]),
+                    Some(sid) => {
+                        d.write_bytes(&[1]);
+                        d.write_u32(sid.0);
+                    }
+                }
+                d.write_bytes(nr_key.canonical_name.as_bytes());
+                d.write_bytes(&[0]);
+                d.write_bytes(nr_def.name.as_bytes());
+                nr_def.formula.write_digest(&mut d);
+                match nr_def.comment.as_deref() {
+                    None => d.write_bytes(&[0]),
+                    Some(c) => {
+                        d.write_bytes(&[1]);
+                        d.write_bytes(c.as_bytes());
+                    }
+                }
+                d.write_bytes(&[u8::from(nr_def.hidden)]);
+            }
         }
         d.finish()
     }
@@ -2126,6 +2604,10 @@ impl<F: FormulaPayload> Workbook<F> {
             }
         }
 
+        // 2b. E25 anchor handoff for defined named ranges referencing `sheet_id`.
+        let (rewritten_names, names_delta) = self.handoff_names_row_anchors(sheet_id, ids, after);
+        formula_delta = formula_delta.wrapping_add(names_delta);
+
         // 3. Relocate runs on `row_axis`.
         let target = self.sheet_mut(sheet_id).ok_or(OpError::SheetNotFound)?;
         let old_ax = axis_content_hash(sheet_id, AXIS_KIND_ROW, target.row_axis());
@@ -2142,6 +2624,7 @@ impl<F: FormulaPayload> Workbook<F> {
             sheet: sheet_id,
             prior_runs,
             rewritten,
+            rewritten_names,
         })
     }
 
@@ -2186,6 +2669,9 @@ impl<F: FormulaPayload> Workbook<F> {
             }
         }
 
+        let (rewritten_names, names_delta) = self.handoff_names_col_anchors(sheet_id, ids, after);
+        formula_delta = formula_delta.wrapping_add(names_delta);
+
         let target = self.sheet_mut(sheet_id).ok_or(OpError::SheetNotFound)?;
         let old_ax = axis_content_hash(sheet_id, AXIS_KIND_COL, target.col_axis());
         let prior_runs = target.col_axis_mut().move_runs(ids, after.map(|c| c.0))?;
@@ -2201,6 +2687,7 @@ impl<F: FormulaPayload> Workbook<F> {
             sheet: sheet_id,
             prior_runs,
             rewritten,
+            rewritten_names,
         })
     }
 
@@ -3156,6 +3643,681 @@ impl<F: FormulaPayload> Workbook<F> {
             .saturating_add(new_pop);
         Ok(())
     }
+
+    fn apply_define_named_range(
+        &mut self,
+        scope: Option<SheetId>,
+        name: String,
+        formula: F,
+        comment: Option<String>,
+        hidden: bool,
+    ) -> Result<InverseOp<F>, OpError> {
+        if !is_valid_named_range_name(&name) {
+            return Err(OpError::InvalidNamedRange);
+        }
+        if let Some(sid) = scope
+            && self.sheet(sid).is_none()
+        {
+            return Err(OpError::SheetNotFound);
+        }
+        if let Some(ref c) = comment
+            && c.chars().count() > MAX_NAMED_RANGE_COMMENT_CHARS
+        {
+            return Err(OpError::InvalidNamedRange);
+        }
+        formula.validate()?;
+
+        let key = NamedRangeKey::new(scope, &name);
+        let new_def = NamedRangeDef {
+            name,
+            formula,
+            comment,
+            hidden,
+        };
+        let is_new = !self.named_ranges.contains_key(&key);
+        if is_new && self.named_ranges.len() >= MAX_NAMED_RANGES {
+            return Err(OpError::TooManyNamedRanges);
+        }
+        let old_bytes = self
+            .named_ranges
+            .get(&key)
+            .map_or(0, |d| named_range_entry_bytes(&key, d));
+        let new_bytes = named_range_entry_bytes(&key, &new_def);
+        if self
+            .estimated_bytes()
+            .saturating_sub(old_bytes)
+            .saturating_add(new_bytes)
+            > MAX_WORKBOOK_BYTES
+        {
+            return Err(OpError::MemoryLimitExceeded);
+        }
+
+        let new_h = named_range_digest(&key, &new_def);
+        let prior = self.named_ranges.insert(key.clone(), new_def);
+        let old_h = prior.as_ref().map_or(0, |d| named_range_digest(&key, d));
+        self.named_ranges_bytes = self
+            .named_ranges_bytes
+            .saturating_sub(old_bytes)
+            .saturating_add(new_bytes);
+        self.content_digest = self.content_digest.wrapping_sub(old_h).wrapping_add(new_h);
+        self.seed_origin = None;
+
+        Ok(InverseOp::RestoreNamedRange { key, prior })
+    }
+
+    fn apply_delete_named_range(
+        &mut self,
+        scope: Option<SheetId>,
+        name: &str,
+    ) -> Result<InverseOp<F>, OpError> {
+        let key = NamedRangeKey::new(scope, name);
+        let prior = self
+            .named_ranges
+            .remove(&key)
+            .ok_or(OpError::TargetNotFound)?;
+        let old_bytes = named_range_entry_bytes(&key, &prior);
+        let old_h = named_range_digest(&key, &prior);
+        self.named_ranges_bytes = self.named_ranges_bytes.saturating_sub(old_bytes);
+        self.content_digest = self.content_digest.wrapping_sub(old_h);
+        self.seed_origin = None;
+        Ok(InverseOp::RestoreNamedRange {
+            key,
+            prior: Some(prior),
+        })
+    }
+
+    fn restore_named_range(
+        &mut self,
+        key: NamedRangeKey,
+        prior: Option<NamedRangeDef<F>>,
+    ) -> Result<(), OpError> {
+        if let Some(ref def) = prior {
+            def.formula.validate()?;
+        }
+        let mut delta = 0_u128;
+        if let Some(cur) = self.named_ranges.remove(&key) {
+            self.named_ranges_bytes = self
+                .named_ranges_bytes
+                .saturating_sub(named_range_entry_bytes(&key, &cur));
+            delta = delta.wrapping_sub(named_range_digest(&key, &cur));
+        }
+        if let Some(restored) = prior {
+            self.named_ranges_bytes = self
+                .named_ranges_bytes
+                .saturating_add(named_range_entry_bytes(&key, &restored));
+            delta = delta.wrapping_add(named_range_digest(&key, &restored));
+            self.named_ranges.insert(key, restored);
+        }
+        self.content_digest = self.content_digest.wrapping_add(delta);
+        Ok(())
+    }
+
+    fn handoff_names_row_anchors(
+        &mut self,
+        sheet_id: SheetId,
+        ids: &[IdRun],
+        after: Option<RowId>,
+    ) -> (Vec<(NamedRangeKey, F)>, u128) {
+        self.handoff_names_anchors(sheet_id, true, ids, after.map(|r| r.0), None)
+    }
+
+    fn handoff_names_col_anchors(
+        &mut self,
+        sheet_id: SheetId,
+        ids: &[IdRun],
+        after: Option<ColId>,
+    ) -> (Vec<(NamedRangeKey, F)>, u128) {
+        self.handoff_names_anchors(sheet_id, false, ids, None, after.map(|c| c.0))
+    }
+
+    fn handoff_names_anchors(
+        &mut self,
+        sheet_id: SheetId,
+        is_row: bool,
+        ids: &[IdRun],
+        after_row: Option<u64>,
+        after_col: Option<u64>,
+    ) -> (Vec<(NamedRangeKey, F)>, u128) {
+        if self.named_ranges.is_empty() {
+            return (Vec::new(), 0);
+        }
+        let Some(axis_clone) = self.sheet(sheet_id).map(|s| {
+            if is_row {
+                s.row_axis().clone()
+            } else {
+                s.col_axis().clone()
+            }
+        }) else {
+            return (Vec::new(), 0);
+        };
+        let fallback_sheet = self.sheets.first().map_or(sheet_id, Sheet::id);
+        let keys: Vec<NamedRangeKey> = self.named_ranges.keys().cloned().collect();
+        let mut rewritten = Vec::new();
+        let mut delta = 0_u128;
+        for key in keys {
+            let host = key.scope.unwrap_or(fallback_sheet);
+            let Some(def) = self.named_ranges.get_mut(&key) else {
+                continue;
+            };
+            let prior_f = def.formula.clone();
+            let changed = if is_row {
+                def.formula.handoff_row_anchors(
+                    host,
+                    sheet_id,
+                    &axis_clone,
+                    ids,
+                    after_row.map(RowId),
+                )
+            } else {
+                def.formula.handoff_col_anchors(
+                    host,
+                    sheet_id,
+                    &axis_clone,
+                    ids,
+                    after_col.map(ColId),
+                )
+            };
+            if changed {
+                let mut old_bytes = named_range_entry_bytes(&key, def);
+                old_bytes = old_bytes
+                    .saturating_sub(def.formula.estimated_bytes())
+                    .saturating_add(prior_f.estimated_bytes());
+                let new_bytes = named_range_entry_bytes(&key, def);
+                let new_h = named_range_digest(&key, def);
+                let old_def_tmp = NamedRangeDef {
+                    name: def.name.clone(),
+                    formula: prior_f.clone(),
+                    comment: def.comment.clone(),
+                    hidden: def.hidden,
+                };
+                let old_h = named_range_digest(&key, &old_def_tmp);
+                self.named_ranges_bytes = self
+                    .named_ranges_bytes
+                    .saturating_sub(old_bytes)
+                    .saturating_add(new_bytes);
+                delta = delta.wrapping_sub(old_h).wrapping_add(new_h);
+                rewritten.push((key, prior_f));
+            }
+        }
+        (rewritten, delta)
+    }
+
+    fn restore_rewritten_names(&mut self, rewritten_names: Vec<(NamedRangeKey, F)>) -> u128 {
+        let mut delta = 0_u128;
+        for (key, prior_f) in rewritten_names {
+            if let Some(def) = self.named_ranges.get_mut(&key) {
+                let old_bytes = named_range_entry_bytes(&key, def);
+                let old_h = named_range_digest(&key, def);
+                def.formula = prior_f;
+                let new_bytes = named_range_entry_bytes(&key, def);
+                let new_h = named_range_digest(&key, def);
+                self.named_ranges_bytes = self
+                    .named_ranges_bytes
+                    .saturating_sub(old_bytes)
+                    .saturating_add(new_bytes);
+                delta = delta.wrapping_sub(old_h).wrapping_add(new_h);
+            }
+        }
+        delta
+    }
+
+    fn apply_permute_content(
+        &mut self,
+        sheet_id: SheetId,
+        rows: &[RowId],
+        cols: &[ColId],
+        row_perm: &[u32],
+    ) -> Result<InverseOp<F>, OpError> {
+        if rows.is_empty() || cols.is_empty() || rows.len() != row_perm.len() {
+            return Err(OpError::InvalidPermutation);
+        }
+        let total_cells = rows
+            .len()
+            .checked_mul(cols.len())
+            .ok_or(OpError::TooManyEdits)?;
+        if total_cells > MAX_BULK_CELLS_PER_OP {
+            return Err(OpError::TooManyEdits);
+        }
+        let n = rows.len();
+        let mut seen_perm = alloc::vec![false; n];
+        for &src_idx in row_perm {
+            let Some(flag) = usize::try_from(src_idx)
+                .ok()
+                .and_then(|u| seen_perm.get_mut(u))
+            else {
+                return Err(OpError::InvalidPermutation);
+            };
+            if *flag {
+                return Err(OpError::InvalidPermutation);
+            }
+            *flag = true;
+        }
+
+        let row_positions = {
+            let sheet = self.sheet(sheet_id).ok_or(OpError::SheetNotFound)?;
+            if sheet.is_deleted() {
+                return Err(OpError::InvalidPermutation);
+            }
+            let mut seen_rows = BTreeSet::new();
+            let mut positions = Vec::with_capacity(n);
+            for &r in rows {
+                if !seen_rows.insert(r) {
+                    return Err(OpError::InvalidPermutation);
+                }
+                let pos = sheet
+                    .row_axis()
+                    .id_to_pos(r.0)
+                    .ok_or(OpError::TargetNotFound)?;
+                positions.push(pos);
+            }
+            let mut seen_cols = BTreeSet::new();
+            for &c in cols {
+                if !seen_cols.insert(c) {
+                    return Err(OpError::InvalidPermutation);
+                }
+                if !sheet.col_axis().is_live(c.0) {
+                    return Err(OpError::TargetNotFound);
+                }
+            }
+            positions
+        };
+
+        let moved_dst_indices: Vec<usize> = row_perm
+            .iter()
+            .enumerate()
+            .filter_map(|(dst_i, &src_i)| {
+                if usize::try_from(src_i).ok() == Some(dst_i) {
+                    None
+                } else {
+                    Some(dst_i)
+                }
+            })
+            .collect();
+
+        if moved_dst_indices.is_empty() {
+            return Ok(InverseOp::RestorePermutedCells {
+                sheet: sheet_id,
+                prior: Vec::new(),
+            });
+        }
+
+        let cell_count = moved_dst_indices.len().saturating_mul(cols.len());
+        let mut prior = Vec::with_capacity(cell_count);
+        let mut staged = Vec::with_capacity(cell_count);
+        let mut old_formula_mem = 0usize;
+        let mut new_formula_mem = 0usize;
+
+        for &dst_i in &moved_dst_indices {
+            let Some(&dst_row) = rows.get(dst_i) else {
+                return Err(OpError::InvalidPermutation);
+            };
+            let Some(&dst_pos) = row_positions.get(dst_i) else {
+                return Err(OpError::InvalidPermutation);
+            };
+            let Some(&src_i_u32) = row_perm.get(dst_i) else {
+                return Err(OpError::InvalidPermutation);
+            };
+            let Ok(src_i) = usize::try_from(src_i_u32) else {
+                return Err(OpError::InvalidPermutation);
+            };
+            let Some(&src_row) = rows.get(src_i) else {
+                return Err(OpError::InvalidPermutation);
+            };
+            let Some(&src_pos) = row_positions.get(src_i) else {
+                return Err(OpError::InvalidPermutation);
+            };
+
+            for &col in cols {
+                let old_dst = self
+                    .snapshot_cell_backup(sheet_id, dst_row, col)
+                    .ok_or(OpError::SheetNotFound)?;
+                if let CellInput::Formula { ref formula, .. } = old_dst.input {
+                    old_formula_mem = old_formula_mem.saturating_add(formula_entry_bytes(formula));
+                }
+                prior.push(old_dst);
+
+                let mut moved = self
+                    .snapshot_cell_backup(sheet_id, src_row, col)
+                    .ok_or(OpError::SheetNotFound)?;
+                moved.row = dst_row;
+                if let CellInput::Formula {
+                    ref mut formula, ..
+                } = moved.input
+                {
+                    let shifted =
+                        formula.shift_for_row_permutation(sheet_id, src_pos, dst_pos, &self.sheets);
+                    shifted.validate()?;
+                    new_formula_mem = new_formula_mem.saturating_add(formula_entry_bytes(&shifted));
+                    *formula = shifted;
+                }
+                staged.push(moved);
+            }
+        }
+
+        if self
+            .estimated_bytes()
+            .saturating_sub(old_formula_mem)
+            .saturating_add(new_formula_mem)
+            > MAX_WORKBOOK_BYTES
+        {
+            return Err(OpError::MemoryLimitExceeded);
+        }
+
+        self.seed_origin = None;
+        for backup in staged {
+            if let Err(err) = self.write_cell_backup(sheet_id, backup) {
+                let _ = self.restore_permuted_cells(sheet_id, prior);
+                return Err(err);
+            }
+        }
+
+        Ok(InverseOp::RestorePermutedCells {
+            sheet: sheet_id,
+            prior,
+        })
+    }
+
+    fn restore_permuted_cells(
+        &mut self,
+        sheet_id: SheetId,
+        prior: Vec<PermutedCellBackup<F>>,
+    ) -> Result<(), OpError> {
+        let _ = self.sheet(sheet_id).ok_or(OpError::SheetNotFound)?;
+        for backup in prior {
+            self.write_cell_backup(sheet_id, backup)?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn apply_move_cells(
+        &mut self,
+        src_sheet: SheetId,
+        src_rows: &[RowId],
+        src_cols: &[ColId],
+        dst_sheet: SheetId,
+        dst_rows: &[RowId],
+        dst_cols: &[ColId],
+    ) -> Result<InverseOp<F>, OpError> {
+        if src_rows.is_empty()
+            || src_cols.is_empty()
+            || src_rows.len() != dst_rows.len()
+            || src_cols.len() != dst_cols.len()
+        {
+            return Err(OpError::InvalidMoveCells);
+        }
+        let total_cells = src_rows
+            .len()
+            .checked_mul(src_cols.len())
+            .ok_or(OpError::TooManyEdits)?;
+        if total_cells > MAX_BULK_CELLS_PER_OP {
+            return Err(OpError::TooManyEdits);
+        }
+
+        {
+            let s_src = self.sheet(src_sheet).ok_or(OpError::SheetNotFound)?;
+            if s_src.is_deleted() {
+                return Err(OpError::InvalidMoveCells);
+            }
+            validate_contiguous_live_axis_ids(
+                s_src.row_axis(),
+                src_rows.iter().map(|r| r.0),
+                src_rows.len(),
+            )?;
+            validate_contiguous_live_axis_ids(
+                s_src.col_axis(),
+                src_cols.iter().map(|c| c.0),
+                src_cols.len(),
+            )?;
+
+            let s_dst = self.sheet(dst_sheet).ok_or(OpError::SheetNotFound)?;
+            if s_dst.is_deleted() {
+                return Err(OpError::InvalidMoveCells);
+            }
+            validate_contiguous_live_axis_ids(
+                s_dst.row_axis(),
+                dst_rows.iter().map(|r| r.0),
+                dst_rows.len(),
+            )?;
+            validate_contiguous_live_axis_ids(
+                s_dst.col_axis(),
+                dst_cols.iter().map(|c| c.0),
+                dst_cols.len(),
+            )?;
+        }
+
+        if src_sheet == dst_sheet && src_rows == dst_rows && src_cols == dst_cols {
+            return Ok(InverseOp::RestoreMovedCells {
+                prior_cells: Vec::new(),
+                rewritten_formulas: Vec::new(),
+                rewritten_names: Vec::new(),
+            });
+        }
+
+        let mut dst_set = BTreeSet::new();
+        for &r in dst_rows {
+            for &c in dst_cols {
+                dst_set.insert((dst_sheet, r, c));
+            }
+        }
+        let mut src_union_dst = dst_set.clone();
+        let mut src_only = Vec::new();
+        for &r in src_rows {
+            for &c in src_cols {
+                let k = (src_sheet, r, c);
+                src_union_dst.insert(k);
+                if !dst_set.contains(&k) {
+                    src_only.push(k);
+                }
+            }
+        }
+
+        let mut prior_cells = Vec::with_capacity(src_union_dst.len());
+        let mut old_mem = 0usize;
+        for &(s, r, c) in &src_union_dst {
+            let b = self
+                .snapshot_cell_backup(s, r, c)
+                .ok_or(OpError::SheetNotFound)?;
+            if let CellInput::Formula { ref formula, .. } = b.input {
+                old_mem = old_mem.saturating_add(formula_entry_bytes(formula));
+            }
+            prior_cells.push((s, b));
+        }
+
+        let fallback_sheet = self.sheets.first().map_or(src_sheet, Sheet::id);
+        let ctx = MoveCellsRewriteCtx {
+            sheets: &self.sheets,
+            src_sheet,
+            src_rows,
+            src_cols,
+            dst_sheet,
+            dst_rows,
+            dst_cols,
+        };
+
+        let mut staged_dst = Vec::with_capacity(total_cells);
+        let mut new_mem = 0usize;
+        for (&sr, &dr) in src_rows.iter().zip(dst_rows) {
+            for (&sc, &dc) in src_cols.iter().zip(dst_cols) {
+                let mut moved = self
+                    .snapshot_cell_backup(src_sheet, sr, sc)
+                    .ok_or(OpError::SheetNotFound)?;
+                moved.row = dr;
+                moved.col = dc;
+                if let CellInput::Formula {
+                    ref mut formula, ..
+                } = moved.input
+                {
+                    let _ = formula.rewrite_for_move_cells(src_sheet, true, &ctx);
+                    formula.validate()?;
+                    new_mem = new_mem.saturating_add(formula_entry_bytes(formula));
+                }
+                if src_sheet != dst_sheet
+                    && let CellInput::Scalar(ScalarValue::Text(ref t))
+                    | CellInput::Formula {
+                        cached: Some(ScalarValue::Text(ref t)),
+                        ..
+                    } = moved.input
+                {
+                    new_mem = new_mem.saturating_add(t.len());
+                }
+                staged_dst.push((dst_sheet, moved));
+            }
+        }
+
+        let mut staged_stationary = Vec::new();
+        for (&key, prior_f) in &self.formulas {
+            if src_union_dst.contains(&key) {
+                continue;
+            }
+            let mut next_f = prior_f.clone();
+            if next_f.rewrite_for_move_cells(key.0, false, &ctx) {
+                next_f.validate()?;
+                old_mem = old_mem.saturating_add(formula_entry_bytes(prior_f));
+                new_mem = new_mem.saturating_add(formula_entry_bytes(&next_f));
+                staged_stationary.push((key, prior_f.clone(), next_f));
+            }
+        }
+
+        let mut staged_names = Vec::new();
+        for (nr_key, nr_def) in &self.named_ranges {
+            let host = nr_key.scope.unwrap_or(fallback_sheet);
+            let mut next_f = nr_def.formula.clone();
+            if next_f.rewrite_for_move_cells(host, false, &ctx) {
+                next_f.validate()?;
+                old_mem = old_mem.saturating_add(nr_def.formula.estimated_bytes());
+                new_mem = new_mem.saturating_add(next_f.estimated_bytes());
+                staged_names.push((nr_key.clone(), nr_def.formula.clone(), next_f));
+            }
+        }
+
+        if self
+            .estimated_bytes()
+            .saturating_sub(old_mem)
+            .saturating_add(new_mem)
+            > MAX_WORKBOOK_BYTES
+        {
+            return Err(OpError::MemoryLimitExceeded);
+        }
+
+        self.seed_origin = None;
+        for (s, r, c) in src_only {
+            let clear_backup = PermutedCellBackup {
+                row: r,
+                col: c,
+                input: CellInput::Empty,
+                format: None,
+                style: StylePatch::default(),
+            };
+            if let Err(err) = self.write_cell_backup(s, clear_backup) {
+                let _ = self.restore_moved_cells(prior_cells, Vec::new(), Vec::new());
+                return Err(err);
+            }
+        }
+        for (s, backup) in staged_dst {
+            if let Err(err) = self.write_cell_backup(s, backup) {
+                let _ = self.restore_moved_cells(prior_cells, Vec::new(), Vec::new());
+                return Err(err);
+            }
+        }
+
+        let mut rewritten_formulas = Vec::with_capacity(staged_stationary.len());
+        let mut formula_delta = 0_u128;
+        for (key, prior_f, next_f) in staged_stationary {
+            formula_delta = formula_delta
+                .wrapping_sub(hash_formula_cell(key.0, key.1, key.2, &prior_f))
+                .wrapping_add(hash_formula_cell(key.0, key.1, key.2, &next_f));
+            self.put_formula(key, next_f);
+            rewritten_formulas.push((key, prior_f));
+        }
+
+        let mut rewritten_names = Vec::with_capacity(staged_names.len());
+        for (nr_key, prior_f, next_f) in staged_names {
+            if let Some(def) = self.named_ranges.get_mut(&nr_key) {
+                let old_bytes = named_range_entry_bytes(&nr_key, def);
+                let old_h = named_range_digest(&nr_key, def);
+                def.formula = next_f;
+                let new_bytes = named_range_entry_bytes(&nr_key, def);
+                let new_h = named_range_digest(&nr_key, def);
+                self.named_ranges_bytes = self
+                    .named_ranges_bytes
+                    .saturating_sub(old_bytes)
+                    .saturating_add(new_bytes);
+                formula_delta = formula_delta.wrapping_sub(old_h).wrapping_add(new_h);
+                rewritten_names.push((nr_key, prior_f));
+            }
+        }
+        self.content_digest = self.content_digest.wrapping_add(formula_delta);
+
+        Ok(InverseOp::RestoreMovedCells {
+            prior_cells,
+            rewritten_formulas,
+            rewritten_names,
+        })
+    }
+
+    fn restore_moved_cells(
+        &mut self,
+        prior_cells: Vec<(SheetId, PermutedCellBackup<F>)>,
+        rewritten_formulas: Vec<(WorkbookCellKey, F)>,
+        rewritten_names: Vec<(NamedRangeKey, F)>,
+    ) -> Result<(), OpError> {
+        for (s, backup) in prior_cells {
+            self.write_cell_backup(s, backup)?;
+        }
+        let mut delta = 0_u128;
+        for (key, prior_f) in rewritten_formulas {
+            if let Some(cur_f) = self.formulas.get(&key) {
+                delta = delta.wrapping_sub(hash_formula_cell(key.0, key.1, key.2, cur_f));
+            }
+            delta = delta.wrapping_add(hash_formula_cell(key.0, key.1, key.2, &prior_f));
+            self.put_formula(key, prior_f);
+        }
+        delta = delta.wrapping_add(self.restore_rewritten_names(rewritten_names));
+        self.content_digest = self.content_digest.wrapping_add(delta);
+        Ok(())
+    }
+
+    fn snapshot_cell_backup(
+        &self,
+        sheet_id: SheetId,
+        row: RowId,
+        col: ColId,
+    ) -> Option<PermutedCellBackup<F>> {
+        let snap = self.cell_snapshot(sheet_id, row, col)?;
+        let sheet = self.sheet(sheet_id)?;
+        Some(PermutedCellBackup {
+            row,
+            col,
+            input: snap.input,
+            format: snap.explicit_format,
+            style: sheet.cell_style_patch(row, col),
+        })
+    }
+
+    fn write_cell_backup(
+        &mut self,
+        sheet_id: SheetId,
+        backup: PermutedCellBackup<F>,
+    ) -> Result<(), OpError> {
+        let format_patch = match backup.format {
+            Some(fmt) => FormatPatch::Set(fmt),
+            None => FormatPatch::Clear,
+        };
+        let (old_sh, new_sh) = {
+            let sheet = self.sheet_mut(sheet_id).ok_or(OpError::SheetNotFound)?;
+            let old_st = sheet.cell_style_patch(backup.row, backup.col);
+            let old_h = hash_cell_style(sheet_id, backup.row, backup.col, old_st);
+            sheet.set_cell_style_patch(backup.row, backup.col, backup.style);
+            let new_h = hash_cell_style(sheet_id, backup.row, backup.col, backup.style);
+            (old_h, new_h)
+        };
+        self.content_digest = self
+            .content_digest
+            .wrapping_sub(old_sh)
+            .wrapping_add(new_sh);
+        self.write_validated_cell(sheet_id, backup.row, backup.col, backup.input, format_patch)
+    }
 }
 
 fn scalar_value_canonical(s: &ScalarValue) -> CanonicalScalar<'_> {
@@ -3222,6 +4384,51 @@ fn formula_entry_bytes<F: FormulaPayload>(formula: &F) -> usize {
     formula
         .estimated_bytes()
         .saturating_add(size_of::<WorkbookCellKey>().saturating_mul(2))
+}
+
+fn named_range_entry_bytes<F: FormulaPayload>(
+    key: &NamedRangeKey,
+    def: &NamedRangeDef<F>,
+) -> usize {
+    size_of::<NamedRangeKey>()
+        .saturating_add(size_of::<NamedRangeDef<F>>())
+        .saturating_add(key.canonical_name.capacity())
+        .saturating_add(def.name.capacity())
+        .saturating_add(def.formula.estimated_bytes())
+        .saturating_add(def.comment.as_ref().map_or(0, String::capacity))
+}
+
+fn named_range_digest<F: FormulaPayload>(key: &NamedRangeKey, def: &NamedRangeDef<F>) -> u128 {
+    hash_named_range(
+        key.scope,
+        &key.canonical_name,
+        &def.name,
+        &def.formula,
+        def.comment.as_deref(),
+        def.hidden,
+    )
+}
+
+fn validate_contiguous_live_axis_ids(
+    axis: &Axis,
+    ids: impl Iterator<Item = u64>,
+    len: usize,
+) -> Result<(), OpError> {
+    let mut expected_pos: Option<u32> = None;
+    let mut count = 0usize;
+    for raw in ids {
+        let pos = axis.id_to_pos(raw).ok_or(OpError::InvalidMoveCells)?;
+        match expected_pos {
+            None => expected_pos = Some(pos.saturating_add(1)),
+            Some(exp) if pos == exp => expected_pos = Some(pos.saturating_add(1)),
+            Some(_) => return Err(OpError::InvalidMoveCells),
+        }
+        count = count.saturating_add(1);
+    }
+    if count != len || count == 0 {
+        return Err(OpError::InvalidMoveCells);
+    }
+    Ok(())
 }
 
 fn validate_scalar(scalar: &ScalarValue) -> Result<usize, OpError> {
@@ -3494,6 +4701,11 @@ fn classify_op<F: FormulaPayload>(op: &Op<F>) -> (SheetId, OpClass<'_, F>) {
         | Op::DeleteSheet { sheet }
         | Op::UndeleteSheet { sheet }
         | Op::MoveSheet { sheet, .. } => (*sheet, OpClass::SheetOp),
+        Op::PermuteContent { sheet, .. } => (*sheet, OpClass::ConservativeNo),
+        Op::MoveCells { src_sheet, .. } => (*src_sheet, OpClass::ConservativeNo),
+        Op::DefineNamedRange { scope, .. } | Op::DeleteNamedRange { scope, .. } => {
+            (scope.unwrap_or(SheetId(0)), OpClass::ConservativeNo)
+        }
     }
 }
 
@@ -3798,7 +5010,7 @@ mod tests {
 
     use super::{
         CellEdit, CellInput, ConditionalCellEdit, FormatPatch, FormatTarget, FormulaMode, Op,
-        OpError, RawFormula, ScalarValue, Workbook, ops_commute,
+        OpError, RawFormula, ScalarValue, Workbook, is_valid_named_range_name, ops_commute,
     };
     use crate::format::NumberFormat;
     use crate::id::{ColId, IdRun, RowId, SheetId, pack_id};
@@ -4279,5 +5491,224 @@ mod tests {
         assert!(ops_commute(&a, &b));
         assert!(!ops_commute(&a, &conflict));
         assert!(!ops_commute(&a, &cond));
+    }
+
+    #[test]
+    fn named_range_validation_and_crud_digest_round_trip() {
+        assert!(is_valid_named_range_name("TaxRate"));
+        assert!(is_valid_named_range_name("_xlnm.Print_Area"));
+        assert!(is_valid_named_range_name("XFE1"));
+        assert!(is_valid_named_range_name("A1048577"));
+        assert!(is_valid_named_range_name("Sales_2026.Q1"));
+        assert!(!is_valid_named_range_name(""));
+        assert!(!is_valid_named_range_name("1Bad"));
+        assert!(!is_valid_named_range_name("A1"));
+        assert!(!is_valid_named_range_name("XFD1048576"));
+        assert!(!is_valid_named_range_name("R1C1"));
+        assert!(!is_valid_named_range_name("C12"));
+        assert!(!is_valid_named_range_name("TRUE"));
+        assert!(!is_valid_named_range_name("r"));
+        assert!(!is_valid_named_range_name("c"));
+
+        let mut wb: Workbook = Workbook::new();
+        let s0 = SheetId(0);
+        let d0 = wb.logical_digest();
+        let c0 = wb.content_digest();
+
+        // Case-insensitive update preserves canonical key and restores cleanly on undo.
+        let inv1 = wb
+            .apply(Op::DefineNamedRange {
+                scope: None,
+                name: String::from("TaxRate"),
+                formula: RawFormula {
+                    source: String::from("=Sheet1!$A$1"),
+                    mode: FormulaMode::Dynamic,
+                },
+                comment: Some(String::from("VAT")),
+                hidden: false,
+            })
+            .unwrap();
+        assert_eq!(wb.named_ranges().len(), 1);
+        assert_eq!(
+            wb.resolve_named_range(s0, "taxrate").unwrap().1.name,
+            "TaxRate"
+        );
+        assert_eq!(
+            wb.content_digest(),
+            wb.compute_content_digest_from_scratch()
+        );
+
+        // Sheet-local name shadows workbook name cleanly.
+        let inv2 = wb
+            .apply(Op::DefineNamedRange {
+                scope: Some(s0),
+                name: String::from("TAXRATE"),
+                formula: RawFormula {
+                    source: String::from("=0.2"),
+                    mode: FormulaMode::Dynamic,
+                },
+                comment: None,
+                hidden: true,
+            })
+            .unwrap();
+        assert_eq!(wb.named_ranges().len(), 2);
+        assert!(wb.resolve_named_range(s0, "TaxRate").unwrap().0.scope == Some(s0));
+        assert_eq!(
+            wb.content_digest(),
+            wb.compute_content_digest_from_scratch()
+        );
+
+        let inv3 = wb
+            .apply(Op::DeleteNamedRange {
+                scope: None,
+                name: String::from("TAXRATE"),
+            })
+            .unwrap();
+        assert_eq!(wb.named_ranges().len(), 1);
+        assert_eq!(
+            wb.content_digest(),
+            wb.compute_content_digest_from_scratch()
+        );
+
+        wb.apply_inverse(inv3).unwrap();
+        assert_eq!(wb.named_ranges().len(), 2);
+        assert_eq!(
+            wb.content_digest(),
+            wb.compute_content_digest_from_scratch()
+        );
+        wb.apply_inverse(inv2).unwrap();
+        wb.apply_inverse(inv1).unwrap();
+        assert!(wb.named_ranges().is_empty());
+        assert_eq!(wb.content_digest(), c0);
+        assert_eq!(wb.logical_digest(), d0);
+    }
+
+    #[test]
+    fn permute_content_and_move_cells_preserve_styles_and_round_trip() {
+        let mut wb: Workbook = Workbook::new();
+        let s0 = SheetId(0);
+        let s1 = wb.add_sheet(String::from("Target")).unwrap();
+        wb.apply(Op::SetCells {
+            sheet: s0,
+            edits: vec![
+                CellEdit {
+                    row: RowId(0),
+                    col: ColId(0),
+                    input: CellInput::Scalar(ScalarValue::Number(30.0)),
+                    format: FormatPatch::Set(NumberFormat::Fixed2),
+                },
+                CellEdit {
+                    row: RowId(1),
+                    col: ColId(0),
+                    input: CellInput::Scalar(ScalarValue::Number(10.0)),
+                    format: FormatPatch::Keep,
+                },
+                CellEdit {
+                    row: RowId(2),
+                    col: ColId(0),
+                    input: CellInput::Scalar(ScalarValue::Number(20.0)),
+                    format: FormatPatch::Keep,
+                },
+            ],
+        })
+        .unwrap();
+        wb.apply(Op::SetFormat {
+            sheet: s0,
+            target: FormatTarget::Cells {
+                rows: vec![IdRun::new(0, 1).unwrap()],
+                cols: vec![IdRun::new(0, 1).unwrap()],
+            },
+            number_format: FormatPatch::Keep,
+            style: StylePatch {
+                bold: Some(true),
+                ..StylePatch::default()
+            },
+        })
+        .unwrap();
+        let d_before_perm = wb.logical_digest();
+
+        // Permute rows [0, 1, 2] -> source order [1, 2, 0] (10, 20, 30)
+        let perm_op: Op<RawFormula> = Op::PermuteContent {
+            sheet: s0,
+            rows: vec![RowId(0), RowId(1), RowId(2)],
+            cols: vec![ColId(0)],
+            row_perm: vec![1, 2, 0],
+        };
+        assert!(!ops_commute(&perm_op, &perm_op));
+        let inv_perm = wb.apply(perm_op).unwrap();
+        assert_eq!(wb.sheet(s0).unwrap().value(0, 0), Value::Number(10.0));
+        assert_eq!(wb.sheet(s0).unwrap().value(1, 0), Value::Number(20.0));
+        assert_eq!(wb.sheet(s0).unwrap().value(2, 0), Value::Number(30.0));
+        assert_eq!(
+            wb.sheet(s0).unwrap().cell_format_by_id(RowId(2), ColId(0)),
+            Some(NumberFormat::Fixed2)
+        );
+        assert_eq!(
+            wb.sheet(s0)
+                .unwrap()
+                .cell_style_patch(RowId(2), ColId(0))
+                .bold,
+            Some(true)
+        );
+        assert_eq!(
+            wb.content_digest(),
+            wb.compute_content_digest_from_scratch()
+        );
+
+        wb.apply_inverse(inv_perm).unwrap();
+        assert_eq!(wb.logical_digest(), d_before_perm);
+        assert_eq!(
+            wb.content_digest(),
+            wb.compute_content_digest_from_scratch()
+        );
+
+        // Overlapping MoveCells within s0: [0,1] -> [1,2]
+        let inv_overlap = wb
+            .apply(Op::MoveCells {
+                src_sheet: s0,
+                src_rows: vec![RowId(0), RowId(1)],
+                src_cols: vec![ColId(0)],
+                dst_sheet: s0,
+                dst_rows: vec![RowId(1), RowId(2)],
+                dst_cols: vec![ColId(0)],
+            })
+            .unwrap();
+        assert_eq!(wb.sheet(s0).unwrap().value(0, 0), Value::Empty);
+        assert_eq!(wb.sheet(s0).unwrap().value(1, 0), Value::Number(30.0));
+        assert_eq!(wb.sheet(s0).unwrap().value(2, 0), Value::Number(10.0));
+        assert_eq!(
+            wb.content_digest(),
+            wb.compute_content_digest_from_scratch()
+        );
+
+        wb.apply_inverse(inv_overlap).unwrap();
+        assert_eq!(wb.logical_digest(), d_before_perm);
+
+        // Cross-sheet MoveCells: s0 row 0 -> s1 row 5
+        let inv_cross = wb
+            .apply(Op::MoveCells {
+                src_sheet: s0,
+                src_rows: vec![RowId(0)],
+                src_cols: vec![ColId(0)],
+                dst_sheet: s1,
+                dst_rows: vec![RowId(5)],
+                dst_cols: vec![ColId(2)],
+            })
+            .unwrap();
+        assert_eq!(wb.sheet(s0).unwrap().value(0, 0), Value::Empty);
+        assert_eq!(wb.sheet(s1).unwrap().value(5, 2), Value::Number(30.0));
+        assert_eq!(
+            wb.sheet(s1)
+                .unwrap()
+                .cell_style_patch(RowId(5), ColId(2))
+                .bold,
+            Some(true)
+        );
+        assert_eq!(
+            wb.content_digest(),
+            wb.compute_content_digest_from_scratch()
+        );
+        wb.apply_inverse(inv_cross).unwrap();
+        assert_eq!(wb.logical_digest(), d_before_perm);
     }
 }

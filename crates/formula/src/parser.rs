@@ -97,12 +97,30 @@ impl Parser<'_> {
 
         let mut lhs = self.parse_prefix(depth)?;
 
+        let mut postfix_depth = depth;
         while let Some(tok) = self.peek() {
+            // Postfix `#` (spill range) binds tightest (`lbp = 90`), above `%` (`80`) and unary (`70`).
+            if matches!(tok, Token::Hash) {
+                if 90 < min_bp {
+                    break;
+                }
+                postfix_depth = postfix_depth.saturating_add(1);
+                if postfix_depth > MAX_NESTING_DEPTH {
+                    return Err(ParseError::NestingTooDeep);
+                }
+                let _ = self.bump();
+                lhs = Expr::SpillRef(Box::new(lhs));
+                continue;
+            }
             // Postfix `%` binds tighter (`lbp = 80`) than prefix `-` (`rbp = 70`)
             // and exponentiation `^` (`lbp = 60`).
             if matches!(tok, Token::Percent) {
                 if 80 < min_bp {
                     break;
+                }
+                postfix_depth = postfix_depth.saturating_add(1);
+                if postfix_depth > MAX_NESTING_DEPTH {
+                    return Err(ParseError::NestingTooDeep);
                 }
                 let _ = self.bump();
                 lhs = Expr::Unary {
@@ -253,6 +271,11 @@ impl Parser<'_> {
                         sheet: Some(sheet),
                         addr,
                     })
+                } else if !ident.contains('$')
+                    && !ident.eq_ignore_ascii_case("TRUE")
+                    && !ident.eq_ignore_ascii_case("FALSE")
+                {
+                    Ok(Expr::QualifiedName { sheet, name: ident })
                 } else {
                     Err(ParseError::InvalidRange)
                 }
@@ -535,12 +558,27 @@ mod tests {
             "={1,-2.5,\"hi\";TRUE,FALSE,#N/A}",
             "=@A2:A100+10",
             "=(A1-B1)",
+            "=A1#",
+            "=-A1#",
+            "=A1#%",
+            "=SUM('Sales 2026'!A1#)",
+            "=Sheet2!TaxRate",
+            "='Sales 2026'!TaxRate#",
         ] {
             let ast = parse_formula(sample).unwrap();
             let printed = ast.to_formula_string();
             let reparsed = parse_formula(&printed).unwrap();
             assert_eq!(ast, reparsed, "mismatch on {sample} -> {printed}");
         }
+
+        let neg_spill = parse_formula("=-A1#").unwrap();
+        assert!(matches!(
+            neg_spill,
+            Expr::Unary {
+                op: UnaryOp::Neg,
+                ref expr,
+            } if matches!(**expr, Expr::SpillRef(_))
+        ));
     }
 
     #[test]

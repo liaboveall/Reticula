@@ -18,8 +18,8 @@ use reticula_core::axis::Axis;
 use reticula_core::digest::Digest64;
 use reticula_core::id::{ColId, IdRun, RowId, SheetId};
 use reticula_core::ops::{
-    CellEdit, CellInput, FormatPatch, FormulaMode, FormulaPayload, MAX_EDITS_PER_OP, Op, OpError,
-    Workbook,
+    CellEdit, CellInput, FormatPatch, FormulaMode, FormulaPayload, MAX_CELL_TEXT_UTF16,
+    MAX_EDITS_PER_OP, MAX_FORMULA_CHARS, MoveCellsRewriteCtx, Op, OpError, ScalarValue, Workbook,
 };
 use reticula_core::sheet::Sheet;
 use serde::{Deserialize, Serialize};
@@ -124,7 +124,7 @@ pub enum BoundExpr {
     },
     /// Identity-bound cell or range reference.
     Reference(BoundRef),
-    /// Unresolved name (evaluates to `#NAME?`).
+    /// Unresolved or workbook/sheet-local defined name.
     Name(String),
     /// Explicit parentheses `(inner)` — suppresses outermost tail-zeroing on
     /// `=(A1-B1)`.
@@ -151,6 +151,29 @@ pub enum BoundExpr {
         name: String,
         /// Bound argument expressions.
         args: Vec<Self>,
+    },
+    /// Worksheet-qualified defined name (`Sheet2!TaxRate`).
+    ScopedName {
+        /// Bound worksheet identity when resolved (`None` if missing or deleted).
+        sheet: Option<SheetId>,
+        /// Original worksheet name preserved when target sheet was unresolved at bind time.
+        missing_sheet: Option<String>,
+        /// Identifier spelling.
+        name: String,
+    },
+    /// Dynamic-array spill-range operator (`expr#`).
+    SpillRef(Box<Self>),
+    /// Unsupported external/imported formula preserved verbatim without recalculating.
+    Opaque {
+        /// Original raw formula text.
+        raw: String,
+    },
+    /// Unsupported external/imported formula whose cached value from XLSX is preserved.
+    PreservedCached {
+        /// Original raw formula text.
+        raw: String,
+        /// Cached scalar evaluation imported from storage.
+        cached: ScalarValue,
     },
 }
 
@@ -288,7 +311,7 @@ pub enum TemplateExpr {
     },
     /// Template cell or range reference.
     Reference(TemplateRef),
-    /// Unresolved identifier (`#NAME?`).
+    /// Unresolved or workbook/sheet-local defined name.
     Name(String),
     /// Explicit parentheses `(inner)`.
     Paren(Box<Self>),
@@ -314,6 +337,29 @@ pub enum TemplateExpr {
         name: String,
         /// Argument expressions.
         args: Vec<Self>,
+    },
+    /// Worksheet-qualified defined name (`Sheet2!TaxRate`).
+    ScopedName {
+        /// Bound worksheet identity when resolved (`None` if missing or deleted).
+        sheet: Option<SheetId>,
+        /// Original worksheet name preserved when unresolved at bind time.
+        missing_sheet: Option<String>,
+        /// Identifier spelling.
+        name: String,
+    },
+    /// Dynamic-array spill-range operator (`expr#`).
+    SpillRef(Box<Self>),
+    /// Unsupported external formula preserved verbatim.
+    Opaque {
+        /// Original raw formula text.
+        raw: String,
+    },
+    /// Unsupported external formula with preserved cached value.
+    PreservedCached {
+        /// Original raw formula text.
+        raw: String,
+        /// Cached scalar value.
+        cached: ScalarValue,
     },
 }
 
@@ -405,6 +451,41 @@ impl FormulaPayload for BoundFormula {
 
     fn finalize_purged_tombstones(&mut self, host_sheet: SheetId, sheets: &[Sheet]) -> bool {
         finalize_expr_tombstones(&mut self.root, host_sheet, sheets)
+    }
+
+    fn shift_for_row_permutation(
+        &self,
+        sheet: SheetId,
+        src_row_pos: u32,
+        dst_row_pos: u32,
+        sheets: &[Sheet],
+    ) -> Self {
+        if src_row_pos == dst_row_pos {
+            return self.clone();
+        }
+        let dr = i64::from(dst_row_pos).saturating_sub(i64::from(src_row_pos));
+        let find_sheet = |id: SheetId| -> Option<&Sheet> { sheets.iter().find(|s| s.id() == id) };
+        Self {
+            mode: self.mode,
+            root: shift_bound_expr_with(&self.root, &find_sheet, sheet, sheet, dr, 0),
+        }
+    }
+
+    fn rewrite_for_move_cells(
+        &mut self,
+        host_sheet_before: SheetId,
+        is_moved_formula: bool,
+        ctx: &MoveCellsRewriteCtx<'_>,
+    ) -> bool {
+        let Some(plan) = MoveCellsPlan::from_ctx(ctx) else {
+            return false;
+        };
+        rewrite_bound_expr_for_move_cells(
+            &mut self.root,
+            host_sheet_before,
+            is_moved_formula,
+            &plan,
+        )
     }
 }
 
@@ -523,7 +604,14 @@ fn remap_bound_expr(
     cols: &BTreeMap<ColId, ColId>,
 ) {
     match expr {
-        BoundExpr::Literal(_) | BoundExpr::ArrayLiteral { .. } | BoundExpr::Name(_) => {}
+        BoundExpr::Literal(_)
+        | BoundExpr::ArrayLiteral { .. }
+        | BoundExpr::Name(_)
+        | BoundExpr::Opaque { .. }
+        | BoundExpr::PreservedCached { .. } => {}
+        BoundExpr::ScopedName { sheet, .. } => {
+            remap_opt_sheet(sheet, sheets);
+        }
         BoundExpr::Reference(r) => match r {
             BoundRef::Cell {
                 sheet, row, col, ..
@@ -568,7 +656,9 @@ fn remap_bound_expr(
             }
             BoundRef::Invalid { .. } => {}
         },
-        BoundExpr::Paren(inner) | BoundExpr::Unary { expr: inner, .. } => {
+        BoundExpr::Paren(inner)
+        | BoundExpr::Unary { expr: inner, .. }
+        | BoundExpr::SpillRef(inner) => {
             remap_bound_expr(inner, sheets, rows, cols);
         }
         BoundExpr::Binary { left, right, .. } => {
@@ -590,7 +680,14 @@ fn remap_template_expr(
     cols: &BTreeMap<ColId, ColId>,
 ) {
     match expr {
-        TemplateExpr::Literal(_) | TemplateExpr::ArrayLiteral { .. } | TemplateExpr::Name(_) => {}
+        TemplateExpr::Literal(_)
+        | TemplateExpr::ArrayLiteral { .. }
+        | TemplateExpr::Name(_)
+        | TemplateExpr::Opaque { .. }
+        | TemplateExpr::PreservedCached { .. } => {}
+        TemplateExpr::ScopedName { sheet, .. } => {
+            remap_opt_sheet(sheet, sheets);
+        }
         TemplateExpr::Reference(r) => match r {
             TemplateRef::Cell {
                 sheet, row, col, ..
@@ -663,7 +760,9 @@ fn remap_template_expr(
             }
             TemplateRef::Invalid { .. } => {}
         },
-        TemplateExpr::Paren(inner) | TemplateExpr::Unary { expr: inner, .. } => {
+        TemplateExpr::Paren(inner)
+        | TemplateExpr::Unary { expr: inner, .. }
+        | TemplateExpr::SpillRef(inner) => {
             remap_template_expr(inner, sheets, rows, cols);
         }
         TemplateExpr::Binary { left, right, .. } => {
@@ -733,6 +832,28 @@ pub fn bind_expr(ast: &Expr, workbook: &Workbook<BoundFormula>, host_sheet: Shee
             host_sheet,
         )),
         Expr::Name(name) => BoundExpr::Name(name.clone()),
+        Expr::QualifiedName { sheet, name } => {
+            match resolve_target_sheet(Some(sheet.as_str()), workbook, host_sheet) {
+                Some((Some(sid), _)) => BoundExpr::ScopedName {
+                    sheet: Some(sid),
+                    missing_sheet: None,
+                    name: name.clone(),
+                },
+                Some((None, _)) => BoundExpr::ScopedName {
+                    sheet: Some(host_sheet),
+                    missing_sheet: None,
+                    name: name.clone(),
+                },
+                None => BoundExpr::ScopedName {
+                    sheet: None,
+                    missing_sheet: Some(sheet.clone()),
+                    name: name.clone(),
+                },
+            }
+        }
+        Expr::SpillRef(inner) => {
+            BoundExpr::SpillRef(Box::new(bind_expr(inner, workbook, host_sheet)))
+        }
         Expr::Paren(inner) => BoundExpr::Paren(Box::new(bind_expr(inner, workbook, host_sheet))),
         Expr::Unary { op, expr } => BoundExpr::Unary {
             op: *op,
@@ -798,6 +919,14 @@ fn bind_expr_single_sheet(ast: &Expr, sheet: &Sheet) -> BoundExpr {
             sheet_name: Some(s.clone()),
         }),
         Expr::Name(name) => BoundExpr::Name(name.clone()),
+        Expr::QualifiedName { sheet: s, name } => BoundExpr::ScopedName {
+            sheet: None,
+            missing_sheet: Some(s.clone()),
+            name: name.clone(),
+        },
+        Expr::SpillRef(inner) => {
+            BoundExpr::SpillRef(Box::new(bind_expr_single_sheet(inner, sheet)))
+        }
         Expr::Paren(inner) => BoundExpr::Paren(Box::new(bind_expr_single_sheet(inner, sheet))),
         Expr::Unary { op, expr } => BoundExpr::Unary {
             op: *op,
@@ -1061,6 +1190,39 @@ fn unparse_expr(
         } => write_array_literal(*rows, *cols, elements, out),
         BoundExpr::Reference(r) => unparse_ref(r, workbook, host_sheet, out),
         BoundExpr::Name(name) => out.push_str(name),
+        BoundExpr::ScopedName {
+            sheet,
+            missing_sheet,
+            name,
+        } => match sheet {
+            Some(id) => match workbook.sheet(*id) {
+                Some(s) if !s.is_deleted() => {
+                    write_sheet_prefix(Some(s.name()), out);
+                    out.push_str(name);
+                }
+                _ => out.push_str("#REF!"),
+            },
+            None => {
+                if let Some(ms) = missing_sheet {
+                    write_sheet_prefix(Some(ms), out);
+                }
+                out.push_str(name);
+            }
+        },
+        BoundExpr::SpillRef(inner) => {
+            let wrap = parent_prec.is_some_and(|(p, _)| 90 < p);
+            if wrap {
+                out.push('(');
+            }
+            unparse_expr(inner, workbook, host_sheet, out, Some((90, false)));
+            out.push('#');
+            if wrap {
+                out.push(')');
+            }
+        }
+        BoundExpr::Opaque { raw } | BoundExpr::PreservedCached { raw, .. } => {
+            out.push_str(raw.strip_prefix('=').unwrap_or(raw));
+        }
         BoundExpr::Paren(inner) => {
             out.push('(');
             unparse_expr(inner, workbook, host_sheet, out, None);
@@ -1137,6 +1299,35 @@ fn unparse_expr_single_sheet(
         } => write_array_literal(*rows, *cols, elements, out),
         BoundExpr::Reference(r) => unparse_ref_on_sheet(r, SheetPrefix::None, Some(sheet), out),
         BoundExpr::Name(name) => out.push_str(name),
+        BoundExpr::ScopedName {
+            sheet: target_id,
+            missing_sheet,
+            name,
+        } => {
+            if let Some(ms) = missing_sheet {
+                write_sheet_prefix(Some(ms), out);
+                out.push_str(name);
+            } else if target_id.is_some_and(|id| id == sheet.id()) && !sheet.is_deleted() {
+                write_sheet_prefix(Some(sheet.name()), out);
+                out.push_str(name);
+            } else {
+                out.push_str("#REF!");
+            }
+        }
+        BoundExpr::SpillRef(inner) => {
+            let wrap = parent_prec.is_some_and(|(p, _)| 90 < p);
+            if wrap {
+                out.push('(');
+            }
+            unparse_expr_single_sheet(inner, sheet, out, Some((90, false)));
+            out.push('#');
+            if wrap {
+                out.push(')');
+            }
+        }
+        BoundExpr::Opaque { raw } | BoundExpr::PreservedCached { raw, .. } => {
+            out.push_str(raw.strip_prefix('=').unwrap_or(raw));
+        }
         BoundExpr::Paren(inner) => {
             out.push('(');
             unparse_expr_single_sheet(inner, sheet, out, None);
@@ -1452,10 +1643,13 @@ fn expr_is_structure_sensitive(expr: &BoundExpr) -> bool {
         BoundExpr::Literal(_)
         | BoundExpr::ArrayLiteral { .. }
         | BoundExpr::Reference(_)
-        | BoundExpr::Name(_) => false,
-        BoundExpr::Paren(inner) | BoundExpr::Unary { expr: inner, .. } => {
-            expr_is_structure_sensitive(inner)
-        }
+        | BoundExpr::Name(_)
+        | BoundExpr::ScopedName { .. }
+        | BoundExpr::Opaque { .. }
+        | BoundExpr::PreservedCached { .. } => false,
+        BoundExpr::Paren(inner)
+        | BoundExpr::Unary { expr: inner, .. }
+        | BoundExpr::SpillRef(inner) => expr_is_structure_sensitive(inner),
         BoundExpr::Binary { left, right, .. } => {
             expr_is_structure_sensitive(left) || expr_is_structure_sensitive(right)
         }
@@ -1470,8 +1664,13 @@ fn expr_is_volatile(expr: &BoundExpr) -> bool {
         BoundExpr::Literal(_)
         | BoundExpr::ArrayLiteral { .. }
         | BoundExpr::Reference(_)
-        | BoundExpr::Name(_) => false,
-        BoundExpr::Paren(inner) | BoundExpr::Unary { expr: inner, .. } => expr_is_volatile(inner),
+        | BoundExpr::Name(_)
+        | BoundExpr::ScopedName { .. }
+        | BoundExpr::Opaque { .. }
+        | BoundExpr::PreservedCached { .. } => false,
+        BoundExpr::Paren(inner)
+        | BoundExpr::Unary { expr: inner, .. }
+        | BoundExpr::SpillRef(inner) => expr_is_volatile(inner),
         BoundExpr::Binary { left, right, .. } => expr_is_volatile(left) || expr_is_volatile(right),
         BoundExpr::Call { name, args } => {
             crate::functions::catalog::is_volatile_function(name)
@@ -1483,16 +1682,30 @@ fn expr_is_volatile(expr: &BoundExpr) -> bool {
 fn expr_bytes(expr: &BoundExpr) -> usize {
     let base = size_of::<BoundExpr>();
     match expr {
-        BoundExpr::Literal(Literal::Text(s)) | BoundExpr::Name(s) => {
-            base.saturating_add(s.capacity())
+        BoundExpr::Literal(Literal::Text(s))
+        | BoundExpr::Name(s)
+        | BoundExpr::Opaque { raw: s } => base.saturating_add(s.capacity()),
+        BoundExpr::ScopedName {
+            missing_sheet,
+            name,
+            ..
+        } => base
+            .saturating_add(name.capacity())
+            .saturating_add(missing_sheet.as_ref().map_or(0, String::capacity)),
+        BoundExpr::PreservedCached { raw, cached } => {
+            let text_cap = match cached {
+                ScalarValue::Text(s) => s.capacity(),
+                _ => 0,
+            };
+            base.saturating_add(raw.capacity()).saturating_add(text_cap)
         }
         BoundExpr::Literal(_) | BoundExpr::Reference(_) => base,
         BoundExpr::ArrayLiteral { elements, .. } => {
             base.saturating_add(elements.capacity().saturating_mul(size_of::<Literal>()))
         }
-        BoundExpr::Paren(inner) | BoundExpr::Unary { expr: inner, .. } => {
-            base.saturating_add(expr_bytes(inner))
-        }
+        BoundExpr::Paren(inner)
+        | BoundExpr::Unary { expr: inner, .. }
+        | BoundExpr::SpillRef(inner) => base.saturating_add(expr_bytes(inner)),
         BoundExpr::Binary { left, right, .. } => base
             .saturating_add(expr_bytes(left))
             .saturating_add(expr_bytes(right)),
@@ -1515,7 +1728,29 @@ fn validate_bound_expr(expr: &BoundExpr, depth: usize) -> Result<(), OpError> {
             }
             Ok(())
         }
-        BoundExpr::Literal(_) | BoundExpr::Reference(_) | BoundExpr::Name(_) => Ok(()),
+        BoundExpr::Literal(_)
+        | BoundExpr::Reference(_)
+        | BoundExpr::Name(_)
+        | BoundExpr::ScopedName { .. } => Ok(()),
+        BoundExpr::Opaque { raw } => {
+            if raw.chars().count() > MAX_FORMULA_CHARS {
+                Err(OpError::FormulaTooLong)
+            } else {
+                Ok(())
+            }
+        }
+        BoundExpr::PreservedCached { raw, cached } => {
+            if raw.chars().count() > MAX_FORMULA_CHARS {
+                return Err(OpError::FormulaTooLong);
+            }
+            match cached {
+                ScalarValue::Number(n) if !n.is_finite() => Err(OpError::NonFiniteNumber),
+                ScalarValue::Text(s) if s.encode_utf16().count() > MAX_CELL_TEXT_UTF16 => {
+                    Err(OpError::TextTooLong)
+                }
+                _ => Ok(()),
+            }
+        }
         BoundExpr::ArrayLiteral {
             rows,
             cols,
@@ -1534,9 +1769,9 @@ fn validate_bound_expr(expr: &BoundExpr, depth: usize) -> Result<(), OpError> {
             }
             Ok(())
         }
-        BoundExpr::Paren(inner) | BoundExpr::Unary { expr: inner, .. } => {
-            validate_bound_expr(inner, depth.saturating_add(1))
-        }
+        BoundExpr::Paren(inner)
+        | BoundExpr::Unary { expr: inner, .. }
+        | BoundExpr::SpillRef(inner) => validate_bound_expr(inner, depth.saturating_add(1)),
         BoundExpr::Binary { left, right, .. } => {
             validate_bound_expr(left, depth.saturating_add(1))?;
             validate_bound_expr(right, depth.saturating_add(1))
@@ -1606,6 +1841,64 @@ fn write_expr_digest(expr: &BoundExpr, d: &mut Digest64) {
             d.write_u32(u32::try_from(args.len()).unwrap_or(u32::MAX));
             for arg in args {
                 write_expr_digest(arg, d);
+            }
+        }
+        BoundExpr::SpillRef(inner) => {
+            d.write_bytes(&[9]);
+            write_expr_digest(inner, d);
+        }
+        BoundExpr::ScopedName {
+            sheet,
+            missing_sheet,
+            name,
+        } => {
+            d.write_bytes(&[10]);
+            match sheet {
+                None => d.write_bytes(&[0]),
+                Some(sid) => {
+                    d.write_bytes(&[1]);
+                    d.write_u32(sid.0);
+                }
+            }
+            match missing_sheet.as_deref() {
+                None => d.write_bytes(&[0]),
+                Some(ms) => {
+                    d.write_bytes(&[1]);
+                    d.write_u32(u32::try_from(ms.len()).unwrap_or(u32::MAX));
+                    d.write_bytes(ms.as_bytes());
+                }
+            }
+            d.write_u32(u32::try_from(name.len()).unwrap_or(u32::MAX));
+            d.write_bytes(name.as_bytes());
+        }
+        BoundExpr::Opaque { raw } => {
+            d.write_bytes(&[11]);
+            d.write_u32(u32::try_from(raw.len()).unwrap_or(u32::MAX));
+            d.write_bytes(raw.as_bytes());
+        }
+        BoundExpr::PreservedCached { raw, cached } => {
+            d.write_bytes(&[12]);
+            d.write_u32(u32::try_from(raw.len()).unwrap_or(u32::MAX));
+            d.write_bytes(raw.as_bytes());
+            match cached {
+                ScalarValue::Number(n) => {
+                    d.write_bytes(&[1]);
+                    d.write_u64(if *n == 0.0 {
+                        0.0_f64.to_bits()
+                    } else {
+                        n.to_bits()
+                    });
+                }
+                ScalarValue::Text(s) => {
+                    d.write_bytes(&[2]);
+                    d.write_u32(u32::try_from(s.len()).unwrap_or(u32::MAX));
+                    d.write_bytes(s.as_bytes());
+                }
+                ScalarValue::Bool(b) => d.write_bytes(&[3, u8::from(*b)]),
+                ScalarValue::Error(e) => {
+                    d.write_bytes(&[4]);
+                    d.write_bytes(e.as_str().as_bytes());
+                }
             }
         }
     }
@@ -1712,7 +2005,29 @@ fn validate_template_expr(expr: &TemplateExpr, depth: usize) -> Result<(), OpErr
             }
             Ok(())
         }
-        TemplateExpr::Literal(_) | TemplateExpr::Reference(_) | TemplateExpr::Name(_) => Ok(()),
+        TemplateExpr::Literal(_)
+        | TemplateExpr::Reference(_)
+        | TemplateExpr::Name(_)
+        | TemplateExpr::ScopedName { .. } => Ok(()),
+        TemplateExpr::Opaque { raw } => {
+            if raw.chars().count() > MAX_FORMULA_CHARS {
+                Err(OpError::FormulaTooLong)
+            } else {
+                Ok(())
+            }
+        }
+        TemplateExpr::PreservedCached { raw, cached } => {
+            if raw.chars().count() > MAX_FORMULA_CHARS {
+                return Err(OpError::FormulaTooLong);
+            }
+            match cached {
+                ScalarValue::Number(n) if !n.is_finite() => Err(OpError::NonFiniteNumber),
+                ScalarValue::Text(s) if s.encode_utf16().count() > MAX_CELL_TEXT_UTF16 => {
+                    Err(OpError::TextTooLong)
+                }
+                _ => Ok(()),
+            }
+        }
         TemplateExpr::ArrayLiteral {
             rows,
             cols,
@@ -1731,9 +2046,9 @@ fn validate_template_expr(expr: &TemplateExpr, depth: usize) -> Result<(), OpErr
             }
             Ok(())
         }
-        TemplateExpr::Paren(inner) | TemplateExpr::Unary { expr: inner, .. } => {
-            validate_template_expr(inner, depth.saturating_add(1))
-        }
+        TemplateExpr::Paren(inner)
+        | TemplateExpr::Unary { expr: inner, .. }
+        | TemplateExpr::SpillRef(inner) => validate_template_expr(inner, depth.saturating_add(1)),
         TemplateExpr::Binary { left, right, .. } => {
             validate_template_expr(left, depth.saturating_add(1))?;
             validate_template_expr(right, depth.saturating_add(1))
@@ -1754,16 +2069,30 @@ fn validate_template_expr(expr: &TemplateExpr, depth: usize) -> Result<(), OpErr
 fn template_expanded_bytes(expr: &TemplateExpr) -> usize {
     let base = size_of::<BoundExpr>();
     match expr {
-        TemplateExpr::Literal(Literal::Text(s)) | TemplateExpr::Name(s) => {
-            base.saturating_add(s.len())
+        TemplateExpr::Literal(Literal::Text(s))
+        | TemplateExpr::Name(s)
+        | TemplateExpr::Opaque { raw: s } => base.saturating_add(s.len()),
+        TemplateExpr::ScopedName {
+            missing_sheet,
+            name,
+            ..
+        } => base
+            .saturating_add(name.len())
+            .saturating_add(missing_sheet.as_ref().map_or(0, String::len)),
+        TemplateExpr::PreservedCached { raw, cached } => {
+            let text_len = match cached {
+                ScalarValue::Text(s) => s.len(),
+                _ => 0,
+            };
+            base.saturating_add(raw.len()).saturating_add(text_len)
         }
         TemplateExpr::Literal(_) | TemplateExpr::Reference(_) => base,
         TemplateExpr::ArrayLiteral { elements, .. } => {
             base.saturating_add(elements.len().saturating_mul(size_of::<Literal>()))
         }
-        TemplateExpr::Paren(inner) | TemplateExpr::Unary { expr: inner, .. } => {
-            base.saturating_add(template_expanded_bytes(inner))
-        }
+        TemplateExpr::Paren(inner)
+        | TemplateExpr::Unary { expr: inner, .. }
+        | TemplateExpr::SpillRef(inner) => base.saturating_add(template_expanded_bytes(inner)),
         TemplateExpr::Binary { left, right, .. } => base
             .saturating_add(template_expanded_bytes(left))
             .saturating_add(template_expanded_bytes(right)),
@@ -1791,6 +2120,23 @@ fn expand_template_expr(expr: &TemplateExpr, self_row: RowId, self_col: ColId) -
             BoundExpr::Reference(expand_template_ref(tref, self_row, self_col))
         }
         TemplateExpr::Name(s) => BoundExpr::Name(s.clone()),
+        TemplateExpr::ScopedName {
+            sheet,
+            missing_sheet,
+            name,
+        } => BoundExpr::ScopedName {
+            sheet: *sheet,
+            missing_sheet: missing_sheet.clone(),
+            name: name.clone(),
+        },
+        TemplateExpr::SpillRef(inner) => {
+            BoundExpr::SpillRef(Box::new(expand_template_expr(inner, self_row, self_col)))
+        }
+        TemplateExpr::Opaque { raw } => BoundExpr::Opaque { raw: raw.clone() },
+        TemplateExpr::PreservedCached { raw, cached } => BoundExpr::PreservedCached {
+            raw: raw.clone(),
+            cached: cached.clone(),
+        },
         TemplateExpr::Paren(inner) => {
             BoundExpr::Paren(Box::new(expand_template_expr(inner, self_row, self_col)))
         }
@@ -1896,7 +2242,12 @@ fn collect_expr_range_endpoints(
     col_eps: &mut Vec<(SheetId, ColId)>,
 ) {
     match expr {
-        BoundExpr::Literal(_) | BoundExpr::ArrayLiteral { .. } | BoundExpr::Name(_) => {}
+        BoundExpr::Literal(_)
+        | BoundExpr::ArrayLiteral { .. }
+        | BoundExpr::Name(_)
+        | BoundExpr::ScopedName { .. }
+        | BoundExpr::Opaque { .. }
+        | BoundExpr::PreservedCached { .. } => {}
         BoundExpr::Reference(r) => match r {
             BoundRef::Area {
                 sheet,
@@ -1942,7 +2293,9 @@ fn collect_expr_range_endpoints(
             }
             BoundRef::Cell { .. } | BoundRef::Invalid { .. } => {}
         },
-        BoundExpr::Paren(inner) | BoundExpr::Unary { expr: inner, .. } => {
+        BoundExpr::Paren(inner)
+        | BoundExpr::Unary { expr: inner, .. }
+        | BoundExpr::SpillRef(inner) => {
             collect_expr_range_endpoints(inner, host_sheet, row_eps, col_eps);
         }
         BoundExpr::Binary { left, right, .. } => {
@@ -2059,7 +2412,12 @@ fn handoff_expr_rows(
     after: Option<u64>,
 ) -> bool {
     match expr {
-        BoundExpr::Literal(_) | BoundExpr::ArrayLiteral { .. } | BoundExpr::Name(_) => false,
+        BoundExpr::Literal(_)
+        | BoundExpr::ArrayLiteral { .. }
+        | BoundExpr::Name(_)
+        | BoundExpr::ScopedName { .. }
+        | BoundExpr::Opaque { .. }
+        | BoundExpr::PreservedCached { .. } => false,
         BoundExpr::Reference(r) => match r {
             BoundRef::Area {
                 sheet,
@@ -2088,7 +2446,9 @@ fn handoff_expr_rows(
             }
             BoundRef::Cell { .. } | BoundRef::ColRange { .. } | BoundRef::Invalid { .. } => false,
         },
-        BoundExpr::Paren(inner) | BoundExpr::Unary { expr: inner, .. } => {
+        BoundExpr::Paren(inner)
+        | BoundExpr::Unary { expr: inner, .. }
+        | BoundExpr::SpillRef(inner) => {
             handoff_expr_rows(inner, host_sheet, moved_sheet, row_axis, moved, after)
         }
         BoundExpr::Binary { left, right, .. } => {
@@ -2117,7 +2477,12 @@ fn handoff_expr_cols(
     after: Option<u64>,
 ) -> bool {
     match expr {
-        BoundExpr::Literal(_) | BoundExpr::ArrayLiteral { .. } | BoundExpr::Name(_) => false,
+        BoundExpr::Literal(_)
+        | BoundExpr::ArrayLiteral { .. }
+        | BoundExpr::Name(_)
+        | BoundExpr::ScopedName { .. }
+        | BoundExpr::Opaque { .. }
+        | BoundExpr::PreservedCached { .. } => false,
         BoundExpr::Reference(r) => match r {
             BoundRef::Area {
                 sheet,
@@ -2146,7 +2511,9 @@ fn handoff_expr_cols(
             }
             BoundRef::Cell { .. } | BoundRef::RowRange { .. } | BoundRef::Invalid { .. } => false,
         },
-        BoundExpr::Paren(inner) | BoundExpr::Unary { expr: inner, .. } => {
+        BoundExpr::Paren(inner)
+        | BoundExpr::Unary { expr: inner, .. }
+        | BoundExpr::SpillRef(inner) => {
             handoff_expr_cols(inner, host_sheet, moved_sheet, col_axis, moved, after)
         }
         BoundExpr::Binary { left, right, .. } => {
@@ -2185,11 +2552,29 @@ fn live_span_ids(axis: &Axis, first_anchor: u64, last_anchor: u64) -> Option<(u6
 
 fn finalize_expr_tombstones(expr: &mut BoundExpr, host_sheet: SheetId, sheets: &[Sheet]) -> bool {
     match expr {
-        BoundExpr::Literal(_) | BoundExpr::ArrayLiteral { .. } | BoundExpr::Name(_) => false,
-        BoundExpr::Reference(r) => finalize_ref_tombstones(r, host_sheet, sheets),
-        BoundExpr::Paren(inner) | BoundExpr::Unary { expr: inner, .. } => {
-            finalize_expr_tombstones(inner, host_sheet, sheets)
+        BoundExpr::Literal(_)
+        | BoundExpr::ArrayLiteral { .. }
+        | BoundExpr::Name(_)
+        | BoundExpr::Opaque { .. }
+        | BoundExpr::PreservedCached { .. } => false,
+        BoundExpr::ScopedName {
+            sheet,
+            missing_sheet,
+            ..
+        } => {
+            if let Some(sid) = *sheet
+                && !sheets.iter().any(|s| s.id() == sid && !s.is_deleted())
+            {
+                *sheet = None;
+                *missing_sheet = None;
+                return true;
+            }
+            false
         }
+        BoundExpr::Reference(r) => finalize_ref_tombstones(r, host_sheet, sheets),
+        BoundExpr::Paren(inner)
+        | BoundExpr::Unary { expr: inner, .. }
+        | BoundExpr::SpillRef(inner) => finalize_expr_tombstones(inner, host_sheet, sheets),
         BoundExpr::Binary { left, right, .. } => {
             let l = finalize_expr_tombstones(left, host_sheet, sheets);
             let r = finalize_expr_tombstones(right, host_sheet, sheets);
@@ -2344,11 +2729,12 @@ pub fn shift_formula_for_cell(
 ) -> BoundFormula {
     let dr = i64::from(spec.dst_row_pos).saturating_sub(i64::from(spec.src_row_pos));
     let dc = i64::from(spec.dst_col_pos).saturating_sub(i64::from(spec.src_col_pos));
+    let find_sheet = |id: SheetId| workbook.sheet(id);
     BoundFormula {
         mode: formula.mode,
-        root: shift_bound_expr(
+        root: shift_bound_expr_with(
             &formula.root,
-            workbook,
+            &find_sheet,
             spec.src_sheet,
             spec.dst_sheet,
             dr,
@@ -2366,9 +2752,9 @@ fn shift_coord(pos: u32, delta: i64, is_abs: bool) -> Option<u32> {
     }
 }
 
-fn shift_bound_expr(
+fn shift_bound_expr_with<'a>(
     expr: &BoundExpr,
-    workbook: &Workbook<BoundFormula>,
+    find_sheet: &dyn Fn(SheetId) -> Option<&'a Sheet>,
     src_sheet: SheetId,
     dst_sheet: SheetId,
     dr: i64,
@@ -2385,41 +2771,58 @@ fn shift_bound_expr(
             cols: *cols,
             elements: elements.clone(),
         },
-        BoundExpr::Reference(r) => {
-            BoundExpr::Reference(shift_bound_ref(r, workbook, src_sheet, dst_sheet, dr, dc))
-        }
+        BoundExpr::Reference(r) => BoundExpr::Reference(shift_bound_ref_with(
+            r, find_sheet, src_sheet, dst_sheet, dr, dc,
+        )),
         BoundExpr::Name(s) => BoundExpr::Name(s.clone()),
-        BoundExpr::Paren(inner) => BoundExpr::Paren(Box::new(shift_bound_expr(
-            inner, workbook, src_sheet, dst_sheet, dr, dc,
+        BoundExpr::ScopedName {
+            sheet,
+            missing_sheet,
+            name,
+        } => BoundExpr::ScopedName {
+            sheet: *sheet,
+            missing_sheet: missing_sheet.clone(),
+            name: name.clone(),
+        },
+        BoundExpr::SpillRef(inner) => BoundExpr::SpillRef(Box::new(shift_bound_expr_with(
+            inner, find_sheet, src_sheet, dst_sheet, dr, dc,
+        ))),
+        BoundExpr::Opaque { raw } => BoundExpr::Opaque { raw: raw.clone() },
+        BoundExpr::PreservedCached { raw, cached } => BoundExpr::PreservedCached {
+            raw: raw.clone(),
+            cached: cached.clone(),
+        },
+        BoundExpr::Paren(inner) => BoundExpr::Paren(Box::new(shift_bound_expr_with(
+            inner, find_sheet, src_sheet, dst_sheet, dr, dc,
         ))),
         BoundExpr::Unary { op, expr: inner } => BoundExpr::Unary {
             op: *op,
-            expr: Box::new(shift_bound_expr(
-                inner, workbook, src_sheet, dst_sheet, dr, dc,
+            expr: Box::new(shift_bound_expr_with(
+                inner, find_sheet, src_sheet, dst_sheet, dr, dc,
             )),
         },
         BoundExpr::Binary { op, left, right } => BoundExpr::Binary {
             op: *op,
-            left: Box::new(shift_bound_expr(
-                left, workbook, src_sheet, dst_sheet, dr, dc,
+            left: Box::new(shift_bound_expr_with(
+                left, find_sheet, src_sheet, dst_sheet, dr, dc,
             )),
-            right: Box::new(shift_bound_expr(
-                right, workbook, src_sheet, dst_sheet, dr, dc,
+            right: Box::new(shift_bound_expr_with(
+                right, find_sheet, src_sheet, dst_sheet, dr, dc,
             )),
         },
         BoundExpr::Call { name, args } => BoundExpr::Call {
             name: name.clone(),
             args: args
                 .iter()
-                .map(|a| shift_bound_expr(a, workbook, src_sheet, dst_sheet, dr, dc))
+                .map(|a| shift_bound_expr_with(a, find_sheet, src_sheet, dst_sheet, dr, dc))
                 .collect(),
         },
     }
 }
 
-fn shift_bound_ref(
+fn shift_bound_ref_with<'a>(
     r: &BoundRef,
-    workbook: &Workbook<BoundFormula>,
+    find_sheet: &dyn Fn(SheetId) -> Option<&'a Sheet>,
     src_sheet: SheetId,
     dst_sheet: SheetId,
     dr: i64,
@@ -2438,8 +2841,8 @@ fn shift_bound_ref(
             abs_row,
         } => {
             let (Some(ref_src), Some(ref_dst)) = (
-                workbook.sheet(sheet.unwrap_or(src_sheet)),
-                workbook.sheet(sheet.unwrap_or(dst_sheet)),
+                find_sheet(sheet.unwrap_or(src_sheet)),
+                find_sheet(sheet.unwrap_or(dst_sheet)),
             ) else {
                 return BoundRef::Invalid { sheet_name: None };
             };
@@ -2480,8 +2883,8 @@ fn shift_bound_ref(
             abs_last_row,
         } => {
             let (Some(ref_src), Some(ref_dst)) = (
-                workbook.sheet(sheet.unwrap_or(src_sheet)),
-                workbook.sheet(sheet.unwrap_or(dst_sheet)),
+                find_sheet(sheet.unwrap_or(src_sheet)),
+                find_sheet(sheet.unwrap_or(dst_sheet)),
             ) else {
                 return BoundRef::Invalid { sheet_name: None };
             };
@@ -2526,8 +2929,8 @@ fn shift_bound_ref(
             abs_last,
         } => {
             let (Some(ref_src), Some(ref_dst)) = (
-                workbook.sheet(sheet.unwrap_or(src_sheet)),
-                workbook.sheet(sheet.unwrap_or(dst_sheet)),
+                find_sheet(sheet.unwrap_or(src_sheet)),
+                find_sheet(sheet.unwrap_or(dst_sheet)),
             ) else {
                 return BoundRef::Invalid { sheet_name: None };
             };
@@ -2560,8 +2963,8 @@ fn shift_bound_ref(
             abs_last,
         } => {
             let (Some(ref_src), Some(ref_dst)) = (
-                workbook.sheet(sheet.unwrap_or(src_sheet)),
-                workbook.sheet(sheet.unwrap_or(dst_sheet)),
+                find_sheet(sheet.unwrap_or(src_sheet)),
+                find_sheet(sheet.unwrap_or(dst_sheet)),
             ) else {
                 return BoundRef::Invalid { sheet_name: None };
             };
@@ -2584,6 +2987,323 @@ fn shift_bound_ref(
                 *abs_last,
                 ref_dst,
             )
+        }
+    }
+}
+
+struct MoveCellsPlan<'a> {
+    ctx: &'a MoveCellsRewriteCtx<'a>,
+    src_sheet_ref: &'a Sheet,
+    dst_sheet_ref: &'a Sheet,
+    sr0: u32,
+    sr1: u32,
+    sc0: u32,
+    sc1: u32,
+    dr0: u32,
+    dr1: u32,
+    dc0: u32,
+    dc1: u32,
+    dr: i64,
+    dc: i64,
+}
+
+impl<'a> MoveCellsPlan<'a> {
+    fn from_ctx(ctx: &'a MoveCellsRewriteCtx<'a>) -> Option<Self> {
+        let src_sheet_ref = ctx.sheets.iter().find(|s| s.id() == ctx.src_sheet)?;
+        let dst_sheet_ref = ctx.sheets.iter().find(|s| s.id() == ctx.dst_sheet)?;
+        let sr0 = src_sheet_ref
+            .row_axis()
+            .id_to_pos(ctx.src_rows.first()?.0)?;
+        let sr1 = src_sheet_ref.row_axis().id_to_pos(ctx.src_rows.last()?.0)?;
+        let sc0 = src_sheet_ref
+            .col_axis()
+            .id_to_pos(ctx.src_cols.first()?.0)?;
+        let sc1 = src_sheet_ref.col_axis().id_to_pos(ctx.src_cols.last()?.0)?;
+        let dr0 = dst_sheet_ref
+            .row_axis()
+            .id_to_pos(ctx.dst_rows.first()?.0)?;
+        let dr1 = dst_sheet_ref.row_axis().id_to_pos(ctx.dst_rows.last()?.0)?;
+        let dc0 = dst_sheet_ref
+            .col_axis()
+            .id_to_pos(ctx.dst_cols.first()?.0)?;
+        let dc1 = dst_sheet_ref.col_axis().id_to_pos(ctx.dst_cols.last()?.0)?;
+        Some(Self {
+            ctx,
+            src_sheet_ref,
+            dst_sheet_ref,
+            sr0,
+            sr1,
+            sc0,
+            sc1,
+            dr0,
+            dr1,
+            dc0,
+            dc1,
+            dr: i64::from(dr0).saturating_sub(i64::from(sr0)),
+            dc: i64::from(dc0).saturating_sub(i64::from(sc0)),
+        })
+    }
+
+    fn find_sheet(&self, id: SheetId) -> Option<&'a Sheet> {
+        self.ctx.sheets.iter().find(|s| s.id() == id)
+    }
+}
+
+fn rewrite_bound_expr_for_move_cells(
+    expr: &mut BoundExpr,
+    host_sheet_before: SheetId,
+    is_moved_formula: bool,
+    plan: &MoveCellsPlan<'_>,
+) -> bool {
+    match expr {
+        BoundExpr::Literal(_)
+        | BoundExpr::ArrayLiteral { .. }
+        | BoundExpr::Name(_)
+        | BoundExpr::ScopedName { .. }
+        | BoundExpr::Opaque { .. }
+        | BoundExpr::PreservedCached { .. } => false,
+        BoundExpr::Reference(r) => {
+            rewrite_bound_ref_for_move_cells(r, host_sheet_before, is_moved_formula, plan)
+        }
+        BoundExpr::Paren(inner)
+        | BoundExpr::Unary { expr: inner, .. }
+        | BoundExpr::SpillRef(inner) => {
+            rewrite_bound_expr_for_move_cells(inner, host_sheet_before, is_moved_formula, plan)
+        }
+        BoundExpr::Binary { left, right, .. } => {
+            let l =
+                rewrite_bound_expr_for_move_cells(left, host_sheet_before, is_moved_formula, plan);
+            let r =
+                rewrite_bound_expr_for_move_cells(right, host_sheet_before, is_moved_formula, plan);
+            l || r
+        }
+        BoundExpr::Call { args, .. } => {
+            let mut changed = false;
+            for arg in args {
+                if rewrite_bound_expr_for_move_cells(arg, host_sheet_before, is_moved_formula, plan)
+                {
+                    changed = true;
+                }
+            }
+            changed
+        }
+    }
+}
+
+fn qualify_moved_cross_sheet(
+    sheet: &mut Option<SheetId>,
+    is_moved_formula: bool,
+    plan: &MoveCellsPlan<'_>,
+) -> bool {
+    if is_moved_formula && plan.ctx.src_sheet != plan.ctx.dst_sheet && sheet.is_none() {
+        *sheet = Some(plan.ctx.src_sheet);
+        true
+    } else {
+        false
+    }
+}
+
+fn rewrite_bound_ref_for_move_cells(
+    r: &mut BoundRef,
+    host_sheet_before: SheetId,
+    is_moved_formula: bool,
+    plan: &MoveCellsPlan<'_>,
+) -> bool {
+    let ctx = plan.ctx;
+    let host_after = if is_moved_formula {
+        ctx.dst_sheet
+    } else {
+        host_sheet_before
+    };
+    match r {
+        BoundRef::Invalid { .. } => false,
+        BoundRef::ColRange { sheet, .. } | BoundRef::RowRange { sheet, .. } => {
+            qualify_moved_cross_sheet(sheet, is_moved_formula, plan)
+        }
+        BoundRef::Cell {
+            sheet,
+            missing_sheet,
+            row,
+            col,
+            ..
+        } => {
+            let target_sheet = sheet.unwrap_or(host_sheet_before);
+            if target_sheet == ctx.src_sheet
+                && let (Some(rp), Some(cp)) = (
+                    plan.src_sheet_ref.row_axis().id_to_pos(row.0),
+                    plan.src_sheet_ref.col_axis().id_to_pos(col.0),
+                )
+                && (plan.sr0..=plan.sr1).contains(&rp)
+                && (plan.sc0..=plan.sc1).contains(&cp)
+            {
+                let ri = usize::try_from(rp.saturating_sub(plan.sr0)).unwrap_or(usize::MAX);
+                let ci = usize::try_from(cp.saturating_sub(plan.sc0)).unwrap_or(usize::MAX);
+                if let (Some(&new_r), Some(&new_c)) = (ctx.dst_rows.get(ri), ctx.dst_cols.get(ci)) {
+                    *row = new_r;
+                    *col = new_c;
+                    *missing_sheet = None;
+                    *sheet = if sheet.is_some() || ctx.dst_sheet != host_after {
+                        Some(ctx.dst_sheet)
+                    } else {
+                        None
+                    };
+                    return true;
+                }
+                return false;
+            }
+            if target_sheet == ctx.dst_sheet
+                && let (Some(rp), Some(cp)) = (
+                    plan.dst_sheet_ref.row_axis().id_to_pos(row.0),
+                    plan.dst_sheet_ref.col_axis().id_to_pos(col.0),
+                )
+                && (plan.dr0..=plan.dr1).contains(&rp)
+                && (plan.dc0..=plan.dc1).contains(&cp)
+            {
+                *r = BoundRef::Invalid { sheet_name: None };
+                return true;
+            }
+            qualify_moved_cross_sheet(sheet, is_moved_formula, plan)
+        }
+        BoundRef::Area {
+            sheet,
+            missing_sheet,
+            first_row,
+            first_col,
+            last_row,
+            last_col,
+            ..
+        } => {
+            let target_sheet = sheet.unwrap_or(host_sheet_before);
+            let Some(target) = plan.find_sheet(target_sheet) else {
+                return qualify_moved_cross_sheet(sheet, is_moved_formula, plan);
+            };
+            let (Some(p_fr), Some(p_lr), Some(p_fc), Some(p_lc)) = (
+                target.row_axis().id_to_pos(first_row.0),
+                target.row_axis().id_to_pos(last_row.0),
+                target.col_axis().id_to_pos(first_col.0),
+                target.col_axis().id_to_pos(last_col.0),
+            ) else {
+                return qualify_moved_cross_sheet(sheet, is_moved_formula, plan);
+            };
+            let (low_r, high_r, ar0, ar1) = if p_fr <= p_lr {
+                (first_row, last_row, p_fr, p_lr)
+            } else {
+                (last_row, first_row, p_lr, p_fr)
+            };
+            let (low_c, high_c, ac0, ac1) = if p_fc <= p_lc {
+                (first_col, last_col, p_fc, p_lc)
+            } else {
+                (last_col, first_col, p_lc, p_fc)
+            };
+
+            // 1. Entire area fits within `src`: move all 4 anchors into `dst`.
+            if target_sheet == ctx.src_sheet
+                && ar0 >= plan.sr0
+                && ar1 <= plan.sr1
+                && ac0 >= plan.sc0
+                && ac1 <= plan.sc1
+                && let (Some(&nr0), Some(&nr1), Some(&nc0), Some(&nc1)) = (
+                    ctx.dst_rows
+                        .get(usize::try_from(ar0.saturating_sub(plan.sr0)).unwrap_or(usize::MAX)),
+                    ctx.dst_rows
+                        .get(usize::try_from(ar1.saturating_sub(plan.sr0)).unwrap_or(usize::MAX)),
+                    ctx.dst_cols
+                        .get(usize::try_from(ac0.saturating_sub(plan.sc0)).unwrap_or(usize::MAX)),
+                    ctx.dst_cols
+                        .get(usize::try_from(ac1.saturating_sub(plan.sc0)).unwrap_or(usize::MAX)),
+                )
+            {
+                *low_r = nr0;
+                *high_r = nr1;
+                *low_c = nc0;
+                *high_c = nc1;
+                *missing_sheet = None;
+                *sheet = if sheet.is_some() || ctx.dst_sheet != host_after {
+                    Some(ctx.dst_sheet)
+                } else {
+                    None
+                };
+                return true;
+            }
+
+            // 2. Same-sheet corner / full-edge outward stretches matching Excel 16.0.
+            if target_sheet == ctx.src_sheet && ctx.src_sheet == ctx.dst_sheet {
+                if plan.dc == 0 && plan.sc0 <= ac0 && ac1 <= plan.sc1 && ar0 < ar1 {
+                    if plan.sr0 > ar0
+                        && plan.sr0 <= ar1
+                        && ar1 <= plan.sr1
+                        && plan.dr > 0
+                        && let Some(&nr) = ctx.dst_rows.get(
+                            usize::try_from(ar1.saturating_sub(plan.sr0)).unwrap_or(usize::MAX),
+                        )
+                    {
+                        *high_r = nr;
+                        return true;
+                    }
+                    if plan.sr0 <= ar0
+                        && ar0 <= plan.sr1
+                        && plan.sr1 < ar1
+                        && plan.dr < 0
+                        && let Some(&nr) = ctx.dst_rows.get(
+                            usize::try_from(ar0.saturating_sub(plan.sr0)).unwrap_or(usize::MAX),
+                        )
+                    {
+                        *low_r = nr;
+                        return true;
+                    }
+                }
+                if plan.dr == 0 && plan.sr0 <= ar0 && ar1 <= plan.sr1 && ac0 < ac1 {
+                    if plan.sc0 > ac0
+                        && plan.sc0 <= ac1
+                        && ac1 <= plan.sc1
+                        && plan.dc > 0
+                        && let Some(&nc) = ctx.dst_cols.get(
+                            usize::try_from(ac1.saturating_sub(plan.sc0)).unwrap_or(usize::MAX),
+                        )
+                    {
+                        *high_c = nc;
+                        return true;
+                    }
+                    if plan.sc0 <= ac0
+                        && ac0 <= plan.sc1
+                        && plan.sc1 < ac1
+                        && plan.dc < 0
+                        && let Some(&nc) = ctx.dst_cols.get(
+                            usize::try_from(ac0.saturating_sub(plan.sc0)).unwrap_or(usize::MAX),
+                        )
+                    {
+                        *low_c = nc;
+                        return true;
+                    }
+                }
+                if plan.sr0 == plan.sr1 && plan.sc0 == plan.sc1 && (ar0 < ar1 || ac0 < ac1) {
+                    if plan.sr0 == ar1
+                        && plan.sc0 == ac1
+                        && plan.dr >= 0
+                        && plan.dc >= 0
+                        && (plan.dr > 0 || plan.dc > 0)
+                        && let (Some(&nr), Some(&nc)) = (ctx.dst_rows.first(), ctx.dst_cols.first())
+                    {
+                        *high_r = nr;
+                        *high_c = nc;
+                        return true;
+                    }
+                    if plan.sr0 == ar0
+                        && plan.sc0 == ac0
+                        && plan.dr <= 0
+                        && plan.dc <= 0
+                        && (plan.dr < 0 || plan.dc < 0)
+                        && let (Some(&nr), Some(&nc)) = (ctx.dst_rows.first(), ctx.dst_cols.first())
+                    {
+                        *low_r = nr;
+                        *low_c = nc;
+                        return true;
+                    }
+                }
+            }
+
+            // 3. Otherwise leave endpoints unchanged (qualifying sheet if formula moved cross-sheet).
+            qualify_moved_cross_sheet(sheet, is_moved_formula, plan)
         }
     }
 }
@@ -2616,6 +3336,23 @@ fn templatize_expr(expr: &BoundExpr, self_row: RowId, self_col: ColId) -> Templa
         },
         BoundExpr::Reference(r) => TemplateExpr::Reference(templatize_ref(r, self_row, self_col)),
         BoundExpr::Name(s) => TemplateExpr::Name(s.clone()),
+        BoundExpr::ScopedName {
+            sheet,
+            missing_sheet,
+            name,
+        } => TemplateExpr::ScopedName {
+            sheet: *sheet,
+            missing_sheet: missing_sheet.clone(),
+            name: name.clone(),
+        },
+        BoundExpr::SpillRef(inner) => {
+            TemplateExpr::SpillRef(Box::new(templatize_expr(inner, self_row, self_col)))
+        }
+        BoundExpr::Opaque { raw } => TemplateExpr::Opaque { raw: raw.clone() },
+        BoundExpr::PreservedCached { raw, cached } => TemplateExpr::PreservedCached {
+            raw: raw.clone(),
+            cached: cached.clone(),
+        },
         BoundExpr::Paren(inner) => {
             TemplateExpr::Paren(Box::new(templatize_expr(inner, self_row, self_col)))
         }
@@ -2950,8 +3687,15 @@ fn collect_ref_splits(
     splits: &mut BTreeSet<u32>,
 ) {
     match expr {
-        BoundExpr::Literal(_) | BoundExpr::ArrayLiteral { .. } | BoundExpr::Name(_) => {}
-        BoundExpr::Paren(inner) | BoundExpr::Unary { expr: inner, .. } => collect_ref_splits(
+        BoundExpr::Literal(_)
+        | BoundExpr::ArrayLiteral { .. }
+        | BoundExpr::Name(_)
+        | BoundExpr::ScopedName { .. }
+        | BoundExpr::Opaque { .. }
+        | BoundExpr::PreservedCached { .. } => {}
+        BoundExpr::Paren(inner)
+        | BoundExpr::Unary { expr: inner, .. }
+        | BoundExpr::SpillRef(inner) => collect_ref_splits(
             inner,
             workbook,
             src_sheet,

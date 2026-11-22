@@ -13,7 +13,7 @@
 //!   without losing work already completed in earlier slices.
 
 use alloc::boxed::Box;
-use alloc::collections::BTreeSet;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -27,13 +27,17 @@ use reticula_core::id::{ColId, IdRun, RowId, SheetId};
 use reticula_core::input::{InferredInput, infer_input, infer_input_for_cell};
 use reticula_core::memory::try_reserve_heap;
 use reticula_core::ops::{
-    CellEdit, CellInput, CellSnapshot, FormatBackup, FormatPatch, FormulaMode, InverseOp, Op,
-    OpError, ScalarValue, SeedOrigin, Workbook, WorkbookCellKey,
+    CellEdit, CellInput, CellSnapshot, FormatBackup, FormatPatch, FormulaMode, InverseOp,
+    NamedRangeKey, Op, OpError, PermutedCellBackup, ScalarValue, SeedOrigin, Workbook,
+    WorkbookCellKey,
 };
 use reticula_core::sample;
 use reticula_core::sheet::Sheet;
 use reticula_core::snapshot::{SnapshotError, decode_snapshot, encode_snapshot};
 use reticula_core::value::{CalcError, Value};
+use reticula_core::viewport::{
+    FLAG_FORMULA, Page, ViewportCellOverlay, encode_page_with_formulas, encode_page_with_overlay,
+};
 use rustc_hash::FxHasher;
 use smallvec::SmallVec;
 
@@ -43,9 +47,11 @@ use crate::binder::{BoundExpr, BoundFormula, BoundRef, live_span_positions};
 use crate::dep_graph::{DepGraph, FormulaRegistration};
 use crate::functions::{EvalEnv, combine_choose, combine_if, combine_iferror, eval_eager_function};
 use crate::parser::ParseError;
+use crate::spill::{CommitSpillOutcome, SpillRegistry};
 use crate::value_eval::{
-    Array2D, CallerContext, EvalScalar, EvalValue, ResolvedRef, coerce_for_scalar_op, eval_binary,
-    eval_unary, finalize_top_level, resolve_bound_ref,
+    Array2D, CallerContext, EvalScalar, EvalValue, ResolvedRef, ScalarOrArray,
+    coerce_for_scalar_op, eval_binary, eval_unary, finalize_top_level, materialise_reference,
+    resolve_bound_ref,
 };
 
 type FxMap<K, V> = HashMap<K, V, BuildHasherDefault<FxHasher>>;
@@ -54,6 +60,7 @@ type FxSet<T> = HashSet<T, BuildHasherDefault<FxHasher>>;
 const STATE_CLEAN: u8 = 0;
 const STATE_DIRTY: u8 = 1;
 const STATE_EVALUATING: u8 = 2;
+const MAX_WAVE_SPILL_REQUEUES: u8 = 16;
 
 /// Number of live formula rows populated in `M2..=M100001` of the default
 /// 1,000,000-row sample (`13-m1a.md` 5.8).
@@ -131,6 +138,12 @@ struct FormulaSlot {
     reg: FormulaRegistration,
 }
 
+#[derive(Clone, Debug, Default)]
+struct CycleSpillRecord {
+    peers: Vec<WorkbookCellKey>,
+    cleared_shadows: Vec<WorkbookCellKey>,
+}
+
 enum ExprOutcome {
     Ready(EvalValue),
     Blocked(SmallVec<[u32; 4]>),
@@ -143,6 +156,16 @@ enum ExprOutcome {
 pub struct FormulaEngine {
     workbook: Workbook<BoundFormula>,
     dep_graph: DepGraph,
+    spills: SpillRegistry,
+    name_dep_graph: DepGraph,
+    name_slots: Vec<Option<(NamedRangeKey, FormulaRegistration)>>,
+    name_to_nid: BTreeMap<NamedRangeKey, u32>,
+    free_name_slots: Vec<u32>,
+    volatile_names: BTreeSet<u32>,
+    name_eval_stack: Vec<NamedRangeKey>,
+    wave_spill_requeues: BTreeMap<u32, u8>,
+    cycle_spills: BTreeMap<WorkbookCellKey, CycleSpillRecord>,
+    cycle_shadow_watch: BTreeMap<WorkbookCellKey, Vec<WorkbookCellKey>>,
     slots: Vec<Option<FormulaSlot>>,
     states: Vec<u8>,
     free_slots: Vec<u32>,
@@ -195,9 +218,36 @@ impl FormulaEngine {
             cell_to_fid.insert(key, fid);
         }
 
+        let name_count = workbook.named_ranges().len();
+        let mut name_dep_graph = DepGraph::with_formula_capacity(name_count);
+        let mut name_slots = Vec::with_capacity(name_count);
+        let mut name_to_nid = BTreeMap::new();
+        let mut volatile_names = BTreeSet::new();
+        let fallback_sheet = workbook_fallback_sheet(&workbook);
+        for (nkey, def) in workbook.named_ranges() {
+            let nid = u32::try_from(name_slots.len()).unwrap_or(0);
+            let host_sheet = nkey.scope.unwrap_or(fallback_sheet);
+            let (reg, is_vol) = name_dep_graph.register_with_flags(nid, host_sheet, &def.formula);
+            if is_vol {
+                volatile_names.insert(nid);
+            }
+            name_slots.push(Some((nkey.clone(), reg)));
+            name_to_nid.insert(nkey.clone(), nid);
+        }
+
         Self {
             workbook,
             dep_graph,
+            spills: SpillRegistry::new(),
+            name_dep_graph,
+            name_slots,
+            name_to_nid,
+            free_name_slots: Vec::new(),
+            volatile_names,
+            name_eval_stack: Vec::new(),
+            wave_spill_requeues: BTreeMap::new(),
+            cycle_spills: BTreeMap::new(),
+            cycle_shadow_watch: BTreeMap::new(),
             slots,
             states,
             free_slots: Vec::new(),
@@ -383,6 +433,16 @@ impl FormulaEngine {
         Self {
             workbook: wb,
             dep_graph,
+            spills: SpillRegistry::new(),
+            name_dep_graph: DepGraph::new(),
+            name_slots: Vec::new(),
+            name_to_nid: BTreeMap::new(),
+            free_name_slots: Vec::new(),
+            volatile_names: BTreeSet::new(),
+            name_eval_stack: Vec::new(),
+            wave_spill_requeues: BTreeMap::new(),
+            cycle_spills: BTreeMap::new(),
+            cycle_shadow_watch: BTreeMap::new(),
             slots,
             states,
             free_slots: Vec::new(),
@@ -411,16 +471,63 @@ impl FormulaEngine {
     /// dirty (`14-m1b.md` 5.3).
     pub fn set_eval_env(&mut self, now_serial: f64, seed: u64) {
         self.env = EvalEnv::new(now_serial, seed);
-        if !self.volatile_set.is_empty() {
-            let roots: Vec<u32> = self.volatile_set.iter().copied().collect();
-            self.propagate_dirty(roots);
-        }
+        self.invalidate_volatile_after_edit();
     }
 
     /// Underlying [`Workbook<BoundFormula>`].
     #[must_use]
     pub const fn workbook(&self) -> &Workbook<BoundFormula> {
         &self.workbook
+    }
+
+    /// Active and blocked dynamic-array spill registry.
+    #[must_use]
+    pub const fn spills(&self) -> &SpillRegistry {
+        &self.spills
+    }
+
+    /// Returns the materialized `(rows, cols)` spill shape anchored at `anchor`, if active.
+    #[must_use]
+    pub fn spill_range(&self, anchor: WorkbookCellKey) -> Option<(u32, u32)> {
+        self.spills.spill_shape(anchor)
+    }
+
+    /// Encodes one v2 viewport page of `sheet_id`, marking formula cells with
+    /// `FLAG_FORMULA` and overlaid spill shadow cells with `FLAG_SPILL`.
+    #[must_use]
+    pub fn encode_viewport_page(
+        &self,
+        sheet_id: SheetId,
+        page: Page,
+        epoch: u32,
+        text: &mut String,
+    ) -> Option<Vec<u8>> {
+        let sheet = self.workbook.sheet(sheet_id)?;
+        if !self.spills.has_spills_on_sheet(sheet_id) {
+            return Some(encode_page_with_formulas(
+                sheet,
+                page,
+                epoch,
+                text,
+                |r, c| self.has_formula(sheet_id, r, c),
+            ));
+        }
+        Some(encode_page_with_overlay(
+            sheet,
+            page,
+            epoch,
+            text,
+            |r, c| {
+                let mut ov = ViewportCellOverlay::default();
+                if self.has_formula(sheet_id, r, c) {
+                    ov.extra_flags |= FLAG_FORMULA;
+                } else if let Some((val, flags)) = self.spills.viewport_overlay(sheet_id, r, c) {
+                    ov.value = Some(val);
+                    ov.extra_flags |= flags;
+                }
+                ov
+            },
+        ))
     }
 
     /// Interns resolved styles for `page` on `sheet_id` before immutable
@@ -488,9 +595,31 @@ impl FormulaEngine {
     /// graph cleanly over the compacted workbook.
     pub fn compact_local_garbage(&mut self) {
         self.recalc_all();
+        let mut spill_anchors = Vec::new();
+        if !self.spills.is_empty() {
+            for sheet in self.workbook.live_sheets() {
+                spill_anchors.extend(self.spills.anchors_on_sheet(sheet.id()));
+            }
+        }
+        for (anchor, rec) in &self.cycle_spills {
+            spill_anchors.push(*anchor);
+            spill_anchors.extend_from_slice(&rec.peers);
+        }
         let mut wb = core::mem::take(&mut self.workbook);
         wb.compact_local_garbage();
-        *self = Self::from_workbook_clean(wb);
+        let mut rebuilt = Self::from_workbook_clean(wb);
+        if !spill_anchors.is_empty() {
+            let mut roots = Vec::new();
+            for anchor in spill_anchors {
+                if let Some(&fid) = rebuilt.cell_to_fid.get(&anchor) {
+                    roots.push(fid);
+                }
+            }
+            rebuilt.propagate_dirty(roots);
+            rebuilt.recalc_all();
+            rebuilt.changes = DirtyChanges::default();
+        }
+        *self = rebuilt;
     }
 
     /// Mutable access to the workbook's [`IdAllocator`] for allocating fresh
@@ -547,6 +676,44 @@ impl FormulaEngine {
         .write_a1(&mut address);
 
         let val = sheet.value_by_id(row, col);
+        if val == Value::Empty
+            && self.workbook.formula(sheet_id, row, col).is_none()
+            && let Some(shadow) = self.spills.shadow_value(sheet_id, row, col)
+        {
+            let mut display = String::new();
+            let error = match shadow {
+                EvalScalar::Empty => None,
+                EvalScalar::Number(n) => {
+                    let packed = Value::number(*n);
+                    sheet.format_value(packed, row, col, &mut display);
+                    if let Value::Error(e) = packed {
+                        Some(String::from(e.as_str()))
+                    } else {
+                        None
+                    }
+                }
+                EvalScalar::Bool(b) => {
+                    sheet.format_value(Value::Bool(*b), row, col, &mut display);
+                    None
+                }
+                EvalScalar::Error(e) => {
+                    display.push_str(e.as_str());
+                    Some(String::from(e.as_str()))
+                }
+                EvalScalar::Text(s) => {
+                    display.push_str(s);
+                    None
+                }
+            };
+            return Some(InspectedCell {
+                address,
+                raw: String::new(),
+                display,
+                is_formula: false,
+                error,
+            });
+        }
+
         let mut display = String::new();
         sheet.format_value(val, row, col, &mut display);
 
@@ -682,10 +849,12 @@ impl FormulaEngine {
 
     /// Invalidates volatile formulas following direct cell input.
     pub fn invalidate_volatile_after_edit(&mut self) {
-        if !self.volatile_set.is_empty() {
-            let vol_roots: Vec<u32> = self.volatile_set.iter().copied().collect();
-            self.propagate_dirty(vol_roots);
+        if self.volatile_set.is_empty() && self.volatile_names.is_empty() {
+            return;
         }
+        let mut vol_roots: Vec<u32> = self.volatile_set.iter().copied().collect();
+        self.collect_volatile_name_dependents(&mut vol_roots);
+        self.propagate_dirty(vol_roots);
     }
 
     /// Applies a multi-operation transaction atomically: if any operation fails,
@@ -728,6 +897,7 @@ impl FormulaEngine {
                         self.changes.cells.push(key);
                     }
                     self.remove_slot_by_key(key);
+                    self.notify_cell_written_for_spills(key, &mut root_dirty);
                     if let Some(new_f) = self.workbook.formula(*sheet, cell.row, cell.col).cloned()
                     {
                         let fid = self.insert_slot(key, &new_f, false);
@@ -747,6 +917,8 @@ impl FormulaEngine {
                 let mut root_dirty = Vec::new();
                 self.dep_graph
                     .on_rows_inserted(*sheet, *ids, &self.workbook, |fid| root_dirty.push(fid));
+                self.collect_name_dep_structural_rows_inserted(*sheet, *ids, &mut root_dirty);
+                self.refresh_sheet_spills_on_structural_change(*sheet, false, &mut root_dirty);
                 self.propagate_dirty(root_dirty);
             }
             InverseOp::RemoveInsertedCols { sheet, ids } => {
@@ -754,6 +926,8 @@ impl FormulaEngine {
                 let mut root_dirty = Vec::new();
                 self.dep_graph
                     .on_cols_inserted(*sheet, *ids, &self.workbook, |fid| root_dirty.push(fid));
+                self.collect_name_dep_structural_cols_inserted(*sheet, *ids, &mut root_dirty);
+                self.refresh_sheet_spills_on_structural_change(*sheet, false, &mut root_dirty);
                 self.propagate_dirty(root_dirty);
             }
             InverseOp::UndeleteRows { sheet, ids } => {
@@ -761,6 +935,8 @@ impl FormulaEngine {
                 let mut root_dirty = Vec::new();
                 self.dep_graph
                     .on_rows_toggled(*sheet, ids, &self.workbook, |fid| root_dirty.push(fid));
+                self.collect_name_dep_structural_rows_toggled(*sheet, ids, &mut root_dirty);
+                self.refresh_sheet_spills_on_structural_change(*sheet, false, &mut root_dirty);
                 self.propagate_dirty(root_dirty);
             }
             InverseOp::UndeleteCols { sheet, ids } => {
@@ -768,6 +944,8 @@ impl FormulaEngine {
                 let mut root_dirty = Vec::new();
                 self.dep_graph
                     .on_cols_toggled(*sheet, ids, &self.workbook, |fid| root_dirty.push(fid));
+                self.collect_name_dep_structural_cols_toggled(*sheet, ids, &mut root_dirty);
+                self.refresh_sheet_spills_on_structural_change(*sheet, false, &mut root_dirty);
                 self.propagate_dirty(root_dirty);
             }
             InverseOp::RedeleteRows { sheet, ids } => {
@@ -777,12 +955,18 @@ impl FormulaEngine {
                 self.on_cols_undeleted(*sheet, ids);
             }
             InverseOp::RestoreMovedRows {
-                sheet, rewritten, ..
+                sheet,
+                rewritten,
+                rewritten_names,
+                ..
             }
             | InverseOp::RestoreMovedCols {
-                sheet, rewritten, ..
+                sheet,
+                rewritten,
+                rewritten_names,
+                ..
             } => {
-                self.on_axis_reordered(*sheet, rewritten);
+                self.on_axis_reordered(*sheet, rewritten, rewritten_names);
             }
             InverseOp::RestoreRowHeights { .. }
             | InverseOp::RestoreColWidths { .. }
@@ -806,12 +990,22 @@ impl FormulaEngine {
             InverseOp::UndeleteSheet { sheet } | InverseOp::RedeleteSheet { sheet, .. } => {
                 self.on_sheet_visibility_changed(*sheet);
             }
+            InverseOp::RestorePermutedCells { sheet, prior } => {
+                self.on_permuted_cells_changed(*sheet, prior);
+            }
+            InverseOp::RestoreMovedCells {
+                prior_cells,
+                rewritten_formulas,
+                rewritten_names,
+            } => {
+                self.on_moved_cells_changed(prior_cells, rewritten_formulas, rewritten_names);
+            }
+            InverseOp::RestoreNamedRange { key, .. } => {
+                self.on_named_range_changed(key);
+            }
         }
 
-        if !self.volatile_set.is_empty() {
-            let vol_roots: Vec<u32> = self.volatile_set.iter().copied().collect();
-            self.propagate_dirty(vol_roots);
-        }
+        self.invalidate_volatile_after_edit();
 
         Ok(inv)
     }
@@ -822,6 +1016,7 @@ impl FormulaEngine {
         // For `RemoveInsertedRows`/`Cols`, capture straddling ranges BEFORE
         // removing the run from the axis!
         let mut pre_dirty: Vec<u32> = Vec::new();
+        let mut pre_nids: Vec<u32> = Vec::new();
         match &inv {
             InverseOp::RemoveInsertedRows { sheet, ids } => {
                 self.dep_graph.on_rows_toggled(
@@ -830,6 +1025,14 @@ impl FormulaEngine {
                     &self.workbook,
                     |fid| pre_dirty.push(fid),
                 );
+                if !self.name_slots.is_empty() {
+                    self.name_dep_graph.on_rows_toggled(
+                        *sheet,
+                        core::slice::from_ref(ids),
+                        &self.workbook,
+                        |nid| pre_nids.push(nid),
+                    );
+                }
             }
             InverseOp::RemoveInsertedCols { sheet, ids } => {
                 self.dep_graph.on_cols_toggled(
@@ -838,6 +1041,14 @@ impl FormulaEngine {
                     &self.workbook,
                     |fid| pre_dirty.push(fid),
                 );
+                if !self.name_slots.is_empty() {
+                    self.name_dep_graph.on_cols_toggled(
+                        *sheet,
+                        core::slice::from_ref(ids),
+                        &self.workbook,
+                        |nid| pre_nids.push(nid),
+                    );
+                }
             }
             _ => {}
         }
@@ -858,6 +1069,7 @@ impl FormulaEngine {
                         self.changes.cells.push(key);
                     }
                     self.remove_slot_by_key(key);
+                    self.notify_cell_written_for_spills(key, &mut root_dirty);
                     if let CellInput::Formula { formula, .. } = &cell.input {
                         let fid = self.insert_slot(key, formula, false);
                         root_dirty.push(fid);
@@ -874,8 +1086,11 @@ impl FormulaEngine {
             } => {
                 self.on_filled_range_restored(sheet, &rows, &cols, &prior_non_empty);
             }
-            InverseOp::RemoveInsertedRows { .. } | InverseOp::RemoveInsertedCols { .. } => {
+            InverseOp::RemoveInsertedRows { sheet, .. }
+            | InverseOp::RemoveInsertedCols { sheet, .. } => {
                 self.changes.structural = true;
+                self.collect_name_dependents_from_nids(&pre_nids, &mut pre_dirty);
+                self.refresh_sheet_spills_on_structural_change(sheet, false, &mut pre_dirty);
                 self.propagate_dirty(pre_dirty);
             }
             InverseOp::UndeleteRows { sheet, ids } => {
@@ -889,6 +1104,8 @@ impl FormulaEngine {
                 let mut root_dirty = Vec::new();
                 self.dep_graph
                     .on_rows_toggled(sheet, &ids, &self.workbook, |fid| root_dirty.push(fid));
+                self.collect_name_dep_structural_rows_toggled(sheet, &ids, &mut root_dirty);
+                self.refresh_sheet_spills_on_structural_change(sheet, false, &mut root_dirty);
                 self.propagate_dirty(root_dirty);
             }
             InverseOp::RedeleteCols { sheet, ids } => {
@@ -896,15 +1113,23 @@ impl FormulaEngine {
                 let mut root_dirty = Vec::new();
                 self.dep_graph
                     .on_cols_toggled(sheet, &ids, &self.workbook, |fid| root_dirty.push(fid));
+                self.collect_name_dep_structural_cols_toggled(sheet, &ids, &mut root_dirty);
+                self.refresh_sheet_spills_on_structural_change(sheet, false, &mut root_dirty);
                 self.propagate_dirty(root_dirty);
             }
             InverseOp::RestoreMovedRows {
-                sheet, rewritten, ..
+                sheet,
+                rewritten,
+                rewritten_names,
+                ..
             }
             | InverseOp::RestoreMovedCols {
-                sheet, rewritten, ..
+                sheet,
+                rewritten,
+                rewritten_names,
+                ..
             } => {
-                self.on_axis_reordered(sheet, &rewritten);
+                self.on_axis_reordered(sheet, &rewritten, &rewritten_names);
             }
             InverseOp::RemoveAddedSheet { sheet, .. } => {
                 self.changes.structural = true;
@@ -942,6 +1167,19 @@ impl FormulaEngine {
             InverseOp::UndeleteSheet { sheet } | InverseOp::RedeleteSheet { sheet, .. } => {
                 self.on_sheet_visibility_changed(sheet);
             }
+            InverseOp::RestorePermutedCells { sheet, prior } => {
+                self.on_permuted_cells_changed(sheet, &prior);
+            }
+            InverseOp::RestoreMovedCells {
+                prior_cells,
+                rewritten_formulas,
+                rewritten_names,
+            } => {
+                self.on_moved_cells_changed(&prior_cells, &rewritten_formulas, &rewritten_names);
+            }
+            InverseOp::RestoreNamedRange { key, .. } => {
+                self.on_named_range_changed(&key);
+            }
         }
 
         Ok(())
@@ -973,6 +1211,9 @@ impl FormulaEngine {
 
         loop {
             if self.call_stack.is_empty() {
+                if self.dirty_needs_sort {
+                    self.prepare_dirty_queue();
+                }
                 // Advance `dirty_cursor` to the next still-DIRTY formula.
                 let mut next_root: Option<u32> = None;
                 while let Some(&fid) = self.dirty_queue.get(self.dirty_cursor) {
@@ -988,6 +1229,7 @@ impl FormulaEngine {
                     self.dirty_cursor = 0;
                     self.dirty_needs_sort = false;
                     self.wave_done = 0;
+                    self.wave_spill_requeues.clear();
                     return RecalcStatus::Complete { recalculated: done };
                 };
                 self.call_stack.push(root_fid);
@@ -1021,10 +1263,7 @@ impl FormulaEngine {
 
             match self.eval_root_formula(&formula.root, caller) {
                 ExprOutcome::Ready(val) => {
-                    let final_scalar = finalize_top_level(val, &self.workbook, caller);
-                    self.store_eval_scalar(key, final_scalar);
-                    self.set_state(cur_fid, STATE_CLEAN);
-                    let _ = self.call_stack.pop();
+                    self.commit_evaluated_formula(cur_fid, key, caller, val);
                     self.wave_done = self.wave_done.saturating_add(1);
                     since_check = since_check.saturating_add(1);
                     if since_check >= stride {
@@ -1084,6 +1323,378 @@ impl FormulaEngine {
 
     // -------------------------------------------------------- internal helpers
 
+    fn commit_evaluated_formula(
+        &mut self,
+        cur_fid: u32,
+        key: WorkbookCellKey,
+        caller: CallerContext,
+        val: EvalValue,
+    ) {
+        if caller.mode == FormulaMode::Legacy {
+            let final_scalar = finalize_top_level(val, &self.workbook, &self.spills, caller);
+            self.finish_scalar_formula(cur_fid, key, final_scalar);
+            return;
+        }
+
+        enum TopLevelResult {
+            Scalar(EvalScalar),
+            Array(Array2D),
+        }
+
+        let top = match val {
+            EvalValue::Scalar(s) => TopLevelResult::Scalar(s),
+            EvalValue::Array(arr) => TopLevelResult::Array(arr),
+            EvalValue::Reference(r) => {
+                match materialise_reference(&r, &self.workbook, &self.spills) {
+                    Ok(ScalarOrArray::Scalar(s)) => {
+                        TopLevelResult::Scalar(if s == EvalScalar::Empty {
+                            EvalScalar::Number(0.0)
+                        } else {
+                            s
+                        })
+                    }
+                    Ok(ScalarOrArray::Array(mut arr)) => {
+                        for item in &mut arr.values {
+                            if *item == EvalScalar::Empty {
+                                *item = EvalScalar::Number(0.0);
+                            }
+                        }
+                        TopLevelResult::Array(arr)
+                    }
+                    Err(e) => TopLevelResult::Scalar(EvalScalar::Error(e)),
+                }
+            }
+        };
+
+        match top {
+            TopLevelResult::Scalar(s) => {
+                self.finish_scalar_formula(cur_fid, key, s);
+            }
+            TopLevelResult::Array(arr) => {
+                let old_bits = self
+                    .workbook
+                    .sheet(key.0)
+                    .map(|s| s.value_by_id(key.1, key.2).pack());
+                let old_shape = self.spills.spill_shape(key);
+                let was_active = old_shape.is_some();
+                match self.spills.commit_array(key, arr, &self.workbook) {
+                    CommitSpillOutcome::Materialized {
+                        anchor_scalar,
+                        changed_shadows,
+                        unblocked_watchers,
+                    } => {
+                        let new_shape = self.spills.spill_shape(key);
+                        let shape_changed = old_shape != new_shape;
+                        self.store_eval_scalar(key, anchor_scalar);
+                        let new_bits = self
+                            .workbook
+                            .sheet(key.0)
+                            .map(|s| s.value_by_id(key.1, key.2).pack());
+                        let anchor_changed = old_bits != new_bits;
+                        self.record_changed_cells(&changed_shadows);
+                        self.set_state(cur_fid, STATE_CLEAN);
+                        let _ = self.call_stack.pop();
+
+                        let mut post_dirty = Vec::new();
+                        if anchor_changed {
+                            self.collect_direct_dependents(key, &mut post_dirty);
+                        }
+                        if shape_changed || anchor_changed || !changed_shadows.is_empty() {
+                            self.collect_spill_anchor_dependents(key, &mut post_dirty);
+                        }
+                        // Strip `cur_fid` for direct anchor / spill-anchor dependents before
+                        // collecting changed-shadow dependents so self-shadow cycles
+                        // (`A1 = =A2:A3`) re-evaluate once and report `#CYCLE!` consistently
+                        // on both fresh and incremental recalculation.
+                        post_dirty.retain(|&fid| fid != cur_fid);
+                        for shadow_key in changed_shadows {
+                            self.collect_direct_dependents(shadow_key, &mut post_dirty);
+                            if self.spills.anchor_of_cell(shadow_key) == Some(key) {
+                                self.wake_cycle_shadow_watchers(
+                                    shadow_key,
+                                    Some(cur_fid),
+                                    &mut post_dirty,
+                                );
+                            }
+                        }
+                        self.push_unblocked_watchers(&unblocked_watchers, cur_fid, &mut post_dirty);
+                        self.drain_cycle_spill_anchor(key, Some(cur_fid), &mut post_dirty);
+                        self.propagate_dirty_in_wave(post_dirty, &[]);
+                    }
+                    CommitSpillOutcome::Blocked {
+                        revoked_anchors,
+                        freed_shadows,
+                        unblocked_watchers,
+                    } => {
+                        self.store_eval_scalar(key, EvalScalar::Error(CalcError::Spill));
+                        let new_bits = self
+                            .workbook
+                            .sheet(key.0)
+                            .map(|s| s.value_by_id(key.1, key.2).pack());
+                        let anchor_changed = old_bits != new_bits;
+                        self.set_state(cur_fid, STATE_CLEAN);
+                        let _ = self.call_stack.pop();
+
+                        let mut post_dirty = Vec::new();
+                        if anchor_changed || was_active {
+                            self.collect_direct_dependents(key, &mut post_dirty);
+                        }
+                        for revoked in revoked_anchors {
+                            self.store_eval_scalar(revoked, EvalScalar::Error(CalcError::Spill));
+                            self.collect_direct_dependents(revoked, &mut post_dirty);
+                        }
+                        self.record_changed_cells(&freed_shadows);
+                        for shadow_key in freed_shadows {
+                            self.collect_direct_dependents(shadow_key, &mut post_dirty);
+                        }
+                        self.push_unblocked_watchers(&unblocked_watchers, cur_fid, &mut post_dirty);
+                        post_dirty.retain(|&fid| fid != cur_fid);
+                        self.drain_cycle_spill_anchor(key, Some(cur_fid), &mut post_dirty);
+                        self.propagate_dirty_in_wave(post_dirty, &[]);
+                    }
+                }
+            }
+        }
+    }
+
+    fn finish_scalar_formula(&mut self, cur_fid: u32, key: WorkbookCellKey, scalar: EvalScalar) {
+        let clear_out = self.spills.clear_anchor(key);
+        self.store_eval_scalar(key, scalar);
+        self.set_state(cur_fid, STATE_CLEAN);
+        let _ = self.call_stack.pop();
+        let mut post_dirty = Vec::new();
+        if clear_out.had_state {
+            self.record_changed_cells(&clear_out.cleared_shadows);
+            for shadow_key in clear_out.cleared_shadows {
+                self.collect_direct_dependents(shadow_key, &mut post_dirty);
+            }
+            self.collect_spill_anchor_dependents(key, &mut post_dirty);
+            self.push_unblocked_watchers(&clear_out.unblocked_watchers, cur_fid, &mut post_dirty);
+            post_dirty.retain(|&fid| fid != cur_fid);
+        }
+        self.drain_cycle_spill_anchor(key, Some(cur_fid), &mut post_dirty);
+        if !post_dirty.is_empty() {
+            self.propagate_dirty_in_wave(post_dirty, &[]);
+        }
+    }
+
+    fn record_cycle_spill(
+        &mut self,
+        anchor: WorkbookCellKey,
+        unwound_keys: &[WorkbookCellKey],
+        cleared_shadows: &[WorkbookCellKey],
+    ) {
+        if let Some(prev) = self.cycle_spills.get(&anchor) {
+            for cell in &prev.cleared_shadows {
+                if let Some(anchors) = self.cycle_shadow_watch.get_mut(cell) {
+                    anchors.retain(|&a| a != anchor);
+                    if anchors.is_empty() {
+                        self.cycle_shadow_watch.remove(cell);
+                    }
+                }
+            }
+        }
+        let mut peers = self
+            .cycle_spills
+            .remove(&anchor)
+            .map(|r| r.peers)
+            .unwrap_or_default();
+        for &peer in unwound_keys {
+            if peer != anchor && !peers.contains(&peer) {
+                peers.push(peer);
+            }
+        }
+        let mut dedup_shadows = Vec::with_capacity(cleared_shadows.len());
+        for &cell in cleared_shadows {
+            if !dedup_shadows.contains(&cell) {
+                dedup_shadows.push(cell);
+            }
+        }
+        if peers.is_empty() && dedup_shadows.is_empty() {
+            return;
+        }
+        for &cell in &dedup_shadows {
+            let entry = self.cycle_shadow_watch.entry(cell).or_default();
+            if !entry.contains(&anchor) {
+                entry.push(anchor);
+            }
+        }
+        self.cycle_spills.insert(
+            anchor,
+            CycleSpillRecord {
+                peers,
+                cleared_shadows: dedup_shadows,
+            },
+        );
+    }
+
+    fn drain_cycle_spill_anchor(
+        &mut self,
+        anchor: WorkbookCellKey,
+        exclude_fid: Option<u32>,
+        out: &mut Vec<u32>,
+    ) {
+        let Some(rec) = self.cycle_spills.remove(&anchor) else {
+            return;
+        };
+        for cell in rec.cleared_shadows {
+            if let Some(anchors) = self.cycle_shadow_watch.get_mut(&cell) {
+                anchors.retain(|&a| a != anchor);
+                if anchors.is_empty() {
+                    self.cycle_shadow_watch.remove(&cell);
+                }
+            }
+        }
+        for peer in rec.peers {
+            if let Some(&pfid) = self.cell_to_fid.get(&peer)
+                && Some(pfid) != exclude_fid
+                && self.state_of(pfid) == STATE_CLEAN
+            {
+                out.push(pfid);
+            }
+        }
+    }
+
+    fn wake_cycle_shadow_watchers(
+        &self,
+        cell: WorkbookCellKey,
+        exclude_fid: Option<u32>,
+        out: &mut Vec<u32>,
+    ) {
+        if let Some(anchors) = self.cycle_shadow_watch.get(&cell) {
+            for &anchor in anchors {
+                if let Some(&afid) = self.cell_to_fid.get(&anchor)
+                    && Some(afid) != exclude_fid
+                    && self.state_of(afid) == STATE_CLEAN
+                {
+                    out.push(afid);
+                }
+            }
+        }
+    }
+
+    fn push_unblocked_watchers(
+        &self,
+        watchers: &[WorkbookCellKey],
+        self_fid: u32,
+        out: &mut Vec<u32>,
+    ) {
+        for w in watchers {
+            if let Some(&fid) = self.cell_to_fid.get(w)
+                && fid != self_fid
+            {
+                out.push(fid);
+            }
+        }
+    }
+
+    fn record_changed_cells(&mut self, cells: &[WorkbookCellKey]) {
+        if cells.is_empty() || self.changes.structural {
+            return;
+        }
+        if self.changes.cells.len().saturating_add(cells.len()) > 256 {
+            self.changes.structural = true;
+            return;
+        }
+        self.changes.cells.extend_from_slice(cells);
+    }
+
+    fn notify_cell_written_for_spills(&mut self, key: WorkbookCellKey, root_dirty: &mut Vec<u32>) {
+        if self.spills.is_empty() && self.cycle_spills.is_empty() {
+            return;
+        }
+        self.drain_cycle_spill_anchor(key, None, root_dirty);
+        self.wake_cycle_shadow_watchers(key, None, root_dirty);
+        let clear_out = self.spills.clear_anchor(key);
+        if clear_out.had_state {
+            self.record_changed_cells(&clear_out.cleared_shadows);
+            for shadow_key in clear_out.cleared_shadows {
+                self.collect_direct_dependents(shadow_key, root_dirty);
+            }
+            self.collect_spill_anchor_dependents(key, root_dirty);
+            for w in clear_out.unblocked_watchers {
+                if let Some(&wfid) = self.cell_to_fid.get(&w)
+                    && self.state_of(wfid) == STATE_CLEAN
+                {
+                    root_dirty.push(wfid);
+                }
+            }
+        }
+        if let Some(owner) = self.spills.anchor_of_cell(key)
+            && let Some(&ofid) = self.cell_to_fid.get(&owner)
+            && self.state_of(ofid) == STATE_CLEAN
+        {
+            root_dirty.push(ofid);
+        }
+        for w in self.spills.watchers_of_cell(key) {
+            if let Some(&wfid) = self.cell_to_fid.get(&w)
+                && self.state_of(wfid) == STATE_CLEAN
+            {
+                root_dirty.push(wfid);
+            }
+        }
+    }
+
+    fn refresh_sheet_spills_on_structural_change(
+        &mut self,
+        sheet_id: SheetId,
+        sheet_removed_or_deleted: bool,
+        out: &mut Vec<u32>,
+    ) {
+        if self.spills.is_empty() && self.cycle_spills.is_empty() {
+            return;
+        }
+        let anchors = self.spills.anchors_on_sheet(sheet_id);
+        for anchor in anchors {
+            let is_live = !sheet_removed_or_deleted
+                && self.workbook.live_sheet(sheet_id).is_some_and(|s| {
+                    s.row_axis().id_to_pos(anchor.1.0).is_some()
+                        && s.col_axis().id_to_pos(anchor.2.0).is_some()
+                });
+            let clear_out = self.spills.clear_anchor(anchor);
+            if clear_out.had_state {
+                self.record_changed_cells(&clear_out.cleared_shadows);
+                for shadow_key in clear_out.cleared_shadows {
+                    self.collect_direct_dependents(shadow_key, out);
+                }
+                self.collect_spill_anchor_dependents(anchor, out);
+                for w in clear_out.unblocked_watchers {
+                    if let Some(&wfid) = self.cell_to_fid.get(&w)
+                        && self.state_of(wfid) == STATE_CLEAN
+                    {
+                        out.push(wfid);
+                    }
+                }
+            }
+            if is_live
+                && let Some(&fid) = self.cell_to_fid.get(&anchor)
+                && self.state_of(fid) == STATE_CLEAN
+            {
+                out.push(fid);
+            }
+        }
+        if !self.cycle_spills.is_empty() {
+            let lo = (sheet_id, RowId(0), ColId(0));
+            let hi = (sheet_id, RowId(u64::MAX), ColId(u64::MAX));
+            let peer_anchors: Vec<WorkbookCellKey> =
+                self.cycle_spills.range(lo..=hi).map(|(k, _)| *k).collect();
+            for anchor in peer_anchors {
+                let is_live = !sheet_removed_or_deleted
+                    && self.workbook.live_sheet(sheet_id).is_some_and(|s| {
+                        s.row_axis().id_to_pos(anchor.1.0).is_some()
+                            && s.col_axis().id_to_pos(anchor.2.0).is_some()
+                    });
+                self.drain_cycle_spill_anchor(anchor, None, out);
+                if is_live
+                    && let Some(&fid) = self.cell_to_fid.get(&anchor)
+                    && self.state_of(fid) == STATE_CLEAN
+                {
+                    out.push(fid);
+                }
+            }
+        }
+    }
+
     fn on_filled_range_applied(&mut self, sheet: SheetId, rows: &[IdRun], cols: &[IdRun]) {
         let total_r: usize = rows
             .iter()
@@ -1103,6 +1714,7 @@ impl FormulaEngine {
             self.dep_graph.reserve_for_formulas(total_cells);
         }
 
+        let check_spills = !self.spills.is_empty() || !self.cycle_spills.is_empty();
         let mut root_dirty = Vec::with_capacity(total_cells.saturating_add(8));
         for c_run in cols {
             for raw_c in c_run.iter() {
@@ -1116,6 +1728,9 @@ impl FormulaEngine {
                         }
                         if self.cell_to_fid.contains_key(&key) {
                             self.remove_slot_by_key(key);
+                        }
+                        if check_spills {
+                            self.notify_cell_written_for_spills(key, &mut root_dirty);
                         }
                         if let Some(new_f) = self.workbook.formula(sheet, row, col) {
                             let fid = if let Some(reused) = self.free_slots.pop() {
@@ -1147,6 +1762,12 @@ impl FormulaEngine {
                     root_dirty.push(fid);
                 }
             });
+        if !self.name_slots.is_empty() {
+            let mut seed_nids = Vec::new();
+            self.name_dep_graph
+                .on_rect_written(sheet, rows, cols, &self.workbook, |nid| seed_nids.push(nid));
+            self.collect_name_dependents_from_nids(&seed_nids, &mut root_dirty);
+        }
         self.propagate_dirty(root_dirty);
     }
 
@@ -1167,6 +1788,8 @@ impl FormulaEngine {
         if total_cells > 256 {
             self.changes.structural = true;
         }
+        let check_spills = !self.spills.is_empty() || !self.cycle_spills.is_empty();
+        let mut root_dirty = Vec::new();
         for c_run in cols {
             for raw_c in c_run.iter() {
                 let col = ColId(raw_c);
@@ -1177,11 +1800,13 @@ impl FormulaEngine {
                             self.changes.cells.push(key);
                         }
                         self.remove_slot_by_key(key);
+                        if check_spills {
+                            self.notify_cell_written_for_spills(key, &mut root_dirty);
+                        }
                     }
                 }
             }
         }
-        let mut root_dirty = Vec::new();
         for cell in prior_non_empty {
             if let CellInput::Formula { formula, .. } = &cell.input {
                 let key = (sheet, cell.row, cell.col);
@@ -1195,6 +1820,12 @@ impl FormulaEngine {
                     root_dirty.push(fid);
                 }
             });
+        if !self.name_slots.is_empty() {
+            let mut seed_nids = Vec::new();
+            self.name_dep_graph
+                .on_rect_written(sheet, rows, cols, &self.workbook, |nid| seed_nids.push(nid));
+            self.collect_name_dependents_from_nids(&seed_nids, &mut root_dirty);
+        }
         self.propagate_dirty(root_dirty);
     }
 
@@ -1203,6 +1834,7 @@ impl FormulaEngine {
         let mut root_dirty = Vec::new();
         self.dep_graph
             .on_rows_toggled(sheet, ids, &self.workbook, |fid| root_dirty.push(fid));
+        self.collect_name_dep_structural_rows_toggled(sheet, ids, &mut root_dirty);
         for run in ids {
             for raw_r in run.iter() {
                 let start = (sheet, RowId(raw_r), ColId(0));
@@ -1214,6 +1846,7 @@ impl FormulaEngine {
                 }
             }
         }
+        self.refresh_sheet_spills_on_structural_change(sheet, false, &mut root_dirty);
         self.propagate_dirty(root_dirty);
     }
 
@@ -1222,6 +1855,7 @@ impl FormulaEngine {
         let mut root_dirty = Vec::new();
         self.dep_graph
             .on_cols_toggled(sheet, ids, &self.workbook, |fid| root_dirty.push(fid));
+        self.collect_name_dep_structural_cols_toggled(sheet, ids, &mut root_dirty);
         let start = (sheet, RowId(0), ColId(0));
         let end = (sheet, RowId(u64::MAX), ColId(u64::MAX));
         for (&k @ (_, _, col), _) in self.workbook.formulas().range(start..=end) {
@@ -1231,10 +1865,16 @@ impl FormulaEngine {
                 root_dirty.push(fid);
             }
         }
+        self.refresh_sheet_spills_on_structural_change(sheet, false, &mut root_dirty);
         self.propagate_dirty(root_dirty);
     }
 
-    fn on_axis_reordered(&mut self, sheet: SheetId, rewritten: &[(WorkbookCellKey, BoundFormula)]) {
+    fn on_axis_reordered(
+        &mut self,
+        sheet: SheetId,
+        rewritten: &[(WorkbookCellKey, BoundFormula)],
+        rewritten_names: &[(NamedRangeKey, BoundFormula)],
+    ) {
         self.changes.structural = true;
         let mut root_dirty = Vec::new();
         for &(key, _) in rewritten {
@@ -1244,13 +1884,27 @@ impl FormulaEngine {
                 root_dirty.push(fid);
             }
         }
+        let mut changed_names = Vec::new();
+        for (nkey, _) in rewritten_names {
+            self.sync_named_range_slot(nkey);
+            changed_names.push(nkey.canonical_name.clone());
+        }
         self.dep_graph
             .on_sheet_reordered(sheet, |fid| root_dirty.push(fid));
+        if !self.name_slots.is_empty() {
+            let mut seed_nids = Vec::new();
+            self.name_dep_graph
+                .on_sheet_reordered(sheet, |nid| seed_nids.push(nid));
+            self.collect_name_dependents_from_nids(&seed_nids, &mut root_dirty);
+        }
+        self.collect_name_dependents_for_names(&changed_names, &mut root_dirty);
+        self.refresh_sheet_spills_on_structural_change(sheet, false, &mut root_dirty);
         self.propagate_dirty(root_dirty);
     }
 
     fn on_sheet_visibility_changed(&mut self, sheet: SheetId) {
         self.changes.structural = true;
+        let is_deleted = self.workbook.live_sheet(sheet).is_none();
         let mut root_dirty = Vec::new();
         for idx in 0..self.slots.len() {
             if let Some(slot) = self.slots.get(idx).and_then(Option::as_ref)
@@ -1260,7 +1914,255 @@ impl FormulaEngine {
                 root_dirty.push(fid);
             }
         }
+        if !self.name_slots.is_empty() {
+            let mut affected_names = Vec::new();
+            for entry in self.name_slots.iter().flatten() {
+                if entry.0.scope == Some(sheet) || entry.1.references_sheet(sheet) {
+                    affected_names.push(entry.0.canonical_name.clone());
+                }
+            }
+            self.collect_name_dependents_for_names(&affected_names, &mut root_dirty);
+        }
+        self.refresh_sheet_spills_on_structural_change(sheet, is_deleted, &mut root_dirty);
         self.propagate_dirty(root_dirty);
+    }
+
+    fn on_permuted_cells_changed(
+        &mut self,
+        sheet: SheetId,
+        prior: &[PermutedCellBackup<BoundFormula>],
+    ) {
+        if prior.len() > 256 {
+            self.changes.structural = true;
+        }
+        let mut root_dirty = Vec::new();
+        for backup in prior {
+            let key = (sheet, backup.row, backup.col);
+            if prior.len() <= 256 {
+                self.changes.cells.push(key);
+            }
+            self.remove_slot_by_key(key);
+            self.notify_cell_written_for_spills(key, &mut root_dirty);
+            if let Some(new_f) = self
+                .workbook
+                .formula(sheet, backup.row, backup.col)
+                .cloned()
+            {
+                let fid = self.insert_slot(key, &new_f, false);
+                root_dirty.push(fid);
+            }
+            self.collect_direct_dependents(key, &mut root_dirty);
+        }
+        self.propagate_dirty(root_dirty);
+    }
+
+    fn on_moved_cells_changed(
+        &mut self,
+        prior_cells: &[(SheetId, PermutedCellBackup<BoundFormula>)],
+        rewritten_formulas: &[(WorkbookCellKey, BoundFormula)],
+        rewritten_names: &[(NamedRangeKey, BoundFormula)],
+    ) {
+        let mut touched = BTreeSet::new();
+        for (sheet, backup) in prior_cells {
+            touched.insert((*sheet, backup.row, backup.col));
+        }
+        for &(key, _) in rewritten_formulas {
+            touched.insert(key);
+        }
+        if touched.len() > 256 {
+            self.changes.structural = true;
+        }
+        let mut root_dirty = Vec::new();
+        for key in touched {
+            if !self.changes.structural {
+                self.changes.cells.push(key);
+            }
+            self.remove_slot_by_key(key);
+            self.notify_cell_written_for_spills(key, &mut root_dirty);
+            if let Some(new_f) = self.workbook.formula(key.0, key.1, key.2).cloned() {
+                let fid = self.insert_slot(key, &new_f, false);
+                root_dirty.push(fid);
+            }
+            self.collect_direct_dependents(key, &mut root_dirty);
+        }
+        let mut changed_names = Vec::new();
+        for (nkey, _) in rewritten_names {
+            self.sync_named_range_slot(nkey);
+            changed_names.push(nkey.canonical_name.clone());
+        }
+        self.collect_name_dependents_for_names(&changed_names, &mut root_dirty);
+        self.propagate_dirty(root_dirty);
+    }
+
+    fn on_named_range_changed(&mut self, key: &NamedRangeKey) {
+        self.sync_named_range_slot(key);
+        let mut root_dirty = Vec::new();
+        self.collect_name_dependents_for_names(
+            core::slice::from_ref(&key.canonical_name),
+            &mut root_dirty,
+        );
+        self.propagate_dirty(root_dirty);
+    }
+
+    fn sync_named_range_slot(&mut self, key: &NamedRangeKey) {
+        if let Some(old_nid) = self.name_to_nid.remove(key) {
+            self.volatile_names.remove(&old_nid);
+            if let Some(slot_opt) = self.name_slots.get_mut(old_nid as usize)
+                && let Some((_, old_reg)) = slot_opt.take()
+            {
+                self.name_dep_graph.unregister(old_nid, &old_reg);
+                self.free_name_slots.push(old_nid);
+            }
+        }
+        let Some(def) = self.workbook.named_ranges().get(key) else {
+            return;
+        };
+        let nid = if let Some(reused) = self.free_name_slots.pop() {
+            reused
+        } else {
+            let fresh = u32::try_from(self.name_slots.len()).unwrap_or(0);
+            self.name_slots.push(None);
+            fresh
+        };
+        let host_sheet = key
+            .scope
+            .unwrap_or_else(|| workbook_fallback_sheet(&self.workbook));
+        let (reg, is_vol) = self
+            .name_dep_graph
+            .register_with_flags(nid, host_sheet, &def.formula);
+        if is_vol {
+            self.volatile_names.insert(nid);
+        }
+        if let Some(slot_ref) = self.name_slots.get_mut(nid as usize) {
+            *slot_ref = Some((key.clone(), reg));
+        }
+        self.name_to_nid.insert(key.clone(), nid);
+    }
+
+    fn collect_volatile_name_dependents(&self, out: &mut Vec<u32>) {
+        if self.volatile_names.is_empty() {
+            return;
+        }
+        let seed_nids: Vec<u32> = self.volatile_names.iter().copied().collect();
+        self.collect_name_dependents_from_nids(&seed_nids, out);
+    }
+
+    fn collect_name_dep_structural_rows_inserted(
+        &self,
+        sheet: SheetId,
+        ids: IdRun,
+        out: &mut Vec<u32>,
+    ) {
+        if self.name_slots.is_empty() {
+            return;
+        }
+        let mut seed_nids = Vec::new();
+        self.name_dep_graph
+            .on_rows_inserted(sheet, ids, &self.workbook, |nid| seed_nids.push(nid));
+        self.collect_name_dependents_from_nids(&seed_nids, out);
+    }
+
+    fn collect_name_dep_structural_cols_inserted(
+        &self,
+        sheet: SheetId,
+        ids: IdRun,
+        out: &mut Vec<u32>,
+    ) {
+        if self.name_slots.is_empty() {
+            return;
+        }
+        let mut seed_nids = Vec::new();
+        self.name_dep_graph
+            .on_cols_inserted(sheet, ids, &self.workbook, |nid| seed_nids.push(nid));
+        self.collect_name_dependents_from_nids(&seed_nids, out);
+    }
+
+    fn collect_name_dep_structural_rows_toggled(
+        &self,
+        sheet: SheetId,
+        ids: &[IdRun],
+        out: &mut Vec<u32>,
+    ) {
+        if self.name_slots.is_empty() {
+            return;
+        }
+        let mut seed_nids = Vec::new();
+        self.name_dep_graph
+            .on_rows_toggled(sheet, ids, &self.workbook, |nid| seed_nids.push(nid));
+        self.collect_name_dependents_from_nids(&seed_nids, out);
+    }
+
+    fn collect_name_dep_structural_cols_toggled(
+        &self,
+        sheet: SheetId,
+        ids: &[IdRun],
+        out: &mut Vec<u32>,
+    ) {
+        if self.name_slots.is_empty() {
+            return;
+        }
+        let mut seed_nids = Vec::new();
+        self.name_dep_graph
+            .on_cols_toggled(sheet, ids, &self.workbook, |nid| seed_nids.push(nid));
+        self.collect_name_dependents_from_nids(&seed_nids, out);
+    }
+
+    fn collect_name_dependents_from_nids(&self, seed_nids: &[u32], out: &mut Vec<u32>) {
+        if seed_nids.is_empty() {
+            return;
+        }
+        let mut names = Vec::with_capacity(seed_nids.len());
+        for &nid in seed_nids {
+            if let Some((nkey, _)) = self.name_slots.get(nid as usize).and_then(Option::as_ref) {
+                names.push(nkey.canonical_name.clone());
+            }
+        }
+        self.collect_name_dependents_for_names(&names, out);
+    }
+
+    fn collect_name_dependents_for_names(&self, seed_names: &[String], out: &mut Vec<u32>) {
+        if seed_names.is_empty() {
+            return;
+        }
+        let mut seen_names: BTreeSet<String> = BTreeSet::new();
+        let mut queue: Vec<String> = Vec::with_capacity(seed_names.len());
+        for s in seed_names {
+            let canon = s.to_ascii_lowercase();
+            if seen_names.insert(canon.clone()) {
+                queue.push(canon);
+            }
+        }
+        let mut head = 0usize;
+        while let Some(canon) = queue.get(head).cloned() {
+            head = head.saturating_add(1);
+            self.dep_graph.for_each_name_dependent(&canon, |fid| {
+                if self.state_of(fid) == STATE_CLEAN {
+                    out.push(fid);
+                }
+            });
+            self.name_dep_graph.for_each_name_dependent(&canon, |nid| {
+                if let Some((dep_key, _)) =
+                    self.name_slots.get(nid as usize).and_then(Option::as_ref)
+                    && seen_names.insert(dep_key.canonical_name.clone())
+                {
+                    queue.push(dep_key.canonical_name.clone());
+                }
+            });
+        }
+    }
+
+    fn collect_spill_anchor_dependents(&self, anchor: WorkbookCellKey, out: &mut Vec<u32>) {
+        self.dep_graph.for_each_spill_dependent(anchor, |fid| {
+            if self.state_of(fid) == STATE_CLEAN {
+                out.push(fid);
+            }
+        });
+        if !self.name_slots.is_empty() {
+            let mut seed_nids = Vec::new();
+            self.name_dep_graph
+                .for_each_spill_dependent(anchor, |nid| seed_nids.push(nid));
+            self.collect_name_dependents_from_nids(&seed_nids, out);
+        }
     }
 
     fn slot_of(&self, fid: u32) -> Option<&FormulaSlot> {
@@ -1353,20 +2255,59 @@ impl FormulaEngine {
                     out.push(fid);
                 }
             });
+        self.collect_spill_anchor_dependents(key, out);
+        if !self.name_slots.is_empty() {
+            let mut seed_nids = Vec::new();
+            self.name_dep_graph
+                .for_each_cell_dependent(key, &self.workbook, |nid| seed_nids.push(nid));
+            self.collect_name_dependents_from_nids(&seed_nids, out);
+        }
     }
 
     fn propagate_dirty(&mut self, roots: Vec<u32>) {
+        self.propagate_dirty_impl(roots, &[], false);
+    }
+
+    /// Marks `roots` and their transitive dependents dirty within an active recalc
+    /// wave, capping per-formula re-queues at [`MAX_WAVE_SPILL_REQUEUES`] and
+    /// skipping any `fid` in `exclude` to prevent shadow-mediated infinite loops.
+    fn propagate_dirty_in_wave(&mut self, roots: Vec<u32>, exclude: &[u32]) {
+        self.propagate_dirty_impl(roots, exclude, true);
+    }
+
+    fn try_mark_dirty_for_bfs(
+        &mut self,
+        fid: u32,
+        exclude: &[u32],
+        cap_wave_requeues: bool,
+        bfs: &mut Vec<u32>,
+    ) {
+        if exclude.contains(&fid)
+            || self.state_of(fid) != STATE_CLEAN
+            || self.slot_of(fid).is_none()
+        {
+            return;
+        }
+        if cap_wave_requeues {
+            let count = self.wave_spill_requeues.entry(fid).or_insert(0);
+            if *count >= MAX_WAVE_SPILL_REQUEUES {
+                return;
+            }
+            *count = count.saturating_add(1);
+        }
+        self.set_state(fid, STATE_DIRTY);
+        self.dirty_queue.push(fid);
+        bfs.push(fid);
+    }
+
+    fn propagate_dirty_impl(&mut self, roots: Vec<u32>, exclude: &[u32], cap_wave_requeues: bool) {
         if roots.is_empty() {
             return;
         }
         self.dirty_queue.reserve(roots.len());
         let mut bfs: Vec<u32> = Vec::with_capacity(roots.len());
         for fid in roots {
-            if self.state_of(fid) == STATE_CLEAN && self.slot_of(fid).is_some() {
-                self.set_state(fid, STATE_DIRTY);
-                self.dirty_queue.push(fid);
-                bfs.push(fid);
-            }
+            self.try_mark_dirty_for_bfs(fid, exclude, cap_wave_requeues, &mut bfs);
         }
         let mut head = 0usize;
         while let Some(&fid) = bfs.get(head) {
@@ -1387,12 +2328,28 @@ impl FormulaEngine {
                         newly_found.push(dep_fid);
                     }
                 });
+            self.dep_graph
+                .for_each_spill_dependent(cell_key, |dep_fid| {
+                    let st = states_ref
+                        .get(dep_fid as usize)
+                        .copied()
+                        .unwrap_or(STATE_CLEAN);
+                    if st == STATE_CLEAN {
+                        newly_found.push(dep_fid);
+                    }
+                });
+            if !self.name_slots.is_empty() {
+                let mut seed_nids = Vec::new();
+                self.name_dep_graph
+                    .for_each_cell_dependent(cell_key, wb_ref, |nid| seed_nids.push(nid));
+                self.name_dep_graph
+                    .for_each_spill_dependent(cell_key, |nid| seed_nids.push(nid));
+                let mut name_fids = Vec::new();
+                self.collect_name_dependents_from_nids(&seed_nids, &mut name_fids);
+                newly_found.extend(name_fids);
+            }
             for dep_fid in newly_found {
-                if self.state_of(dep_fid) == STATE_CLEAN && self.slot_of(dep_fid).is_some() {
-                    self.set_state(dep_fid, STATE_DIRTY);
-                    self.dirty_queue.push(dep_fid);
-                    bfs.push(dep_fid);
-                }
+                self.try_mark_dirty_for_bfs(dep_fid, exclude, cap_wave_requeues, &mut bfs);
             }
         }
         if !bfs.is_empty() {
@@ -1441,15 +2398,48 @@ impl FormulaEngine {
             .iter()
             .rposition(|&f| f == target_fid)
             .unwrap_or(0);
+        let mut cleared_anchors = Vec::new();
+        let mut unwound_fids: SmallVec<[u32; 8]> = SmallVec::new();
+        let mut unwound_keys: SmallVec<[WorkbookCellKey; 8]> = SmallVec::new();
         while self.call_stack.len() > start_idx {
             let Some(fid) = self.call_stack.pop() else {
                 break;
             };
-            if let Some(key) = self.slot_of(fid).map(|s| s.key) {
-                self.store_eval_scalar(key, EvalScalar::Error(CalcError::Cycle));
+            match self.state_of(fid) {
+                STATE_EVALUATING => {
+                    if let Some(key) = self.slot_of(fid).map(|s| s.key) {
+                        let clear_out = self.spills.clear_anchor(key);
+                        if clear_out.had_state {
+                            self.record_changed_cells(&clear_out.cleared_shadows);
+                            cleared_anchors.push((fid, key, clear_out));
+                        }
+                        self.store_eval_scalar(key, EvalScalar::Error(CalcError::Cycle));
+                        unwound_keys.push(key);
+                    }
+                    self.set_state(fid, STATE_CLEAN);
+                    self.wave_done = self.wave_done.saturating_add(1);
+                    unwound_fids.push(fid);
+                }
+                STATE_DIRTY => {
+                    // Sibling dependency queued from `Blocked(deps)` that has not
+                    // begun evaluating yet; keep it dirty and re-queue for evaluation.
+                    self.dirty_queue.push(fid);
+                    self.dirty_needs_sort = true;
+                }
+                _ => {}
             }
-            self.set_state(fid, STATE_CLEAN);
-            self.wave_done = self.wave_done.saturating_add(1);
+        }
+        if !cleared_anchors.is_empty() {
+            let mut post_dirty = Vec::new();
+            for (fid, key, clear_out) in cleared_anchors {
+                self.record_cycle_spill(key, &unwound_keys, &clear_out.cleared_shadows);
+                for shadow_key in clear_out.cleared_shadows {
+                    self.collect_direct_dependents(shadow_key, &mut post_dirty);
+                }
+                self.collect_spill_anchor_dependents(key, &mut post_dirty);
+                self.push_unblocked_watchers(&clear_out.unblocked_watchers, fid, &mut post_dirty);
+            }
+            self.propagate_dirty_in_wave(post_dirty, &unwound_fids);
         }
     }
 
@@ -1518,8 +2508,85 @@ impl FormulaEngine {
                 &self.workbook,
                 caller.sheet,
             ))),
-            BoundExpr::Name(_) => {
+            BoundExpr::Name(raw_name) => {
+                self.eval_named_range(caller.sheet, raw_name, caller, next_depth)
+            }
+            BoundExpr::ScopedName {
+                sheet,
+                missing_sheet,
+                name,
+            } => {
+                if missing_sheet.is_some() {
+                    return ExprOutcome::Ready(EvalValue::Scalar(EvalScalar::Error(
+                        CalcError::Ref,
+                    )));
+                }
+                let Some(sid) = *sheet else {
+                    return ExprOutcome::Ready(EvalValue::Scalar(EvalScalar::Error(
+                        CalcError::Ref,
+                    )));
+                };
+                if self.workbook.live_sheet(sid).is_none() {
+                    return ExprOutcome::Ready(EvalValue::Scalar(EvalScalar::Error(
+                        CalcError::Ref,
+                    )));
+                }
+                self.eval_named_range(sid, name, caller, next_depth)
+            }
+            BoundExpr::SpillRef(inner) => {
+                let inner_val = match self.eval_expr(inner, caller, false, next_depth) {
+                    ExprOutcome::Ready(v) => v,
+                    other => return other,
+                };
+                let EvalValue::Reference(ResolvedRef::Cell { sheet, row, col }) = inner_val else {
+                    return ExprOutcome::Ready(EvalValue::Scalar(EvalScalar::Error(
+                        CalcError::Ref,
+                    )));
+                };
+                if let Err(wait) = self.ensure_value_ready(&inner_val) {
+                    return wait;
+                }
+                let Some(entry) = self.spills.active_spill((sheet, row, col)) else {
+                    return ExprOutcome::Ready(EvalValue::Scalar(EvalScalar::Error(
+                        CalcError::Ref,
+                    )));
+                };
+                if entry.rows.len() == 1 && entry.cols.len() == 1 {
+                    return ExprOutcome::Ready(EvalValue::Reference(ResolvedRef::Cell {
+                        sheet,
+                        row,
+                        col,
+                    }));
+                }
+                let (Some(&first_row), Some(&last_row), Some(&first_col), Some(&last_col)) = (
+                    entry.rows.first(),
+                    entry.rows.last(),
+                    entry.cols.first(),
+                    entry.cols.last(),
+                ) else {
+                    return ExprOutcome::Ready(EvalValue::Scalar(EvalScalar::Error(
+                        CalcError::Ref,
+                    )));
+                };
+                ExprOutcome::Ready(EvalValue::Reference(ResolvedRef::Area {
+                    sheet,
+                    first_row,
+                    last_row,
+                    first_col,
+                    last_col,
+                }))
+            }
+            BoundExpr::Opaque { .. } => {
                 ExprOutcome::Ready(EvalValue::Scalar(EvalScalar::Error(CalcError::Name)))
+            }
+            BoundExpr::PreservedCached { cached, .. } => {
+                let scalar = match cached {
+                    ScalarValue::Number(n) => EvalScalar::Number(*n),
+                    ScalarValue::Text(s) => EvalScalar::Text(s.clone()),
+                    ScalarValue::Bool(b) => EvalScalar::Bool(*b),
+                    ScalarValue::Error(e) => EvalScalar::Error(*e),
+                };
+                ExprOutcome::Ready(EvalValue::Scalar(scalar))
             }
             // Explicit parentheses suppress outermost `Add`/`Sub` tail-zeroing!
             BoundExpr::Paren(inner) => self.eval_expr(inner, caller, false, next_depth),
@@ -1531,7 +2598,13 @@ impl FormulaEngine {
                 if let Err(wait) = self.ensure_value_ready(&inner_val) {
                     return wait;
                 }
-                ExprOutcome::Ready(eval_unary(*op, inner_val, &self.workbook, caller))
+                ExprOutcome::Ready(eval_unary(
+                    *op,
+                    inner_val,
+                    &self.workbook,
+                    &self.spills,
+                    caller,
+                ))
             }
             BoundExpr::Binary { op, left, right } => {
                 let lhs = match self.eval_expr(left, caller, false, next_depth) {
@@ -1549,10 +2622,46 @@ impl FormulaEngine {
                     return wait;
                 }
                 let snap = is_outermost && matches!(op, BinaryOp::Add | BinaryOp::Sub);
-                ExprOutcome::Ready(eval_binary(*op, lhs, rhs, snap, &self.workbook, caller))
+                ExprOutcome::Ready(eval_binary(
+                    *op,
+                    lhs,
+                    rhs,
+                    snap,
+                    &self.workbook,
+                    &self.spills,
+                    caller,
+                ))
             }
             BoundExpr::Call { name, args } => self.eval_call(name, args, caller, next_depth),
         }
+    }
+
+    fn eval_named_range(
+        &mut self,
+        scope_sheet: SheetId,
+        raw_name: &str,
+        caller: CallerContext,
+        depth: usize,
+    ) -> ExprOutcome {
+        let Some((key, def)) = self.workbook.resolve_named_range(scope_sheet, raw_name) else {
+            return ExprOutcome::Ready(EvalValue::Scalar(EvalScalar::Error(CalcError::Name)));
+        };
+        let key_owned = key.clone();
+        let root_owned = def.formula.root.clone();
+        let eval_sheet = key_owned.scope.unwrap_or(scope_sheet);
+        if self.name_eval_stack.contains(&key_owned) {
+            return ExprOutcome::Ready(EvalValue::Scalar(EvalScalar::Error(CalcError::Cycle)));
+        }
+        self.name_eval_stack.push(key_owned);
+        let sub_caller = CallerContext {
+            sheet: eval_sheet,
+            row: caller.row,
+            col: caller.col,
+            mode: caller.mode,
+        };
+        let out = self.eval_expr(&root_owned, sub_caller, false, depth);
+        let _ = self.name_eval_stack.pop();
+        out
     }
 
     fn eval_call(
@@ -1577,7 +2686,8 @@ impl FormulaEngine {
             if let Err(wait) = self.ensure_value_ready(&cond_raw) {
                 return wait;
             }
-            let cond_sa = match coerce_for_scalar_op(cond_raw, &self.workbook, caller) {
+            let cond_sa = match coerce_for_scalar_op(cond_raw, &self.workbook, &self.spills, caller)
+            {
                 Ok(sa) => sa,
                 Err(e) => return ExprOutcome::Ready(EvalValue::Scalar(EvalScalar::Error(e))),
             };
@@ -1639,6 +2749,7 @@ impl FormulaEngine {
                 when_false,
                 args.len() == 3,
                 &self.workbook,
+                &self.spills,
                 caller,
             ));
         }
@@ -1658,7 +2769,7 @@ impl FormulaEngine {
             if let Err(wait) = self.ensure_value_ready(&p_raw) {
                 return wait;
             }
-            let p_sa = match coerce_for_scalar_op(p_raw, &self.workbook, caller) {
+            let p_sa = match coerce_for_scalar_op(p_raw, &self.workbook, &self.spills, caller) {
                 Ok(sa) => sa,
                 Err(e) => crate::value_eval::ScalarOrArray::Scalar(EvalScalar::Error(e)),
             };
@@ -1688,6 +2799,7 @@ impl FormulaEngine {
                 fb_val,
                 only_na,
                 &self.workbook,
+                &self.spills,
                 caller,
             ));
         }
@@ -1706,7 +2818,7 @@ impl FormulaEngine {
             if let Err(wait) = self.ensure_value_ready(&idx_raw) {
                 return wait;
             }
-            let idx_sa = match coerce_for_scalar_op(idx_raw, &self.workbook, caller) {
+            let idx_sa = match coerce_for_scalar_op(idx_raw, &self.workbook, &self.spills, caller) {
                 Ok(sa) => sa,
                 Err(e) => return ExprOutcome::Ready(EvalValue::Scalar(EvalScalar::Error(e))),
             };
@@ -1764,6 +2876,7 @@ impl FormulaEngine {
                 idx_sa,
                 evaluated_choices,
                 &self.workbook,
+                &self.spills,
                 caller,
             ));
         }
@@ -1800,6 +2913,7 @@ impl FormulaEngine {
             name,
             evaluated_args,
             &self.workbook,
+            &self.spills,
             caller,
             &mut self.env,
         ))
@@ -1812,7 +2926,13 @@ impl FormulaEngine {
         match r {
             ResolvedRef::Invalid(_) => Ok(()),
             ResolvedRef::Cell { sheet, row, col } => {
-                if let Some(&fid) = self.cell_to_fid.get(&(*sheet, *row, *col)) {
+                let target_key = (*sheet, *row, *col);
+                let fid_opt = self.cell_to_fid.get(&target_key).copied().or_else(|| {
+                    self.spills
+                        .anchor_of_cell(target_key)
+                        .and_then(|anchor| self.cell_to_fid.get(&anchor).copied())
+                });
+                if let Some(fid) = fid_opt {
                     match self.state_of(fid) {
                         STATE_EVALUATING => return Err(ExprOutcome::Cycle(fid)),
                         STATE_DIRTY => {
@@ -1883,11 +3003,14 @@ impl FormulaEngine {
         let Some(sheet) = self.workbook.sheet(sheet_id) else {
             return Ok(());
         };
-        if live_span_positions(sheet.row_axis(), first_row, last_row).is_none() {
+        let Some((r1_ord, r2_ord)) = live_span_positions(sheet.row_axis(), first_row, last_row)
+        else {
             return Ok(());
-        }
+        };
 
+        let has_sheet_spills = self.spills.has_spills_on_sheet(sheet_id);
         let mut active_cols: SmallVec<[ColId; 4]> = SmallVec::new();
+        let mut shadow_cols: SmallVec<[ColId; 4]> = SmallVec::new();
         sheet
             .col_axis()
             .for_each_live_in_range(first_col, last_col, |run| {
@@ -1902,38 +3025,70 @@ impl FormulaEngine {
                     {
                         active_cols.push(col);
                     }
+                    if has_sheet_spills && self.spills.has_shadows_in_col(sheet_id, col) {
+                        shadow_cols.push(col);
+                    }
                 }
             });
-        if active_cols.is_empty() {
+        if active_cols.is_empty() && shadow_cols.is_empty() {
             return Ok(());
         }
 
         let mut blocked: SmallVec<[u32; 4]> = SmallVec::new();
         let mut cycle_target: Option<u32> = None;
-        sheet
-            .row_axis()
-            .for_each_live_in_range(first_row, last_row, |run| {
+        if !active_cols.is_empty() {
+            sheet
+                .row_axis()
+                .for_each_live_in_range(first_row, last_row, |run| {
+                    if cycle_target.is_some() {
+                        return;
+                    }
+                    for raw_r in run.iter() {
+                        let row = RowId(raw_r);
+                        for &col in &active_cols {
+                            if let Some(&fid) = self.cell_to_fid.get(&(sheet_id, row, col)) {
+                                match self.state_of(fid) {
+                                    STATE_EVALUATING => {
+                                        cycle_target = Some(fid);
+                                        return;
+                                    }
+                                    STATE_DIRTY => {
+                                        blocked.push(fid);
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                });
+        }
+
+        if cycle_target.is_none() && !shadow_cols.is_empty() {
+            for col in shadow_cols {
                 if cycle_target.is_some() {
-                    return;
+                    break;
                 }
-                for raw_r in run.iter() {
-                    let row = RowId(raw_r);
-                    for &col in &active_cols {
-                        if let Some(&fid) = self.cell_to_fid.get(&(sheet_id, row, col)) {
+                self.spills
+                    .for_each_shadow_in_col_span(sheet, col, r1_ord, r2_ord, |row_id, _| {
+                        if cycle_target.is_some() {
+                            return;
+                        }
+                        if let Some(anchor) = self.spills.anchor_of_cell((sheet_id, row_id, col))
+                            && let Some(&fid) = self.cell_to_fid.get(&anchor)
+                        {
                             match self.state_of(fid) {
                                 STATE_EVALUATING => {
                                     cycle_target = Some(fid);
-                                    return;
                                 }
-                                STATE_DIRTY => {
+                                STATE_DIRTY if !blocked.contains(&fid) => {
                                     blocked.push(fid);
                                 }
                                 _ => {}
                             }
                         }
-                    }
-                }
-            });
+                    });
+            }
+        }
 
         if let Some(cyc) = cycle_target {
             return Err(ExprOutcome::Cycle(cyc));
@@ -1943,6 +3098,14 @@ impl FormulaEngine {
         }
         Ok(())
     }
+}
+
+fn workbook_fallback_sheet(workbook: &Workbook<BoundFormula>) -> SheetId {
+    workbook
+        .live_sheets()
+        .next()
+        .or_else(|| workbook.sheets().first())
+        .map_or(SheetId(0), Sheet::id)
 }
 
 fn merge_blocked(dst: &mut SmallVec<[u32; 4]>, src: SmallVec<[u32; 4]>) {
@@ -2244,6 +3407,1240 @@ mod tests {
         assert_eq!(
             sliced.workbook().logical_digest(),
             fresh.workbook().logical_digest()
+        );
+    }
+
+    #[test]
+    fn e14_e24_move_cells_excel_parity_and_undo() {
+        use alloc::string::String;
+        use reticula_core::ops::FormulaMode;
+
+        let mut eng = FormulaEngine::new();
+        let s0 = SheetId(0);
+        let s1 = eng.alloc_sheet_id();
+        eng.apply_op(Op::AddSheet {
+            sheet: s1,
+            name: String::from("Sheet2"),
+            after: Some(s0),
+        })
+        .unwrap();
+
+        // Populate source A1:A3 and external reference targets.
+        eng.edit_cell_raw(s0, RowId(0), ColId(2), "5").unwrap(); // C1
+        eng.edit_cell_raw(s0, RowId(0), ColId(0), "=C1+10").unwrap(); // A1 (15)
+        eng.edit_cell_raw(s0, RowId(1), ColId(0), "=A1*2").unwrap(); // A2 (30, internal ref)
+        eng.edit_cell_raw(s0, RowId(2), ColId(0), "7").unwrap(); // A3
+        eng.edit_cell_raw(s0, RowId(1), ColId(1), "4").unwrap(); // B2
+        eng.edit_cell_raw(s0, RowId(1), ColId(3), "99").unwrap(); // D2 (overwritten target)
+
+        // External formulas watching src, partial range, full src range, and overwritten dst.
+        eng.edit_cell_raw(s0, RowId(0), ColId(4), "=A1+1").unwrap(); // E1 -> becomes =D1+1
+        eng.edit_cell_raw(s0, RowId(1), ColId(4), "=SUM(A1:B2)")
+            .unwrap(); // E2 -> stays =SUM(A1:B2) (partial overlap)
+        eng.edit_cell_raw(s0, RowId(2), ColId(4), "=SUM(A1:A3)")
+            .unwrap(); // E3 -> becomes =SUM(D1:D3) (endpoints in src)
+        eng.edit_cell_raw(s0, RowId(0), ColId(5), "=D2+100")
+            .unwrap(); // F1 -> becomes =#REF!+100
+        eng.recalc_all();
+
+        let digest_before = eng.workbook().state_digest();
+
+        // Move A1:A3 -> D1:D3 within Sheet1.
+        let inv1 = eng
+            .apply_op(Op::MoveCells {
+                src_sheet: s0,
+                src_rows: vec![RowId(0), RowId(1), RowId(2)],
+                src_cols: vec![ColId(0)],
+                dst_sheet: s0,
+                dst_rows: vec![RowId(0), RowId(1), RowId(2)],
+                dst_cols: vec![ColId(3)],
+            })
+            .unwrap();
+        eng.recalc_all();
+
+        // Source vacated; moved formulas preserve external C1 and remap internal A1 -> D1.
+        assert_eq!(
+            eng.workbook()
+                .sheet(s0)
+                .unwrap()
+                .value_by_id(RowId(0), ColId(0)),
+            Value::Empty
+        );
+        assert_eq!(
+            eng.inspect_cell(s0, RowId(0), ColId(3)).unwrap().raw,
+            "=C1+10"
+        );
+        assert_eq!(
+            eng.workbook()
+                .sheet(s0)
+                .unwrap()
+                .value_by_id(RowId(0), ColId(3)),
+            Value::Number(15.0)
+        );
+        assert_eq!(
+            eng.inspect_cell(s0, RowId(1), ColId(3)).unwrap().raw,
+            "=D1*2"
+        );
+        assert_eq!(
+            eng.workbook()
+                .sheet(s0)
+                .unwrap()
+                .value_by_id(RowId(1), ColId(3)),
+            Value::Number(30.0)
+        );
+        assert_eq!(
+            eng.inspect_cell(s0, RowId(0), ColId(4)).unwrap().raw,
+            "=D1+1"
+        );
+        assert_eq!(
+            eng.workbook()
+                .sheet(s0)
+                .unwrap()
+                .value_by_id(RowId(0), ColId(4)),
+            Value::Number(16.0)
+        );
+        assert_eq!(
+            eng.inspect_cell(s0, RowId(1), ColId(4)).unwrap().raw,
+            "=SUM(A1:B2)"
+        );
+        assert_eq!(
+            eng.workbook()
+                .sheet(s0)
+                .unwrap()
+                .value_by_id(RowId(1), ColId(4)),
+            Value::Number(4.0)
+        );
+        assert_eq!(
+            eng.inspect_cell(s0, RowId(2), ColId(4)).unwrap().raw,
+            "=SUM(D1:D3)"
+        );
+        assert_eq!(
+            eng.workbook()
+                .sheet(s0)
+                .unwrap()
+                .value_by_id(RowId(2), ColId(4)),
+            Value::Number(52.0) // 15 + 30 + 7
+        );
+        assert_eq!(
+            eng.workbook()
+                .sheet(s0)
+                .unwrap()
+                .value_by_id(RowId(0), ColId(5)),
+            Value::Error(CalcError::Ref)
+        );
+        assert!(
+            eng.inspect_cell(s0, RowId(0), ColId(5))
+                .unwrap()
+                .raw
+                .contains("#REF!")
+        );
+
+        // Named range pointing into src shifts under MoveCells as well!
+        eng.apply_op(Op::DefineNamedRange {
+            scope: None,
+            name: String::from("TargetCell"),
+            formula: crate::binder::BoundFormula::parse_and_bind(
+                "=D3",
+                FormulaMode::Dynamic,
+                eng.workbook(),
+                s0,
+            )
+            .unwrap(),
+            comment: None,
+            hidden: false,
+        })
+        .unwrap();
+        eng.edit_cell_raw(s0, RowId(0), ColId(6), "=TargetCell+1")
+            .unwrap(); // G1 -> 8
+        eng.recalc_all();
+        assert_eq!(
+            eng.workbook()
+                .sheet(s0)
+                .unwrap()
+                .value_by_id(RowId(0), ColId(6)),
+            Value::Number(8.0)
+        );
+
+        // Cross-sheet MoveCells: Sheet1!D1:D3 -> Sheet2!B5:B7.
+        let inv_cross = eng
+            .apply_op(Op::MoveCells {
+                src_sheet: s0,
+                src_rows: vec![RowId(0), RowId(1), RowId(2)],
+                src_cols: vec![ColId(3)],
+                dst_sheet: s1,
+                dst_rows: vec![RowId(4), RowId(5), RowId(6)],
+                dst_cols: vec![ColId(1)],
+            })
+            .unwrap();
+        eng.recalc_all();
+        assert_eq!(
+            eng.inspect_cell(s0, RowId(0), ColId(4)).unwrap().raw,
+            "=Sheet2!B5+1"
+        );
+        assert_eq!(
+            eng.workbook()
+                .sheet(s0)
+                .unwrap()
+                .value_by_id(RowId(0), ColId(4)),
+            Value::Number(16.0)
+        );
+        assert_eq!(
+            eng.workbook()
+                .sheet(s0)
+                .unwrap()
+                .value_by_id(RowId(0), ColId(6)),
+            Value::Number(8.0)
+        );
+        assert_eq!(
+            eng.workbook()
+                .sheet(s1)
+                .unwrap()
+                .value_by_id(RowId(4), ColId(1)),
+            Value::Number(15.0)
+        );
+
+        // Undo cross-sheet move & undo TargetCell/G1 & undo inv1 -> exact baseline StateDigest!
+        eng.apply_inverse(inv_cross).unwrap();
+        eng.recalc_all();
+        eng.edit_cell_raw(s0, RowId(0), ColId(6), "").unwrap();
+        eng.apply_op(Op::DeleteNamedRange {
+            scope: None,
+            name: String::from("TargetCell"),
+        })
+        .unwrap();
+        eng.apply_inverse(inv1).unwrap();
+        eng.recalc_all();
+        assert_eq!(eng.workbook().state_digest(), digest_before);
+        assert_eq!(
+            eng.workbook()
+                .sheet(s0)
+                .unwrap()
+                .value_by_id(RowId(0), ColId(4)),
+            Value::Number(16.0)
+        );
+        assert_eq!(
+            eng.workbook()
+                .sheet(s0)
+                .unwrap()
+                .value_by_id(RowId(0), ColId(5)),
+            Value::Number(199.0)
+        );
+    }
+
+    #[test]
+    fn e15_permute_content_excel_parity_and_undo() {
+        let mut eng = FormulaEngine::new();
+        let s0 = SheetId(0);
+
+        eng.edit_cell_raw(s0, RowId(0), ColId(3), "5").unwrap(); // D1 (absolute anchor)
+        eng.edit_cell_raw(s0, RowId(0), ColId(1), "100").unwrap(); // B1 (stationary)
+        eng.edit_cell_raw(s0, RowId(1), ColId(1), "200").unwrap(); // B2
+        eng.edit_cell_raw(s0, RowId(2), ColId(1), "300").unwrap(); // B3
+
+        eng.edit_cell_raw(s0, RowId(0), ColId(0), "30").unwrap(); // A1
+        eng.edit_cell_raw(s0, RowId(1), ColId(0), "10").unwrap(); // A2
+        eng.edit_cell_raw(s0, RowId(2), ColId(0), "20").unwrap(); // A3
+
+        eng.edit_cell_raw(s0, RowId(0), ColId(2), "=B1*2+$D$1")
+            .unwrap(); // C1 -> 205
+        eng.edit_cell_raw(s0, RowId(1), ColId(2), "=B2*2+$D$1")
+            .unwrap(); // C2 -> 405
+        eng.edit_cell_raw(s0, RowId(2), ColId(2), "=B3*2+$D$1")
+            .unwrap(); // C3 -> 605
+        eng.edit_cell_raw(s0, RowId(0), ColId(4), "=C1+1").unwrap(); // E1 -> external, stays =C1+1
+        eng.recalc_all();
+
+        let digest_before = eng.workbook().state_digest();
+
+        // Permute columns [A, C] across rows [1, 2, 3] (IDs 0, 1, 2) with row_perm [1, 2, 0].
+        let inv = eng
+            .apply_op(Op::PermuteContent {
+                sheet: s0,
+                rows: vec![RowId(0), RowId(1), RowId(2)],
+                cols: vec![ColId(0), ColId(2)],
+                row_perm: vec![1, 2, 0],
+            })
+            .unwrap();
+        eng.recalc_all();
+
+        assert_eq!(
+            eng.workbook()
+                .sheet(s0)
+                .unwrap()
+                .value_by_id(RowId(0), ColId(0)),
+            Value::Number(10.0)
+        );
+        // Formula moved from row 1 -> row 0 shifts relative `B2` -> `B1` while keeping `$D$1` fixed!
+        assert_eq!(
+            eng.inspect_cell(s0, RowId(0), ColId(2)).unwrap().raw,
+            "=B1*2+$D$1"
+        );
+        assert_eq!(
+            eng.workbook()
+                .sheet(s0)
+                .unwrap()
+                .value_by_id(RowId(0), ColId(2)),
+            Value::Number(205.0)
+        );
+        // External formula keeps original row anchor `C1`.
+        assert_eq!(
+            eng.inspect_cell(s0, RowId(0), ColId(4)).unwrap().raw,
+            "=C1+1"
+        );
+        assert_eq!(
+            eng.workbook()
+                .sheet(s0)
+                .unwrap()
+                .value_by_id(RowId(0), ColId(4)),
+            Value::Number(206.0)
+        );
+
+        eng.apply_inverse(inv).unwrap();
+        eng.recalc_all();
+        assert_eq!(eng.workbook().state_digest(), digest_before);
+        assert_eq!(
+            eng.workbook()
+                .sheet(s0)
+                .unwrap()
+                .value_by_id(RowId(0), ColId(2)),
+            Value::Number(205.0)
+        );
+        assert_eq!(
+            eng.workbook()
+                .sheet(s0)
+                .unwrap()
+                .value_by_id(RowId(1), ColId(2)),
+            Value::Number(405.0)
+        );
+    }
+
+    #[test]
+    fn e22_spill_registry_hash_viewport_and_symmetric_collisions() {
+        use alloc::string::String;
+        use reticula_core::viewport::{
+            CELL_FLAGS_AT, CELL_LEN, CELL_TEXT_LEN_AT, CELL_TEXT_START_AT, COL_COUNT_AT,
+            FLAG_FORMULA, FLAG_SPILL, HEADER_LEN, ID_LEN, OVERFLOW_COUNT_AT, OVERFLOW_LEN, Page,
+            ROW_COUNT_AT,
+        };
+
+        let mut eng = FormulaEngine::new();
+        let s0 = SheetId(0);
+
+        // 1. Clean 2x2 array spill + text spill + `#` + downstream Layer 0/1 consumers.
+        eng.edit_cell_raw(s0, RowId(0), ColId(0), "={1,2;3,4}")
+            .unwrap(); // A1:B2
+        eng.edit_cell_raw(s0, RowId(0), ColId(5), "=A1:B2").unwrap(); // F1:G2 (range spill!)
+        eng.edit_cell_raw(s0, RowId(0), ColId(7), "={\"hi\",\"there\"}")
+            .unwrap(); // H1:I1 (text spill!)
+        eng.edit_cell_raw(s0, RowId(3), ColId(0), "=SUM(A1#)")
+            .unwrap(); // A4 -> 10
+        eng.edit_cell_raw(s0, RowId(4), ColId(0), "=ROWS(A1#)")
+            .unwrap(); // A5 -> 2
+        eng.edit_cell_raw(s0, RowId(5), ColId(0), "=COLUMNS(A1#)")
+            .unwrap(); // A6 -> 2
+        eng.edit_cell_raw(s0, RowId(6), ColId(0), "=INDEX(A1#,2,2)")
+            .unwrap(); // A7 -> 4
+        eng.edit_cell_raw(s0, RowId(7), ColId(0), "=MATCH(3,A2:B2,0)")
+            .unwrap(); // A8 -> 1
+        eng.edit_cell_raw(s0, RowId(8), ColId(0), "=VLOOKUP(3,A1:B2,2,FALSE)")
+            .unwrap(); // A9 -> 4
+        eng.edit_cell_raw(s0, RowId(9), ColId(0), "=COUNTIF(A1:B2,\">1\")")
+            .unwrap(); // A10 -> 3
+        eng.edit_cell_raw(s0, RowId(10), ColId(0), "=COUNTBLANK(H1:I1)")
+            .unwrap(); // A11 -> 0
+        eng.edit_cell_raw(s0, RowId(11), ColId(0), "=SUMIF(A1:B2,\">1\")")
+            .unwrap(); // A12 -> 9
+        eng.edit_cell_raw(s0, RowId(12), ColId(0), "=AVERAGEIF(A1:B2,\">1\")")
+            .unwrap(); // A13 -> 3
+        eng.recalc_all();
+
+        let s = eng.workbook().sheet(s0).unwrap();
+        assert_eq!(s.value_by_id(RowId(0), ColId(0)), Value::Number(1.0));
+        assert_eq!(s.value_by_id(RowId(0), ColId(1)), Value::Empty); // Sheet shadow untouched!
+        assert_eq!(s.strings().len(), 1); // Only `"hi"` in H1 anchor; `"there"` NOT interned!
+        assert_eq!(eng.spill_range((s0, RowId(0), ColId(0))), Some((2, 2)));
+        assert_eq!(s.value_by_id(RowId(3), ColId(0)), Value::Number(10.0));
+        assert_eq!(s.value_by_id(RowId(4), ColId(0)), Value::Number(2.0));
+        assert_eq!(s.value_by_id(RowId(5), ColId(0)), Value::Number(2.0));
+        assert_eq!(s.value_by_id(RowId(6), ColId(0)), Value::Number(4.0));
+        assert_eq!(s.value_by_id(RowId(7), ColId(0)), Value::Number(1.0));
+        assert_eq!(s.value_by_id(RowId(8), ColId(0)), Value::Number(4.0));
+        assert_eq!(s.value_by_id(RowId(9), ColId(0)), Value::Number(3.0));
+        assert_eq!(s.value_by_id(RowId(10), ColId(0)), Value::Number(0.0));
+        assert_eq!(s.value_by_id(RowId(11), ColId(0)), Value::Number(9.0));
+        assert_eq!(s.value_by_id(RowId(12), ColId(0)), Value::Number(3.0));
+
+        // Shadow cell inspection & viewport FLAG_SPILL verification.
+        let b2_inspect = eng.inspect_cell(s0, RowId(1), ColId(1)).unwrap();
+        assert_eq!(b2_inspect.raw, "");
+        assert_eq!(b2_inspect.display, "4");
+        assert!(!b2_inspect.is_formula);
+
+        let mut scratch = String::new();
+        let bytes = eng
+            .encode_viewport_page(s0, Page { row: 0, col: 0 }, 1, &mut scratch)
+            .unwrap();
+        let rows = usize::from(u16::from_le_bytes(
+            bytes[ROW_COUNT_AT..ROW_COUNT_AT + 2].try_into().unwrap(),
+        ));
+        let cols = usize::from(u16::from_le_bytes(
+            bytes[COL_COUNT_AT..COL_COUNT_AT + 2].try_into().unwrap(),
+        ));
+        let overflow_count = usize::from(u16::from_le_bytes(
+            bytes[OVERFLOW_COUNT_AT..OVERFLOW_COUNT_AT + 2]
+                .try_into()
+                .unwrap(),
+        ));
+        let cells_at = HEADER_LEN + (rows + cols) * ID_LEN;
+        let text_at = cells_at + rows * cols * CELL_LEN + overflow_count * OVERFLOW_LEN;
+        let page_text = core::str::from_utf8(&bytes[text_at..]).unwrap();
+        let page_units: Vec<u16> = page_text.encode_utf16().collect();
+        let read_cell = |r: usize, c: usize| -> (String, u16) {
+            let rec = cells_at + (r * cols + c) * CELL_LEN;
+            let start = u32::from_le_bytes(
+                bytes[rec + CELL_TEXT_START_AT..rec + CELL_TEXT_START_AT + 4]
+                    .try_into()
+                    .unwrap(),
+            ) as usize;
+            let len = usize::from(u16::from_le_bytes(
+                bytes[rec + CELL_TEXT_LEN_AT..rec + CELL_TEXT_LEN_AT + 2]
+                    .try_into()
+                    .unwrap(),
+            ));
+            let flags = u16::from_le_bytes(
+                bytes[rec + CELL_FLAGS_AT..rec + CELL_FLAGS_AT + 2]
+                    .try_into()
+                    .unwrap(),
+            );
+            (
+                String::from_utf16(&page_units[start..start + len]).unwrap(),
+                flags,
+            )
+        };
+        let (a1_txt, a1_flags) = read_cell(0, 0);
+        let (b2_txt, b2_flags) = read_cell(1, 1);
+        let (i1_txt, i1_flags) = read_cell(0, 8);
+        assert_eq!(a1_txt, "1");
+        assert_ne!(a1_flags & FLAG_FORMULA, 0);
+        assert_eq!(a1_flags & FLAG_SPILL, 0);
+        assert_eq!(b2_txt, "4");
+        assert_eq!(b2_flags & FLAG_FORMULA, 0);
+        assert_ne!(b2_flags & FLAG_SPILL, 0);
+        assert_eq!(i1_txt, "there");
+        assert_ne!(i1_flags & FLAG_SPILL, 0);
+        assert_eq!(eng.workbook().sheet(s0).unwrap().strings().len(), 1);
+
+        // 2. Static obstacle blocks spill and clearing obstacle pops it open.
+        eng.edit_cell_raw(s0, RowId(0), ColId(1), "block").unwrap(); // B1
+        eng.recalc_all();
+        assert_eq!(
+            eng.workbook()
+                .sheet(s0)
+                .unwrap()
+                .value_by_id(RowId(0), ColId(0)),
+            Value::Error(CalcError::Spill)
+        );
+        assert_eq!(
+            eng.workbook()
+                .sheet(s0)
+                .unwrap()
+                .value_by_id(RowId(3), ColId(0)),
+            Value::Error(CalcError::Ref)
+        );
+        assert!(eng.spills().shadow_value(s0, RowId(1), ColId(1)).is_none());
+
+        eng.edit_cell_raw(s0, RowId(0), ColId(1), "").unwrap();
+        eng.recalc_all();
+        assert_eq!(
+            eng.workbook()
+                .sheet(s0)
+                .unwrap()
+                .value_by_id(RowId(0), ColId(0)),
+            Value::Number(1.0)
+        );
+        assert_eq!(
+            eng.workbook()
+                .sheet(s0)
+                .unwrap()
+                .value_by_id(RowId(3), ColId(0)),
+            Value::Number(10.0)
+        );
+
+        // Structural insert inside spill & compact_local_garbage keep active spill intact.
+        let ins_r = eng.allocator_mut().alloc_run(1).unwrap();
+        eng.apply_op(Op::InsertRows {
+            sheet: s0,
+            after: Some(RowId(0)),
+            ids: ins_r,
+        })
+        .unwrap();
+        eng.recalc_all();
+        eng.compact_local_garbage();
+        assert_eq!(eng.spill_range((s0, RowId(0), ColId(0))), Some((2, 2)));
+
+        // 3. Symmetric 3-way chain collision under all 6 insertion/evaluation orders!
+        // P at D1={1;2} (D1,D2); Q at B2={10,20,30;40,50,60} (B2..D3); R at A3={100,200} (A3,B3).
+        let p = (RowId(0), ColId(3), "={1;2}");
+        let q = (RowId(1), ColId(1), "={10,20,30;40,50,60}");
+        let r = (RowId(2), ColId(0), "={100,200}");
+        let orders = [
+            [p, q, r],
+            [p, r, q],
+            [q, p, r],
+            [q, r, p],
+            [r, p, q],
+            [r, q, p],
+        ];
+        for order in orders {
+            let mut ce = FormulaEngine::new();
+            for &(row, col, raw) in &order {
+                ce.edit_cell_raw(s0, row, col, raw).unwrap();
+                ce.recalc_all();
+            }
+            let cs = ce.workbook().sheet(s0).unwrap();
+            assert_eq!(
+                cs.value_by_id(RowId(0), ColId(3)),
+                Value::Error(CalcError::Spill)
+            );
+            assert_eq!(
+                cs.value_by_id(RowId(1), ColId(1)),
+                Value::Error(CalcError::Spill)
+            );
+            assert_eq!(
+                cs.value_by_id(RowId(2), ColId(0)),
+                Value::Error(CalcError::Spill)
+            );
+
+            // Way A: Deleting Q pops BOTH P and R open.
+            let mut del_q = ce.clone();
+            del_q.edit_cell_raw(s0, RowId(1), ColId(1), "").unwrap();
+            del_q.recalc_all();
+            let ds = del_q.workbook().sheet(s0).unwrap();
+            assert_eq!(ds.value_by_id(RowId(0), ColId(3)), Value::Number(1.0));
+            assert_eq!(ds.value_by_id(RowId(2), ColId(0)), Value::Number(100.0));
+            assert!(
+                del_q
+                    .spills()
+                    .shadow_value(s0, RowId(1), ColId(3))
+                    .is_some()
+            );
+
+            // Way B: Shrinking Q to scalar opens BOTH P and R.
+            let mut shrink_q = ce.clone();
+            shrink_q
+                .edit_cell_raw(s0, RowId(1), ColId(1), "=99")
+                .unwrap();
+            shrink_q.recalc_all();
+            let ss = shrink_q.workbook().sheet(s0).unwrap();
+            assert_eq!(ss.value_by_id(RowId(0), ColId(3)), Value::Number(1.0));
+            assert_eq!(ss.value_by_id(RowId(1), ColId(1)), Value::Number(99.0));
+            assert_eq!(ss.value_by_id(RowId(2), ColId(0)), Value::Number(100.0));
+
+            // Way C: Statically blocking Q on C2 (not overlapping P or R!) opens BOTH P and R.
+            let mut static_q = ce;
+            static_q
+                .edit_cell_raw(s0, RowId(1), ColId(2), "stop")
+                .unwrap();
+            static_q.recalc_all();
+            let sq = static_q.workbook().sheet(s0).unwrap();
+            assert_eq!(sq.value_by_id(RowId(0), ColId(3)), Value::Number(1.0));
+            assert_eq!(
+                sq.value_by_id(RowId(1), ColId(1)),
+                Value::Error(CalcError::Spill)
+            );
+            assert_eq!(sq.value_by_id(RowId(2), ColId(0)), Value::Number(100.0));
+        }
+    }
+
+    #[test]
+    fn named_ranges_scoping_cycles_e25_and_digest() {
+        use alloc::string::String;
+        use reticula_core::ops::FormulaMode;
+
+        let mut eng = FormulaEngine::new();
+        let s0 = SheetId(0);
+        let s1 = eng.alloc_sheet_id();
+        eng.apply_op(Op::AddSheet {
+            sheet: s1,
+            name: String::from("Sheet2"),
+            after: Some(s0),
+        })
+        .unwrap();
+
+        eng.edit_cell_raw(s0, RowId(0), ColId(0), "=Rate").unwrap(); // A1 (#NAME? initially)
+        eng.edit_cell_raw(s1, RowId(0), ColId(0), "=Rate").unwrap(); // Sheet2!A1
+        eng.edit_cell_raw(s0, RowId(0), ColId(1), "=Sheet2!LocalOnly")
+            .unwrap(); // B1 (#NAME? initially)
+        eng.recalc_all();
+        assert_eq!(
+            eng.workbook()
+                .sheet(s0)
+                .unwrap()
+                .value_by_id(RowId(0), ColId(0)),
+            Value::Error(CalcError::Name)
+        );
+        let baseline_digest = eng.workbook().state_digest();
+
+        // 1. Workbook-scoped name changes digest and resolves `#NAME?`.
+        let rate_global = crate::binder::BoundFormula::parse_and_bind(
+            "=0.1",
+            FormulaMode::Dynamic,
+            eng.workbook(),
+            s0,
+        )
+        .unwrap();
+        let inv_rate_global = eng
+            .apply_op(Op::DefineNamedRange {
+                scope: None,
+                name: String::from("Rate"),
+                formula: rate_global,
+                comment: Some(String::from("Global rate")),
+                hidden: false,
+            })
+            .unwrap();
+        eng.recalc_all();
+        assert_ne!(eng.workbook().state_digest(), baseline_digest);
+        assert_eq!(
+            eng.workbook()
+                .sheet(s0)
+                .unwrap()
+                .value_by_id(RowId(0), ColId(0)),
+            Value::Number(0.1)
+        );
+        assert_eq!(
+            eng.workbook()
+                .sheet(s1)
+                .unwrap()
+                .value_by_id(RowId(0), ColId(0)),
+            Value::Number(0.1)
+        );
+
+        // Deleting restores zero named-range digest contribution!
+        eng.apply_inverse(inv_rate_global.clone()).unwrap();
+        eng.recalc_all();
+        assert_eq!(eng.workbook().state_digest(), baseline_digest);
+        assert_eq!(
+            eng.workbook()
+                .sheet(s0)
+                .unwrap()
+                .value_by_id(RowId(0), ColId(0)),
+            Value::Error(CalcError::Name)
+        );
+
+        // Re-define global, then shadow on Sheet1 only.
+        eng.apply_op(Op::DefineNamedRange {
+            scope: None,
+            name: String::from("Rate"),
+            formula: crate::binder::BoundFormula::parse_and_bind(
+                "=0.1",
+                FormulaMode::Dynamic,
+                eng.workbook(),
+                s0,
+            )
+            .unwrap(),
+            comment: None,
+            hidden: false,
+        })
+        .unwrap();
+        eng.apply_op(Op::DefineNamedRange {
+            scope: Some(s0),
+            name: String::from("Rate"),
+            formula: crate::binder::BoundFormula::parse_and_bind(
+                "=0.25",
+                FormulaMode::Dynamic,
+                eng.workbook(),
+                s0,
+            )
+            .unwrap(),
+            comment: None,
+            hidden: false,
+        })
+        .unwrap();
+        eng.recalc_all();
+        assert_eq!(
+            eng.workbook()
+                .sheet(s0)
+                .unwrap()
+                .value_by_id(RowId(0), ColId(0)),
+            Value::Number(0.25)
+        );
+        assert_eq!(
+            eng.workbook()
+                .sheet(s1)
+                .unwrap()
+                .value_by_id(RowId(0), ColId(0)),
+            Value::Number(0.1)
+        );
+
+        // 2. Scoped name `Sheet2!LocalOnly` + DeleteSheet -> #REF! -> UndeleteSheet recovery.
+        eng.edit_cell_raw(s1, RowId(0), ColId(2), "7").unwrap();
+        eng.apply_op(Op::DefineNamedRange {
+            scope: Some(s1),
+            name: String::from("LocalOnly"),
+            formula: crate::binder::BoundFormula::parse_and_bind(
+                "=C1*2",
+                FormulaMode::Dynamic,
+                eng.workbook(),
+                s1,
+            )
+            .unwrap(),
+            comment: None,
+            hidden: false,
+        })
+        .unwrap();
+        eng.recalc_all();
+        assert_eq!(
+            eng.workbook()
+                .sheet(s0)
+                .unwrap()
+                .value_by_id(RowId(0), ColId(1)),
+            Value::Number(14.0)
+        );
+
+        let inv_del_s1 = eng.apply_op(Op::DeleteSheet { sheet: s1 }).unwrap();
+        eng.recalc_all();
+        assert_eq!(
+            eng.workbook()
+                .sheet(s0)
+                .unwrap()
+                .value_by_id(RowId(0), ColId(1)),
+            Value::Error(CalcError::Ref)
+        );
+        eng.apply_inverse(inv_del_s1).unwrap();
+        eng.recalc_all();
+        assert_eq!(
+            eng.workbook()
+                .sheet(s0)
+                .unwrap()
+                .value_by_id(RowId(0), ColId(1)),
+            Value::Number(14.0)
+        );
+
+        // 3. Chained names TaxRate1 -> TaxRate2 -> D1 and invalidation on editing D1.
+        eng.edit_cell_raw(s0, RowId(0), ColId(3), "4").unwrap(); // D1
+        eng.apply_op(Op::DefineNamedRange {
+            scope: None,
+            name: String::from("TaxRate1"),
+            formula: crate::binder::BoundFormula::parse_and_bind(
+                "=Sheet1!D1+1",
+                FormulaMode::Dynamic,
+                eng.workbook(),
+                s0,
+            )
+            .unwrap(),
+            comment: None,
+            hidden: false,
+        })
+        .unwrap();
+        eng.apply_op(Op::DefineNamedRange {
+            scope: None,
+            name: String::from("TaxRate2"),
+            formula: crate::binder::BoundFormula::parse_and_bind(
+                "=TaxRate1*3",
+                FormulaMode::Dynamic,
+                eng.workbook(),
+                s0,
+            )
+            .unwrap(),
+            comment: None,
+            hidden: false,
+        })
+        .unwrap();
+        eng.edit_cell_raw(s0, RowId(0), ColId(4), "=TaxRate2")
+            .unwrap(); // E1 -> (4+1)*3=15
+        eng.recalc_all();
+        assert_eq!(
+            eng.workbook()
+                .sheet(s0)
+                .unwrap()
+                .value_by_id(RowId(0), ColId(4)),
+            Value::Number(15.0)
+        );
+        eng.edit_cell_raw(s0, RowId(0), ColId(3), "9").unwrap();
+        eng.recalc_all();
+        assert_eq!(
+            eng.workbook()
+                .sheet(s0)
+                .unwrap()
+                .value_by_id(RowId(0), ColId(4)),
+            Value::Number(30.0)
+        );
+
+        // 4. Cyclic named ranges & mixed cell+name cycles yield #CYCLE!.
+        eng.apply_op(Op::DefineNamedRange {
+            scope: None,
+            name: String::from("CycleOne"),
+            formula: crate::binder::BoundFormula::parse_and_bind(
+                "=CycleTwo+1",
+                FormulaMode::Dynamic,
+                eng.workbook(),
+                s0,
+            )
+            .unwrap(),
+            comment: None,
+            hidden: false,
+        })
+        .unwrap();
+        eng.apply_op(Op::DefineNamedRange {
+            scope: None,
+            name: String::from("CycleTwo"),
+            formula: crate::binder::BoundFormula::parse_and_bind(
+                "=CycleOne+1",
+                FormulaMode::Dynamic,
+                eng.workbook(),
+                s0,
+            )
+            .unwrap(),
+            comment: None,
+            hidden: false,
+        })
+        .unwrap();
+        eng.edit_cell_raw(s0, RowId(0), ColId(5), "=CycleOne")
+            .unwrap();
+        eng.apply_op(Op::DefineNamedRange {
+            scope: None,
+            name: String::from("CycleCell"),
+            formula: crate::binder::BoundFormula::parse_and_bind(
+                "=Sheet1!G1",
+                FormulaMode::Dynamic,
+                eng.workbook(),
+                s0,
+            )
+            .unwrap(),
+            comment: None,
+            hidden: false,
+        })
+        .unwrap();
+        eng.edit_cell_raw(s0, RowId(0), ColId(6), "=CycleCell")
+            .unwrap();
+        eng.recalc_all();
+        assert_eq!(
+            eng.workbook()
+                .sheet(s0)
+                .unwrap()
+                .value_by_id(RowId(0), ColId(5)),
+            Value::Error(CalcError::Cycle)
+        );
+        assert_eq!(
+            eng.workbook()
+                .sheet(s0)
+                .unwrap()
+                .value_by_id(RowId(0), ColId(6)),
+            Value::Error(CalcError::Cycle)
+        );
+
+        // 5. E25 MoveRows updates named range and undo restores exact StateDigest.
+        let before_move = eng.workbook().state_digest();
+        let inv_mv = eng
+            .apply_op(Op::MoveRows {
+                sheet: s0,
+                ids: vec![IdRun::new(0, 1).unwrap()],
+                after: Some(RowId(4)),
+            })
+            .unwrap();
+        eng.recalc_all();
+        assert_eq!(
+            eng.workbook()
+                .sheet(s0)
+                .unwrap()
+                .value_by_id(RowId(0), ColId(4)),
+            Value::Number(30.0)
+        );
+        eng.apply_inverse(inv_mv).unwrap();
+        eng.recalc_all();
+        assert_eq!(eng.workbook().state_digest(), before_move);
+    }
+
+    #[test]
+    fn e22_spill_shadow_cycles_and_no_requeue_loops() {
+        let s0 = SheetId(0);
+
+        // 1. Two-cell shadow-mediated cycle (`A1 = =B1:B2`, `B1 = =A2:A3`) + observer `C1`.
+        let mut eng = FormulaEngine::new();
+        eng.edit_cell_raw(s0, RowId(0), ColId(0), "=B1:B2").unwrap();
+        eng.edit_cell_raw(s0, RowId(0), ColId(1), "=A2:A3").unwrap();
+        eng.edit_cell_raw(s0, RowId(0), ColId(2), "=A2+1").unwrap();
+        eng.recalc_all();
+
+        let fresh = FormulaEngine::from_workbook_recalc_all(eng.workbook().clone());
+        for col in 0..3u64 {
+            assert_eq!(
+                eng.workbook()
+                    .sheet(s0)
+                    .unwrap()
+                    .value_by_id(RowId(0), ColId(col)),
+                fresh
+                    .workbook()
+                    .sheet(s0)
+                    .unwrap()
+                    .value_by_id(RowId(0), ColId(col))
+            );
+        }
+        assert_eq!(
+            eng.workbook()
+                .sheet(s0)
+                .unwrap()
+                .value_by_id(RowId(0), ColId(0)),
+            Value::Error(CalcError::Cycle)
+        );
+        assert_eq!(
+            eng.workbook()
+                .sheet(s0)
+                .unwrap()
+                .value_by_id(RowId(0), ColId(1)),
+            Value::Error(CalcError::Cycle)
+        );
+        assert_eq!(
+            eng.workbook()
+                .sheet(s0)
+                .unwrap()
+                .value_by_id(RowId(0), ColId(2)),
+            Value::Number(1.0)
+        );
+        assert!(eng.spills().shadow_value(s0, RowId(1), ColId(0)).is_none());
+        assert!(eng.spills().shadow_value(s0, RowId(1), ColId(1)).is_none());
+
+        // 2. Self-shadow cycle (`A1 = =A2:A3`) must match fresh recalc across incremental edits.
+        let mut self_cyc = FormulaEngine::new();
+        self_cyc
+            .edit_cell_raw(s0, RowId(0), ColId(0), "=A2:A3")
+            .unwrap();
+        self_cyc.recalc_all();
+        assert_eq!(
+            self_cyc
+                .workbook()
+                .sheet(s0)
+                .unwrap()
+                .value_by_id(RowId(0), ColId(0)),
+            Value::Error(CalcError::Cycle)
+        );
+        self_cyc.edit_cell_raw(s0, RowId(2), ColId(0), "5").unwrap();
+        self_cyc.recalc_all();
+        let fresh_self = FormulaEngine::from_workbook_recalc_all(self_cyc.workbook().clone());
+        assert_eq!(
+            self_cyc
+                .workbook()
+                .sheet(s0)
+                .unwrap()
+                .value_by_id(RowId(0), ColId(0)),
+            Value::Error(CalcError::Cycle)
+        );
+        assert_eq!(
+            fresh_self
+                .workbook()
+                .sheet(s0)
+                .unwrap()
+                .value_by_id(RowId(0), ColId(0)),
+            Value::Error(CalcError::Cycle)
+        );
+        assert!(
+            self_cyc
+                .spills()
+                .shadow_value(s0, RowId(1), ColId(0))
+                .is_none()
+        );
+
+        // 3. Conditional short-circuit self-shadow reference (`B1 = 1`, `A1 = =IF(B1=1, {1;2}, A2)`).
+        let mut cond = FormulaEngine::new();
+        cond.edit_cell_raw(s0, RowId(0), ColId(1), "1").unwrap();
+        cond.edit_cell_raw(s0, RowId(0), ColId(0), "=IF(B1=1, {1;2}, A2)")
+            .unwrap();
+        cond.recalc_all();
+        let fresh_cond = FormulaEngine::from_workbook_recalc_all(cond.workbook().clone());
+        assert_eq!(
+            cond.workbook()
+                .sheet(s0)
+                .unwrap()
+                .value_by_id(RowId(0), ColId(0)),
+            Value::Number(1.0)
+        );
+        assert_eq!(
+            cond.spills().shadow_value(s0, RowId(1), ColId(0)),
+            Some(&crate::value_eval::EvalScalar::Number(2.0))
+        );
+        assert_eq!(
+            fresh_cond
+                .workbook()
+                .sheet(s0)
+                .unwrap()
+                .value_by_id(RowId(0), ColId(0)),
+            Value::Number(1.0)
+        );
+        assert_eq!(
+            fresh_cond.spills().shadow_value(s0, RowId(1), ColId(0)),
+            Some(&crate::value_eval::EvalScalar::Number(2.0))
+        );
+
+        // 4. Cleared-shadow cycle recovery across delete/insert/overwrite (proptest seed).
+        let mut rec = FormulaEngine::new();
+        let rid0 = RowId(
+            rec.workbook()
+                .sheet(s0)
+                .unwrap()
+                .row_axis()
+                .pos_to_id(0)
+                .unwrap(),
+        );
+        rec.apply_op(Op::DeleteRows {
+            sheet: s0,
+            ids: vec![IdRun::new(rid0.0, 1).unwrap()],
+        })
+        .unwrap();
+        rec.recalc_all();
+        let r3 = RowId(
+            rec.workbook()
+                .sheet(s0)
+                .unwrap()
+                .row_axis()
+                .pos_to_id(3)
+                .unwrap(),
+        );
+        rec.edit_cell_raw(s0, r3, ColId(0), "=A1:B1").unwrap();
+        rec.recalc_all();
+        let r0 = RowId(
+            rec.workbook()
+                .sheet(s0)
+                .unwrap()
+                .row_axis()
+                .pos_to_id(0)
+                .unwrap(),
+        );
+        rec.edit_cell_raw(s0, r0, ColId(0), "=COUNTIF(B3:D5, \">1\")")
+            .unwrap();
+        rec.recalc_all();
+        for _ in 0..2 {
+            let run = rec.allocator_mut().alloc_run(1).unwrap();
+            rec.apply_op(Op::InsertRows {
+                sheet: s0,
+                after: None,
+                ids: run,
+            })
+            .unwrap();
+            rec.recalc_all();
+        }
+        let r5 = RowId(
+            rec.workbook()
+                .sheet(s0)
+                .unwrap()
+                .row_axis()
+                .pos_to_id(5)
+                .unwrap(),
+        );
+        rec.edit_cell_raw(s0, r5, ColId(0), "=A1#").unwrap();
+        rec.recalc_all();
+        let fresh_rec = FormulaEngine::from_workbook_recalc_all(rec.workbook().clone());
+        let p2_row = RowId(
+            rec.workbook()
+                .sheet(s0)
+                .unwrap()
+                .row_axis()
+                .pos_to_id(2)
+                .unwrap(),
+        );
+        assert_eq!(
+            rec.workbook()
+                .sheet(s0)
+                .unwrap()
+                .value_by_id(p2_row, ColId(0)),
+            Value::Number(0.0)
+        );
+        assert_eq!(
+            fresh_rec
+                .workbook()
+                .sheet(s0)
+                .unwrap()
+                .value_by_id(p2_row, ColId(0)),
+            Value::Number(0.0)
+        );
+
+        // 5. Indirect cycle break on a non-cyclic precedent of the cleared spill anchor.
+        let mut ind = FormulaEngine::new();
+        ind.edit_cell_raw(s0, RowId(0), ColId(2), "1").unwrap(); // C1
+        ind.edit_cell_raw(s0, RowId(3), ColId(0), "=IF(C1=1, A1:B1, 0)")
+            .unwrap(); // A4 -> shadow B4
+        ind.recalc_all();
+        ind.edit_cell_raw(s0, RowId(0), ColId(0), "=COUNTIF(B3:D5, \">1\")")
+            .unwrap(); // A1 cycles with A4's shadow B4
+        ind.recalc_all();
+        assert_eq!(
+            ind.workbook()
+                .sheet(s0)
+                .unwrap()
+                .value_by_id(RowId(0), ColId(0)),
+            Value::Error(CalcError::Cycle)
+        );
+        ind.edit_cell_raw(s0, RowId(0), ColId(2), "0").unwrap(); // break cycle indirectly
+        ind.recalc_all();
+        let fresh_ind = FormulaEngine::from_workbook_recalc_all(ind.workbook().clone());
+        assert_eq!(
+            ind.workbook()
+                .sheet(s0)
+                .unwrap()
+                .value_by_id(RowId(0), ColId(0)),
+            Value::Number(0.0)
+        );
+        assert_eq!(
+            ind.workbook()
+                .sheet(s0)
+                .unwrap()
+                .value_by_id(RowId(3), ColId(0)),
+            Value::Number(0.0)
+        );
+        assert_eq!(
+            fresh_ind
+                .workbook()
+                .sheet(s0)
+                .unwrap()
+                .value_by_id(RowId(0), ColId(0)),
+            Value::Number(0.0)
+        );
+
+        // 6. Tombstoned rows before a spill shadow still match COUNTIF by live row position.
+        let mut tomb = FormulaEngine::new();
+        let del0 = RowId(
+            tomb.workbook()
+                .sheet(s0)
+                .unwrap()
+                .row_axis()
+                .pos_to_id(0)
+                .unwrap(),
+        );
+        tomb.apply_op(Op::DeleteRows {
+            sheet: s0,
+            ids: vec![IdRun::new(del0.0, 1).unwrap()],
+        })
+        .unwrap();
+        let anchor_row = RowId(
+            tomb.workbook()
+                .sheet(s0)
+                .unwrap()
+                .row_axis()
+                .pos_to_id(3)
+                .unwrap(),
+        );
+        tomb.edit_cell_raw(s0, anchor_row, ColId(0), "={1,5}")
+            .unwrap();
+        let query_row = RowId(
+            tomb.workbook()
+                .sheet(s0)
+                .unwrap()
+                .row_axis()
+                .pos_to_id(0)
+                .unwrap(),
+        );
+        tomb.edit_cell_raw(s0, query_row, ColId(0), "=COUNTIF(B4:B4, \">1\")")
+            .unwrap();
+        tomb.recalc_all();
+        assert_eq!(
+            tomb.workbook()
+                .sheet(s0)
+                .unwrap()
+                .value_by_id(query_row, ColId(0)),
+            Value::Number(1.0)
+        );
+
+        // 7. Self-shadow cycle blocked later by a static write or dynamic shadow recovers to #SPILL!.
+        let mut blk = FormulaEngine::new();
+        blk.edit_cell_raw(s0, RowId(3), ColId(1), "=C3:D4").unwrap(); // B4 self-shadow 2x2
+        blk.recalc_all();
+        assert_eq!(
+            blk.workbook()
+                .sheet(s0)
+                .unwrap()
+                .value_by_id(RowId(3), ColId(1)),
+            Value::Error(CalcError::Cycle)
+        );
+        let blk_del = RowId(
+            blk.workbook()
+                .sheet(s0)
+                .unwrap()
+                .row_axis()
+                .pos_to_id(0)
+                .unwrap(),
+        );
+        blk.apply_op(Op::DeleteRows {
+            sheet: s0,
+            ids: vec![IdRun::new(blk_del.0, 1).unwrap()],
+        })
+        .unwrap();
+        blk.recalc_all();
+        let p3_row = RowId(
+            blk.workbook()
+                .sheet(s0)
+                .unwrap()
+                .row_axis()
+                .pos_to_id(3)
+                .unwrap(),
+        );
+        let p2_b_row = RowId(
+            blk.workbook()
+                .sheet(s0)
+                .unwrap()
+                .row_axis()
+                .pos_to_id(2)
+                .unwrap(),
+        );
+        blk.edit_cell_raw(s0, p3_row, ColId(1), "=A1#").unwrap();
+        blk.recalc_all();
+        let fresh_blk = FormulaEngine::from_workbook_recalc_all(blk.workbook().clone());
+        assert_eq!(
+            blk.workbook()
+                .sheet(s0)
+                .unwrap()
+                .value_by_id(p2_b_row, ColId(1)),
+            Value::Error(CalcError::Spill)
+        );
+        assert_eq!(
+            fresh_blk
+                .workbook()
+                .sheet(s0)
+                .unwrap()
+                .value_by_id(p2_b_row, ColId(1)),
+            Value::Error(CalcError::Spill)
+        );
+
+        // Same recovery when blocked dynamically by another array spilling onto the cleared shadow.
+        let mut dyn_blk = FormulaEngine::new();
+        dyn_blk
+            .edit_cell_raw(s0, RowId(3), ColId(1), "=C3:D4")
+            .unwrap(); // B4 self-shadow 2x2 over B4:C5
+        dyn_blk.recalc_all();
+        dyn_blk
+            .edit_cell_raw(s0, RowId(4), ColId(0), "={10,20}")
+            .unwrap(); // A5 spills into B5 -> dynamic collision with B4's cleared footprint
+        dyn_blk.recalc_all();
+        let fresh_dyn = FormulaEngine::from_workbook_recalc_all(dyn_blk.workbook().clone());
+        assert_eq!(
+            dyn_blk
+                .workbook()
+                .sheet(s0)
+                .unwrap()
+                .value_by_id(RowId(3), ColId(1)),
+            Value::Error(CalcError::Spill)
+        );
+        assert_eq!(
+            dyn_blk
+                .workbook()
+                .sheet(s0)
+                .unwrap()
+                .value_by_id(RowId(4), ColId(0)),
+            Value::Error(CalcError::Spill)
+        );
+        assert_eq!(
+            fresh_dyn
+                .workbook()
+                .sheet(s0)
+                .unwrap()
+                .value_by_id(RowId(3), ColId(1)),
+            Value::Error(CalcError::Spill)
+        );
+        assert_eq!(
+            fresh_dyn
+                .workbook()
+                .sheet(s0)
+                .unwrap()
+                .value_by_id(RowId(4), ColId(0)),
+            Value::Error(CalcError::Spill)
         );
     }
 }

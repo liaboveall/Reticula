@@ -102,6 +102,7 @@ fn layout() -> String {
         FLAG_ERROR,
         FLAG_FORMULA,
         FLAG_TRUNCATED,
+        FLAG_SPILL,
         MAX_CELL_DISPLAY_UTF16,
         MAX_SUBSCRIBED_PAGE_ROWS,
         MAX_SUBSCRIBED_PAGE_COLS,

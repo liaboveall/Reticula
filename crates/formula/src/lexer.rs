@@ -30,6 +30,8 @@ pub enum Token {
     Ident(String),
     /// `:`
     Colon,
+    /// `#` (dynamic array spill-range operator `A1#`).
+    Hash,
     /// `,`
     Comma,
     /// `;`
@@ -209,9 +211,17 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
                 pos = next_pos;
             }
             b'#' => {
-                let (err, next_pos) = lex_error_literal(input, pos)?;
-                tokens.push(Token::ErrorLit(err));
-                pos = next_pos;
+                if bytes
+                    .get(pos.saturating_add(1))
+                    .is_some_and(|&next| next.is_ascii_alphabetic())
+                {
+                    let (err, next_pos) = lex_error_literal(input, pos)?;
+                    tokens.push(Token::ErrorLit(err));
+                    pos = next_pos;
+                } else {
+                    tokens.push(Token::Hash);
+                    pos = pos.saturating_add(1);
+                }
             }
             b'0'..=b'9' | b'.' => {
                 let (tok, next_pos) = lex_number(input, pos)?;

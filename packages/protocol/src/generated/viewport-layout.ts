@@ -34,6 +34,7 @@ export const FLAG_BOOL = 2;
 export const FLAG_ERROR = 4;
 export const FLAG_FORMULA = 8;
 export const FLAG_TRUNCATED = 16;
+export const FLAG_SPILL = 32;
 export const MAX_CELL_DISPLAY_UTF16 = 512;
 export const MAX_SUBSCRIBED_PAGE_ROWS = 64;
 export const MAX_SUBSCRIBED_PAGE_COLS = 16;
