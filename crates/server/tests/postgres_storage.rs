@@ -22,7 +22,8 @@ fn pending_edit(replica: u32, client_seq: u64, base_server_seq: u64) -> WirePend
                 format: FormatPatch::Keep,
             }],
         }],
-    );
+    )
+    .unwrap();
     WirePendingTxnV2 {
         replica,
         client_seq,

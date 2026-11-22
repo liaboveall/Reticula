@@ -13,16 +13,26 @@ use crate::convert_v1::{WireConvertError, check_text_len, runs_from_wire, runs_t
 use crate::v1::{WireCellEditV1, WireCellInputV1, WireFormatPatchV1, WireNumberFormatV1, WireOpV1};
 use crate::v2::{WireConditionalCellEditV2, WireOpV2, WireStateDigestV1, WireTxnV2};
 
-impl From<&ConditionalCellEdit<BoundFormula>> for WireConditionalCellEditV2 {
-    fn from(e: &ConditionalCellEdit<BoundFormula>) -> Self {
-        Self {
+fn map_v1_to_v2_err(err: WireConvertError) -> WireConvertError {
+    match err {
+        WireConvertError::UnsupportedInV1 => WireConvertError::UnsupportedInV2,
+        other => other,
+    }
+}
+
+impl TryFrom<&ConditionalCellEdit<BoundFormula>> for WireConditionalCellEditV2 {
+    type Error = WireConvertError;
+
+    fn try_from(e: &ConditionalCellEdit<BoundFormula>) -> Result<Self, Self::Error> {
+        Ok(Self {
             row: e.row.0,
             col: e.col.0,
-            expected_input: WireCellInputV1::from(&e.expected_input),
+            expected_input: WireCellInputV1::try_from(&e.expected_input)
+                .map_err(map_v1_to_v2_err)?,
             expected_format: e.expected_format.map(WireNumberFormatV1::from),
-            new_input: WireCellInputV1::from(&e.new_input),
+            new_input: WireCellInputV1::try_from(&e.new_input).map_err(map_v1_to_v2_err)?,
             new_format: WireFormatPatchV1::from(e.new_format),
-        }
+        })
     }
 }
 
@@ -45,16 +55,24 @@ impl TryFrom<WireConditionalCellEditV2> for ConditionalCellEdit<BoundFormula> {
     }
 }
 
-impl From<&Op<BoundFormula>> for WireOpV2 {
-    fn from(op: &Op<BoundFormula>) -> Self {
-        match op {
+impl TryFrom<&Op<BoundFormula>> for WireOpV2 {
+    type Error = WireConvertError;
+
+    fn try_from(op: &Op<BoundFormula>) -> Result<Self, Self::Error> {
+        let converted = match op {
             Op::SetCells { sheet, edits } => Self::SetCells {
                 sheet: sheet.0,
-                edits: edits.iter().map(WireCellEditV1::from).collect(),
+                edits: edits
+                    .iter()
+                    .map(|e| WireCellEditV1::try_from(e).map_err(map_v1_to_v2_err))
+                    .collect::<Result<Vec<_>, _>>()?,
             },
             Op::SetCellsIf { sheet, edits } => Self::SetCellsIf {
                 sheet: sheet.0,
-                edits: edits.iter().map(WireConditionalCellEditV2::from).collect(),
+                edits: edits
+                    .iter()
+                    .map(WireConditionalCellEditV2::try_from)
+                    .collect::<Result<Vec<_>, _>>()?,
             },
             Op::ClearRange { sheet, rows, cols } => Self::ClearRange {
                 sheet: sheet.0,
@@ -136,8 +154,12 @@ impl From<&Op<BoundFormula>> for WireOpV2 {
                 cols: cols.iter().map(|c| c.0).collect(),
                 columns_data: columns_data
                     .iter()
-                    .map(|col| col.iter().map(WireCellInputV1::from).collect())
-                    .collect(),
+                    .map(|col| {
+                        col.iter()
+                            .map(|c| WireCellInputV1::try_from(c).map_err(map_v1_to_v2_err))
+                            .collect::<Result<Vec<_>, _>>()
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
             },
             Op::FillFormula {
                 sheet,
@@ -148,7 +170,7 @@ impl From<&Op<BoundFormula>> for WireOpV2 {
                 sheet: sheet.0,
                 rows: runs_to_wire(rows),
                 cols: runs_to_wire(cols),
-                template: template.into(),
+                template: template.try_into().map_err(map_v1_to_v2_err)?,
             },
             Op::AddSheet { sheet, name, after } => Self::AddSheet {
                 sheet: sheet.0,
@@ -165,7 +187,12 @@ impl From<&Op<BoundFormula>> for WireOpV2 {
                 sheet: sheet.0,
                 after: after.map(|s| s.0),
             },
-        }
+            Op::PermuteContent { .. }
+            | Op::MoveCells { .. }
+            | Op::DefineNamedRange { .. }
+            | Op::DeleteNamedRange { .. } => return Err(WireConvertError::UnsupportedInV2),
+        };
+        Ok(converted)
     }
 }
 
@@ -427,12 +454,16 @@ impl TryFrom<WireStateDigestV1> for StateDigest {
 }
 
 /// Converts a slice of in-memory operations into a [`WireTxnV2`].
-#[must_use]
-pub fn ops_to_wire_txn_v2(label: String, ops: &[Op<BoundFormula>]) -> WireTxnV2 {
-    WireTxnV2 {
+pub fn ops_to_wire_txn_v2(
+    label: String,
+    ops: &[Op<BoundFormula>],
+) -> Result<WireTxnV2, WireConvertError> {
+    let converted: Result<Vec<WireOpV2>, WireConvertError> =
+        ops.iter().map(WireOpV2::try_from).collect();
+    Ok(WireTxnV2 {
         label,
-        ops: ops.iter().map(WireOpV2::from).collect(),
-    }
+        ops: converted?,
+    })
 }
 
 /// Validates and converts a [`WireTxnV2`] back into `(label, Vec<Op<BoundFormula>>)`.
@@ -474,7 +505,8 @@ mod tests {
                 new_format: FormatPatch::Clear,
             }],
         };
-        let txn = ops_to_wire_txn_v2(String::from("Undo cell"), core::slice::from_ref(&cond));
+        let txn =
+            ops_to_wire_txn_v2(String::from("Undo cell"), core::slice::from_ref(&cond)).unwrap();
         assert!(matches!(txn.ops[0], WireOpV2::SetCellsIf { .. }));
         let (lbl, ops_back) = ops_from_wire_txn_v2(txn).unwrap();
         assert_eq!(lbl, "Undo cell");
@@ -483,5 +515,159 @@ mod tests {
         let sd = StateDigest::from_parts(0x1234_5678_9ABC_DEF0_FEDC_BA98_7654_3210, 42);
         let wsd = WireStateDigestV1::from(sd);
         assert_eq!(StateDigest::try_from(wsd).unwrap(), sd);
+    }
+
+    #[test]
+    fn v1_and_v2_reject_m3a_ops_and_ast_variants() {
+        use reticula_core::id::IdRun;
+        use reticula_core::ops::{CellEdit, FormulaMode, NamedRangeKey, Workbook};
+        use reticula_formula::binder::{BoundExpr, BoundFormula, TemplateExpr, TemplateFormula};
+
+        use crate::convert_v1::{WireConvertError, ops_to_wire_txn};
+        use crate::v1::{WireBoundFormulaV1, WireOpV1, WireTemplateFormulaV1};
+
+        let simple_formula = BoundFormula::parse_and_bind(
+            "=1",
+            FormulaMode::Dynamic,
+            &Workbook::<BoundFormula>::new(),
+            SheetId(0),
+        )
+        .unwrap();
+
+        let m3a_ops = [
+            Op::PermuteContent {
+                sheet: SheetId(0),
+                rows: vec![RowId(0)],
+                cols: vec![ColId(0)],
+                row_perm: vec![0],
+            },
+            Op::MoveCells {
+                src_sheet: SheetId(0),
+                src_rows: vec![RowId(0)],
+                src_cols: vec![ColId(0)],
+                dst_sheet: SheetId(0),
+                dst_rows: vec![RowId(1)],
+                dst_cols: vec![ColId(1)],
+            },
+            Op::DefineNamedRange {
+                scope: None,
+                name: String::from("Tax"),
+                formula: simple_formula,
+                comment: None,
+                hidden: false,
+            },
+            Op::DeleteNamedRange {
+                scope: Some(SheetId(0)),
+                name: String::from("Tax"),
+            },
+        ];
+
+        for op in &m3a_ops {
+            assert_eq!(
+                WireOpV1::try_from(op),
+                Err(WireConvertError::UnsupportedInV1)
+            );
+            assert_eq!(
+                ops_to_wire_txn(String::from("m3a"), core::slice::from_ref(op)),
+                Err(WireConvertError::UnsupportedInV1)
+            );
+            assert_eq!(
+                WireOpV2::try_from(op),
+                Err(WireConvertError::UnsupportedInV2)
+            );
+            assert_eq!(
+                ops_to_wire_txn_v2(String::from("m3a"), core::slice::from_ref(op)),
+                Err(WireConvertError::UnsupportedInV2)
+            );
+        }
+        let _ = NamedRangeKey::new(None, "Tax");
+
+        let m3a_bound_exprs = [
+            BoundExpr::SpillRef(alloc::boxed::Box::new(BoundExpr::Name(String::from("X")))),
+            BoundExpr::ScopedName {
+                sheet: Some(SheetId(0)),
+                missing_sheet: None,
+                name: String::from("Rate"),
+            },
+            BoundExpr::Opaque {
+                raw: String::from("=FUTURE()"),
+            },
+            BoundExpr::PreservedCached {
+                raw: String::from("=FUTURE()"),
+                cached: ScalarValue::Number(7.0),
+            },
+        ];
+        for expr in m3a_bound_exprs {
+            let bf = BoundFormula {
+                mode: FormulaMode::Dynamic,
+                root: expr,
+            };
+            assert_eq!(
+                WireBoundFormulaV1::try_from(&bf),
+                Err(WireConvertError::UnsupportedInV1)
+            );
+            let op = Op::SetCells {
+                sheet: SheetId(0),
+                edits: vec![CellEdit {
+                    row: RowId(0),
+                    col: ColId(0),
+                    input: CellInput::Formula {
+                        formula: bf,
+                        cached: None,
+                    },
+                    format: FormatPatch::Keep,
+                }],
+            };
+            assert_eq!(
+                WireOpV1::try_from(&op),
+                Err(WireConvertError::UnsupportedInV1)
+            );
+            assert_eq!(
+                WireOpV2::try_from(&op),
+                Err(WireConvertError::UnsupportedInV2)
+            );
+        }
+
+        let m3a_template_exprs = [
+            TemplateExpr::SpillRef(alloc::boxed::Box::new(TemplateExpr::Name(String::from(
+                "X",
+            )))),
+            TemplateExpr::ScopedName {
+                sheet: Some(SheetId(0)),
+                missing_sheet: None,
+                name: String::from("Rate"),
+            },
+            TemplateExpr::Opaque {
+                raw: String::from("=FUTURE()"),
+            },
+            TemplateExpr::PreservedCached {
+                raw: String::from("=FUTURE()"),
+                cached: ScalarValue::Bool(true),
+            },
+        ];
+        for expr in m3a_template_exprs {
+            let tf = TemplateFormula {
+                mode: FormulaMode::Dynamic,
+                root: expr,
+            };
+            assert_eq!(
+                WireTemplateFormulaV1::try_from(&tf),
+                Err(WireConvertError::UnsupportedInV1)
+            );
+            let op = Op::FillFormula {
+                sheet: SheetId(0),
+                rows: vec![IdRun::new(0, 1).unwrap()],
+                cols: vec![IdRun::new(0, 1).unwrap()],
+                template: tf,
+            };
+            assert_eq!(
+                WireOpV1::try_from(&op),
+                Err(WireConvertError::UnsupportedInV1)
+            );
+            assert_eq!(
+                WireOpV2::try_from(&op),
+                Err(WireConvertError::UnsupportedInV2)
+            );
+        }
     }
 }

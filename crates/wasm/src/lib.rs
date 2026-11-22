@@ -1413,14 +1413,9 @@ impl Engine {
                     .collect(),
             });
         }
-        let engine_ref = &self.engine;
-        Some(viewport::encode_page_with_formulas(
-            sheet,
-            page,
-            self.epoch,
-            &mut self.text,
-            |r, c| engine_ref.has_formula(sheet_id, r, c),
-        ))
+        let _ = sheet;
+        self.engine
+            .encode_viewport_page(sheet_id, page, self.epoch, &mut self.text)
     }
 
     /// Takes an auxiliary event (such as [`EngineEvent::StylesUpdated`] emitted
@@ -3271,6 +3266,32 @@ fn record_inverse_on_snapshot_encoder(enc: &mut SnapshotEncoder, inv: &InverseOp
                 enc.record_formula_before_edit(*k, Some(prior_f.clone()));
             }
         }
+        InverseOp::RestorePermutedCells { sheet, prior } => {
+            for c in prior {
+                let p = match &c.input {
+                    CellInput::Formula { formula, .. } => Some(formula.clone()),
+                    CellInput::Empty | CellInput::Scalar(_) => None,
+                };
+                enc.record_formula_before_edit((*sheet, c.row, c.col), p);
+            }
+        }
+        InverseOp::RestoreMovedCells {
+            prior_cells,
+            rewritten_formulas,
+            ..
+        } => {
+            for (sheet, c) in prior_cells {
+                let p = match &c.input {
+                    CellInput::Formula { formula, .. } => Some(formula.clone()),
+                    CellInput::Empty | CellInput::Scalar(_) => None,
+                };
+                enc.record_formula_before_edit((*sheet, c.row, c.col), p);
+            }
+            for (k, prior_f) in rewritten_formulas {
+                enc.record_formula_before_edit(*k, Some(prior_f.clone()));
+            }
+        }
+        InverseOp::RestoreNamedRange { .. } => {}
         _ => {}
     }
 }
@@ -3479,6 +3500,12 @@ fn format_op_error(err: OpError) -> String {
             String::from("Local workbook memory limit (1 GiB) exceeded.")
         }
         OpError::ReadOnly => String::from("This workbook is read-only."),
+        OpError::InvalidNamedRange => String::from("Named range identifier or comment is invalid."),
+        OpError::TooManyNamedRanges => String::from("Maximum named range count reached."),
+        OpError::InvalidPermutation => String::from("Row sort permutation is invalid."),
+        OpError::InvalidMoveCells => {
+            String::from("Cut-and-paste source and destination ranges are invalid.")
+        }
     }
 }
 

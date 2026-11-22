@@ -318,6 +318,52 @@ impl RemapState<'_> {
                 sheet: self.map_sheet(sheet),
                 after: after.map(|s| self.map_sheet(s)),
             }),
+            Op::PermuteContent {
+                sheet,
+                rows,
+                cols,
+                row_perm,
+            } => Some(Op::PermuteContent {
+                sheet: self.map_sheet(sheet),
+                rows: rows.into_iter().map(|r| self.map_row(r)).collect(),
+                cols: cols.into_iter().map(|c| self.map_col(c)).collect(),
+                row_perm,
+            }),
+            Op::MoveCells {
+                src_sheet,
+                src_rows,
+                src_cols,
+                dst_sheet,
+                dst_rows,
+                dst_cols,
+            } => Some(Op::MoveCells {
+                src_sheet: self.map_sheet(src_sheet),
+                src_rows: src_rows.into_iter().map(|r| self.map_row(r)).collect(),
+                src_cols: src_cols.into_iter().map(|c| self.map_col(c)).collect(),
+                dst_sheet: self.map_sheet(dst_sheet),
+                dst_rows: dst_rows.into_iter().map(|r| self.map_row(r)).collect(),
+                dst_cols: dst_cols.into_iter().map(|c| self.map_col(c)).collect(),
+            }),
+            Op::DefineNamedRange {
+                scope,
+                name,
+                mut formula,
+                comment,
+                hidden,
+            } => {
+                formula.remap_ids(&self.sheets, &self.rows, &self.cols);
+                Some(Op::DefineNamedRange {
+                    scope: scope.map(|s| self.map_sheet(s)),
+                    name,
+                    formula,
+                    comment,
+                    hidden,
+                })
+            }
+            Op::DeleteNamedRange { scope, name } => Some(Op::DeleteNamedRange {
+                scope: scope.map(|s| self.map_sheet(s)),
+                name,
+            }),
         }
     }
 }

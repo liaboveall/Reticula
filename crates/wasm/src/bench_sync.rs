@@ -121,7 +121,8 @@ fn remote_commit(seq: u64, n: u64) -> WireCommittedTxnV2 {
         txn: ops_to_wire_txn_v2(
             "Remote edit".into(),
             &[set_cells(vec![number(row, COL_A, value)])],
-        ),
+        )
+        .expect("bench op fits wire v2"),
     }
 }
 

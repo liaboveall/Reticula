@@ -608,7 +608,7 @@ mod tests {
             client_seq: 1,
             user_id: USER_A,
             timestamp_ms: 1,
-            txn: ops_to_wire_txn_v2(String::new(), &[]),
+            txn: ops_to_wire_txn_v2(String::new(), &[]).unwrap(),
         };
         let mut dm_client = ClientSyncMachine::new(DOC_ID, BRANCH_ID);
         dm_client.on_connected();
@@ -1006,7 +1006,8 @@ mod tests {
                                 format: FormatPatch::Keep,
                             }],
                         }],
-                    ),
+                    )
+                    .unwrap(),
                 },
                 2,
             )
@@ -1032,7 +1033,8 @@ mod tests {
                                 format: FormatPatch::Keep,
                             }],
                         }],
-                    ),
+                    )
+                    .unwrap(),
                 },
                 3,
             )
@@ -1194,7 +1196,8 @@ mod tests {
                             format: FormatPatch::Keep,
                         }],
                     }],
-                ),
+                )
+                .unwrap(),
             },
             3,
         )
@@ -1406,7 +1409,7 @@ mod tests {
             client_seq: 1,
             base_server_seq: snap_seq,
             timestamp_ms: 99,
-            txn: ops_to_wire_txn_v2(String::from("Rogue"), &[set_num(0, 0, 99.0)]),
+            txn: ops_to_wire_txn_v2(String::from("Rogue"), &[set_num(0, 0, 99.0)]).unwrap(),
         };
         assert!(matches!(
             server.validate_and_try_apply(

@@ -344,6 +344,7 @@ impl ClientSyncMachine {
         if self.read_only {
             return Err(OpError::ReadOnly);
         }
+        let wire_txn = ops_to_wire_txn_v2(label, &ops).map_err(|_| OpError::InvalidFormula)?;
         let inverses = apply_ops_atomic(&mut self.visible, &ops)?;
         let client_seq = self.next_client_seq;
         self.next_client_seq = client_seq.saturating_add(1);
@@ -353,7 +354,7 @@ impl ClientSyncMachine {
             client_seq,
             base_server_seq: self.confirmed_seq,
             timestamp_ms,
-            txn: ops_to_wire_txn_v2(label, &ops),
+            txn: wire_txn,
         };
         let entry = PendingEntry {
             wire: wire.clone(),
@@ -893,12 +894,15 @@ impl ClientSyncMachine {
                         remapped_ops.push(m);
                     }
                 }
+                let Ok(txn) = ops_to_wire_txn_v2(entry.wire.txn.label, &remapped_ops) else {
+                    continue;
+                };
                 let wire = WirePendingTxnV2 {
                     replica,
                     client_seq: cs,
                     base_server_seq: self.confirmed_seq,
                     timestamp_ms: entry.wire.timestamp_ms,
-                    txn: ops_to_wire_txn_v2(entry.wire.txn.label, &remapped_ops),
+                    txn,
                 };
                 cs = cs.saturating_add(1);
                 self.pending.push_back(PendingEntry {

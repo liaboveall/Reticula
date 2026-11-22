@@ -353,7 +353,8 @@ impl CollabSession {
             client_seq: self.machine.next_client_seq(),
             base_server_seq: self.machine.confirmed_seq(),
             timestamp_ms,
-            txn: ops_to_wire_txn_v2(label.into(), ops),
+            txn: ops_to_wire_txn_v2(label.into(), ops)
+                .map_err(|_| String::from("This transaction cannot be encoded in wire v2."))?,
         };
         if !encode_sync_frame(&WireSyncFrameV1::Push {
             txns: vec![pending],

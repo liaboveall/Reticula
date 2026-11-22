@@ -564,7 +564,7 @@ impl SnapshotEncoder {
 
             EncodePhase::EmitFormulas => {
                 // Collect up to `ENCODE_FORMULAS_PER_CHUNK` point-in-time formulas per step!
-                let batch = self.next_formula_batch(live_workbook, ENCODE_FORMULAS_PER_CHUNK);
+                let batch = self.next_formula_batch(live_workbook, ENCODE_FORMULAS_PER_CHUNK)?;
                 if !batch.is_empty() {
                     let count_u32 = u32::try_from(batch.len()).map_err(|_| SnapshotError::Codec)?;
                     self.total_formulas_encoded = self
@@ -662,7 +662,7 @@ impl SnapshotEncoder {
         &mut self,
         live_workbook: &Workbook<BoundFormula>,
         limit: usize,
-    ) -> Vec<WireFormulaEntryV1> {
+    ) -> Result<Vec<WireFormulaEntryV1>, SnapshotError> {
         if self.formula_before_image.is_empty() {
             // Fast path (no formulas edited while snapshot in flight): stream
             // directly from `live_workbook.formulas()` with zero allocations!
@@ -680,23 +680,28 @@ impl SnapshotEncoder {
                     sheet: key.0.0,
                     row: key.1.0,
                     col: key.2.0,
-                    formula: f.into(),
+                    formula: WireBoundFormulaV1::try_from(f).map_err(|_| SnapshotError::Codec)?,
                 });
             }
-            return batch;
+            return Ok(batch);
         }
 
         // Merge live `formulas()` with `formula_before_image` in sorted key order.
         if self.formulas_collected.is_none() {
-            let mut merged: BTreeMap<WorkbookCellKey, WireBoundFormulaV1> = live_workbook
-                .formulas()
-                .iter()
-                .map(|(&k, f)| (k, WireBoundFormulaV1::from(f)))
-                .collect();
+            let mut merged: BTreeMap<WorkbookCellKey, WireBoundFormulaV1> = BTreeMap::new();
+            for (&k, f) in live_workbook.formulas() {
+                merged.insert(
+                    k,
+                    WireBoundFormulaV1::try_from(f).map_err(|_| SnapshotError::Codec)?,
+                );
+            }
             for (&k, prior) in &self.formula_before_image {
                 match prior {
                     Some(f) => {
-                        merged.insert(k, WireBoundFormulaV1::from(f));
+                        merged.insert(
+                            k,
+                            WireBoundFormulaV1::try_from(f).map_err(|_| SnapshotError::Codec)?,
+                        );
                     }
                     None => {
                         merged.remove(&k);
@@ -716,13 +721,13 @@ impl SnapshotEncoder {
             );
         }
         let Some(all) = &mut self.formulas_collected else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         if all.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         let take = all.len().min(limit);
-        all.drain(..take).collect()
+        Ok(all.drain(..take).collect())
     }
 }
 
@@ -1515,6 +1520,10 @@ fn validate_and_normalize_direct_expr(
         }
         BoundExpr::Reference(_) => Ok(()),
         BoundExpr::Name(n) => check_direct_text_len(n),
+        BoundExpr::ScopedName { .. }
+        | BoundExpr::SpillRef(_)
+        | BoundExpr::Opaque { .. }
+        | BoundExpr::PreservedCached { .. } => Err(SnapshotError::Codec),
         BoundExpr::Paren(inner) | BoundExpr::Unary { expr: inner, .. } => {
             validate_and_normalize_direct_expr(inner, next)
         }
@@ -1990,7 +1999,7 @@ mod tests {
                 sheet: u32::try_from(i).unwrap(),
                 row: (i as u64) + 10,
                 col: (i as u64) + 20,
-                formula: WireBoundFormulaV1::from(f),
+                formula: WireBoundFormulaV1::try_from(f).unwrap(),
             })
             .collect();
         let encoded = postcard::to_allocvec(&wire_entries).unwrap();

@@ -1436,15 +1436,17 @@ impl SimWorld {
             }
         } else if kind == RogueKind::OversizedPushBatch {
             let count = self.server_limits.max_push_batch.saturating_add(1);
-            let txns: Vec<WirePendingTxnV2> = (1..=count)
-                .map(|i| WirePendingTxnV2 {
+            let mut txns: Vec<WirePendingTxnV2> = Vec::with_capacity(count);
+            for i in 1..=count {
+                txns.push(WirePendingTxnV2 {
                     replica: 1,
                     client_seq: i as u64,
                     base_server_seq: 0,
                     timestamp_ms: 1,
-                    txn: ops_to_wire_txn_v2(String::from("over"), &[]),
-                })
-                .collect();
+                    txn: ops_to_wire_txn_v2(String::from("over"), &[])
+                        .map_err(|e| format!("ops_to_wire_txn_v2: {e:?}"))?,
+                });
+            }
             let push = WireSyncFrameV1::Push { txns: txns.clone() };
             let raw = encode_sync_frame(&push).unwrap_or_default();
             if self.server.validate_push_batch(&txns, raw.len()).is_ok() {
@@ -1465,7 +1467,8 @@ impl SimWorld {
                         frozen_rows: 1,
                         frozen_cols: 0,
                     }],
-                ),
+                )
+                .map_err(|e| format!("ops_to_wire_txn_v2: {e:?}"))?,
             };
             let res = self.server.apply_and_commit(
                 USER_D,

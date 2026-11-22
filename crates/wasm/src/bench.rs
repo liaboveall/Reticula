@@ -13,7 +13,7 @@ use reticula_core::sheet::Sheet;
 use reticula_core::store::{BLOCK_ROWS, Block, Column, SlotMap};
 use reticula_core::strings::StringTable;
 use reticula_core::value::Value;
-use reticula_core::viewport::{self, Page};
+use reticula_core::viewport::Page;
 use reticula_formula::ast::{BinaryOp, Literal};
 use reticula_formula::binder::{BoundExpr, BoundFormula, BoundRef};
 use reticula_formula::engine::FormulaEngine;
@@ -433,17 +433,15 @@ impl WasmBench {
         let _ = self
             .engine
             .edit_cell_raw(SheetId(0), row, ColId(0), &format!("{v}"));
-        let wb = self.engine.workbook();
-        let Some(sheet) = wb.sheet(SheetId(0)) else {
-            return 0;
-        };
-        let bytes = viewport::encode_page_with_formulas(
-            sheet,
-            Page { row: 0, col: 0 },
-            self.step_counter,
-            &mut self.text_scratch,
-            |r, c| wb.formula(SheetId(0), r, c).is_some(),
-        );
+        let bytes = self
+            .engine
+            .encode_viewport_page(
+                SheetId(0),
+                Page { row: 0, col: 0 },
+                self.step_counter,
+                &mut self.text_scratch,
+            )
+            .unwrap_or_default();
         bytes.len()
     }
 
@@ -453,15 +451,12 @@ impl WasmBench {
         let decoded = decode_snapshot_any(bytes)
             .map_err(|e| JsError::new(&format!("decode_snapshot_any failed: {e:?}")))?;
         let mut bench = Self::from_engine(decoded.engine);
-        let wb = bench.engine.workbook();
-        if let Some(sheet) = wb.sheet(SheetId(0)) {
-            let page = viewport::encode_page_with_formulas(
-                sheet,
-                Page { row: 0, col: 0 },
-                1,
-                &mut bench.text_scratch,
-                |r, c| wb.formula(SheetId(0), r, c).is_some(),
-            );
+        if let Some(page) = bench.engine.encode_viewport_page(
+            SheetId(0),
+            Page { row: 0, col: 0 },
+            1,
+            &mut bench.text_scratch,
+        ) {
             assert!(!page.is_empty());
         }
         Ok(bench)

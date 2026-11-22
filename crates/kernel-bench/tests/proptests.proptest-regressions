@@ -5,3 +5,6 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 9018a47f4bf3d4fc96286de86208b5553a7a0cccfb62c848c4f5056647353aff # shrinks to ast = Binary { op: Pow, left: Literal(Number(0.0)), right: Binary { op: Div, left: Literal(Error(Na)), right: Literal(Number(0.0)) } }
+cc 6714e62c7ed9fff2be0a6008f786c1cda010cfee35ccf989cd959d9f640f726b # shrinks to steps = [SetConsumer { r: 3, c: 1, ar: 1, ac: 0, kind: 2 }, SetArray { r: 3, c: 2, rows: 1, cols: 1, base: 1 }, SetConsumer { r: 1, c: 0, ar: 1, ac: 1, kind: 2 }]
+cc 61f7ed0c77f9cacca9034df8ef3d8d1ab17e3f3ea4442e772e17e124e2a38e18 # shrinks to steps = [DeleteRow { pos: 0 }, SetRangeSpill { r: 3, c: 0, sr: 0, sc: 0, er: 0, ec: 1 }, SetConsumer { r: 0, c: 0, ar: 2, ac: 1, kind: 2 }, InsertRowAfter { after: None }, InsertRowAfter { after: None }, SetConsumer { r: 5, c: 0, ar: 0, ac: 0, kind: 0 }]
+cc b6bf7db168db2497c05bfc4f337907098ed7548d90d5e931dfabfc20babc9374 # shrinks to steps = [SetRangeSpill { r: 3, c: 1, sr: 2, sc: 2, er: 3, ec: 3 }, DeleteRow { pos: 0 }, SetConsumer { r: 3, c: 1, ar: 0, ac: 0, kind: 0 }]

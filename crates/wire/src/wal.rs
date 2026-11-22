@@ -1169,7 +1169,7 @@ mod tests {
             seq: 1,
             timestamp_ms: 100,
             label: String::from("Undo conditional"),
-            ops: vec![WireOpV2::from(&cond_op)],
+            ops: vec![WireOpV2::try_from(&cond_op).unwrap()],
         };
         let wal2 = encode_wal_complete_v2(0, core::slice::from_ref(&rec1)).unwrap();
         let scan2 = scan_wal_v2(&wal2, 0, 1).unwrap();
@@ -1190,7 +1190,7 @@ mod tests {
             seq: 2,
             timestamp_ms: 200,
             label: String::from("Torn"),
-            ops: vec![WireOpV2::from(&cond_op)],
+            ops: vec![WireOpV2::try_from(&cond_op).unwrap()],
         })
         .unwrap();
         let mut torn_wal2 = wal2.clone();
@@ -1210,7 +1210,7 @@ mod tests {
             timestamp_ms: 1000,
             txn: WireTxnV2 {
                 label: String::from("Pending 1"),
-                ops: vec![WireOpV2::from(&cond_op)],
+                ops: vec![WireOpV2::try_from(&cond_op).unwrap()],
             },
         };
         let p2 = WirePendingTxnV2 {

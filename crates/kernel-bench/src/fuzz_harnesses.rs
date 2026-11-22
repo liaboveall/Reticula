@@ -646,14 +646,16 @@ pub fn fuzz_one_sync(data: &[u8]) {
             4 => {
                 let cs = u.int_in_range(0_u64..=8).unwrap_or(1);
                 let rep = u.int_in_range(0_u32..=8).unwrap_or(1);
-                let pending = WirePendingTxnV2 {
-                    replica: rep,
-                    client_seq: cs,
-                    base_server_seq: u.arbitrary().unwrap_or(0),
-                    timestamp_ms: step as u64,
-                    txn: ops_to_wire_txn_v2(String::from("arb"), &[]),
-                };
-                let _ = server.apply_and_commit(user, role, rep, pending, step as u64);
+                if let Ok(txn) = ops_to_wire_txn_v2(String::from("arb"), &[]) {
+                    let pending = WirePendingTxnV2 {
+                        replica: rep,
+                        client_seq: cs,
+                        base_server_seq: u.arbitrary().unwrap_or(0),
+                        timestamp_ms: step as u64,
+                        txn,
+                    };
+                    let _ = server.apply_and_commit(user, role, rep, pending, step as u64);
+                }
             }
             5 => {
                 let cs = u.int_in_range(0_u64..=6).unwrap_or(1);

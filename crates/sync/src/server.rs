@@ -497,6 +497,11 @@ impl ServerDocMachine {
             return Err(WireRejectReasonV1::QuotaExceeded);
         }
 
+        let Ok(wire_txn) = ops_to_wire_txn_v2(label, &ops) else {
+            rewind_inverses(&mut self.workbook, inverses);
+            return Err(WireRejectReasonV1::InvalidOp);
+        };
+
         let next_seq = self.head_seq.saturating_add(1);
         self.head_seq = next_seq;
         if let Some(entry) = self.replicas.get_mut(&session_replica) {
@@ -504,7 +509,6 @@ impl ServerDocMachine {
             entry.max_id_counter = new_max_id;
         }
 
-        let wire_txn = ops_to_wire_txn_v2(label, &ops);
         Ok(TryApplyOutcome::Staged(StagedTxn {
             committed: WireCommittedTxnV2 {
                 seq: next_seq,

@@ -327,15 +327,8 @@ impl HistoryPlayer {
         epoch: u32,
     ) -> Option<Vec<u8>> {
         self.engine.prepare_page_styles(sheet_id, page);
-        let sheet = self.engine.workbook().sheet(sheet_id)?;
-        let engine_ref = &self.engine;
-        Some(viewport::encode_page_with_formulas(
-            sheet,
-            page,
-            epoch,
-            &mut self.text_scratch,
-            |r, c| engine_ref.has_formula(sheet_id, r, c),
-        ))
+        self.engine
+            .encode_viewport_page(sheet_id, page, epoch, &mut self.text_scratch)
     }
 
     pub fn subscribe_range(
@@ -486,7 +479,7 @@ mod tests {
             client_seq: seq,
             user_id: [1; 16],
             timestamp_ms: 1_795_000_000_000 + seq,
-            txn: ops_to_wire_txn_v2(label.to_owned(), &ops),
+            txn: ops_to_wire_txn_v2(label.to_owned(), &ops).unwrap(),
         }
     }
 
@@ -545,7 +538,8 @@ mod tests {
                     client_seq: seq,
                     user_id: [1; 16],
                     timestamp_ms: 1_795_000_000_000 + seq,
-                    txn: ops_to_wire_txn_v2("A3=SUM".into(), core::slice::from_ref(&sum_op)),
+                    txn: ops_to_wire_txn_v2("A3=SUM".into(), core::slice::from_ref(&sum_op))
+                        .unwrap(),
                 },
                 4 => {
                     let ins = pack_id(0, 1, 99).unwrap();
@@ -563,7 +557,7 @@ mod tests {
                         client_seq: seq,
                         user_id: [1; 16],
                         timestamp_ms: 1_795_000_000_000 + seq,
-                        txn: ops_to_wire_txn_v2("Insert row".into(), &ops),
+                        txn: ops_to_wire_txn_v2("Insert row".into(), &ops).unwrap(),
                     }
                 }
                 _ => make_edit_txn(

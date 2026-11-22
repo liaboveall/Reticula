@@ -221,7 +221,7 @@ fn collaborative_undo_and_redo_preserve_remote_cells_and_reject_saves_before_tru
             client_seq: 1,
             base_server_seq: 1,
             timestamp_ms: 11,
-            txn: ops_to_wire_txn_v2("Bob edited A1".into(), &[edit_op(0, 77.0)]),
+            txn: ops_to_wire_txn_v2("Bob edited A1".into(), &[edit_op(0, 77.0)]).unwrap(),
         },
     );
     deliver(&mut engine, overwrite);
@@ -314,7 +314,7 @@ fn remote_presence_is_resolved_again_after_a_structural_commit() {
             client_seq: 1,
             base_server_seq: 0,
             timestamp_ms: 0,
-            txn: ops_to_wire_txn_v2("Insert".into(), &[insert]),
+            txn: ops_to_wire_txn_v2("Insert".into(), &[insert]).unwrap(),
         },
     );
     deliver(&mut engine, inserted);
@@ -357,7 +357,7 @@ fn local_cursor_follows_rows_inserted_by_someone_else() {
             client_seq: 1,
             base_server_seq: 0,
             timestamp_ms: 0,
-            txn: ops_to_wire_txn_v2("Insert".into(), &[insert]),
+            txn: ops_to_wire_txn_v2("Insert".into(), &[insert]).unwrap(),
         },
     );
     deliver(&mut engine, inserted);
@@ -394,7 +394,7 @@ fn local_cursor_follows_rows_inserted_by_someone_else() {
             client_seq: 2,
             base_server_seq: 1,
             timestamp_ms: 0,
-            txn: ops_to_wire_txn_v2("Edit".into(), &[edit_op(5, 1.0)]),
+            txn: ops_to_wire_txn_v2("Edit".into(), &[edit_op(5, 1.0)]).unwrap(),
         },
     );
     deliver(&mut engine, edit);
@@ -512,7 +512,7 @@ fn incremental_reconciliation_with_pending_edits_recalculates_only_affected_form
             client_seq: 1,
             base_server_seq: 4,
             timestamp_ms: 20,
-            txn: ops_to_wire_txn_v2("Bob A2".into(), &[edit_op(1, 7.0)]),
+            txn: ops_to_wire_txn_v2("Bob A2".into(), &[edit_op(1, 7.0)]).unwrap(),
         },
     );
     deliver(&mut engine, remote);
@@ -590,7 +590,7 @@ fn reopened_pending_wal_falls_back_cleanly_then_re_enables_incremental_reconcile
             client_seq: 1,
             base_server_seq: 1,
             timestamp_ms: 30,
-            txn: ops_to_wire_txn_v2("Bob A2".into(), &[edit_op(1, 9.0)]),
+            txn: ops_to_wire_txn_v2("Bob A2".into(), &[edit_op(1, 9.0)]).unwrap(),
         },
     );
     deliver(&mut reopened, bob_commit);
@@ -624,7 +624,7 @@ fn viewer_receives_commits_reports_read_only_rejects_edits_and_skips_presence() 
             client_seq: 1,
             base_server_seq: 0,
             timestamp_ms: 10,
-            txn: ops_to_wire_txn_v2("Init".into(), &[edit_op(0, 12.0)]),
+            txn: ops_to_wire_txn_v2("Init".into(), &[edit_op(0, 12.0)]).unwrap(),
         },
     );
 

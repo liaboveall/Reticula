@@ -20,8 +20,8 @@ use reticula_core::format::NumberFormat;
 use reticula_core::id::{ColId, IdRun, RowId, SheetId};
 use reticula_core::ops::{
     CellEdit, CellInput, CellSnapshot, ConditionalCellEdit, FormatBackup, FormatPatch,
-    FormatTarget, FormulaPayload, InverseOp, MAX_EDITS_PER_OP, Op, ScalarValue, Workbook,
-    WorkbookCellKey,
+    FormatTarget, FormulaPayload, InverseOp, MAX_EDITS_PER_OP, NamedRangeKey, Op,
+    PermutedCellBackup, ScalarValue, Workbook, WorkbookCellKey,
 };
 use reticula_core::sheet::Sheet;
 use reticula_core::style::{BorderWeight, ColorPatch, HorizontalAlign, StylePatch};
@@ -418,6 +418,7 @@ fn synthesize_compensating_ops(
             sheet,
             prior_runs,
             rewritten,
+            rewritten_names,
         } => {
             let moved_ids = match forward_op {
                 Op::MoveRows { ids, .. } => ids.as_slice(),
@@ -438,11 +439,13 @@ fn synthesize_compensating_ops(
                 formula_map.insert(k, prior_f);
             }
             emit_formula_restores(post_wb, formula_map, out);
+            emit_named_range_restores(post_wb, rewritten_names, out);
         }
         InverseOp::RestoreMovedCols {
             sheet,
             prior_runs,
             rewritten,
+            rewritten_names,
         } => {
             let moved_ids = match forward_op {
                 Op::MoveCols { ids, .. } => ids.as_slice(),
@@ -463,6 +466,7 @@ fn synthesize_compensating_ops(
                 formula_map.insert(k, prior_f);
             }
             emit_formula_restores(post_wb, formula_map, out);
+            emit_named_range_restores(post_wb, rewritten_names, out);
         }
         InverseOp::RestoreRowHeights { sheet, prior } => {
             let sizes = coalesce_row_sizes(&prior);
@@ -531,6 +535,108 @@ fn synthesize_compensating_ops(
                 });
             }
         }
+        InverseOp::RestorePermutedCells { sheet, prior } => {
+            emit_permuted_backup_restores(sheet, prior, post_wb, out);
+        }
+        InverseOp::RestoreMovedCells {
+            prior_cells,
+            rewritten_formulas,
+            rewritten_names,
+        } => {
+            let mut by_sheet: BTreeMap<SheetId, Vec<PermutedCellBackup<BoundFormula>>> =
+                BTreeMap::new();
+            for (sheet, backup) in prior_cells {
+                by_sheet.entry(sheet).or_default().push(backup);
+            }
+            for (sheet, backups) in by_sheet {
+                emit_permuted_backup_restores(sheet, backups, post_wb, out);
+            }
+            let formula_map: BTreeMap<WorkbookCellKey, BoundFormula> =
+                rewritten_formulas.into_iter().collect();
+            emit_formula_restores(post_wb, formula_map, out);
+            emit_named_range_restores(post_wb, rewritten_names, out);
+        }
+        InverseOp::RestoreNamedRange { key, prior } => match prior {
+            Some(def) => out.push(Op::DefineNamedRange {
+                scope: key.scope,
+                name: def.name,
+                formula: def.formula,
+                comment: def.comment,
+                hidden: def.hidden,
+            }),
+            None => out.push(Op::DeleteNamedRange {
+                scope: key.scope,
+                name: key.canonical_name,
+            }),
+        },
+    }
+}
+
+fn emit_permuted_backup_restores(
+    sheet: SheetId,
+    backups: Vec<PermutedCellBackup<BoundFormula>>,
+    post_wb: &Workbook<BoundFormula>,
+    out: &mut Vec<Op<BoundFormula>>,
+) {
+    let mut snapshots = Vec::with_capacity(backups.len());
+    let mut style_entries: Vec<(RowId, ColId, Option<NumberFormat>, StylePatch)> = Vec::new();
+    let sheet_opt = post_wb.sheet(sheet);
+    for b in backups {
+        let cur_style = sheet_opt
+            .and_then(|s| s.cell_styles().get(&(b.row, b.col)).copied())
+            .unwrap_or_default();
+        if cur_style != b.style {
+            style_entries.push((b.row, b.col, b.format, b.style));
+        }
+        snapshots.push(CellSnapshot {
+            row: b.row,
+            col: b.col,
+            input: b.input,
+            explicit_format: b.format,
+        });
+    }
+    emit_snapshot_restore_chunks(sheet, snapshots, out);
+    if !style_entries.is_empty() {
+        const ALL_STYLE_FIELDS: StylePatch = StylePatch {
+            bold: Some(true),
+            italic: Some(true),
+            strikethrough: Some(true),
+            align: Some(HorizontalAlign::Auto),
+            text_color: ColorPatch::Clear,
+            fill_color: ColorPatch::Clear,
+            border_top: Some(BorderWeight::None),
+            border_right: Some(BorderWeight::None),
+            border_bottom: Some(BorderWeight::None),
+            border_left: Some(BorderWeight::None),
+        };
+        synthesize_format_restore(
+            sheet,
+            FormatBackup::Cells(style_entries),
+            FormatPatch::Keep,
+            ALL_STYLE_FIELDS,
+            sheet_opt,
+            out,
+        );
+    }
+}
+
+fn emit_named_range_restores(
+    post_wb: &Workbook<BoundFormula>,
+    rewritten_names: Vec<(NamedRangeKey, BoundFormula)>,
+    out: &mut Vec<Op<BoundFormula>>,
+) {
+    for (nkey, prior_formula) in rewritten_names {
+        let (name, comment, hidden) = match post_wb.named_ranges().get(&nkey) {
+            Some(def) => (def.name.clone(), def.comment.clone(), def.hidden),
+            None => (nkey.canonical_name, None, false),
+        };
+        out.push(Op::DefineNamedRange {
+            scope: nkey.scope,
+            name,
+            formula: prior_formula,
+            comment,
+            hidden,
+        });
     }
 }
 
@@ -1067,6 +1173,42 @@ fn estimate_single_op_bytes(op: &Op<BoundFormula>) -> usize {
             .saturating_mul(size_of::<IdRun>())
             .saturating_add(BoundFormula::validate_template(template).unwrap_or(256)),
         Op::AddSheet { name, .. } | Op::RenameSheet { name, .. } => name.capacity(),
+        Op::PermuteContent {
+            rows,
+            cols,
+            row_perm,
+            ..
+        } => rows
+            .capacity()
+            .saturating_mul(size_of::<RowId>())
+            .saturating_add(cols.capacity().saturating_mul(size_of::<ColId>()))
+            .saturating_add(row_perm.capacity().saturating_mul(size_of::<u32>())),
+        Op::MoveCells {
+            src_rows,
+            src_cols,
+            dst_rows,
+            dst_cols,
+            ..
+        } => src_rows
+            .capacity()
+            .saturating_add(dst_rows.capacity())
+            .saturating_mul(size_of::<RowId>())
+            .saturating_add(
+                src_cols
+                    .capacity()
+                    .saturating_add(dst_cols.capacity())
+                    .saturating_mul(size_of::<ColId>()),
+            ),
+        Op::DefineNamedRange {
+            name,
+            formula,
+            comment,
+            ..
+        } => name
+            .capacity()
+            .saturating_add(formula.estimated_bytes())
+            .saturating_add(comment.as_ref().map_or(0, String::capacity)),
+        Op::DeleteNamedRange { name, .. } => name.capacity(),
     }
 }
 

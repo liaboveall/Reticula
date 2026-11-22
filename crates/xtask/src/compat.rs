@@ -442,21 +442,21 @@ fn freeze_v2() -> Result {
             seq: 6,
             timestamp_ms: 1_763_600_000_006,
             label: String::from("Peer update A2"),
-            ops: vec![WireOpV2::from(&peer_edit_a2)],
+            ops: vec![WireOpV2::try_from(&peer_edit_a2).map_err(|e| format!("WireOpV2: {e:?}"))?],
         },
         WireWalRecordV2 {
             seq: 7,
             timestamp_ms: 1_763_600_000_007,
             label: String::from("Conditional undo"),
-            ops: vec![WireOpV2::from(&cond_undo)],
+            ops: vec![WireOpV2::try_from(&cond_undo).map_err(|e| format!("WireOpV2: {e:?}"))?],
         },
         WireWalRecordV2 {
             seq: 8,
             timestamp_ms: 1_763_600_000_008,
             label: String::from("Add collaborative sheet"),
             ops: vec![
-                WireOpV2::from(&add_collab_sheet),
-                WireOpV2::from(&set_collab_cell),
+                WireOpV2::try_from(&add_collab_sheet).map_err(|e| format!("WireOpV2: {e:?}"))?,
+                WireOpV2::try_from(&set_collab_cell).map_err(|e| format!("WireOpV2: {e:?}"))?,
             ],
         },
     ];
@@ -506,7 +506,10 @@ fn freeze_v2() -> Result {
                     timestamp_ms: 1_763_600_000_006,
                     txn: WireTxnV2 {
                         label: String::from("Peer"),
-                        ops: vec![WireOpV2::from(&peer_edit_a2)],
+                        ops: vec![
+                            WireOpV2::try_from(&peer_edit_a2)
+                                .map_err(|e| format!("WireOpV2: {e:?}"))?,
+                        ],
                     },
                 }],
             },
@@ -530,7 +533,9 @@ fn freeze_v2() -> Result {
                 timestamp_ms: 1_763_600_000_007,
                 txn: WireTxnV2 {
                     label: String::from("Conditional undo"),
-                    ops: vec![WireOpV2::from(&cond_undo)],
+                    ops: vec![
+                        WireOpV2::try_from(&cond_undo).map_err(|e| format!("WireOpV2: {e:?}"))?,
+                    ],
                 },
             }],
         },
@@ -552,7 +557,10 @@ fn freeze_v2() -> Result {
             timestamp_ms: 1_763_600_000_008,
             txn: WireTxnV2 {
                 label: String::from("Add collaborative sheet"),
-                ops: vec![WireOpV2::from(&add_collab_sheet)],
+                ops: vec![
+                    WireOpV2::try_from(&add_collab_sheet)
+                        .map_err(|e| format!("WireOpV2: {e:?}"))?,
+                ],
             },
         },
         WireSyncFrameV1::Digest {

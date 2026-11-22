@@ -136,29 +136,34 @@ pub fn build_seed_corpus() -> Vec<Vec<u8>> {
         seeds.push(wal_bytes);
     }
 
-    let wire_op_v2 = WireOpV2::from(&wal_op);
-    let wal_v2 = vec![WireWalRecordV2 {
-        seq: 1,
-        timestamp_ms: 1_760_000_000_001,
-        label: String::from("v2"),
-        ops: vec![wire_op_v2.clone()],
-    }];
-    if let Ok(wal2) = encode_wal_complete_v2(0, &wal_v2) {
-        seeds.push(wal2);
-    }
-    let pending_txns = vec![WirePendingTxnV2 {
-        replica: 1,
-        client_seq: 1,
-        base_server_seq: 0,
-        timestamp_ms: 1_760_000_000_001,
-        txn: WireTxnV2 {
-            label: String::from("pend"),
-            ops: vec![wire_op_v2],
+    let pending_txns = WireOpV2::try_from(&wal_op).map_or_else(
+        |_| Vec::new(),
+        |wire_op_v2| {
+            let wal_v2 = vec![WireWalRecordV2 {
+                seq: 1,
+                timestamp_ms: 1_760_000_000_001,
+                label: String::from("v2"),
+                ops: vec![wire_op_v2.clone()],
+            }];
+            if let Ok(wal2) = encode_wal_complete_v2(0, &wal_v2) {
+                seeds.push(wal2);
+            }
+            let txns = vec![WirePendingTxnV2 {
+                replica: 1,
+                client_seq: 1,
+                base_server_seq: 0,
+                timestamp_ms: 1_760_000_000_001,
+                txn: WireTxnV2 {
+                    label: String::from("pend"),
+                    ops: vec![wire_op_v2],
+                },
+            }];
+            if let Ok(pwal) = encode_pending_wal_complete(&txns) {
+                seeds.push(pwal);
+            }
+            txns
         },
-    }];
-    if let Ok(pwal) = encode_pending_wal_complete(&pending_txns) {
-        seeds.push(pwal);
-    }
+    );
     if let Ok(f1) = encode_sync_frame(&WireSyncFrameV1::Hello {
         protocol_version: SYNC_PROTOCOL_VERSION,
         doc_id: [0x11; 16],

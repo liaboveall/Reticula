@@ -48,6 +48,8 @@ pub enum WireConvertError {
     InvalidArrayLiteral,
     /// Operation variant introduced in wire v2+ cannot be encoded as [`WireOpV1`].
     UnsupportedInV1,
+    /// Operation or formula variant introduced in wire v3+ cannot be encoded as v2.
+    UnsupportedInV2,
     /// State digest version is unsupported.
     UnsupportedDigestVersion,
 }
@@ -818,34 +820,44 @@ impl From<WireBoundRefV1> for BoundRef {
     }
 }
 
-fn bound_expr_to_wire(expr: &BoundExpr) -> WireBoundExprV1 {
+fn bound_expr_to_wire(expr: &BoundExpr) -> Result<WireBoundExprV1, WireConvertError> {
     match expr {
-        BoundExpr::Literal(lit) => WireBoundExprV1::Literal(lit.into()),
+        BoundExpr::Literal(lit) => Ok(WireBoundExprV1::Literal(lit.into())),
         BoundExpr::ArrayLiteral {
             rows,
             cols,
             elements,
-        } => WireBoundExprV1::ArrayLiteral {
+        } => Ok(WireBoundExprV1::ArrayLiteral {
             rows: *rows,
             cols: *cols,
             elements: elements.iter().map(WireLiteralV1::from).collect(),
-        },
-        BoundExpr::Reference(r) => WireBoundExprV1::Reference(r.into()),
-        BoundExpr::Name(n) => WireBoundExprV1::Name(n.clone()),
-        BoundExpr::Paren(inner) => WireBoundExprV1::Paren(Box::new(bound_expr_to_wire(inner))),
-        BoundExpr::Unary { op, expr } => WireBoundExprV1::Unary {
+        }),
+        BoundExpr::Reference(r) => Ok(WireBoundExprV1::Reference(r.into())),
+        BoundExpr::Name(n) => Ok(WireBoundExprV1::Name(n.clone())),
+        BoundExpr::Paren(inner) => Ok(WireBoundExprV1::Paren(Box::new(bound_expr_to_wire(inner)?))),
+        BoundExpr::Unary { op, expr } => Ok(WireBoundExprV1::Unary {
             op: (*op).into(),
-            expr: Box::new(bound_expr_to_wire(expr)),
-        },
-        BoundExpr::Binary { op, left, right } => WireBoundExprV1::Binary {
+            expr: Box::new(bound_expr_to_wire(expr)?),
+        }),
+        BoundExpr::Binary { op, left, right } => Ok(WireBoundExprV1::Binary {
             op: (*op).into(),
-            left: Box::new(bound_expr_to_wire(left)),
-            right: Box::new(bound_expr_to_wire(right)),
-        },
-        BoundExpr::Call { name, args } => WireBoundExprV1::Call {
-            name: name.clone(),
-            args: args.iter().map(bound_expr_to_wire).collect(),
-        },
+            left: Box::new(bound_expr_to_wire(left)?),
+            right: Box::new(bound_expr_to_wire(right)?),
+        }),
+        BoundExpr::Call { name, args } => {
+            let mut out = Vec::with_capacity(args.len());
+            for arg in args {
+                out.push(bound_expr_to_wire(arg)?);
+            }
+            Ok(WireBoundExprV1::Call {
+                name: name.clone(),
+                args: out,
+            })
+        }
+        BoundExpr::ScopedName { .. }
+        | BoundExpr::SpillRef(_)
+        | BoundExpr::Opaque { .. }
+        | BoundExpr::PreservedCached { .. } => Err(WireConvertError::UnsupportedInV1),
     }
 }
 
@@ -912,12 +924,14 @@ fn bound_expr_from_wire(w: WireBoundExprV1, depth: usize) -> Result<BoundExpr, W
     }
 }
 
-impl From<&BoundFormula> for WireBoundFormulaV1 {
-    fn from(f: &BoundFormula) -> Self {
-        Self {
+impl TryFrom<&BoundFormula> for WireBoundFormulaV1 {
+    type Error = WireConvertError;
+
+    fn try_from(f: &BoundFormula) -> Result<Self, Self::Error> {
+        Ok(Self {
             mode: f.mode.into(),
-            root: bound_expr_to_wire(&f.root),
-        }
+            root: bound_expr_to_wire(&f.root)?,
+        })
     }
 }
 
@@ -1106,36 +1120,46 @@ impl From<WireTemplateRefV1> for TemplateRef {
     }
 }
 
-fn template_expr_to_wire(expr: &TemplateExpr) -> WireTemplateExprV1 {
+fn template_expr_to_wire(expr: &TemplateExpr) -> Result<WireTemplateExprV1, WireConvertError> {
     match expr {
-        TemplateExpr::Literal(lit) => WireTemplateExprV1::Literal(lit.into()),
+        TemplateExpr::Literal(lit) => Ok(WireTemplateExprV1::Literal(lit.into())),
         TemplateExpr::ArrayLiteral {
             rows,
             cols,
             elements,
-        } => WireTemplateExprV1::ArrayLiteral {
+        } => Ok(WireTemplateExprV1::ArrayLiteral {
             rows: *rows,
             cols: *cols,
             elements: elements.iter().map(WireLiteralV1::from).collect(),
-        },
-        TemplateExpr::Reference(r) => WireTemplateExprV1::Reference(r.into()),
-        TemplateExpr::Name(n) => WireTemplateExprV1::Name(n.clone()),
-        TemplateExpr::Paren(inner) => {
-            WireTemplateExprV1::Paren(Box::new(template_expr_to_wire(inner)))
+        }),
+        TemplateExpr::Reference(r) => Ok(WireTemplateExprV1::Reference(r.into())),
+        TemplateExpr::Name(n) => Ok(WireTemplateExprV1::Name(n.clone())),
+        TemplateExpr::Paren(inner) => Ok(WireTemplateExprV1::Paren(Box::new(
+            template_expr_to_wire(inner)?,
+        ))),
+        TemplateExpr::Unary { op, expr } => Ok(WireTemplateExprV1::Unary {
+            op: (*op).into(),
+            expr: Box::new(template_expr_to_wire(expr)?),
+        }),
+        TemplateExpr::Binary { op, left, right } => Ok(WireTemplateExprV1::Binary {
+            op: (*op).into(),
+            left: Box::new(template_expr_to_wire(left)?),
+            right: Box::new(template_expr_to_wire(right)?),
+        }),
+        TemplateExpr::Call { name, args } => {
+            let mut out = Vec::with_capacity(args.len());
+            for arg in args {
+                out.push(template_expr_to_wire(arg)?);
+            }
+            Ok(WireTemplateExprV1::Call {
+                name: name.clone(),
+                args: out,
+            })
         }
-        TemplateExpr::Unary { op, expr } => WireTemplateExprV1::Unary {
-            op: (*op).into(),
-            expr: Box::new(template_expr_to_wire(expr)),
-        },
-        TemplateExpr::Binary { op, left, right } => WireTemplateExprV1::Binary {
-            op: (*op).into(),
-            left: Box::new(template_expr_to_wire(left)),
-            right: Box::new(template_expr_to_wire(right)),
-        },
-        TemplateExpr::Call { name, args } => WireTemplateExprV1::Call {
-            name: name.clone(),
-            args: args.iter().map(template_expr_to_wire).collect(),
-        },
+        TemplateExpr::ScopedName { .. }
+        | TemplateExpr::SpillRef(_)
+        | TemplateExpr::Opaque { .. }
+        | TemplateExpr::PreservedCached { .. } => Err(WireConvertError::UnsupportedInV1),
     }
 }
 
@@ -1205,12 +1229,14 @@ fn template_expr_from_wire(
     }
 }
 
-impl From<&TemplateFormula> for WireTemplateFormulaV1 {
-    fn from(t: &TemplateFormula) -> Self {
-        Self {
+impl TryFrom<&TemplateFormula> for WireTemplateFormulaV1 {
+    type Error = WireConvertError;
+
+    fn try_from(t: &TemplateFormula) -> Result<Self, Self::Error> {
+        Ok(Self {
             mode: t.mode.into(),
-            root: template_expr_to_wire(&t.root),
-        }
+            root: template_expr_to_wire(&t.root)?,
+        })
     }
 }
 
@@ -1227,15 +1253,17 @@ impl TryFrom<WireTemplateFormulaV1> for TemplateFormula {
 
 // ------------------------------------------------------------ CellInput & Op
 
-impl From<&CellInput<BoundFormula>> for WireCellInputV1 {
-    fn from(inp: &CellInput<BoundFormula>) -> Self {
+impl TryFrom<&CellInput<BoundFormula>> for WireCellInputV1 {
+    type Error = WireConvertError;
+
+    fn try_from(inp: &CellInput<BoundFormula>) -> Result<Self, Self::Error> {
         match inp {
-            CellInput::Empty => Self::Empty,
-            CellInput::Scalar(s) => Self::Scalar(s.into()),
-            CellInput::Formula { formula, cached } => Self::Formula {
-                formula: formula.into(),
+            CellInput::Empty => Ok(Self::Empty),
+            CellInput::Scalar(s) => Ok(Self::Scalar(s.into())),
+            CellInput::Formula { formula, cached } => Ok(Self::Formula {
+                formula: WireBoundFormulaV1::try_from(formula)?,
                 cached: cached.as_ref().map(WireScalarValueV1::from),
-            },
+            }),
         }
     }
 }
@@ -1258,14 +1286,16 @@ impl TryFrom<WireCellInputV1> for CellInput<BoundFormula> {
     }
 }
 
-impl From<&CellEdit<BoundFormula>> for WireCellEditV1 {
-    fn from(e: &CellEdit<BoundFormula>) -> Self {
-        Self {
+impl TryFrom<&CellEdit<BoundFormula>> for WireCellEditV1 {
+    type Error = WireConvertError;
+
+    fn try_from(e: &CellEdit<BoundFormula>) -> Result<Self, Self::Error> {
+        Ok(Self {
             row: e.row.0,
             col: e.col.0,
-            input: (&e.input).into(),
+            input: (&e.input).try_into()?,
             format: e.format.into(),
-        }
+        })
     }
 }
 
@@ -1289,9 +1319,16 @@ impl TryFrom<&Op<BoundFormula>> for WireOpV1 {
         let converted = match op {
             Op::SetCells { sheet, edits } => Self::SetCells {
                 sheet: sheet.0,
-                edits: edits.iter().map(WireCellEditV1::from).collect(),
+                edits: edits
+                    .iter()
+                    .map(WireCellEditV1::try_from)
+                    .collect::<Result<Vec<_>, _>>()?,
             },
-            Op::SetCellsIf { .. } => return Err(WireConvertError::UnsupportedInV1),
+            Op::SetCellsIf { .. }
+            | Op::PermuteContent { .. }
+            | Op::MoveCells { .. }
+            | Op::DefineNamedRange { .. }
+            | Op::DeleteNamedRange { .. } => return Err(WireConvertError::UnsupportedInV1),
             Op::ClearRange { sheet, rows, cols } => Self::ClearRange {
                 sheet: sheet.0,
                 rows: runs_to_wire(rows),
@@ -1372,8 +1409,12 @@ impl TryFrom<&Op<BoundFormula>> for WireOpV1 {
                 cols: cols.iter().map(|c| c.0).collect(),
                 columns_data: columns_data
                     .iter()
-                    .map(|col| col.iter().map(WireCellInputV1::from).collect())
-                    .collect(),
+                    .map(|col| {
+                        col.iter()
+                            .map(WireCellInputV1::try_from)
+                            .collect::<Result<Vec<_>, _>>()
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
             },
             Op::FillFormula {
                 sheet,
@@ -1384,7 +1425,7 @@ impl TryFrom<&Op<BoundFormula>> for WireOpV1 {
                 sheet: sheet.0,
                 rows: runs_to_wire(rows),
                 cols: runs_to_wire(cols),
-                template: template.into(),
+                template: template.try_into()?,
             },
             Op::AddSheet { sheet, name, after } => Self::AddSheet {
                 sheet: sheet.0,

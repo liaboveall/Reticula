@@ -254,7 +254,8 @@ fn edit(replica: u32, client_seq: u64, base_server_seq: u64) -> WirePendingTxnV2
                     format: FormatPatch::Keep,
                 }],
             }],
-        ),
+        )
+        .unwrap(),
     }
 }
 

@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, VecDeque};
 use reticula_core::id::{ColId, IdRun, RowId, SheetId};
 use reticula_core::ops::{CellInput, ConditionalCellEdit, FormatPatch, InverseOp, Op, Workbook};
 use reticula_core::state_digest::StateDigest;
-use reticula_core::viewport::{self, Page};
+use reticula_core::viewport::Page;
 use reticula_formula::binder::BoundFormula;
 use reticula_formula::engine::FormulaEngine;
 use reticula_sim::{
@@ -276,17 +276,9 @@ impl InteractiveSimLab {
             col: page_col,
         };
         rep.engine.prepare_page_styles(SheetId(0), page);
-        let Some(sheet) = rep.engine.workbook().sheet(SheetId(0)) else {
-            return Ok(None);
-        };
-        let engine_ref = &rep.engine;
-        Ok(Some(viewport::encode_page_with_formulas(
-            sheet,
-            page,
-            epoch,
-            &mut rep.text_scratch,
-            |r, c| engine_ref.has_formula(SheetId(0), r, c),
-        )))
+        Ok(rep
+            .engine
+            .encode_viewport_page(SheetId(0), page, epoch, &mut rep.text_scratch))
     }
 
     #[wasm_bindgen(js_name = editCell)]

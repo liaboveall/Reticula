@@ -412,7 +412,8 @@ fn edit_txn(replica: u32, client_seq: u64, base_server_seq: u64, val: f64) -> Wi
                     format: FormatPatch::Keep,
                 }],
             }],
-        ),
+        )
+        .unwrap(),
     }
 }
 
