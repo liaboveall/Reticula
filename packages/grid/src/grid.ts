@@ -1,4 +1,5 @@
 import { PageCache } from "./cache.ts";
+import { type CellRect, type FilterDisplayState, FilterRowMap, filterButtonBox } from "./filter.ts";
 import {
   type Box,
   cellArea,
@@ -45,8 +46,10 @@ export interface IdRun {
   readonly len: number;
 }
 
-/** Sheet dimensions + optional M1b sparse metrics, freeze counts, and style table. */
+/** Sheet dimensions + optional M1b sparse metrics, freeze counts, filter state, and style table. */
 export interface SheetConfig extends SheetSize {
+  readonly totalRows?: number;
+  readonly filter?: FilterDisplayState | null | undefined;
   readonly frozenRows?: number;
   readonly frozenCols?: number;
   readonly customRows?: readonly (readonly [number, number])[];
@@ -90,6 +93,7 @@ export interface GridOptions {
    * reference pick without moving the active cell selection.
    */
   readonly onPointAndClickRange?: (range: Span) => boolean;
+  readonly onFilterButtonClick?: (col: number, anchorRect: DOMRect) => void;
   readonly onContextMenu?: (target: GridContextTarget) => void;
 }
 
@@ -218,6 +222,9 @@ export class Grid {
   #clipboardRange: { readonly span: Span; readonly cut: boolean } | null = null;
   #fillPreview: Span | null = null;
   #reorderGuide: ReorderGuide | null = null;
+  #filterState: FilterDisplayState | null = null;
+  #filterRowMap: FilterRowMap | null = null;
+  #activeSpillRange: CellRect | null = null;
 
   #size: Size = { width: 0, height: 0 };
   #scale = 1;
@@ -314,6 +321,11 @@ export class Grid {
     this.#clipboardRange = null;
     this.#fillPreview = null;
     this.#reorderGuide = null;
+    this.#activeSpillRange = null;
+    if (sheet.filter === undefined) {
+      this.#filterState = null;
+      this.#filterRowMap = null;
+    }
     this.#cache.clear();
     this.#notifySelection();
     this.#invalidate();
@@ -383,7 +395,34 @@ export class Grid {
     this.#invalidate();
   }
 
+  /** Sets or clears the worker-local AutoFilter display state and O(log H) row map. */
+  setFilterState(filter: FilterDisplayState | null, totalRows?: number): void {
+    this.#applyFilterState(filter, totalRows);
+    this.#invalidate();
+  }
+
+  /** Sets or clears the dashed outline shown around an inspected dynamic spill array. */
+  setActiveSpillRange(range: CellRect | null): void {
+    this.#activeSpillRange = range;
+    this.#invalidate();
+  }
+
+  /** Maps a 0-based visible display row index to its physical 0-based row index. */
+  displayRowToPhysicalRow(displayRow: number): number {
+    return this.#filterRowMap ? this.#filterRowMap.displayToPhysical(displayRow) : displayRow;
+  }
+
+  #applyFilterState(filter: FilterDisplayState | null, totalRows?: number): void {
+    this.#filterState = filter;
+    this.#filterRowMap = filter
+      ? new FilterRowMap(totalRows ?? this.#sheet.rows, filter.hiddenRowSpans)
+      : null;
+  }
+
   #applySheetConfig(sheet: SheetConfig): void {
+    if (sheet.filter !== undefined) {
+      this.#applyFilterState(sheet.filter, sheet.totalRows ?? sheet.rows);
+    }
     if (sheet.frozenRows !== undefined) {
       this.#frozenRows = sheet.frozenRows;
     }
@@ -910,6 +949,9 @@ export class Grid {
       clipboardRange: this.#clipboardRange,
       reorderGuide: this.#reorderGuide,
       showFillHandle: this.#extraRanges.length === 0,
+      filterState: this.#filterState,
+      filterRowMap: this.#filterRowMap,
+      activeSpillRange: this.#activeSpillRange,
     });
 
     const content = contentSize(metrics, this.#sheet, this.#layout);
@@ -1197,9 +1239,37 @@ export class Grid {
       return;
     }
 
-    // 3. Cell body click / drag.
+    // 3. Cell body click / drag (after AutoFilter header chevron hit-test).
     const cell = cellAt(this.#metrics, this.#sheet, this.#scroll, this.#size, x, y, this.#layout);
     if (cell) {
+      if (this.#filterState && this.#options.onFilterButtonClick) {
+        const headerDispRow =
+          this.#filterRowMap?.physicalToDisplay(this.#filterState.headerRow) ??
+          this.#filterState.headerRow;
+        if (
+          cell.row === headerDispRow &&
+          cell.col >= this.#filterState.firstCol &&
+          cell.col <= this.#filterState.lastCol
+        ) {
+          const cellBox = this.boxOf(cell.row, cell.col);
+          const btn = filterButtonBox(cellBox.left, cellBox.top, cellBox.width, cellBox.height);
+          if (
+            btn &&
+            x >= btn.x - 2 &&
+            x <= btn.x + btn.size + 2 &&
+            y >= btn.y - 2 &&
+            y <= btn.y + btn.size + 2
+          ) {
+            event.preventDefault();
+            this.#options.onFilterButtonClick(
+              cell.col,
+              new DOMRect(bounds.left + btn.x, bounds.top + btn.y, btn.size, btn.size),
+            );
+            this.#pendingWork += performance.now() - started;
+            return;
+          }
+        }
+      }
       // Formula point-and-click reference insertion check (`14-m1b.md` 6.1):
       const initialSpan: Span = {
         firstRow: cell.row,

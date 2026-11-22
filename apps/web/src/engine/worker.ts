@@ -726,6 +726,7 @@ function sheetFromEvent(event: EngineMessage | undefined): SheetInfo | undefined
     case "ready":
     case "sheetChanged":
     case "clipboardPasted":
+    case "replaceCompleted":
     case "recalcDone":
       return event.sheet;
     default:

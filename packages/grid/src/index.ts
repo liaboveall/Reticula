@@ -8,6 +8,14 @@ export {
   type EditorEvent,
 } from "./editor.ts";
 export {
+  type CellRect,
+  FILTER_BUTTON_SIZE,
+  type FilterButtonRect,
+  type FilterDisplayState,
+  FilterRowMap,
+  filterButtonBox,
+} from "./filter.ts";
+export {
   FormulaBarEditor,
   type FormulaBarEditorOptions,
   formulaDecorationExtension,

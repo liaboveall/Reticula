@@ -36,7 +36,8 @@ use reticula_core::sheet::Sheet;
 use reticula_core::snapshot::{SnapshotError, decode_snapshot, encode_snapshot};
 use reticula_core::value::{CalcError, Value};
 use reticula_core::viewport::{
-    FLAG_FORMULA, Page, ViewportCellOverlay, encode_page_with_formulas, encode_page_with_overlay,
+    FLAG_FORMULA, FLAG_SPILL, Page, ViewportCellOverlay, encode_page_with_formulas,
+    encode_projected_page_with_overlay, prepare_projected_page_styles,
 };
 use rustc_hash::FxHasher;
 use smallvec::SmallVec;
@@ -45,6 +46,10 @@ use crate::address::CellAddr;
 use crate::ast::{BinaryOp, Literal, MAX_NESTING_DEPTH};
 use crate::binder::{BoundExpr, BoundFormula, BoundRef, live_span_positions};
 use crate::dep_graph::{DepGraph, FormulaRegistration};
+use crate::filter::{
+    ColFilterCriterion, DistinctColumnValues, FilterTable, VisibleRowProjection,
+    distinct_column_values, evaluate_filter_table,
+};
 use crate::functions::{EvalEnv, combine_choose, combine_if, combine_iferror, eval_eager_function};
 use crate::parser::ParseError;
 use crate::spill::{CommitSpillOutcome, SpillRegistry};
@@ -162,6 +167,7 @@ pub struct FormulaEngine {
     name_to_nid: BTreeMap<NamedRangeKey, u32>,
     free_name_slots: Vec<u32>,
     volatile_names: BTreeSet<u32>,
+    filter_sensitive_names: BTreeSet<u32>,
     name_eval_stack: Vec<NamedRangeKey>,
     wave_spill_requeues: BTreeMap<u32, u8>,
     cycle_spills: BTreeMap<WorkbookCellKey, CycleSpillRecord>,
@@ -181,6 +187,8 @@ pub struct FormulaEngine {
     wave_done: u32,
     changes: DirtyChanges,
     volatile_set: BTreeSet<u32>,
+    filter_sensitive_set: BTreeSet<u32>,
+    filters: BTreeMap<SheetId, (FilterTable, VisibleRowProjection)>,
     env: EvalEnv,
 }
 
@@ -207,12 +215,16 @@ impl FormulaEngine {
         let states = vec![STATE_CLEAN; count];
         let mut cell_to_fid = FxMap::with_capacity_and_hasher(count, BuildHasherDefault::default());
         let mut volatile_set = BTreeSet::new();
+        let mut filter_sensitive_set = BTreeSet::new();
 
         for (&key, formula) in workbook.formulas() {
             let fid = u32::try_from(slots.len()).unwrap_or(0);
-            let (reg, is_volatile) = dep_graph.register_with_flags(fid, key.0, formula);
-            if is_volatile {
+            let (reg, flags) = dep_graph.register_detailed(fid, key.0, formula);
+            if flags.volatile {
                 volatile_set.insert(fid);
+            }
+            if flags.filter_sensitive {
+                filter_sensitive_set.insert(fid);
             }
             slots.push(Some(FormulaSlot { key, reg }));
             cell_to_fid.insert(key, fid);
@@ -223,13 +235,17 @@ impl FormulaEngine {
         let mut name_slots = Vec::with_capacity(name_count);
         let mut name_to_nid = BTreeMap::new();
         let mut volatile_names = BTreeSet::new();
+        let mut filter_sensitive_names = BTreeSet::new();
         let fallback_sheet = workbook_fallback_sheet(&workbook);
         for (nkey, def) in workbook.named_ranges() {
             let nid = u32::try_from(name_slots.len()).unwrap_or(0);
             let host_sheet = nkey.scope.unwrap_or(fallback_sheet);
-            let (reg, is_vol) = name_dep_graph.register_with_flags(nid, host_sheet, &def.formula);
-            if is_vol {
+            let (reg, flags) = name_dep_graph.register_detailed(nid, host_sheet, &def.formula);
+            if flags.volatile {
                 volatile_names.insert(nid);
+            }
+            if flags.filter_sensitive {
+                filter_sensitive_names.insert(nid);
             }
             name_slots.push(Some((nkey.clone(), reg)));
             name_to_nid.insert(nkey.clone(), nid);
@@ -244,6 +260,7 @@ impl FormulaEngine {
             name_to_nid,
             free_name_slots: Vec::new(),
             volatile_names,
+            filter_sensitive_names,
             name_eval_stack: Vec::new(),
             wave_spill_requeues: BTreeMap::new(),
             cycle_spills: BTreeMap::new(),
@@ -260,6 +277,8 @@ impl FormulaEngine {
             wave_done: 0,
             changes: DirtyChanges::default(),
             volatile_set,
+            filter_sensitive_set,
+            filters: BTreeMap::new(),
             env: EvalEnv::default(),
         }
     }
@@ -439,6 +458,7 @@ impl FormulaEngine {
             name_to_nid: BTreeMap::new(),
             free_name_slots: Vec::new(),
             volatile_names: BTreeSet::new(),
+            filter_sensitive_names: BTreeSet::new(),
             name_eval_stack: Vec::new(),
             wave_spill_requeues: BTreeMap::new(),
             cycle_spills: BTreeMap::new(),
@@ -455,6 +475,8 @@ impl FormulaEngine {
             wave_done: 0,
             changes: DirtyChanges::default(),
             volatile_set: BTreeSet::new(),
+            filter_sensitive_set: BTreeSet::new(),
+            filters: BTreeMap::new(),
             env: EvalEnv::default(),
         }
     }
@@ -492,6 +514,192 @@ impl FormulaEngine {
         self.spills.spill_shape(anchor)
     }
 
+    /// Installs (or replaces) a worker-local AutoFilter table on `sheet_id`.
+    /// Filtering never mutates [`Workbook`], WAL logs, or `StateDigest`.
+    pub fn set_filter_table(
+        &mut self,
+        sheet_id: SheetId,
+        header_row: u32,
+        last_row: u32,
+        first_col: u32,
+        last_col: u32,
+    ) -> bool {
+        let Some(sheet) = self.workbook.live_sheet(sheet_id) else {
+            return false;
+        };
+        if header_row >= sheet.rows() || first_col >= sheet.cols() {
+            return false;
+        }
+        let clamped_last_row = last_row.max(header_row).min(sheet.rows().saturating_sub(1));
+        let lo_col = first_col.min(last_col).min(sheet.cols().saturating_sub(1));
+        let hi_col = first_col.max(last_col).min(sheet.cols().saturating_sub(1));
+        let table = FilterTable {
+            header_row: RowId(sheet.row_id(header_row)),
+            last_row: RowId(sheet.row_id(clamped_last_row)),
+            first_col: ColId(sheet.col_id(lo_col)),
+            last_col: ColId(sheet.col_id(hi_col)),
+            criteria: BTreeMap::new(),
+        };
+        let proj = VisibleRowProjection::identity(sheet.rows());
+        let had_hidden = self
+            .filters
+            .insert(sheet_id, (table, proj))
+            .is_some_and(|(_, old)| !old.is_empty());
+        self.changes.structural = true;
+        if had_hidden {
+            self.invalidate_filter_sensitive();
+        }
+        true
+    }
+
+    /// Sets or clears one column criterion on `sheet_id`'s AutoFilter and
+    /// updates its worker-local [`VisibleRowProjection`].
+    pub fn set_column_filter(
+        &mut self,
+        sheet_id: SheetId,
+        col_pos: u32,
+        criterion: Option<ColFilterCriterion>,
+    ) -> bool {
+        let Some(sheet) = self.workbook.live_sheet(sheet_id) else {
+            return false;
+        };
+        let Some((table, old_proj)) = self.filters.get_mut(&sheet_id) else {
+            return false;
+        };
+        let Some(bounds) = table.resolve_bounds(sheet) else {
+            return false;
+        };
+        if col_pos < bounds.first_col || col_pos > bounds.last_col || col_pos >= sheet.cols() {
+            return false;
+        }
+        let col_id = ColId(sheet.col_id(col_pos));
+        match criterion {
+            Some(c) => {
+                table.criteria.insert(col_id, c);
+            }
+            None => {
+                table.criteria.remove(&col_id);
+            }
+        }
+        let Some(new_proj) = evaluate_filter_table(sheet, table, Some(&self.spills)) else {
+            return false;
+        };
+        let hidden_changed = old_proj.hidden_row_ids() != new_proj.hidden_row_ids();
+        *old_proj = new_proj;
+        self.changes.structural = true;
+        if hidden_changed {
+            self.invalidate_filter_sensitive();
+        }
+        true
+    }
+
+    /// Re-evaluates all column criteria on `sheet_id`'s AutoFilter against live
+    /// cell and spill values.
+    pub fn reapply_filter(&mut self, sheet_id: SheetId) {
+        let Some(sheet) = self.workbook.live_sheet(sheet_id) else {
+            return;
+        };
+        let Some((table, old_proj)) = self.filters.get_mut(&sheet_id) else {
+            return;
+        };
+        if let Some(new_proj) = evaluate_filter_table(sheet, table, Some(&self.spills)) {
+            let hidden_changed = old_proj.hidden_row_ids() != new_proj.hidden_row_ids();
+            *old_proj = new_proj;
+            if hidden_changed {
+                self.changes.structural = true;
+                self.invalidate_filter_sensitive();
+            }
+        }
+    }
+
+    /// Removes any worker-local AutoFilter from `sheet_id`, unhiding all rows.
+    pub fn clear_filter(&mut self, sheet_id: SheetId) {
+        if let Some((_, old_proj)) = self.filters.remove(&sheet_id) {
+            self.changes.structural = true;
+            if !old_proj.is_empty() {
+                self.invalidate_filter_sensitive();
+            }
+        }
+    }
+
+    /// Returns the active [`FilterTable`] and [`VisibleRowProjection`] for `sheet_id`.
+    #[must_use]
+    pub fn filter_state(&self, sheet_id: SheetId) -> Option<(&FilterTable, &VisibleRowProjection)> {
+        self.filters.get(&sheet_id).map(|(t, p)| (t, p))
+    }
+
+    /// Returns `true` if `row_id` on `sheet_id` is currently hidden by AutoFilter.
+    #[must_use]
+    pub fn is_row_hidden(&self, sheet_id: SheetId, row_id: RowId) -> bool {
+        self.filters
+            .get(&sheet_id)
+            .is_some_and(|(_, p)| p.is_row_id_hidden(row_id))
+    }
+
+    /// Maps a visible 0-based display row on `sheet_id` to its physical row position.
+    #[must_use]
+    pub fn display_to_physical_row(&self, sheet_id: SheetId, display_row: u32) -> Option<u32> {
+        let sheet = self.workbook.sheet(sheet_id)?;
+        if let Some((_, proj)) = self.filters.get(&sheet_id) {
+            proj.display_to_physical(display_row)
+        } else if display_row < sheet.rows() {
+            Some(display_row)
+        } else {
+            None
+        }
+    }
+
+    /// Maps a physical 0-based row on `sheet_id` to its visible display row
+    /// position, or `None` if hidden or out of bounds.
+    #[must_use]
+    pub fn physical_to_display_row(&self, sheet_id: SheetId, physical_row: u32) -> Option<u32> {
+        let sheet = self.workbook.sheet(sheet_id)?;
+        if let Some((_, proj)) = self.filters.get(&sheet_id) {
+            proj.physical_to_display(physical_row)
+        } else if physical_row < sheet.rows() {
+            Some(physical_row)
+        } else {
+            None
+        }
+    }
+
+    /// Number of visible rows on `sheet_id` under the active filter projection.
+    #[must_use]
+    pub fn visible_row_count(&self, sheet_id: SheetId) -> u32 {
+        if let Some((_, proj)) = self.filters.get(&sheet_id) {
+            proj.visible_rows()
+        } else {
+            self.workbook.sheet(sheet_id).map_or(0, Sheet::rows)
+        }
+    }
+
+    /// Collects sorted distinct display values in column `col_pos` of `sheet_id`'s
+    /// active filter table (respecting criteria on other columns).
+    #[must_use]
+    pub fn distinct_filter_values(
+        &self,
+        sheet_id: SheetId,
+        col_pos: u32,
+        limit: usize,
+    ) -> DistinctColumnValues {
+        let Some(sheet) = self.workbook.live_sheet(sheet_id) else {
+            return DistinctColumnValues::default();
+        };
+        let Some((table, _)) = self.filters.get(&sheet_id) else {
+            return DistinctColumnValues::default();
+        };
+        if col_pos >= sheet.cols() {
+            return DistinctColumnValues::default();
+        }
+        distinct_column_values(
+            sheet,
+            table,
+            ColId(sheet.col_id(col_pos)),
+            Some(&self.spills),
+            limit,
+        )
+    }
+
     /// Encodes one v2 viewport page of `sheet_id`, marking formula cells with
     /// `FLAG_FORMULA` and overlaid spill shadow cells with `FLAG_SPILL`.
     #[must_use]
@@ -503,7 +711,8 @@ impl FormulaEngine {
         text: &mut String,
     ) -> Option<Vec<u8>> {
         let sheet = self.workbook.sheet(sheet_id)?;
-        if !self.spills.has_spills_on_sheet(sheet_id) {
+        let proj = self.filters.get(&sheet_id).map(|(_, p)| p);
+        if proj.is_none() && !self.spills.has_spills_on_sheet(sheet_id) {
             return Some(encode_page_with_formulas(
                 sheet,
                 page,
@@ -512,15 +721,23 @@ impl FormulaEngine {
                 |r, c| self.has_formula(sheet_id, r, c),
             ));
         }
-        Some(encode_page_with_overlay(
+        let visible_rows = proj.map_or_else(|| sheet.rows(), VisibleRowProjection::visible_rows);
+        Some(encode_projected_page_with_overlay(
             sheet,
             page,
             epoch,
+            visible_rows,
+            |disp| match proj {
+                Some(p) => p.display_to_physical(disp),
+                None => Some(disp),
+            },
             text,
             |r, c| {
                 let mut ov = ViewportCellOverlay::default();
                 if self.has_formula(sheet_id, r, c) {
                     ov.extra_flags |= FLAG_FORMULA;
+                } else if self.spills.is_blocked_anchor((sheet_id, r, c)) {
+                    ov.extra_flags |= FLAG_SPILL;
                 } else if let Some((val, flags)) = self.spills.viewport_overlay(sheet_id, r, c) {
                     ov.value = Some(val);
                     ov.extra_flags |= flags;
@@ -533,8 +750,14 @@ impl FormulaEngine {
     /// Interns resolved styles for `page` on `sheet_id` before immutable
     /// viewport page encoding.
     pub fn prepare_page_styles(&mut self, sheet_id: SheetId, page: reticula_core::viewport::Page) {
+        let proj = self.filters.get(&sheet_id).map(|(_, p)| p);
         if let Some(sheet) = self.workbook.sheet_mut(sheet_id) {
-            reticula_core::viewport::prepare_page_styles(sheet, page);
+            let visible_rows =
+                proj.map_or_else(|| sheet.rows(), VisibleRowProjection::visible_rows);
+            prepare_projected_page_styles(sheet, page, visible_rows, |disp| match proj {
+                Some(p) => p.display_to_physical(disp),
+                None => Some(disp),
+            });
         }
     }
 
@@ -857,6 +1080,64 @@ impl FormulaEngine {
         self.propagate_dirty(vol_roots);
     }
 
+    fn invalidate_filter_sensitive(&mut self) {
+        if self.filter_sensitive_set.is_empty() && self.filter_sensitive_names.is_empty() {
+            return;
+        }
+        let mut roots: Vec<u32> = self.filter_sensitive_set.iter().copied().collect();
+        if !self.filter_sensitive_names.is_empty() {
+            let nids: Vec<u32> = self.filter_sensitive_names.iter().copied().collect();
+            self.collect_name_dependents_from_nids(&nids, &mut roots);
+        }
+        self.propagate_dirty(roots);
+    }
+
+    fn refresh_filter_projection_after_structure(&mut self, sheet_id: SheetId) {
+        let Some((mut table, old_proj)) = self.filters.remove(&sheet_id) else {
+            return;
+        };
+        let Some(sheet) = self.workbook.live_sheet(sheet_id) else {
+            if !old_proj.is_empty() {
+                self.invalidate_filter_sensitive();
+            }
+            return;
+        };
+        let Some(header_pos) = sheet.row_axis().id_to_pos(table.header_row.0) else {
+            if !old_proj.is_empty() {
+                self.invalidate_filter_sensitive();
+            }
+            return;
+        };
+        if sheet.row_axis().id_to_pos(table.last_row.0).is_none() {
+            let fallback_row = sheet
+                .used_extent()
+                .map_or(header_pos, |(r, _)| r.max(header_pos));
+            table.last_row = RowId(sheet.row_id(fallback_row.min(sheet.rows().saturating_sub(1))));
+        }
+        let first_pos = sheet.col_axis().id_to_pos(table.first_col.0);
+        let last_pos = sheet.col_axis().id_to_pos(table.last_col.0);
+        match (first_pos, last_pos) {
+            (Some(_), Some(_)) => {}
+            (Some(c), None) | (None, Some(c)) => {
+                let cid = ColId(sheet.col_id(c));
+                table.first_col = cid;
+                table.last_col = cid;
+            }
+            (None, None) => {
+                if !old_proj.is_empty() {
+                    self.invalidate_filter_sensitive();
+                }
+                return;
+            }
+        }
+        let new_proj = VisibleRowProjection::from_hidden_row_ids(sheet, old_proj.hidden_row_ids());
+        let hidden_changed = old_proj.hidden_row_ids() != new_proj.hidden_row_ids();
+        self.filters.insert(sheet_id, (table, new_proj));
+        if hidden_changed {
+            self.invalidate_filter_sensitive();
+        }
+    }
+
     /// Applies a multi-operation transaction atomically: if any operation fails,
     /// all earlier operations in `ops` are rolled back via [`Self::apply_inverse`]
     /// so the engine remains unchanged.
@@ -914,6 +1195,7 @@ impl FormulaEngine {
             }
             InverseOp::RemoveInsertedRows { sheet, ids } => {
                 self.changes.structural = true;
+                self.refresh_filter_projection_after_structure(*sheet);
                 let mut root_dirty = Vec::new();
                 self.dep_graph
                     .on_rows_inserted(*sheet, *ids, &self.workbook, |fid| root_dirty.push(fid));
@@ -923,6 +1205,7 @@ impl FormulaEngine {
             }
             InverseOp::RemoveInsertedCols { sheet, ids } => {
                 self.changes.structural = true;
+                self.refresh_filter_projection_after_structure(*sheet);
                 let mut root_dirty = Vec::new();
                 self.dep_graph
                     .on_cols_inserted(*sheet, *ids, &self.workbook, |fid| root_dirty.push(fid));
@@ -932,6 +1215,7 @@ impl FormulaEngine {
             }
             InverseOp::UndeleteRows { sheet, ids } => {
                 self.changes.structural = true;
+                self.refresh_filter_projection_after_structure(*sheet);
                 let mut root_dirty = Vec::new();
                 self.dep_graph
                     .on_rows_toggled(*sheet, ids, &self.workbook, |fid| root_dirty.push(fid));
@@ -941,6 +1225,7 @@ impl FormulaEngine {
             }
             InverseOp::UndeleteCols { sheet, ids } => {
                 self.changes.structural = true;
+                self.refresh_filter_projection_after_structure(*sheet);
                 let mut root_dirty = Vec::new();
                 self.dep_graph
                     .on_cols_toggled(*sheet, ids, &self.workbook, |fid| root_dirty.push(fid));
@@ -949,9 +1234,11 @@ impl FormulaEngine {
                 self.propagate_dirty(root_dirty);
             }
             InverseOp::RedeleteRows { sheet, ids } => {
+                self.refresh_filter_projection_after_structure(*sheet);
                 self.on_rows_undeleted(*sheet, ids);
             }
             InverseOp::RedeleteCols { sheet, ids } => {
+                self.refresh_filter_projection_after_structure(*sheet);
                 self.on_cols_undeleted(*sheet, ids);
             }
             InverseOp::RestoreMovedRows {
@@ -1089,18 +1376,22 @@ impl FormulaEngine {
             InverseOp::RemoveInsertedRows { sheet, .. }
             | InverseOp::RemoveInsertedCols { sheet, .. } => {
                 self.changes.structural = true;
+                self.refresh_filter_projection_after_structure(sheet);
                 self.collect_name_dependents_from_nids(&pre_nids, &mut pre_dirty);
                 self.refresh_sheet_spills_on_structural_change(sheet, false, &mut pre_dirty);
                 self.propagate_dirty(pre_dirty);
             }
             InverseOp::UndeleteRows { sheet, ids } => {
+                self.refresh_filter_projection_after_structure(sheet);
                 self.on_rows_undeleted(sheet, &ids);
             }
             InverseOp::UndeleteCols { sheet, ids } => {
+                self.refresh_filter_projection_after_structure(sheet);
                 self.on_cols_undeleted(sheet, &ids);
             }
             InverseOp::RedeleteRows { sheet, ids } => {
                 self.changes.structural = true;
+                self.refresh_filter_projection_after_structure(sheet);
                 let mut root_dirty = Vec::new();
                 self.dep_graph
                     .on_rows_toggled(sheet, &ids, &self.workbook, |fid| root_dirty.push(fid));
@@ -1110,6 +1401,7 @@ impl FormulaEngine {
             }
             InverseOp::RedeleteCols { sheet, ids } => {
                 self.changes.structural = true;
+                self.refresh_filter_projection_after_structure(sheet);
                 let mut root_dirty = Vec::new();
                 self.dep_graph
                     .on_cols_toggled(sheet, &ids, &self.workbook, |fid| root_dirty.push(fid));
@@ -1742,10 +2034,12 @@ impl FormulaEngine {
                                 self.states.push(STATE_CLEAN);
                                 fresh
                             };
-                            let (reg, is_volatile) =
-                                self.dep_graph.register_with_flags(fid, key.0, new_f);
-                            if is_volatile {
+                            let (reg, flags) = self.dep_graph.register_detailed(fid, key.0, new_f);
+                            if flags.volatile {
                                 self.volatile_set.insert(fid);
+                            }
+                            if flags.filter_sensitive {
+                                self.filter_sensitive_set.insert(fid);
                             }
                             if let Some(slot_ref) = self.slots.get_mut(fid as usize) {
                                 *slot_ref = Some(FormulaSlot { key, reg });
@@ -1901,11 +2195,15 @@ impl FormulaEngine {
         self.collect_name_dependents_for_names(&changed_names, &mut root_dirty);
         self.refresh_sheet_spills_on_structural_change(sheet, false, &mut root_dirty);
         self.propagate_dirty(root_dirty);
+        self.refresh_filter_projection_after_structure(sheet);
     }
 
     fn on_sheet_visibility_changed(&mut self, sheet: SheetId) {
         self.changes.structural = true;
         let is_deleted = self.workbook.live_sheet(sheet).is_none();
+        if is_deleted {
+            self.clear_filter(sheet);
+        }
         let mut root_dirty = Vec::new();
         for idx in 0..self.slots.len() {
             if let Some(slot) = self.slots.get(idx).and_then(Option::as_ref)
@@ -1955,6 +2253,7 @@ impl FormulaEngine {
             self.collect_direct_dependents(key, &mut root_dirty);
         }
         self.propagate_dirty(root_dirty);
+        self.reapply_filter(sheet);
     }
 
     fn on_moved_cells_changed(
@@ -2008,6 +2307,7 @@ impl FormulaEngine {
     fn sync_named_range_slot(&mut self, key: &NamedRangeKey) {
         if let Some(old_nid) = self.name_to_nid.remove(key) {
             self.volatile_names.remove(&old_nid);
+            self.filter_sensitive_names.remove(&old_nid);
             if let Some(slot_opt) = self.name_slots.get_mut(old_nid as usize)
                 && let Some((_, old_reg)) = slot_opt.take()
             {
@@ -2028,11 +2328,14 @@ impl FormulaEngine {
         let host_sheet = key
             .scope
             .unwrap_or_else(|| workbook_fallback_sheet(&self.workbook));
-        let (reg, is_vol) = self
+        let (reg, flags) = self
             .name_dep_graph
-            .register_with_flags(nid, host_sheet, &def.formula);
-        if is_vol {
+            .register_detailed(nid, host_sheet, &def.formula);
+        if flags.volatile {
             self.volatile_names.insert(nid);
+        }
+        if flags.filter_sensitive {
+            self.filter_sensitive_names.insert(nid);
         }
         if let Some(slot_ref) = self.name_slots.get_mut(nid as usize) {
             *slot_ref = Some((key.clone(), reg));
@@ -2213,9 +2516,12 @@ impl FormulaEngine {
             self.states.push(STATE_CLEAN);
             fresh
         };
-        let (reg, is_volatile) = self.dep_graph.register_with_flags(fid, key.0, formula);
-        if is_volatile {
+        let (reg, flags) = self.dep_graph.register_detailed(fid, key.0, formula);
+        if flags.volatile {
             self.volatile_set.insert(fid);
+        }
+        if flags.filter_sensitive {
+            self.filter_sensitive_set.insert(fid);
         }
         if let Some(slot_ref) = self.slots.get_mut(fid as usize) {
             *slot_ref = Some(FormulaSlot { key, reg });
@@ -2232,6 +2538,7 @@ impl FormulaEngine {
             return;
         };
         self.volatile_set.remove(&fid);
+        self.filter_sensitive_set.remove(&fid);
         self.set_state(fid, STATE_CLEAN);
         if let Some(slot_opt) = self.slots.get_mut(fid as usize)
             && let Some(old_slot) = slot_opt.take()
@@ -3411,6 +3718,17 @@ impl FormulaEngine {
             return ExprOutcome::Blocked(all_blocked);
         }
 
+        let filters = &self.filters;
+        let filter_pred = |s: SheetId, r: RowId| {
+            filters
+                .get(&s)
+                .is_some_and(|(_, proj)| proj.is_row_id_hidden(r))
+        };
+        let is_row_hidden = if filters.is_empty() {
+            None
+        } else {
+            Some(&filter_pred as &dyn Fn(SheetId, RowId) -> bool)
+        };
         ExprOutcome::Ready(eval_eager_function(
             name,
             evaluated_args,
@@ -3418,7 +3736,7 @@ impl FormulaEngine {
             &self.spills,
             caller,
             &mut self.env,
-            None,
+            is_row_hidden,
         ))
     }
 
@@ -5144,6 +5462,111 @@ mod tests {
                 .unwrap()
                 .value_by_id(RowId(4), ColId(0)),
             Value::Error(CalcError::Spill)
+        );
+    }
+
+    #[test]
+    fn autofilter_projection_recalculates_subtotal_skips_hidden_rows_and_preserves_digest() {
+        use alloc::string::String;
+
+        use reticula_core::viewport::Page;
+
+        use crate::filter::{ColFilterCriterion, FilterCmpOp};
+
+        let mut engine = FormulaEngine::new();
+        let s0 = SheetId(0);
+        engine
+            .edit_cell_raw(s0, RowId(0), ColId(0), "Amount")
+            .unwrap();
+        engine.edit_cell_raw(s0, RowId(1), ColId(0), "10").unwrap();
+        engine.edit_cell_raw(s0, RowId(2), ColId(0), "25").unwrap();
+        engine.edit_cell_raw(s0, RowId(3), ColId(0), "40").unwrap();
+        engine
+            .edit_cell_raw(s0, RowId(0), ColId(1), "=SUBTOTAL(109, A2:A4)")
+            .unwrap();
+        engine
+            .edit_cell_raw(s0, RowId(0), ColId(2), "=AGGREGATE(9, 5, A2:A4)")
+            .unwrap();
+        engine.recalc_all();
+
+        assert_eq!(
+            engine.workbook().sheet(s0).unwrap().value(0, 1),
+            Value::number(75.0)
+        );
+        assert_eq!(
+            engine.workbook().sheet(s0).unwrap().value(0, 2),
+            Value::number(75.0)
+        );
+
+        let digest_before = engine.workbook().state_digest();
+        let initial_rows = engine.workbook().sheet(s0).unwrap().rows();
+        assert!(engine.set_filter_table(s0, 0, 3, 0, 0));
+        assert!(engine.set_column_filter(
+            s0,
+            0,
+            Some(ColFilterCriterion::NumberCompare {
+                op: FilterCmpOp::Ge,
+                value: 20.0,
+            })
+        ));
+        engine.recalc_all();
+
+        // Filter hides row 1 (value 10), leaves workbook StateDigest untouched.
+        assert_eq!(engine.workbook().state_digest(), digest_before);
+        assert!(engine.is_row_hidden(s0, RowId(1)));
+        assert!(!engine.is_row_hidden(s0, RowId(2)));
+        assert_eq!(engine.visible_row_count(s0), initial_rows - 1);
+        assert_eq!(engine.display_to_physical_row(s0, 0), Some(0));
+        assert_eq!(engine.display_to_physical_row(s0, 1), Some(2));
+        assert_eq!(engine.physical_to_display_row(s0, 1), None);
+        assert_eq!(engine.physical_to_display_row(s0, 2), Some(1));
+
+        assert_eq!(
+            engine.workbook().sheet(s0).unwrap().value(0, 1),
+            Value::number(65.0)
+        );
+        assert_eq!(
+            engine.workbook().sheet(s0).unwrap().value(0, 2),
+            Value::number(65.0)
+        );
+
+        // Encoded viewport page 0 includes row IDs [0, 2, 3, ...], skipping hidden RowId(1).
+        let mut text = String::new();
+        let bytes = engine
+            .encode_viewport_page(s0, Page { row: 0, col: 0 }, 1, &mut text)
+            .unwrap();
+        let header_row_ids_start = reticula_core::viewport::HEADER_LEN;
+        let r0 = u64::from_le_bytes(
+            bytes[header_row_ids_start..header_row_ids_start + 8]
+                .try_into()
+                .unwrap(),
+        );
+        let r1 = u64::from_le_bytes(
+            bytes[header_row_ids_start + 8..header_row_ids_start + 16]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(r0, 0);
+        assert_eq!(r1, 2);
+
+        // Inserting a row before header shifts filter header_row from display/phys 0 to 1.
+        engine
+            .apply_op(Op::InsertRows {
+                sheet: s0,
+                after: None,
+                ids: IdRun::new(1_048_576, 1).unwrap(),
+            })
+            .unwrap();
+        assert_eq!(engine.visible_row_count(s0), initial_rows);
+        assert_eq!(engine.display_to_physical_row(s0, 1), Some(1));
+        assert_eq!(engine.display_to_physical_row(s0, 2), Some(3));
+
+        engine.clear_filter(s0);
+        engine.recalc_all();
+        assert_eq!(engine.visible_row_count(s0), initial_rows + 1);
+        assert_eq!(
+            engine.workbook().sheet(s0).unwrap().value(1, 1),
+            Value::number(75.0)
         );
     }
 }

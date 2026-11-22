@@ -1066,7 +1066,17 @@ fn build_internal_paste_ops(
     let mut ops = Vec::new();
     let is_cut = core::mem::replace(&mut clip.cut, false);
 
-    // If cutting, clear source first so overlapping pastes overwrite cleanly!
+    if is_cut
+        && tile_rows == src_r
+        && tile_cols == src_c
+        && let Some(move_ops) =
+            try_build_move_cells_op(workbook, clip, dst_sheet, dst_sheet_ref, applied_rect)
+    {
+        return Ok((move_ops, applied_rect));
+    }
+
+    // If cutting and MoveCells fallback applied (e.g. source rows/cols deleted or split),
+    // clear source first so overlapping pastes overwrite cleanly.
     if is_cut {
         ops.push(Op::ClearRange {
             sheet: clip.src_sheet,
@@ -1208,6 +1218,89 @@ fn build_internal_paste_ops(
     }
     ops.extend(format_ops);
     Ok((ops, applied_rect))
+}
+
+fn try_build_move_cells_op(
+    workbook: &Workbook<BoundFormula>,
+    clip: &InternalClipboard,
+    dst_sheet: SheetId,
+    dst_sheet_ref: &Sheet,
+    applied_rect: RectPos,
+) -> Option<Vec<Op<BoundFormula>>> {
+    let src_sheet_ref = workbook.live_sheet(clip.src_sheet)?;
+
+    let mut src_rows = Vec::with_capacity(clip.src_rect.row_count as usize);
+    let mut prev_r_pos: Option<u32> = None;
+    for run in &clip.src_row_runs {
+        for raw_r in run.iter() {
+            let pos = src_sheet_ref.row_axis().id_to_pos(raw_r)?;
+            if let Some(prev) = prev_r_pos
+                && pos != prev.saturating_add(1)
+            {
+                return None;
+            }
+            prev_r_pos = Some(pos);
+            src_rows.push(RowId(raw_r));
+        }
+    }
+    if src_rows.len() != clip.src_rect.row_count as usize || src_rows.is_empty() {
+        return None;
+    }
+
+    let mut src_cols = Vec::with_capacity(clip.src_rect.col_count as usize);
+    let mut prev_c_pos: Option<u32> = None;
+    for run in &clip.src_col_runs {
+        for raw_c in run.iter() {
+            let pos = src_sheet_ref.col_axis().id_to_pos(raw_c)?;
+            if let Some(prev) = prev_c_pos
+                && pos != prev.saturating_add(1)
+            {
+                return None;
+            }
+            prev_c_pos = Some(pos);
+            src_cols.push(ColId(raw_c));
+        }
+    }
+    if src_cols.len() != clip.src_rect.col_count as usize || src_cols.is_empty() {
+        return None;
+    }
+
+    let mut dst_rows = Vec::with_capacity(applied_rect.row_count as usize);
+    dst_sheet_ref.row_axis().for_each_live_positions(
+        applied_rect.first_row,
+        applied_rect.row_count,
+        |run| {
+            for raw_r in run.iter() {
+                dst_rows.push(RowId(raw_r));
+            }
+        },
+    );
+    let mut dst_cols = Vec::with_capacity(applied_rect.col_count as usize);
+    dst_sheet_ref.col_axis().for_each_live_positions(
+        applied_rect.first_col,
+        applied_rect.col_count,
+        |run| {
+            for raw_c in run.iter() {
+                dst_cols.push(ColId(raw_c));
+            }
+        },
+    );
+
+    if dst_rows.len() != src_rows.len() || dst_cols.len() != src_cols.len() {
+        return None;
+    }
+    if clip.src_sheet == dst_sheet && src_rows == dst_rows && src_cols == dst_cols {
+        return Some(Vec::new());
+    }
+
+    Some(vec![Op::MoveCells {
+        src_sheet: clip.src_sheet,
+        src_rows,
+        src_cols,
+        dst_sheet,
+        dst_rows,
+        dst_cols,
+    }])
 }
 
 #[derive(Clone, Debug)]
@@ -2161,6 +2254,153 @@ mod tests {
         assert_eq!(
             eng.inspect_cell(s0, RowId(5), ColId(1)).unwrap().display,
             "13%"
+        );
+    }
+
+    #[test]
+    fn cut_paste_emits_move_cells_and_rewrites_same_and_cross_sheet_references() {
+        use super::{FormatPatch, FormatTarget, IdRun, Op, StylePatch};
+
+        let mut eng = FormulaEngine::new();
+        let s0 = SheetId(0);
+        let s1 = SheetId(1);
+        eng.apply_op(Op::AddSheet {
+            sheet: s1,
+            name: String::from("Summary"),
+            after: Some(s0),
+        })
+        .unwrap();
+
+        eng.edit_cell_raw(s0, RowId(0), ColId(0), "10").unwrap();
+        eng.edit_cell_raw(s0, RowId(1), ColId(0), "20").unwrap();
+        eng.edit_cell_raw(s0, RowId(2), ColId(0), "30").unwrap();
+        eng.apply_op(Op::SetFormat {
+            sheet: s0,
+            target: FormatTarget::Cells {
+                rows: vec![IdRun::new(0, 3).unwrap()],
+                cols: vec![IdRun::new(0, 1).unwrap()],
+            },
+            number_format: FormatPatch::Keep,
+            style: StylePatch {
+                bold: Some(true),
+                ..StylePatch::default()
+            },
+        })
+        .unwrap();
+        eng.edit_cell_raw(s0, RowId(0), ColId(1), "=SUM(A1:A3)")
+            .unwrap();
+        eng.edit_cell_raw(s1, RowId(0), ColId(0), "=SUM(Sheet1!A1:A3)")
+            .unwrap();
+        eng.recalc_all();
+
+        let (payload, cut_clip) = copy_range(
+            eng.workbook(),
+            s0,
+            RectPos {
+                first_row: 0,
+                row_count: 3,
+                first_col: 0,
+                col_count: 1,
+            },
+            true,
+        )
+        .unwrap();
+        let mut clip_opt = Some(cut_clip);
+        let (ops, _) = build_paste_ops(
+            eng.workbook(),
+            s0,
+            RectPos {
+                first_row: 4,
+                row_count: 1,
+                first_col: 3,
+                col_count: 1,
+            },
+            &payload.tsv,
+            None,
+            &mut clip_opt,
+        )
+        .unwrap();
+        assert_eq!(ops.len(), 1);
+        assert!(matches!(ops[0], Op::MoveCells { .. }));
+
+        let invs = eng.apply_txn(ops).unwrap();
+        eng.recalc_all();
+
+        assert_eq!(
+            eng.inspect_cell(s0, RowId(0), ColId(0)).unwrap().display,
+            ""
+        );
+        assert_eq!(
+            eng.inspect_cell(s0, RowId(4), ColId(3)).unwrap().display,
+            "10"
+        );
+        assert!(
+            eng.workbook()
+                .sheet(s0)
+                .unwrap()
+                .effective_style_by_id(RowId(4), ColId(3))
+                .bold
+        );
+        assert_eq!(
+            eng.inspect_cell(s0, RowId(0), ColId(1)).unwrap().raw,
+            "=SUM(D5:D7)"
+        );
+        assert_eq!(
+            eng.inspect_cell(s0, RowId(0), ColId(1)).unwrap().display,
+            "60"
+        );
+        assert_eq!(
+            eng.inspect_cell(s1, RowId(0), ColId(0)).unwrap().raw,
+            "=SUM(Sheet1!D5:D7)"
+        );
+
+        // Cut-paste consumes `cut` flag, then cross-sheet MoveCells move works via undo + re-cut.
+        for inv in invs.into_iter().rev() {
+            eng.apply_inverse(inv).unwrap();
+        }
+        eng.recalc_all();
+        assert_eq!(
+            eng.inspect_cell(s0, RowId(0), ColId(1)).unwrap().raw,
+            "=SUM(A1:A3)"
+        );
+        assert_eq!(
+            eng.inspect_cell(s1, RowId(0), ColId(0)).unwrap().raw,
+            "=SUM(Sheet1!A1:A3)"
+        );
+
+        let (payload2, cut_clip2) = copy_range(
+            eng.workbook(),
+            s0,
+            RectPos {
+                first_row: 0,
+                row_count: 3,
+                first_col: 0,
+                col_count: 1,
+            },
+            true,
+        )
+        .unwrap();
+        let mut clip_opt2 = Some(cut_clip2);
+        let (ops2, _) = build_paste_ops(
+            eng.workbook(),
+            s1,
+            RectPos {
+                first_row: 2,
+                row_count: 1,
+                first_col: 2,
+                col_count: 1,
+            },
+            &payload2.tsv,
+            None,
+            &mut clip_opt2,
+        )
+        .unwrap();
+        assert!(matches!(ops2.as_slice(), [Op::MoveCells { .. }]));
+        eng.apply_txn(ops2).unwrap();
+        eng.recalc_all();
+        assert_eq!(
+            eng.inspect_cell(s0, RowId(0), ColId(1)).unwrap().raw,
+            "=SUM(Summary!C3:C5)"
         );
     }
 }

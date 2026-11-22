@@ -15,6 +15,10 @@ export interface Theme {
   readonly headerSelected: string;
   readonly selection: string;
   readonly selectionFill: string;
+  readonly filterHeaderText: string;
+  readonly filterIconColor: string;
+  readonly filterIconActiveColor: string;
+  readonly spillBorderColor: string;
   /** Semantic 8-slot text colors (`Palette(0..7)`). */
   readonly paletteText: readonly string[];
   /** Semantic 8-slot background fill colors (`Palette(0..7)`). */
@@ -131,6 +135,10 @@ const FALLBACK: Theme = {
   headerSelected: "#dbe7ff",
   selection: "#1a5fd0",
   selectionFill: "rgba(26, 95, 208, 0.12)",
+  filterHeaderText: "#1a5fd0",
+  filterIconColor: "#59636e",
+  filterIconActiveColor: "#1a5fd0",
+  spillBorderColor: "#1a5fd0",
   paletteText: LIGHT_PALETTE_TEXT,
   paletteFill: LIGHT_PALETTE_FILL,
   refStrokes: REF_COLORS_LIGHT,
@@ -164,6 +172,16 @@ export function readTheme(host: HTMLElement): Theme {
     headerSelected: color("--grid-header-selected", FALLBACK.headerSelected),
     selection: color("--grid-selection", FALLBACK.selection),
     selectionFill: color("--grid-selection-fill", FALLBACK.selectionFill),
+    filterHeaderText: color(
+      "--grid-filter-header-text",
+      dark ? "#6ea1ff" : FALLBACK.filterHeaderText,
+    ),
+    filterIconColor: color("--grid-filter-icon", dark ? "#9aa3ad" : FALLBACK.filterIconColor),
+    filterIconActiveColor: color(
+      "--grid-filter-icon-active",
+      dark ? "#6ea1ff" : FALLBACK.filterIconActiveColor,
+    ),
+    spillBorderColor: color("--grid-spill-border", dark ? "#6ea1ff" : FALLBACK.spillBorderColor),
     paletteText: dark ? DARK_PALETTE_TEXT : LIGHT_PALETTE_TEXT,
     paletteFill: dark ? DARK_PALETTE_FILL : LIGHT_PALETTE_FILL,
     refStrokes: dark ? REF_COLORS_DARK : REF_COLORS_LIGHT,

@@ -2,6 +2,12 @@ import type { RemotePresence, WireCellStyle } from "@reticula/protocol";
 import { PAGE_COLS, PAGE_ROWS } from "@reticula/protocol/viewport";
 import type { PageCache } from "./cache.ts";
 import {
+  type CellRect,
+  type FilterDisplayState,
+  type FilterRowMap,
+  filterButtonBox,
+} from "./filter.ts";
+import {
   type Box,
   columnName,
   defaultLayout,
@@ -74,6 +80,12 @@ export interface Frame {
   readonly reorderGuide?: ReorderGuide | null;
   /** Whether to draw the `6×6` fill handle at the bottom-right of `selectionRange`. */
   readonly showFillHandle?: boolean;
+  /** Active worker-local AutoFilter display bounds and active columns. */
+  readonly filterState?: FilterDisplayState | null;
+  /** O(log H) display-to-physical row map for AutoFilter header labels & gaps. */
+  readonly filterRowMap?: FilterRowMap | null;
+  /** Active dynamic-array spill footprint displayed with a dashed border. */
+  readonly activeSpillRange?: CellRect | null;
 }
 
 export interface FrameCounts {
@@ -291,7 +303,9 @@ export class Renderer {
       this.#lines(frame, layout, q, originX, originY);
       this.#cellBorders(frame, layout, parts, originX, originY);
       this.#textAndOverflows(frame, layout, sheet, q, parts, originX, originY, counts);
+      this.#filterDropdownButtons(frame, layout, q, originX, originY);
       this.#formulaRefs(frame, layout, q, originX, originY);
+      this.#spillBorderOutline(frame, layout, q, originX, originY);
       this.#clipboardOutline(frame, layout, q, originX, originY);
       this.#selectionOutlines(frame, layout, q, originX, originY);
       if (frame.remotePresences?.length) {
@@ -929,6 +943,114 @@ export class Renderer {
     context.restore();
   }
 
+  #filterDropdownButtons(
+    frame: Frame,
+    layout: SheetLayout,
+    q: Quadrant,
+    originX: number,
+    originY: number,
+  ): void {
+    const filter = frame.filterState;
+    if (!filter) {
+      return;
+    }
+    const headerDisp = frame.filterRowMap
+      ? frame.filterRowMap.physicalToDisplay(filter.headerRow)
+      : filter.headerRow;
+    if (headerDisp === null || headerDisp < q.span.firstRow || headerDisp >= q.span.endRow) {
+      return;
+    }
+    const cStart = Math.max(q.span.firstCol, filter.firstCol);
+    const cEnd = Math.min(q.span.endCol - 1, filter.lastCol);
+    if (cStart > cEnd) {
+      return;
+    }
+    const activeSet = new Set(filter.activeCols);
+    const context = this.#context;
+    const { theme } = frame;
+    const rowY = originY + layout.rowAxis.offsetOf(headerDisp);
+    const rowH = layout.rowAxis.sizeOf(headerDisp);
+
+    context.save();
+    context.beginPath();
+    context.rect(q.clip.left, q.clip.top, q.clip.width, q.clip.height);
+    context.clip();
+
+    for (let c = cStart; c <= cEnd; c++) {
+      const colX = originX + layout.colAxis.offsetOf(c);
+      const colW = layout.colAxis.sizeOf(c);
+      const btn = filterButtonBox(colX, rowY, colW, rowH);
+      if (!btn) {
+        continue;
+      }
+      const isActive = activeSet.has(c);
+      context.fillStyle = isActive ? theme.selectionFill : theme.headerBackground;
+      context.fillRect(btn.x, btn.y, btn.size, btn.size);
+      context.strokeStyle = isActive ? theme.filterIconActiveColor : theme.headerLine;
+      context.lineWidth = 1;
+      context.strokeRect(btn.x + 0.5, btn.y + 0.5, btn.size - 1, btn.size - 1);
+
+      const cx = btn.x + btn.size / 2;
+      const cy = btn.y + btn.size / 2;
+      context.fillStyle = isActive ? theme.filterIconActiveColor : theme.filterIconColor;
+      context.beginPath();
+      if (isActive) {
+        context.moveTo(cx - 4, cy - 3);
+        context.lineTo(cx + 4, cy - 3);
+        context.lineTo(cx + 1.2, cy + 0.5);
+        context.lineTo(cx + 1.2, cy + 3.5);
+        context.lineTo(cx - 1.2, cy + 3.5);
+        context.lineTo(cx - 1.2, cy + 0.5);
+      } else {
+        context.moveTo(cx - 3.5, cy - 2);
+        context.lineTo(cx + 3.5, cy - 2);
+        context.lineTo(cx, cy + 2.5);
+      }
+      context.closePath();
+      context.fill();
+    }
+
+    context.restore();
+  }
+
+  #spillBorderOutline(
+    frame: Frame,
+    layout: SheetLayout,
+    q: Quadrant,
+    originX: number,
+    originY: number,
+  ): void {
+    const spill = frame.activeSpillRange;
+    if (!spill) {
+      return;
+    }
+    const endRow = spill.lastRow + 1;
+    const endCol = spill.lastCol + 1;
+    if (
+      endRow <= q.span.firstRow ||
+      spill.firstRow >= q.span.endRow ||
+      endCol <= q.span.firstCol ||
+      spill.firstCol >= q.span.endCol
+    ) {
+      return;
+    }
+    const context = this.#context;
+    const x0 = originX + layout.colAxis.offsetOf(spill.firstCol);
+    const y0 = originY + layout.rowAxis.offsetOf(spill.firstRow);
+    const w = layout.colAxis.offsetOf(endCol) - layout.colAxis.offsetOf(spill.firstCol);
+    const h = layout.rowAxis.offsetOf(endRow) - layout.rowAxis.offsetOf(spill.firstRow);
+
+    context.save();
+    context.beginPath();
+    context.rect(q.clip.left, q.clip.top, q.clip.width, q.clip.height);
+    context.clip();
+    context.lineWidth = 1.5;
+    context.setLineDash([4, 3]);
+    context.strokeStyle = frame.theme.spillBorderColor;
+    context.strokeRect(x0 + 0.75, y0 + 0.75, Math.max(0, w - 1.5), Math.max(0, h - 1.5));
+    context.restore();
+  }
+
   #clipboardOutline(
     frame: Frame,
     layout: SheetLayout,
@@ -1214,14 +1336,25 @@ export class Renderer {
         }
       }
 
+      const filterState = frame.filterState ?? null;
+      const filterRowMap = frame.filterRowMap ?? null;
+      const hasFilteredHidden = Boolean(filterState && filterRowMap?.hasHiddenRows);
+
       context.font = theme.font;
       context.textBaseline = "middle";
       context.textAlign = "center";
-      context.fillStyle = theme.headerText;
       for (let row = firstRow; row < endRow; row++) {
+        const physRow = filterRowMap ? filterRowMap.displayToPhysical(row) : row;
         const ry = oy + layout.rowAxis.offsetOf(row);
         const rh = layout.rowAxis.sizeOf(row);
-        context.fillText(String(row + 1), headerWidth / 2, ry + rh / 2);
+        const isFilterBlue =
+          hasFilteredHidden &&
+          filterState !== null &&
+          ((physRow > filterState.headerRow && physRow <= filterState.lastRow) ||
+            (filterRowMap?.isGapBefore(row) ?? false) ||
+            (filterRowMap?.isGapAfter(row) ?? false));
+        context.fillStyle = isFilterBlue ? theme.filterHeaderText : theme.headerText;
+        context.fillText(String(physRow + 1), headerWidth / 2, ry + rh / 2);
       }
 
       context.beginPath();
@@ -1235,6 +1368,33 @@ export class Renderer {
       context.lineWidth = width;
       context.strokeStyle = theme.headerLine;
       context.stroke();
+
+      if (hasFilteredHidden && filterRowMap) {
+        context.beginPath();
+        for (let row = firstRow; row < endRow; row++) {
+          if (filterRowMap.isGapBefore(row)) {
+            const y = Math.round(oy + layout.rowAxis.offsetOf(row));
+            if (y >= clipTop && y <= clipBottom) {
+              context.moveTo(0, y);
+              context.lineTo(headerWidth, y);
+            }
+          }
+        }
+        if (
+          endRow === sheet.rows &&
+          filterRowMap.totalRows > 0 &&
+          filterRowMap.physicalToDisplay(filterRowMap.totalRows - 1) === null
+        ) {
+          const yBottom = Math.round(oy + layout.rowAxis.offsetOf(endRow));
+          if (yBottom >= clipTop && yBottom <= clipBottom) {
+            context.moveTo(0, yBottom);
+            context.lineTo(headerWidth, yBottom);
+          }
+        }
+        context.lineWidth = 2;
+        context.strokeStyle = theme.filterHeaderText;
+        context.stroke();
+      }
       context.restore();
     };
 

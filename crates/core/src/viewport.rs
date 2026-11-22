@@ -321,6 +321,20 @@ fn pages_along(extent: u32, first: u32, count: u32, page: u32, limit: u32) -> (u
 /// Ensures resolved styles for all cells (and left-overflow origin cells) on
 /// `page` are interned in `sheet.styles_mut()` prior to calling [`encode_page_with_formulas`].
 pub fn prepare_page_styles(sheet: &mut Sheet, page: Page) {
+    let total = sheet.rows();
+    prepare_projected_page_styles(sheet, page, total, Some);
+}
+
+/// Projection-aware variant of [`prepare_page_styles`] mapping display rows
+/// `0..visible_rows` to physical sheet row indices via `map_display_row`.
+pub fn prepare_projected_page_styles<R>(
+    sheet: &mut Sheet,
+    page: Page,
+    visible_rows: u32,
+    mut map_display_row: R,
+) where
+    R: FnMut(u32) -> Option<u32>,
+{
     if sheet.col_styles().is_empty()
         && sheet.row_styles().is_empty()
         && sheet.cell_styles().is_empty()
@@ -329,7 +343,10 @@ pub fn prepare_page_styles(sheet: &mut Sheet, page: Page) {
     }
     let first_row = page.row.saturating_mul(PAGE_ROWS);
     let first_col = page.col.saturating_mul(PAGE_COLS);
-    let rows = sheet.rows().saturating_sub(first_row).min(PAGE_ROWS);
+    let rows = visible_rows
+        .min(sheet.rows())
+        .saturating_sub(first_row)
+        .min(PAGE_ROWS);
     let cols = sheet.cols().saturating_sub(first_col).min(PAGE_COLS);
     if rows == 0 || cols == 0 {
         return;
@@ -340,7 +357,11 @@ pub fn prepare_page_styles(sheet: &mut Sheet, page: Page) {
 
     let mut row_ids: SmallVec<[RowId; 64]> = SmallVec::new();
     for r in first_row..end_row {
-        row_ids.push(RowId(sheet.row_id(r)));
+        if let Some(phys) = map_display_row(r)
+            && phys < sheet.rows()
+        {
+            row_ids.push(RowId(sheet.row_id(phys)));
+        }
     }
     let mut col_ids: SmallVec<[ColId; 32]> = SmallVec::new();
     for c in lookback_start..end_col {
@@ -468,19 +489,55 @@ pub fn encode_page_with_overlay<'a, F>(
     page: Page,
     epoch: u32,
     text: &mut String,
-    mut overlay: F,
+    overlay: F,
 ) -> Vec<u8>
 where
     F: FnMut(RowId, ColId) -> ViewportCellOverlay<'a>,
 {
+    encode_projected_page_with_overlay(sheet, page, epoch, sheet.rows(), Some, text, overlay)
+}
+
+/// Projection-aware variant of [`encode_page_with_overlay`] that maps visible
+/// display row indices `0..visible_rows` to physical sheet row indices via
+/// `map_display_row` without altering the v2 binary viewport page format.
+#[must_use]
+pub fn encode_projected_page_with_overlay<'a, R, F>(
+    sheet: &Sheet,
+    page: Page,
+    epoch: u32,
+    visible_rows: u32,
+    mut map_display_row: R,
+    text: &mut String,
+    mut overlay: F,
+) -> Vec<u8>
+where
+    R: FnMut(u32) -> Option<u32>,
+    F: FnMut(RowId, ColId) -> ViewportCellOverlay<'a>,
+{
     let first_row = page.row.saturating_mul(PAGE_ROWS);
     let first_col = page.col.saturating_mul(PAGE_COLS);
-    let mut rows = sheet.rows().saturating_sub(first_row).min(PAGE_ROWS);
+    let raw_rows = visible_rows
+        .min(sheet.rows())
+        .saturating_sub(first_row)
+        .min(PAGE_ROWS);
     let mut cols = sheet.cols().saturating_sub(first_col).min(PAGE_COLS);
-    if rows == 0 || cols == 0 {
-        (rows, cols) = (0, 0);
+
+    let mut row_ids: SmallVec<[RowId; 64]> = SmallVec::new();
+    if raw_rows > 0 && cols > 0 {
+        let end_row = first_row.saturating_add(raw_rows);
+        for d in first_row..end_row {
+            if let Some(phys) = map_display_row(d)
+                && phys < sheet.rows()
+            {
+                row_ids.push(RowId(sheet.row_id(phys)));
+            }
+        }
     }
-    let end_row = first_row.saturating_add(rows);
+    let rows = u32::try_from(row_ids.len()).unwrap_or(0);
+    if rows == 0 || cols == 0 {
+        row_ids.clear();
+        cols = 0;
+    }
     let end_col = first_col.saturating_add(cols);
 
     let cells = (rows as usize).saturating_mul(cols as usize);
@@ -504,11 +561,8 @@ where
     out.extend_from_slice(&0_u16.to_le_bytes()); // overflow_count, patched below
     out.resize(HEADER_LEN, 0);
 
-    let mut row_ids: SmallVec<[RowId; 64]> = SmallVec::new();
-    for row in first_row..end_row {
-        let id = sheet.row_id(row);
-        row_ids.push(RowId(id));
-        out.extend_from_slice(&id.to_le_bytes());
+    for &row_id in &row_ids {
+        out.extend_from_slice(&row_id.0.to_le_bytes());
     }
     let mut col_ids: SmallVec<[ColId; 16]> = SmallVec::new();
     for col in first_col..end_col {

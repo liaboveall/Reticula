@@ -879,6 +879,32 @@ impl Sheet {
         }
     }
 
+    /// Visits every non-empty live cell stored in `self`, yielding
+    /// `(row_pos, col_pos, row_id, col_id, value)` in sparse storage order.
+    pub fn for_each_non_empty_cell(&self, mut visit: impl FnMut(u32, u32, RowId, ColId, Value)) {
+        for (col_slot_idx, column) in self.columns.iter().enumerate() {
+            if column.is_empty() {
+                continue;
+            }
+            let Ok(col_slot) = u32::try_from(col_slot_idx) else {
+                continue;
+            };
+            let Some(col_id) = self.col_slots.slot_to_id(col_slot) else {
+                continue;
+            };
+            let Some(col_pos) = self.col_axis.id_to_pos(col_id) else {
+                continue;
+            };
+            column.for_each_non_empty(|row_slot, val| {
+                if let Some(row_id) = self.row_slots.slot_to_id(row_slot)
+                    && let Some(row_pos) = self.row_axis.id_to_pos(row_id)
+                {
+                    visit(row_pos, col_pos, RowId(row_id), ColId(col_id), val);
+                }
+            });
+        }
+    }
+
     /// Computes Excel-compatible `Ctrl+Arrow` jump from `(row_pos, col_pos)`.
     /// `(dr, dc)` is one of `(-1, 0)`, `(1, 0)`, `(0, -1)`, `(0, 1)`.
     #[must_use]

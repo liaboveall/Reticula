@@ -58,6 +58,10 @@ use crate::clipboard::{
     InternalClipboard, RectPos, build_fill_ops, build_paste_ops, copy_range, find_autofill_end_row,
 };
 use crate::undo::{UndoStack, collab_compensations};
+use reticula_core::ops::{FormulaMode, NamedRangeKey, is_valid_named_range_name};
+use reticula_formula::filter::{ColFilterCriterion, FilterCmpOp};
+use reticula_formula::search::{self, FindOptions, SearchIn, SearchScope};
+use reticula_formula::sort::{self, SortKey};
 
 /// Maximum raw CSV/TSV file size accepted for import (`256 MiB`, `14-m1b.md` 5.6).
 pub const MAX_CSV_IMPORT_BYTES: usize = 256 * 1024 * 1024;
@@ -525,6 +529,7 @@ impl From<FormulaDiagnostic> for WireFormulaDiagnostic {
 pub enum WireCompletionKind {
     Function,
     Sheet,
+    NamedRange,
 }
 
 impl From<CompletionKind> for WireCompletionKind {
@@ -532,6 +537,7 @@ impl From<CompletionKind> for WireCompletionKind {
         match k {
             CompletionKind::Function => Self::Function,
             CompletionKind::Sheet => Self::Sheet,
+            CompletionKind::NamedRange => Self::NamedRange,
         }
     }
 }
@@ -636,6 +642,230 @@ impl From<FormulaAnalysis> for WireFormulaAnalysis {
             active_ref_span: a.active_ref_span,
         }
     }
+}
+
+// Step 4 DTOs: AutoFilter, Sort, Find & Replace, Named Ranges, and Dynamic Spills
+
+/// 0-based inclusive cell rectangle in visible display coordinates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Tsify)]
+#[serde(rename_all = "camelCase")]
+pub struct WireCellRect {
+    pub first_row: u32,
+    pub last_row: u32,
+    pub first_col: u32,
+    pub last_col: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Tsify)]
+#[serde(rename_all = "camelCase")]
+pub enum WireFilterCmpOp {
+    Eq,
+    Ne,
+    Gt,
+    Ge,
+    Lt,
+    Le,
+}
+
+impl From<WireFilterCmpOp> for FilterCmpOp {
+    fn from(op: WireFilterCmpOp) -> Self {
+        match op {
+            WireFilterCmpOp::Eq => Self::Eq,
+            WireFilterCmpOp::Ne => Self::Ne,
+            WireFilterCmpOp::Gt => Self::Gt,
+            WireFilterCmpOp::Ge => Self::Ge,
+            WireFilterCmpOp::Lt => Self::Lt,
+            WireFilterCmpOp::Le => Self::Le,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Tsify)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum WireColFilterCriterion {
+    Values {
+        allowed: Vec<String>,
+        include_blanks: bool,
+    },
+    TextContains {
+        needle: String,
+        case_sensitive: bool,
+    },
+    TextStartsWith {
+        prefix: String,
+        case_sensitive: bool,
+    },
+    TextEndsWith {
+        suffix: String,
+        case_sensitive: bool,
+    },
+    NumberCompare {
+        op: WireFilterCmpOp,
+        value: f64,
+    },
+    NumberBetween {
+        min: f64,
+        max: f64,
+    },
+    TopN {
+        count: u32,
+        top: bool,
+    },
+}
+
+impl From<WireColFilterCriterion> for ColFilterCriterion {
+    fn from(c: WireColFilterCriterion) -> Self {
+        match c {
+            WireColFilterCriterion::Values {
+                allowed,
+                include_blanks,
+            } => Self::Values {
+                allowed: allowed.into_iter().collect(),
+                include_blanks,
+            },
+            WireColFilterCriterion::TextContains {
+                needle,
+                case_sensitive,
+            } => Self::TextContains {
+                needle,
+                case_sensitive,
+            },
+            WireColFilterCriterion::TextStartsWith {
+                prefix,
+                case_sensitive,
+            } => Self::TextStartsWith {
+                prefix,
+                case_sensitive,
+            },
+            WireColFilterCriterion::TextEndsWith {
+                suffix,
+                case_sensitive,
+            } => Self::TextEndsWith {
+                suffix,
+                case_sensitive,
+            },
+            WireColFilterCriterion::NumberCompare { op, value } => Self::NumberCompare {
+                op: op.into(),
+                value,
+            },
+            WireColFilterCriterion::NumberBetween { min, max } => Self::NumberBetween { min, max },
+            WireColFilterCriterion::TopN { count, top } => Self::TopN { count, top },
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Tsify)]
+#[serde(rename_all = "camelCase")]
+pub struct WireFilterState {
+    pub header_row: u32,
+    pub last_row: u32,
+    pub first_col: u32,
+    pub last_col: u32,
+    pub active_cols: Vec<u32>,
+    pub hidden_row_spans: Vec<(u32, u32)>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Tsify)]
+#[serde(rename_all = "camelCase")]
+pub struct WireDistinctValue {
+    pub value: String,
+    pub count: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Tsify)]
+#[serde(rename_all = "camelCase")]
+pub struct WireSortKey {
+    pub col_offset: u32,
+    pub ascending: bool,
+    pub case_sensitive: bool,
+}
+
+impl From<WireSortKey> for SortKey {
+    fn from(k: WireSortKey) -> Self {
+        Self {
+            col_offset: k.col_offset,
+            ascending: k.ascending,
+            case_sensitive: k.case_sensitive,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Tsify)]
+#[serde(rename_all = "camelCase")]
+pub enum WireSearchScope {
+    ActiveSheet,
+    WholeWorkbook,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Tsify)]
+#[serde(rename_all = "camelCase")]
+pub enum WireSearchIn {
+    DisplayValues,
+    Formulas,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Tsify)]
+#[serde(rename_all = "camelCase")]
+pub struct WireFindOptions {
+    pub query: String,
+    pub scope: WireSearchScope,
+    pub search_in: WireSearchIn,
+    pub case_sensitive: bool,
+    pub whole_cell: bool,
+    pub use_regex: bool,
+    pub skip_hidden: bool,
+}
+
+impl From<WireFindOptions> for FindOptions {
+    fn from(o: WireFindOptions) -> Self {
+        Self {
+            query: o.query,
+            scope: match o.scope {
+                WireSearchScope::ActiveSheet => SearchScope::ActiveSheet,
+                WireSearchScope::WholeWorkbook => SearchScope::WholeWorkbook,
+            },
+            search_in: match o.search_in {
+                WireSearchIn::DisplayValues => SearchIn::DisplayValues,
+                WireSearchIn::Formulas => SearchIn::Formulas,
+            },
+            case_sensitive: o.case_sensitive,
+            whole_cell: o.whole_cell,
+            use_regex: o.use_regex,
+            skip_hidden: o.skip_hidden,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Tsify)]
+#[serde(rename_all = "camelCase")]
+pub struct WireSearchMatch {
+    pub sheet: u32,
+    pub sheet_name: String,
+    pub row: u32,
+    pub physical_row: u32,
+    pub col: u32,
+    #[serde(with = "wire_u64")]
+    #[tsify(type = "string")]
+    pub row_id: u64,
+    #[serde(with = "wire_u64")]
+    #[tsify(type = "string")]
+    pub col_id: u64,
+    pub text: String,
+    pub is_formula: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Tsify)]
+#[serde(rename_all = "camelCase")]
+pub struct WireNamedRangeInfo {
+    pub scope: Option<u32>,
+    pub name: String,
+    pub formula: String,
+    pub comment: Option<String>,
+    pub hidden: bool,
 }
 
 // Persistence & Safe Mode DTOs
@@ -954,6 +1184,66 @@ pub enum EngineCommand {
     ResumeRecalc,
     /// Advance an in-progress time-sliced recalculation by one ~4 ms budget slice.
     ContinueRecalc,
+    /// Install or replace worker-local AutoFilter dropdowns on a rectangular table.
+    SetFilterTable {
+        sheet: u32,
+        header_row: u32,
+        last_row: u32,
+        first_col: u32,
+        last_col: u32,
+    },
+    /// Apply or clear one AutoFilter column criterion (`criterion = null` removes column filter).
+    SetColumnFilter {
+        sheet: u32,
+        col: u32,
+        criterion: Option<WireColFilterCriterion>,
+    },
+    /// Clear the active worker-local AutoFilter on `sheet`.
+    ClearFilter { sheet: u32 },
+    /// Collect sorted distinct values for an AutoFilter dropdown column.
+    GetFilterValues { sheet: u32, col: u32 },
+    /// Multi-key stable sort producing an atomic `Op::PermuteContent` transaction.
+    SortRange {
+        sheet: u32,
+        first_row: u32,
+        last_row: u32,
+        first_col: u32,
+        last_col: u32,
+        has_header: Option<bool>,
+        keys: Vec<WireSortKey>,
+    },
+    /// Bounded workbook/sheet search.
+    FindAll {
+        sheet: u32,
+        options: WireFindOptions,
+        max_results: Option<u32>,
+    },
+    /// Find next/previous matching cell relative to `(from_row, from_col)`.
+    FindNext {
+        sheet: u32,
+        from_row: u32,
+        from_col: u32,
+        backwards: bool,
+        options: WireFindOptions,
+    },
+    /// Atomic batch Replace All (`<= 10,000` edits, syntax-validated formulas).
+    ReplaceAll {
+        sheet: u32,
+        options: WireFindOptions,
+        replacement: String,
+    },
+    /// List all defined workbook- and worksheet-scoped named ranges.
+    ListNamedRanges,
+    /// Define or update a workbook- or worksheet-scoped named range (`Op::DefineNamedRange`).
+    DefineNamedRange {
+        scope: Option<u32>,
+        name: String,
+        formula: String,
+        comment: Option<String>,
+        hidden: Option<bool>,
+    },
+    /// Delete an existing named range (`Op::DeleteNamedRange`).
+    DeleteNamedRange { scope: Option<u32>, name: String },
     /// Run the determinism self-check. Answered by [`EngineEvent::SelfChecked`].
     SelfCheck,
     /// Report the workbook's state digest (`STATE_DIGEST_VERSION`), which two
@@ -1003,6 +1293,8 @@ pub enum EngineEvent {
         error: Option<String>,
         format_code: String,
         style: WireCellStyle,
+        spill_range: Option<WireCellRect>,
+        is_spill_shadow: bool,
     },
     /// Language-service tokens, diagnostics, completions, signature help, and colored refs.
     FormulaAnalyzed { analysis: WireFormulaAnalysis },
@@ -1052,6 +1344,31 @@ pub enum EngineEvent {
         elapsed_ms: f64,
         sheet: SheetInfo,
     },
+    /// Distinct values available for an AutoFilter column dropdown.
+    FilterValues {
+        sheet: u32,
+        col: u32,
+        values: Vec<WireDistinctValue>,
+        blank_count: u32,
+        truncated: bool,
+    },
+    /// Search match results for Find All.
+    SearchResults {
+        matches: Vec<WireSearchMatch>,
+        total: u32,
+        truncated: bool,
+    },
+    /// Result of Find Next / Find Previous navigation.
+    SearchNavigated { found: Option<WireSearchMatch> },
+    /// Batch Replace All result with refreshed worksheet metadata.
+    ReplaceCompleted {
+        replaced_cells: u32,
+        skipped_invalid_formulas: u32,
+        truncated: bool,
+        sheet: SheetInfo,
+    },
+    /// Full defined named ranges listing.
+    NamedRangesListed { items: Vec<WireNamedRangeInfo> },
     /// Command was atomically rejected without mutating workbook state.
     Rejected { reason: String },
     /// The determinism self-check has run.
@@ -1078,10 +1395,14 @@ pub struct SheetInfo {
     pub sheet_name: String,
     /// Ordered list of live worksheet tabs.
     pub sheets: Vec<SheetTabInfo>,
-    /// Number of live rows on the active sheet.
+    /// Number of visible rows on the active sheet (after worker-local filter projection).
     pub rows: u32,
+    /// Total physical live rows on the active sheet.
+    pub total_rows: u32,
     /// Number of live columns on the active sheet.
     pub cols: u32,
+    /// Active worker-local AutoFilter bounds, filtered columns, and hidden row spans.
+    pub filter: Option<WireFilterState>,
     /// Frozen top row count (`0..=32`).
     pub frozen_rows: u32,
     /// Frozen left column count (`0..=32`).
@@ -1936,11 +2257,12 @@ impl Engine {
                 source,
                 cursor_utf16,
             } => {
-                let analysis = lang_service::analyze_formula(
+                let analysis = lang_service::analyze_formula_with_spills(
                     &source,
                     cursor_utf16,
                     self.engine.workbook(),
                     SheetId(sheet),
+                    Some(self.engine.spills()),
                 );
                 Some(EngineEvent::FormulaAnalyzed {
                     analysis: analysis.into(),
@@ -1972,17 +2294,22 @@ impl Engine {
                 c1,
                 r2,
                 c2,
-            } => Some(EngineEvent::RangeRefFormatted {
-                reference: lang_service::format_sheet_range_ref(
-                    self.engine.workbook(),
-                    SheetId(host_sheet),
-                    SheetId(target_sheet),
-                    r1,
-                    c1,
-                    r2,
-                    c2,
-                ),
-            }),
+            } => {
+                let ts = SheetId(target_sheet);
+                let pr1 = self.engine.display_to_physical_row(ts, r1).unwrap_or(r1);
+                let pr2 = self.engine.display_to_physical_row(ts, r2).unwrap_or(r2);
+                Some(EngineEvent::RangeRefFormatted {
+                    reference: lang_service::format_sheet_range_ref(
+                        self.engine.workbook(),
+                        SheetId(host_sheet),
+                        ts,
+                        pr1,
+                        c1,
+                        pr2,
+                        c2,
+                    ),
+                })
+            }
             EngineCommand::JumpEdge {
                 sheet,
                 row,
@@ -1995,6 +2322,89 @@ impl Engine {
             }
             EngineCommand::ResumeRecalc => Some(self.resume_recalc()),
             EngineCommand::ContinueRecalc => self.continue_recalc(),
+            EngineCommand::SetFilterTable {
+                sheet,
+                header_row,
+                last_row,
+                first_col,
+                last_col,
+            } => Some(self.set_filter_table(
+                SheetId(sheet),
+                header_row,
+                last_row,
+                first_col,
+                last_col,
+            )),
+            EngineCommand::SetColumnFilter {
+                sheet,
+                col,
+                criterion,
+            } => Some(self.set_column_filter(SheetId(sheet), col, criterion.map(Into::into))),
+            EngineCommand::ClearFilter { sheet } => Some(self.clear_filter(SheetId(sheet))),
+            EngineCommand::GetFilterValues { sheet, col } => {
+                Some(self.get_filter_values(SheetId(sheet), col))
+            }
+            EngineCommand::SortRange {
+                sheet,
+                first_row,
+                last_row,
+                first_col,
+                last_col,
+                has_header,
+                keys,
+            } => Some(self.sort_range(
+                SheetId(sheet),
+                first_row,
+                last_row,
+                first_col,
+                last_col,
+                has_header,
+                &keys,
+            )),
+            EngineCommand::FindAll {
+                sheet,
+                options,
+                max_results,
+            } => Some(self.find_all_matches(
+                SheetId(sheet),
+                &options.into(),
+                max_results.unwrap_or(500) as usize,
+            )),
+            EngineCommand::FindNext {
+                sheet,
+                from_row,
+                from_col,
+                backwards,
+                options,
+            } => Some(self.find_next_match(
+                SheetId(sheet),
+                from_row,
+                from_col,
+                backwards,
+                &options.into(),
+            )),
+            EngineCommand::ReplaceAll {
+                sheet,
+                options,
+                replacement,
+            } => Some(self.replace_all_matches(SheetId(sheet), &options.into(), &replacement)),
+            EngineCommand::ListNamedRanges => Some(self.list_named_ranges()),
+            EngineCommand::DefineNamedRange {
+                scope,
+                name,
+                formula,
+                comment,
+                hidden,
+            } => Some(self.define_named_range(
+                scope.map(SheetId),
+                &name,
+                &formula,
+                comment,
+                hidden.unwrap_or(false),
+            )),
+            EngineCommand::DeleteNamedRange { scope, name } => {
+                Some(self.delete_named_range(scope.map(SheetId), &name))
+            }
             EngineCommand::StateDigest => {
                 let digest = self.engine.workbook().state_digest();
                 Some(EngineEvent::StateDigested {
@@ -2103,12 +2513,13 @@ impl Engine {
     }
 
     fn subscribe(&mut self, sheet_id: SheetId, epoch: u32, rows: (u32, u32), cols: (u32, u32)) {
+        let visible_rows = self.engine.visible_row_count(sheet_id);
         let (dims, frozen) = self
             .engine
             .workbook()
             .sheet(sheet_id)
             .map_or(((0, 0), (0, 0)), |s| {
-                ((s.rows(), s.cols()), (s.frozen_rows(), s.frozen_cols()))
+                ((visible_rows, s.cols()), (s.frozen_rows(), s.frozen_cols()))
             });
         let base_range = PageRange::covering(dims, rows, cols);
         let wanted = viewport::collect_wanted_pages_with_freeze(base_range, frozen.0, frozen.1);
@@ -2147,12 +2558,13 @@ impl Engine {
             return;
         }
         let sheet_id = self.subscribed_sheet;
+        let visible_rows = self.engine.visible_row_count(sheet_id);
         let (dims, frozen) = self
             .engine
             .workbook()
             .sheet(sheet_id)
             .map_or(((0, 0), (0, 0)), |s| {
-                ((s.rows(), s.cols()), (s.frozen_rows(), s.frozen_cols()))
+                ((visible_rows, s.cols()), (s.frozen_rows(), s.frozen_cols()))
             });
         let base_range = PageRange::covering(dims, self.subscribed_rows, self.subscribed_cols);
         let wanted = viewport::collect_wanted_pages_with_freeze(base_range, frozen.0, frozen.1);
@@ -2198,10 +2610,11 @@ impl Engine {
                 if s_id != target_sheet {
                     continue;
                 }
-                if let (Some(r_pos), Some(c_pos)) = (
+                if let (Some(phys_r), Some(c_pos)) = (
                     sheet.row_axis().id_to_pos(row_id.0),
                     sheet.col_axis().id_to_pos(col_id.0),
-                ) {
+                ) && let Some(r_pos) = self.engine.physical_to_display_row(target_sheet, phys_r)
+                {
                     let page = Page {
                         row: r_pos / PAGE_ROWS,
                         col: c_pos / PAGE_COLS,
@@ -2749,7 +3162,69 @@ impl Engine {
         }
     }
 
+    fn map_display_rect_to_physical(&self, sheet_id: SheetId, rect: RectPos) -> Option<RectPos> {
+        if self.engine.filter_state(sheet_id).is_none() {
+            return Some(rect);
+        }
+        let pr1 = self
+            .engine
+            .display_to_physical_row(sheet_id, rect.first_row)?;
+        let last_disp = rect
+            .first_row
+            .saturating_add(rect.row_count.saturating_sub(1));
+        let pr2 = self.engine.display_to_physical_row(sheet_id, last_disp)?;
+        Some(RectPos {
+            first_row: pr1,
+            row_count: pr2.saturating_sub(pr1).saturating_add(1),
+            first_col: rect.first_col,
+            col_count: rect.col_count,
+        })
+    }
+
+    fn nearest_visible_display_row(&self, sheet_id: SheetId, physical_row: u32) -> u32 {
+        if self.engine.filter_state(sheet_id).is_none() {
+            return physical_row;
+        }
+        if let Some(d) = self.engine.physical_to_display_row(sheet_id, physical_row) {
+            return d;
+        }
+        let Some(sheet) = self.engine.workbook().sheet(sheet_id) else {
+            return 0;
+        };
+        let mut r = physical_row;
+        while r > 0 {
+            r = r.saturating_sub(1);
+            if let Some(d) = self.engine.physical_to_display_row(sheet_id, r) {
+                return d;
+            }
+        }
+        let max_r = sheet.rows().saturating_sub(1);
+        for candidate in physical_row..=max_r {
+            if let Some(d) = self.engine.physical_to_display_row(sheet_id, candidate) {
+                return d;
+            }
+        }
+        0
+    }
+
     fn fill_range(&mut self, sheet_id: SheetId, src: RectPos, dst: RectPos) -> EngineEvent {
+        let (Some(phys_src), Some(phys_dst)) = (
+            self.map_display_rect_to_physical(sheet_id, src),
+            self.map_display_rect_to_physical(sheet_id, dst),
+        ) else {
+            return EngineEvent::Rejected {
+                reason: String::from("Fill range falls outside visible rows."),
+            };
+        };
+        self.fill_range_physical(sheet_id, phys_src, phys_dst)
+    }
+
+    fn fill_range_physical(
+        &mut self,
+        sheet_id: SheetId,
+        src: RectPos,
+        dst: RectPos,
+    ) -> EngineEvent {
         let started = now_ms();
         let ops = match build_fill_ops(self.engine.workbook(), sheet_id, src, dst) {
             Ok(ops) => ops,
@@ -2776,7 +3251,14 @@ impl Engine {
     }
 
     fn auto_fill_down(&mut self, sheet_id: SheetId, src: RectPos) -> EngineEvent {
-        let Some(end_row_incl) = find_autofill_end_row(self.engine.workbook(), sheet_id, src)
+        let Some(phys_src) = self.map_display_rect_to_physical(sheet_id, src) else {
+            return EngineEvent::SheetChanged {
+                sheet: self.sheet_info(sheet_id),
+                action_ms: 0.0,
+                recalculated: 0,
+            };
+        };
+        let Some(end_row_incl) = find_autofill_end_row(self.engine.workbook(), sheet_id, phys_src)
         else {
             return EngineEvent::SheetChanged {
                 sheet: self.sheet_info(sheet_id),
@@ -2785,16 +3267,23 @@ impl Engine {
             };
         };
         let dst = RectPos {
-            first_row: src.first_row,
-            row_count: end_row_incl.saturating_add(1).saturating_sub(src.first_row),
-            first_col: src.first_col,
-            col_count: src.col_count,
+            first_row: phys_src.first_row,
+            row_count: end_row_incl
+                .saturating_add(1)
+                .saturating_sub(phys_src.first_row),
+            first_col: phys_src.first_col,
+            col_count: phys_src.col_count,
         };
-        self.fill_range(sheet_id, src, dst)
+        self.fill_range_physical(sheet_id, phys_src, dst)
     }
 
     fn copy_selection(&mut self, sheet_id: SheetId, rect: RectPos, cut: bool) -> EngineEvent {
-        match copy_range(self.engine.workbook(), sheet_id, rect, cut) {
+        let Some(phys_rect) = self.map_display_rect_to_physical(sheet_id, rect) else {
+            return EngineEvent::Rejected {
+                reason: String::from("Copy selection falls outside visible rows."),
+            };
+        };
+        match copy_range(self.engine.workbook(), sheet_id, phys_rect, cut) {
             Ok((payload, internal)) => {
                 self.clipboard = Some(internal);
                 EngineEvent::ClipboardCopied {
@@ -2821,11 +3310,16 @@ impl Engine {
         html: Option<&str>,
     ) -> EngineEvent {
         let started = now_ms();
+        let Some(phys_dest) = self.map_display_rect_to_physical(sheet_id, dest) else {
+            return EngineEvent::Rejected {
+                reason: String::from("Paste target falls outside visible rows."),
+            };
+        };
         let mut clip_clone = self.clipboard.clone();
         let (ops, applied_rect) = match build_paste_ops(
             self.engine.workbook(),
             sheet_id,
-            dest,
+            phys_dest,
             tsv,
             html,
             &mut clip_clone,
@@ -2840,11 +3334,15 @@ impl Engine {
             self.clipboard = clip_clone;
         }
         let recalculated = self.run_initial_recalc_slice();
+        let dest_first_row = self
+            .engine
+            .physical_to_display_row(sheet_id, applied_rect.first_row)
+            .unwrap_or(dest.first_row);
         let sheet_meta = self.sheet_info(sheet_id);
         self.flush_dirty_pages();
         EngineEvent::ClipboardPasted {
             sheet: sheet_meta,
-            dest_first_row: applied_rect.first_row,
+            dest_first_row,
             dest_row_count: applied_rect.row_count,
             dest_first_col: applied_rect.first_col,
             dest_col_count: applied_rect.col_count,
@@ -3070,12 +3568,17 @@ impl Engine {
                 select,
             };
         }
-        let r0 = row.min(rows.saturating_sub(1));
+        let phys_row = self
+            .engine
+            .display_to_physical_row(sheet_id, row)
+            .unwrap_or(row);
+        let r0 = phys_row.min(rows.saturating_sub(1));
         let c0 = col.min(cols.saturating_sub(1));
         let (nr, nc) = compute_jump_target(self.engine.workbook(), sheet, sheet_id, r0, c0, dir);
+        let disp_nr = self.nearest_visible_display_row(sheet_id, nr);
         EngineEvent::EdgeJumped {
             sheet: sheet_id.0,
-            row: nr,
+            row: disp_nr,
             col: nc,
             select,
         }
@@ -3101,11 +3604,361 @@ impl Engine {
                 }
             }
         }
+        let disp_max_r = self.nearest_visible_display_row(sheet_id, max_r);
         EngineEvent::EdgeJumped {
             sheet: sheet_id.0,
-            row: max_r,
+            row: disp_max_r,
             col: max_c,
             select,
+        }
+    }
+
+    fn set_filter_table(
+        &mut self,
+        sheet_id: SheetId,
+        header_row: u32,
+        last_row: u32,
+        first_col: u32,
+        last_col: u32,
+    ) -> EngineEvent {
+        let started = now_ms();
+        let phys_header = self
+            .engine
+            .display_to_physical_row(sheet_id, header_row)
+            .unwrap_or(header_row);
+        let phys_last = self
+            .engine
+            .display_to_physical_row(sheet_id, last_row)
+            .unwrap_or(last_row);
+        if !self
+            .engine
+            .set_filter_table(sheet_id, phys_header, phys_last, first_col, last_col)
+        {
+            return EngineEvent::Rejected {
+                reason: String::from("Cannot apply AutoFilter to the selected range."),
+            };
+        }
+        let recalculated = self.run_initial_recalc_slice();
+        self.refresh_subscription_extent();
+        let sheet_meta = self.sheet_info(sheet_id);
+        self.flush_dirty_pages();
+        EngineEvent::SheetChanged {
+            sheet: sheet_meta,
+            action_ms: now_ms() - started,
+            recalculated,
+        }
+    }
+
+    fn set_column_filter(
+        &mut self,
+        sheet_id: SheetId,
+        col: u32,
+        criterion: Option<ColFilterCriterion>,
+    ) -> EngineEvent {
+        let started = now_ms();
+        if !self.engine.set_column_filter(sheet_id, col, criterion) {
+            return EngineEvent::Rejected {
+                reason: String::from("Column filter outside active AutoFilter bounds."),
+            };
+        }
+        let recalculated = self.run_initial_recalc_slice();
+        self.refresh_subscription_extent();
+        let sheet_meta = self.sheet_info(sheet_id);
+        self.flush_dirty_pages();
+        EngineEvent::SheetChanged {
+            sheet: sheet_meta,
+            action_ms: now_ms() - started,
+            recalculated,
+        }
+    }
+
+    fn clear_filter(&mut self, sheet_id: SheetId) -> EngineEvent {
+        let started = now_ms();
+        self.engine.clear_filter(sheet_id);
+        let recalculated = self.run_initial_recalc_slice();
+        self.refresh_subscription_extent();
+        let sheet_meta = self.sheet_info(sheet_id);
+        self.flush_dirty_pages();
+        EngineEvent::SheetChanged {
+            sheet: sheet_meta,
+            action_ms: now_ms() - started,
+            recalculated,
+        }
+    }
+
+    fn get_filter_values(&self, sheet_id: SheetId, col: u32) -> EngineEvent {
+        let distinct = self.engine.distinct_filter_values(sheet_id, col, 10_000);
+        EngineEvent::FilterValues {
+            sheet: sheet_id.0,
+            col,
+            values: distinct
+                .values
+                .into_iter()
+                .map(|(value, count)| WireDistinctValue { value, count })
+                .collect(),
+            blank_count: distinct.blank_count,
+            truncated: distinct.truncated,
+        }
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "maps wire SortRange args cleanly"
+    )]
+    fn sort_range(
+        &mut self,
+        sheet_id: SheetId,
+        first_row: u32,
+        last_row: u32,
+        first_col: u32,
+        last_col: u32,
+        has_header: Option<bool>,
+        keys: &[WireSortKey],
+    ) -> EngineEvent {
+        let started = now_ms();
+        let phys_r1 = self
+            .engine
+            .display_to_physical_row(sheet_id, first_row)
+            .unwrap_or(first_row);
+        let phys_r2 = self
+            .engine
+            .display_to_physical_row(sheet_id, last_row)
+            .unwrap_or(last_row);
+        let (r1, r2) = (phys_r1.min(phys_r2), phys_r1.max(phys_r2));
+        let (c1, c2) = (first_col.min(last_col), first_col.max(last_col));
+        let sort_keys: Vec<SortKey> = keys.iter().copied().map(Into::into).collect();
+        let op_opt = {
+            let Some(sheet) = self.engine.workbook().live_sheet(sheet_id) else {
+                return EngineEvent::Rejected {
+                    reason: String::from("Target sheet not found."),
+                };
+            };
+            let detected_header =
+                has_header.unwrap_or_else(|| sort::detect_header_row(sheet, r1, r2, c1, c2));
+            sort::plan_sort(
+                sheet,
+                r1,
+                r2,
+                c1,
+                c2,
+                detected_header,
+                &sort_keys,
+                Some(self.engine.spills()),
+            )
+        };
+        if let Some(op) = op_opt
+            && let Err(reason) = self.execute_user_txn(String::from("Sort"), &[op])
+        {
+            return EngineEvent::Rejected { reason };
+        }
+        let recalculated = self.run_initial_recalc_slice();
+        self.refresh_subscription_extent();
+        let sheet_meta = self.sheet_info(sheet_id);
+        self.flush_dirty_pages();
+        EngineEvent::SheetChanged {
+            sheet: sheet_meta,
+            action_ms: now_ms() - started,
+            recalculated,
+        }
+    }
+
+    fn search_match_to_wire(&self, m: search::SearchMatch) -> WireSearchMatch {
+        let row = self.nearest_visible_display_row(m.sheet, m.row_pos);
+        WireSearchMatch {
+            sheet: m.sheet.0,
+            sheet_name: m.sheet_name,
+            row,
+            physical_row: m.row_pos,
+            col: m.col_pos,
+            row_id: m.row_id.0,
+            col_id: m.col_id.0,
+            text: m.text,
+            is_formula: m.is_formula,
+        }
+    }
+
+    fn find_all_matches(
+        &self,
+        sheet_id: SheetId,
+        opts: &FindOptions,
+        max_results: usize,
+    ) -> EngineEvent {
+        match search::find_all(&self.engine, sheet_id, opts, max_results) {
+            Ok(res) => {
+                let total = u32::try_from(res.matches.len()).unwrap_or(u32::MAX);
+                let matches = res
+                    .matches
+                    .into_iter()
+                    .map(|m| self.search_match_to_wire(m))
+                    .collect();
+                EngineEvent::SearchResults {
+                    matches,
+                    total,
+                    truncated: res.truncated,
+                }
+            }
+            Err(err) => EngineEvent::Rejected {
+                reason: err.to_string(),
+            },
+        }
+    }
+
+    fn find_next_match(
+        &self,
+        sheet_id: SheetId,
+        from_row: u32,
+        from_col: u32,
+        backwards: bool,
+        opts: &FindOptions,
+    ) -> EngineEvent {
+        let phys_row = self
+            .engine
+            .display_to_physical_row(sheet_id, from_row)
+            .unwrap_or(from_row);
+        match search::find_next(&self.engine, sheet_id, phys_row, from_col, backwards, opts) {
+            Ok(found) => EngineEvent::SearchNavigated {
+                found: found.map(|m| self.search_match_to_wire(m)),
+            },
+            Err(err) => EngineEvent::Rejected {
+                reason: err.to_string(),
+            },
+        }
+    }
+
+    fn replace_all_matches(
+        &mut self,
+        sheet_id: SheetId,
+        opts: &FindOptions,
+        replacement: &str,
+    ) -> EngineEvent {
+        let plan = match search::plan_replace_all(
+            &self.engine,
+            sheet_id,
+            opts,
+            replacement,
+            search::MAX_REPLACE_BATCH,
+        ) {
+            Ok(plan) => plan,
+            Err(err) => {
+                return EngineEvent::Rejected {
+                    reason: err.to_string(),
+                };
+            }
+        };
+        if !plan.ops.is_empty() {
+            if let Err(reason) = self.execute_user_txn(String::from("Replace All"), &plan.ops) {
+                return EngineEvent::Rejected { reason };
+            }
+            self.engine.reapply_filter(sheet_id);
+        }
+        let _ = self.run_initial_recalc_slice();
+        self.refresh_subscription_extent();
+        let sheet_meta = self.sheet_info(sheet_id);
+        self.flush_dirty_pages();
+        EngineEvent::ReplaceCompleted {
+            replaced_cells: plan.replaced_cells,
+            skipped_invalid_formulas: plan.skipped_invalid_formulas,
+            truncated: plan.truncated,
+            sheet: sheet_meta,
+        }
+    }
+
+    fn list_named_ranges(&self) -> EngineEvent {
+        let wb = self.engine.workbook();
+        let fallback_sheet = wb.live_sheets().next().map_or(SheetId(0), Sheet::id);
+        let items = wb
+            .named_ranges()
+            .iter()
+            .map(|(k, def)| {
+                let host = k.scope.unwrap_or(fallback_sheet);
+                WireNamedRangeInfo {
+                    scope: k.scope.map(|s| s.0),
+                    name: def.name.clone(),
+                    formula: def.formula.unparse(wb, host),
+                    comment: def.comment.clone(),
+                    hidden: def.hidden,
+                }
+            })
+            .collect();
+        EngineEvent::NamedRangesListed { items }
+    }
+
+    fn define_named_range(
+        &mut self,
+        scope: Option<SheetId>,
+        name: &str,
+        formula_src: &str,
+        comment: Option<String>,
+        hidden: bool,
+    ) -> EngineEvent {
+        let started = now_ms();
+        let trimmed = name.trim();
+        if !is_valid_named_range_name(trimmed) {
+            return EngineEvent::Rejected {
+                reason: format!("Invalid named range identifier '{trimmed}'."),
+            };
+        }
+        let raw_with_eq = if formula_src.trim_start().starts_with('=') {
+            formula_src.to_owned()
+        } else {
+            format!("={}", formula_src.trim())
+        };
+        let host_sheet = scope.unwrap_or(self.subscribed_sheet);
+        let bound = match BoundFormula::parse_and_bind(
+            &raw_with_eq,
+            FormulaMode::Dynamic,
+            self.engine.workbook(),
+            host_sheet,
+        ) {
+            Ok(f) => f,
+            Err(err) => {
+                return EngineEvent::Rejected {
+                    reason: format!("Invalid named range formula: {err:?}"),
+                };
+            }
+        };
+        let op = Op::DefineNamedRange {
+            scope,
+            name: String::from(trimmed),
+            formula: bound,
+            comment,
+            hidden,
+        };
+        if let Err(reason) = self.execute_user_txn(format!("Define {trimmed}"), &[op]) {
+            return EngineEvent::Rejected { reason };
+        }
+        let recalculated = self.run_initial_recalc_slice();
+        let sheet_meta = self.sheet_info(self.subscribed_sheet);
+        self.flush_dirty_pages();
+        EngineEvent::SheetChanged {
+            sheet: sheet_meta,
+            action_ms: now_ms() - started,
+            recalculated,
+        }
+    }
+
+    fn delete_named_range(&mut self, scope: Option<SheetId>, name: &str) -> EngineEvent {
+        let started = now_ms();
+        let key = NamedRangeKey::new(scope, name);
+        if !self.engine.workbook().named_ranges().contains_key(&key) {
+            return EngineEvent::Rejected {
+                reason: format!("Named range '{name}' was not found."),
+            };
+        }
+        let op = Op::DeleteNamedRange {
+            scope,
+            name: name.to_owned(),
+        };
+        if let Err(reason) = self.execute_user_txn(format!("Delete {name}"), &[op]) {
+            return EngineEvent::Rejected { reason };
+        }
+        let recalculated = self.run_initial_recalc_slice();
+        let sheet_meta = self.sheet_info(self.subscribed_sheet);
+        self.flush_dirty_pages();
+        EngineEvent::SheetChanged {
+            sheet: sheet_meta,
+            action_ms: now_ms() - started,
+            recalculated,
         }
     }
 
@@ -3520,6 +4373,36 @@ pub(crate) fn build_cell_inspected(
     let sheet = engine.workbook().sheet(sheet_id)?;
     let format_code = String::from(sheet.effective_format_by_id(row_id, col_id).code_str());
     let style = WireCellStyle::from(sheet.effective_style_by_id(row_id, col_id));
+    let key = (sheet_id, row_id, col_id);
+    let anchor_opt = if engine.spills().active_spill(key).is_some() {
+        Some(key)
+    } else {
+        engine.spills().anchor_of_cell(key)
+    };
+    let is_spill_shadow = anchor_opt.is_some_and(|a| a != key);
+    let spill_range = anchor_opt.and_then(|anchor| {
+        let entry = engine.spills().active_spill(anchor)?;
+        let pr1 = sheet.row_axis().id_to_pos(anchor.1.0)?;
+        let c1 = sheet.col_axis().id_to_pos(anchor.2.0)?;
+        let pr2 = entry
+            .rows
+            .last()
+            .and_then(|r| sheet.row_axis().id_to_pos(r.0))
+            .unwrap_or(pr1);
+        let c2 = entry
+            .cols
+            .last()
+            .and_then(|c| sheet.col_axis().id_to_pos(c.0))
+            .unwrap_or(c1);
+        let d1 = engine.physical_to_display_row(sheet_id, pr1).unwrap_or(pr1);
+        let d2 = engine.physical_to_display_row(sheet_id, pr2).unwrap_or(pr2);
+        Some(WireCellRect {
+            first_row: d1.min(d2),
+            last_row: d1.max(d2),
+            first_col: c1.min(c2),
+            last_col: c1.max(c2),
+        })
+    });
     Some(EngineEvent::CellInspected {
         sheet: sheet_id.0,
         row_id: row_id.0,
@@ -3531,6 +4414,8 @@ pub(crate) fn build_cell_inspected(
         error: info.error,
         format_code,
         style,
+        spill_range,
+        is_spill_shadow,
     })
 }
 
@@ -3551,6 +4436,25 @@ pub(crate) fn build_sheet_info_from_engine(
     recalc_frozen: bool,
 ) -> (SheetInfo, usize) {
     engine.ensure_sheet_styles_interned(sheet_id);
+    let visible_rows = engine.visible_row_count(sheet_id);
+    let filter_wire = engine.filter_state(sheet_id).and_then(|(table, proj)| {
+        let sheet = engine.workbook().sheet(sheet_id)?;
+        let bounds = table.resolve_bounds(sheet)?;
+        let mut active_cols: Vec<u32> = table
+            .criteria
+            .keys()
+            .filter_map(|cid| sheet.col_axis().id_to_pos(cid.0))
+            .collect();
+        active_cols.sort_unstable();
+        Some(WireFilterState {
+            header_row: bounds.header_row,
+            last_row: bounds.last_row,
+            first_col: bounds.first_col,
+            last_col: bounds.last_col,
+            active_cols,
+            hidden_row_spans: proj.hidden_spans().to_vec(),
+        })
+    });
     let wb = engine.workbook();
     let sheets: Vec<SheetTabInfo> = wb
         .live_sheets()
@@ -3560,7 +4464,7 @@ pub(crate) fn build_sheet_info_from_engine(
         })
         .collect();
 
-    let (sheet_name, rows, cols, frozen_rows, frozen_cols, custom_rows, custom_cols, styles) =
+    let (sheet_name, total_rows, cols, frozen_rows, frozen_cols, custom_rows, custom_cols, styles) =
         wb.sheet(sheet_id).map_or_else(
             || {
                 (
@@ -3578,7 +4482,11 @@ pub(crate) fn build_sheet_info_from_engine(
                 let mut cr: Vec<(u32, u16)> = s
                     .row_heights()
                     .iter()
-                    .filter_map(|(&r, &px)| s.row_axis().id_to_pos(r.0).map(|pos| (pos, px)))
+                    .filter_map(|(&r, &px)| {
+                        let phys = s.row_axis().id_to_pos(r.0)?;
+                        let disp = engine.physical_to_display_row(sheet_id, phys)?;
+                        Some((disp, px))
+                    })
                     .collect();
                 cr.sort_unstable_by_key(|&(pos, _)| pos);
 
@@ -3610,12 +4518,19 @@ pub(crate) fn build_sheet_info_from_engine(
         );
     let styles_len = styles.len();
     let formula_count = u32::try_from(wb.formulas().len()).unwrap_or(0);
+    let rows = if filter_wire.is_some() {
+        visible_rows
+    } else {
+        total_rows
+    };
     let info = SheetInfo {
         sheet: sheet_id.0,
         sheet_name,
         sheets,
         rows,
+        total_rows,
         cols,
+        filter: filter_wire,
         frozen_rows,
         frozen_cols,
         custom_rows,
@@ -3844,5 +4759,162 @@ mod tests {
             col_count: 8,
         });
         assert!(eng.subscribed_set.contains(&Page { row: 0, col: 0 }));
+    }
+
+    #[test]
+    fn worker_step4_filter_sort_search_named_ranges_and_spill_inspect_work() {
+        let mut eng = Engine::new();
+        let _ = eng.handle_command(EngineCommand::OpenEmpty).unwrap();
+
+        // Populate A1:B4 with header + 3 rows, and D1 = "=SEQUENCE(3,1)" + E1 = "=SUBTOTAL(109, B2:B4)".
+        for (r, label, val) in [
+            (0, "Region", "Amt"),
+            (1, "West", "30"),
+            (2, "East", "10"),
+            (3, "West", "20"),
+        ] {
+            let _ = eng.handle_command(EngineCommand::EditCell {
+                sheet: 0,
+                row_id: r,
+                col_id: 0,
+                raw: String::from(label),
+            });
+            let _ = eng.handle_command(EngineCommand::EditCell {
+                sheet: 0,
+                row_id: r,
+                col_id: 1,
+                raw: String::from(val),
+            });
+        }
+        let _ = eng.handle_command(EngineCommand::EditCell {
+            sheet: 0,
+            row_id: 0,
+            col_id: 3,
+            raw: String::from("=SEQUENCE(3,1)"),
+        });
+        let _ = eng.handle_command(EngineCommand::EditCell {
+            sheet: 0,
+            row_id: 0,
+            col_id: 4,
+            raw: String::from("=SUBTOTAL(109, B2:B4)"),
+        });
+
+        // Define named range `MyAmt` = `=$B$2:$B$4` and list it cleanly.
+        let def_ev = eng
+            .handle_command(EngineCommand::DefineNamedRange {
+                scope: None,
+                name: String::from("MyAmt"),
+                formula: String::from("=B2:B4"),
+                comment: Some(String::from("Amounts")),
+                hidden: Some(false),
+            })
+            .unwrap();
+        assert!(matches!(def_ev, EngineEvent::SheetChanged { .. }));
+        let EngineEvent::NamedRangesListed { items } =
+            eng.handle_command(EngineCommand::ListNamedRanges).unwrap()
+        else {
+            panic!("expected NamedRangesListed");
+        };
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].name, "MyAmt");
+
+        // Sort A1:B4 ascending by column B (Amt: 10, 20, 30) with auto header detection!
+        let sort_ev = eng
+            .handle_command(EngineCommand::SortRange {
+                sheet: 0,
+                first_row: 0,
+                last_row: 3,
+                first_col: 0,
+                last_col: 1,
+                has_header: None,
+                keys: vec![WireSortKey {
+                    col_offset: 1,
+                    ascending: true,
+                    case_sensitive: false,
+                }],
+            })
+            .unwrap();
+        let EngineEvent::SheetChanged {
+            sheet: s_after_sort,
+            ..
+        } = sort_ev
+        else {
+            panic!("expected SheetChanged");
+        };
+        assert!(s_after_sort.can_undo);
+        assert_eq!(
+            eng.engine.workbook().sheet(SheetId(0)).unwrap().value(1, 1),
+            reticula_core::value::Value::number(10.0)
+        );
+
+        // Apply AutoFilter on A1:B4 and filter col 0 == "West" (hides East/row 1 -> Amt=10).
+        let _ = eng
+            .handle_command(EngineCommand::SetFilterTable {
+                sheet: 0,
+                header_row: 0,
+                last_row: 3,
+                first_col: 0,
+                last_col: 1,
+            })
+            .unwrap();
+        let EngineEvent::FilterValues { values, .. } = eng
+            .handle_command(EngineCommand::GetFilterValues { sheet: 0, col: 0 })
+            .unwrap()
+        else {
+            panic!("expected FilterValues");
+        };
+        assert_eq!(values.len(), 2);
+
+        let f_ev = eng
+            .handle_command(EngineCommand::SetColumnFilter {
+                sheet: 0,
+                col: 0,
+                criterion: Some(WireColFilterCriterion::Values {
+                    allowed: vec![String::from("West")],
+                    include_blanks: false,
+                }),
+            })
+            .unwrap();
+        let EngineEvent::SheetChanged { sheet: f_sheet, .. } = f_ev else {
+            panic!("expected SheetChanged");
+        };
+        assert_eq!(f_sheet.rows, f_sheet.total_rows - 1);
+        assert!(f_sheet.filter.is_some());
+        assert_eq!(
+            eng.engine.workbook().sheet(SheetId(0)).unwrap().value(0, 4),
+            reticula_core::value::Value::number(50.0)
+        );
+
+        // Inspect spill shadow cell D2 (`row_id = 1, col_id = 3`): reports spill_range + is_spill_shadow!
+        let EngineEvent::CellInspected {
+            spill_range,
+            is_spill_shadow,
+            ..
+        } = eng
+            .handle_command(EngineCommand::InspectCell {
+                sheet: 0,
+                row_id: 1,
+                col_id: 3,
+            })
+            .unwrap()
+        else {
+            panic!("expected CellInspected");
+        };
+        assert!(is_spill_shadow);
+        assert!(spill_range.is_some());
+
+        // Clear filter restores visible row count & SUBTOTAL back to 60.
+        let cleared = eng
+            .handle_command(EngineCommand::ClearFilter { sheet: 0 })
+            .unwrap();
+        let EngineEvent::SheetChanged { sheet: c_sheet, .. } = cleared else {
+            panic!("expected SheetChanged");
+        };
+        assert_eq!(c_sheet.rows, c_sheet.total_rows);
+        assert!(c_sheet.filter.is_none());
+        assert_eq!(
+            eng.engine.workbook().sheet(SheetId(0)).unwrap().value(0, 4),
+            reticula_core::value::Value::number(60.0)
+        );
     }
 }

@@ -27,7 +27,7 @@ use rustc_hash::FxHasher;
 use smallvec::SmallVec;
 
 use crate::binder::{BoundExpr, BoundFormula, BoundRef};
-use crate::functions::catalog::is_volatile_function;
+use crate::functions::catalog::{is_filter_sensitive_function, is_volatile_function};
 
 type FxMap<K, V> = HashMap<K, V, BuildHasherDefault<FxHasher>>;
 
@@ -189,6 +189,15 @@ pub struct DepGraph {
     spill_deps: BTreeMap<WorkbookCellKey, Vec<u32>>,
 }
 
+/// Metadata flags extracted alongside [`FormulaRegistration`] in one AST pass.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FormulaFlags {
+    /// Whether the formula calls a volatile function (`TODAY`, `NOW`, `RAND`, ...).
+    pub volatile: bool,
+    /// Whether the formula calls a filter-sensitive function (`SUBTOTAL`, `AGGREGATE`).
+    pub filter_sensitive: bool,
+}
+
 impl DepGraph {
     /// Creates an empty dependency graph.
     #[must_use]
@@ -257,6 +266,18 @@ impl DepGraph {
         host_sheet: SheetId,
         formula: &BoundFormula,
     ) -> (FormulaRegistration, bool) {
+        let (reg, flags) = self.register_detailed(fid, host_sheet, formula);
+        (reg, flags.volatile)
+    }
+
+    /// Single-pass registration returning [`FormulaFlags`] (`volatile` +
+    /// `filter_sensitive`) alongside [`FormulaRegistration`].
+    pub fn register_detailed(
+        &mut self,
+        fid: u32,
+        host_sheet: SheetId,
+        formula: &BoundFormula,
+    ) -> (FormulaRegistration, FormulaFlags) {
         let mut reg = FormulaRegistration::default();
         let mut flags = WalkFlags::default();
         collect_refs(&formula.root, host_sheet, fid, &mut reg, &mut flags);
@@ -311,7 +332,13 @@ impl DepGraph {
                 self.spill_deps.entry(anchor).or_default().push(fid);
             }
         }
-        (reg, flags.volatile)
+        (
+            reg,
+            FormulaFlags {
+                volatile: flags.volatile,
+                filter_sensitive: flags.filter_sensitive,
+            },
+        )
     }
 
     /// Removes all reverse edges previously recorded in `reg` for `fid`.
@@ -829,6 +856,7 @@ impl DepGraph {
 struct WalkFlags {
     structural: bool,
     volatile: bool,
+    filter_sensitive: bool,
 }
 
 fn collect_refs(
@@ -967,6 +995,9 @@ fn collect_refs(
             }
             if is_volatile_function(name) {
                 flags.volatile = true;
+            }
+            if is_filter_sensitive_function(name) {
+                flags.filter_sensitive = true;
             }
             for arg in args {
                 collect_refs(arg, host_sheet, fid, reg, flags);

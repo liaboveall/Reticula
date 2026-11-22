@@ -95,6 +95,8 @@ pub enum CompletionKind {
     Function,
     /// Live worksheet qualifier (`Sheet2!` or `'Sheet 2'!`).
     Sheet,
+    /// Workbook- or worksheet-scoped defined named range.
+    NamedRange,
 }
 
 /// Autocomplete suggestion item for the formula bar popover.
@@ -193,6 +195,7 @@ enum RawKind {
     RParen,
     LBrace,
     RBrace,
+    Hash,
     Operator,
     Unknown,
 }
@@ -220,6 +223,19 @@ pub fn analyze_formula(
     cursor_utf16: u32,
     workbook: &Workbook<BoundFormula>,
     host_sheet: SheetId,
+) -> FormulaAnalysis {
+    analyze_formula_with_spills(source, cursor_utf16, workbook, host_sheet, None)
+}
+
+/// Spill-aware variant of [`analyze_formula`] that expands `A1#` spill-range
+/// highlights to the live materialized footprint in `spills`.
+#[must_use]
+pub fn analyze_formula_with_spills(
+    source: &str,
+    cursor_utf16: u32,
+    workbook: &Workbook<BoundFormula>,
+    host_sheet: SheetId,
+    spills: Option<&crate::spill::SpillRegistry>,
 ) -> FormulaAnalysis {
     let Some(after_eq) = source.strip_prefix('=') else {
         return FormulaAnalysis::default();
@@ -263,10 +279,22 @@ pub fn analyze_formula(
         };
     }
 
-    // Group reference token sequences (`[SheetPrefix?][Coord](:[Coord])?`) when
+    // Group reference token sequences (`[SheetPrefix?][Coord](:[Coord])?` or `A1#`) when
     // NOT immediately followed by `(`.
-    let (mut spans, references) =
+    let groups = find_ref_token_groups(source, &raw_tokens);
+    let (mut spans, mut references) =
         classify_tokens_and_refs(source, &raw_tokens, workbook, host_sheet, &mut diagnostics);
+
+    enrich_named_ranges_and_spills(
+        source,
+        &raw_tokens,
+        &groups,
+        workbook,
+        host_sheet,
+        spills,
+        &mut spans,
+        &mut references,
+    );
 
     // Match parentheses, report unclosed/unmatched parens, check function names &
     // arities, and compute active signature help!
@@ -276,7 +304,15 @@ pub fn analyze_formula(
     // Diagnose incomplete binary operators or trailing `:`, `,` at the end.
     diagnose_incomplete_operators(source, &raw_tokens, &mut diagnostics);
 
-    let completions = build_completions(source, &raw_tokens, cursor, workbook);
+    let mut completions = build_completions(source, &raw_tokens, cursor, workbook);
+    append_named_range_completions(
+        source,
+        &raw_tokens,
+        cursor,
+        workbook,
+        host_sheet,
+        &mut completions,
+    );
     let (can_insert_ref, active_ref_span) =
         compute_ref_insertion_state(&raw_tokens, &spans, cursor);
 
@@ -318,12 +354,13 @@ pub fn toggle_reference_dollar(source: &str, cursor_utf16: u32) -> Option<(Strin
     };
     let first_slice = raw_tokens.get(target.first_coord_tok)?.slice(source);
     let toggled_first = cycle_single_coord(first_slice)?;
+    let spill_suffix = if target.has_spill_hash { "#" } else { "" };
     let replacement = if let Some(second_idx) = target.second_coord_tok {
         let second_slice = raw_tokens.get(second_idx)?.slice(source);
         let toggled_second = cycle_single_coord(second_slice)?;
-        format!("{prefix_slice}{toggled_first}:{toggled_second}")
+        format!("{prefix_slice}{toggled_first}:{toggled_second}{spill_suffix}")
     } else {
-        format!("{prefix_slice}{toggled_first}")
+        format!("{prefix_slice}{toggled_first}{spill_suffix}")
     };
 
     let before = source.get(..target.start_byte)?;
@@ -598,6 +635,20 @@ fn scan_tolerant(source: &str, diagnostics: &mut Vec<FormulaDiagnostic>) -> Vec<
                 });
             }
             b'#' => {
+                if !bytes
+                    .get(start.saturating_add(1))
+                    .is_some_and(u8::is_ascii_alphabetic)
+                {
+                    pos = start.saturating_add(1);
+                    tokens.push(RawTok {
+                        start_byte: start,
+                        end_byte: pos,
+                        start_utf16: u16_at(start),
+                        end_utf16: u16_at(pos),
+                        kind: RawKind::Hash,
+                    });
+                    continue;
+                }
                 let mut end_p = start.saturating_add(1);
                 while let Some(&ch) = bytes.get(end_p) {
                     if ch.is_ascii_alphanumeric() || ch == b'/' || ch == b'!' || ch == b'?' {
@@ -841,6 +892,7 @@ struct RefTokenGroup {
     sheet_tok: Option<usize>,
     first_coord_tok: usize,
     second_coord_tok: Option<usize>,
+    has_spill_hash: bool,
     start_byte: usize,
     end_byte: usize,
     start_utf16: u32,
@@ -915,6 +967,7 @@ fn find_ref_token_groups(source: &str, raw_tokens: &[RawTok]) -> Vec<RefTokenGro
                     sheet_tok,
                     first_coord_tok: coord1_idx,
                     second_coord_tok: Some(c2_idx),
+                    has_spill_hash: false,
                     start_byte: tok.start_byte,
                     end_byte: end_t.end_byte,
                     start_utf16: tok.start_utf16,
@@ -924,18 +977,36 @@ fn find_ref_token_groups(source: &str, raw_tokens: &[RawTok]) -> Vec<RefTokenGro
                 continue;
             }
         } else if c1_is_cell {
+            let hash_opt = raw_tokens
+                .get(coord1_idx.saturating_add(1))
+                .filter(|ht| matches!(ht.kind, RawKind::Hash) && ht.start_byte == coord1.end_byte);
+            let (end_tok_excl, end_byte, end_utf16, has_spill_hash) = match hash_opt {
+                Some(ht) => (
+                    coord1_idx.saturating_add(2),
+                    ht.end_byte,
+                    ht.end_utf16,
+                    true,
+                ),
+                None => (
+                    coord1_idx.saturating_add(1),
+                    coord1.end_byte,
+                    coord1.end_utf16,
+                    false,
+                ),
+            };
             groups.push(RefTokenGroup {
                 start_tok: i,
-                end_tok_excl: coord1_idx.saturating_add(1),
+                end_tok_excl,
                 sheet_tok,
                 first_coord_tok: coord1_idx,
                 second_coord_tok: None,
+                has_spill_hash,
                 start_byte: tok.start_byte,
-                end_byte: coord1.end_byte,
+                end_byte,
                 start_utf16: tok.start_utf16,
-                end_utf16: coord1.end_utf16,
+                end_utf16,
             });
-            i = coord1_idx.saturating_add(1);
+            i = end_tok_excl;
             continue;
         }
 
@@ -1111,7 +1182,7 @@ fn classify_tokens_and_refs(
             | RawKind::Semicolon
             | RawKind::LBrace
             | RawKind::RBrace => SyntaxTokenKind::Punctuation,
-            RawKind::Operator => SyntaxTokenKind::Operator,
+            RawKind::Operator | RawKind::Hash => SyntaxTokenKind::Operator,
             RawKind::Unknown => SyntaxTokenKind::Unknown,
         };
 
@@ -1516,6 +1587,289 @@ fn make_fn_completion(meta: &FunctionMeta, tok: &RawTok) -> CompletionItem {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn enrich_named_ranges_and_spills(
+    source: &str,
+    raw_tokens: &[RawTok],
+    groups: &[RefTokenGroup],
+    workbook: &Workbook<BoundFormula>,
+    host_sheet: SheetId,
+    spills: Option<&crate::spill::SpillRegistry>,
+    spans: &mut [SyntaxTokenSpan],
+    references: &mut Vec<FormulaRefHighlight>,
+) {
+    // 1. Expand `A1#` spill highlights to the active spill footprint and color the `#` token.
+    for g in groups {
+        if !g.has_spill_hash {
+            continue;
+        }
+        let Some(ref_hl) = references
+            .iter_mut()
+            .find(|r| r.start_utf16 == g.start_utf16)
+        else {
+            continue;
+        };
+        if let Some(spills_reg) = spills
+            && let Some(sheet) = workbook.live_sheet(SheetId(ref_hl.sheet))
+        {
+            let target_sheet = SheetId(ref_hl.sheet);
+            let r_id = reticula_core::id::RowId(sheet.row_id(ref_hl.first_row));
+            let c_id = reticula_core::id::ColId(sheet.col_id(ref_hl.first_col));
+            if let Some((rows, cols)) = spills_reg.spill_shape((target_sheet, r_id, c_id)) {
+                ref_hl.last_row = ref_hl
+                    .first_row
+                    .saturating_add(rows.saturating_sub(1))
+                    .min(sheet.rows().saturating_sub(1));
+                ref_hl.last_col = ref_hl
+                    .first_col
+                    .saturating_add(cols.saturating_sub(1))
+                    .min(sheet.cols().saturating_sub(1));
+            }
+        }
+        ref_hl.end_utf16 = g.end_utf16;
+        for sp in spans.iter_mut() {
+            if sp.start_utf16 >= g.start_utf16 && sp.end_utf16 <= g.end_utf16 {
+                if sp.kind != SyntaxTokenKind::SheetRef {
+                    sp.kind = SyntaxTokenKind::Reference;
+                }
+                sp.color_index = Some(ref_hl.color_index);
+            }
+        }
+    }
+
+    // 2. Classify defined named range identifiers (`TaxRate` or `'Sheet 2'!TaxRate`) and
+    //    emit live FormulaRefHighlight spans for direct cell/range named targets.
+    if workbook.named_ranges().is_empty() {
+        return;
+    }
+    let mut color_counter = u8::try_from(references.len()).unwrap_or(0) % REF_COLOR_PALETTE_LEN;
+    for (idx, tok) in raw_tokens.iter().enumerate() {
+        if !matches!(tok.kind, RawKind::Ident) {
+            continue;
+        }
+        let next_is_lparen = raw_tokens
+            .get(idx.saturating_add(1))
+            .is_some_and(|nt| matches!(nt.kind, RawKind::LParen));
+        if next_is_lparen {
+            continue;
+        }
+        let Some(span_idx) = spans
+            .iter()
+            .position(|sp| sp.start_utf16 == tok.start_utf16 && sp.end_utf16 == tok.end_utf16)
+        else {
+            continue;
+        };
+        let already_classified = spans.get(span_idx).is_none_or(|sp| {
+            sp.kind == SyntaxTokenKind::Reference || sp.kind == SyntaxTokenKind::Boolean
+        });
+        if already_classified {
+            continue;
+        }
+
+        let ident = tok.slice(source);
+        let prev_sheet = idx
+            .checked_sub(1)
+            .and_then(|pi| raw_tokens.get(pi))
+            .and_then(|pt| match &pt.kind {
+                RawKind::SheetPrefix {
+                    name,
+                    terminated: true,
+                } => resolve_live_sheet_by_name(workbook, name),
+                _ => None,
+            });
+        let resolved_def = if let Some(scoped_sid) = prev_sheet {
+            workbook
+                .named_ranges()
+                .get(&reticula_core::ops::NamedRangeKey::new(
+                    Some(scoped_sid),
+                    ident,
+                ))
+                .map(|def| (scoped_sid, def))
+        } else {
+            workbook
+                .named_ranges()
+                .get(&reticula_core::ops::NamedRangeKey::new(
+                    Some(host_sheet),
+                    ident,
+                ))
+                .map(|def| (host_sheet, def))
+                .or_else(|| {
+                    workbook
+                        .named_ranges()
+                        .get(&reticula_core::ops::NamedRangeKey::new(None, ident))
+                        .map(|def| (host_sheet, def))
+                })
+        };
+
+        let Some((target_host, def)) = resolved_def else {
+            continue;
+        };
+        if let Some(sp) = spans.get_mut(span_idx) {
+            sp.kind = SyntaxTokenKind::Reference;
+        }
+
+        let resolved_rect = resolve_named_target_rect(workbook, target_host, &def.formula.root);
+        if let Some((sid, r1, r2, c1, c2)) = resolved_rect {
+            let color_index = color_counter;
+            color_counter = color_counter.wrapping_add(1) % REF_COLOR_PALETTE_LEN;
+            if let Some(sp) = spans.get_mut(span_idx) {
+                sp.color_index = Some(color_index);
+            }
+            let hl_start_utf16 = if prev_sheet.is_some()
+                && let Some(pt_tok) = idx.checked_sub(1).and_then(|pi| raw_tokens.get(pi))
+                && let Some(pt_span) = spans.iter_mut().find(|sp| {
+                    sp.start_utf16 == pt_tok.start_utf16 && sp.end_utf16 == pt_tok.end_utf16
+                }) {
+                pt_span.kind = SyntaxTokenKind::SheetRef;
+                pt_span.start_utf16
+            } else {
+                tok.start_utf16
+            };
+            references.push(FormulaRefHighlight {
+                start_utf16: hl_start_utf16,
+                end_utf16: tok.end_utf16,
+                color_index,
+                sheet: sid.0,
+                first_row: r1,
+                last_row: r2,
+                first_col: c1,
+                last_col: c2,
+            });
+        }
+    }
+}
+
+fn resolve_named_target_rect(
+    workbook: &Workbook<BoundFormula>,
+    fallback_sheet: SheetId,
+    expr: &crate::binder::BoundExpr,
+) -> Option<(SheetId, u32, u32, u32, u32)> {
+    let mut cur = expr;
+    while let crate::binder::BoundExpr::Paren(inner) = cur {
+        cur = inner;
+    }
+    let crate::binder::BoundExpr::Reference(r) = cur else {
+        return None;
+    };
+    match r {
+        crate::binder::BoundRef::Cell {
+            sheet, row, col, ..
+        } => {
+            let sid = sheet.unwrap_or(fallback_sheet);
+            let s = workbook.live_sheet(sid)?;
+            let r_pos = s.row_axis().id_to_pos(row.0)?;
+            let c_pos = s.col_axis().id_to_pos(col.0)?;
+            Some((sid, r_pos, r_pos, c_pos, c_pos))
+        }
+        crate::binder::BoundRef::Area {
+            sheet,
+            first_row,
+            first_col,
+            last_row,
+            last_col,
+            ..
+        } => {
+            let sid = sheet.unwrap_or(fallback_sheet);
+            let s = workbook.live_sheet(sid)?;
+            let r1 = s.row_axis().id_to_pos(first_row.0)?;
+            let r2 = s.row_axis().id_to_pos(last_row.0)?;
+            let c1 = s.col_axis().id_to_pos(first_col.0)?;
+            let c2 = s.col_axis().id_to_pos(last_col.0)?;
+            Some((sid, r1.min(r2), r1.max(r2), c1.min(c2), c1.max(c2)))
+        }
+        _ => None,
+    }
+}
+
+fn append_named_range_completions(
+    source: &str,
+    raw_tokens: &[RawTok],
+    cursor_utf16: u32,
+    workbook: &Workbook<BoundFormula>,
+    host_sheet: SheetId,
+    out: &mut Vec<CompletionItem>,
+) {
+    if workbook.named_ranges().is_empty() || out.len() >= MAX_COMPLETIONS {
+        return;
+    }
+    let Some((tok_idx, active_tok)) = raw_tokens
+        .iter()
+        .enumerate()
+        .find(|(_, t)| t.start_utf16 < cursor_utf16 && cursor_utf16 <= t.end_utf16)
+    else {
+        return;
+    };
+    if !matches!(active_tok.kind, RawKind::Ident) {
+        return;
+    }
+    let prefix = active_tok.slice(source);
+    let prefix_upper = prefix.to_ascii_uppercase();
+    if prefix_upper.is_empty() {
+        return;
+    }
+
+    let prev_sheet = tok_idx
+        .checked_sub(1)
+        .and_then(|pi| raw_tokens.get(pi))
+        .and_then(|pt| match &pt.kind {
+            RawKind::SheetPrefix {
+                name,
+                terminated: true,
+            } => resolve_live_sheet_by_name(workbook, name),
+            _ => None,
+        });
+
+    let mut seen_names: alloc::collections::BTreeSet<String> = alloc::collections::BTreeSet::new();
+    // Prioritize sheet-scoped matches on target sheet, then workbook-scoped when unqualified.
+    let target_scope = prev_sheet.unwrap_or(host_sheet);
+    for pass_workbook_wide in [false, true] {
+        if pass_workbook_wide && prev_sheet.is_some() {
+            break;
+        }
+        for (nkey, def) in workbook.named_ranges() {
+            if def.hidden {
+                continue;
+            }
+            let scope_matches = if pass_workbook_wide {
+                nkey.scope.is_none()
+            } else {
+                nkey.scope == Some(target_scope)
+            };
+            if !scope_matches {
+                continue;
+            }
+            if !nkey
+                .canonical_name
+                .to_ascii_uppercase()
+                .starts_with(&prefix_upper)
+            {
+                continue;
+            }
+            if !seen_names.insert(nkey.canonical_name.clone()) {
+                continue;
+            }
+            let sig = def
+                .formula
+                .unparse(workbook, nkey.scope.unwrap_or(host_sheet));
+            out.push(CompletionItem {
+                label: def.name.clone(),
+                insert_text: def.name.clone(),
+                replace_start_utf16: active_tok.start_utf16,
+                replace_end_utf16: active_tok.end_utf16,
+                kind: CompletionKind::NamedRange,
+                signature: sig,
+                summary: def
+                    .comment
+                    .clone()
+                    .unwrap_or_else(|| String::from("Named range")),
+            });
+            if out.len() >= MAX_COMPLETIONS {
+                return;
+            }
+        }
+    }
+}
+
 // ------------------------------------------------ point-and-click & F4
 
 fn compute_ref_insertion_state(
@@ -1732,5 +2086,82 @@ mod tests {
             format_sheet_range_ref(eng.workbook(), SheetId(0), SheetId(0), 4, 2, 4, 2),
             "C5"
         );
+    }
+
+    #[test]
+    fn named_range_completions_highlights_and_spill_ref_work() {
+        use alloc::vec;
+
+        use reticula_core::id::{ColId, RowId};
+        use reticula_core::ops::FormulaMode;
+
+        use super::analyze_formula_with_spills;
+        use crate::binder::BoundFormula;
+
+        let mut eng = FormulaEngine::new();
+        let s0 = SheetId(0);
+        let rate_f =
+            BoundFormula::parse_and_bind("=B2:C3", FormulaMode::Dynamic, eng.workbook(), s0)
+                .unwrap();
+        let hidden_f =
+            BoundFormula::parse_and_bind("=A1", FormulaMode::Dynamic, eng.workbook(), s0).unwrap();
+        eng.apply_txn(vec![
+            Op::DefineNamedRange {
+                scope: None,
+                name: String::from("TaxRate"),
+                formula: rate_f,
+                comment: Some(String::from("VAT matrix")),
+                hidden: false,
+            },
+            Op::DefineNamedRange {
+                scope: None,
+                name: String::from("_xlnm.Print_Area"),
+                formula: hidden_f,
+                comment: None,
+                hidden: true,
+            },
+        ])
+        .unwrap();
+
+        // Active spill at A1 (3 rows x 2 cols)
+        eng.edit_cell_raw(s0, RowId(0), ColId(0), "=SEQUENCE(3,2)")
+            .unwrap();
+        eng.recalc_all();
+
+        let analysis = analyze_formula_with_spills(
+            "=SUM(A1#)+TaxRate",
+            17,
+            eng.workbook(),
+            s0,
+            Some(eng.spills()),
+        );
+        assert!(
+            analysis.diagnostics.is_empty(),
+            "unexpected diagnostics: {:?}",
+            analysis.diagnostics
+        );
+        assert_eq!(analysis.references.len(), 2);
+        assert_eq!(analysis.references[0].first_row, 0);
+        assert_eq!(analysis.references[0].last_row, 2);
+        assert_eq!(analysis.references[0].first_col, 0);
+        assert_eq!(analysis.references[0].last_col, 1);
+        assert_eq!(analysis.references[1].first_row, 1);
+        assert_eq!(analysis.references[1].last_row, 2);
+        assert_eq!(analysis.references[1].first_col, 1);
+        assert_eq!(analysis.references[1].last_col, 2);
+
+        // Autocomplete finds visible NamedRange `TaxRate` and hides `_xlnm.Print_Area`.
+        let comp = analyze_formula("=Tax", 4, eng.workbook(), s0);
+        assert!(
+            comp.completions
+                .iter()
+                .any(|c| c.kind == CompletionKind::NamedRange && c.label == "TaxRate")
+        );
+        let hidden_comp = analyze_formula("=_xlnm", 6, eng.workbook(), s0);
+        assert!(hidden_comp.completions.is_empty());
+
+        // F4 dollar toggle preserves trailing `#` on spill ref.
+        let (toggled, _, _) = toggle_reference_dollar("=SUM(A1#)", 6).unwrap();
+        assert_eq!(toggled, "=SUM($A$1#)");
     }
 }

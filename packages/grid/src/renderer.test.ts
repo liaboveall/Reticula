@@ -103,3 +103,97 @@ test("keeps a visible selection when its cursor has scrolled out of view", () =>
   expect(fills.filter((fill) => fill === theme.refFills[3])).toHaveLength(1);
   expect(context.roundRect).not.toHaveBeenCalled();
 });
+
+test("renders AutoFilter row numbers, gap dividers, and header chevrons", async () => {
+  const { FilterRowMap } = await import("./filter.ts");
+  const { context, fills, frame, renderer, theme } = setup();
+
+  const fillTexts: { text: string; fillStyle: string | CanvasGradient | CanvasPattern }[] = [];
+  const origFillText = context.fillText.bind(context);
+  context.fillText = ((text: string, x: number, y: number, maxWidth?: number) => {
+    fillTexts.push({ text, fillStyle: context.fillStyle });
+    return origFillText(text, x, y, maxWidth);
+  }) as typeof context.fillText;
+
+  const ctxState = context as unknown as { lineWidth?: number | undefined };
+  const pathFills: (string | CanvasGradient | CanvasPattern)[] = [];
+  const origFill = context.fill.bind(context);
+  context.fill = ((...args: Parameters<CanvasRenderingContext2D["fill"]>) => {
+    pathFills.push(context.fillStyle);
+    return origFill(...args);
+  }) as typeof context.fill;
+
+  const strokes: {
+    strokeStyle: string | CanvasGradient | CanvasPattern;
+    lineWidth: number | undefined;
+  }[] = [];
+  const origStroke = context.stroke.bind(context);
+  context.stroke = (() => {
+    strokes.push({ strokeStyle: context.strokeStyle, lineWidth: ctxState.lineWidth });
+    return origStroke();
+  }) as typeof context.stroke;
+
+  renderer.draw({
+    ...frame,
+    filterState: {
+      headerRow: 0,
+      lastRow: 10,
+      firstCol: 0,
+      lastCol: 2,
+      activeCols: [1],
+      hiddenRowSpans: [[1, 3]],
+    },
+    filterRowMap: new FilterRowMap(20, [[1, 3]]),
+  });
+
+  const rowLabels = fillTexts.map((entry) => entry.text);
+  expect(rowLabels).toContain("1");
+  expect(rowLabels).toContain("5");
+  expect(rowLabels).toContain("6");
+  expect(rowLabels).not.toContain("2");
+  expect(rowLabels).not.toContain("3");
+  expect(rowLabels).not.toContain("4");
+  expect(
+    fillTexts.some((entry) => entry.text === "5" && entry.fillStyle === theme.filterHeaderText),
+  ).toBe(true);
+  expect(
+    strokes.some((entry) => entry.strokeStyle === theme.filterHeaderText && entry.lineWidth === 2),
+  ).toBe(true);
+  expect(pathFills).toContain(theme.filterIconActiveColor);
+  expect(pathFills).toContain(theme.filterIconColor);
+  expect(fills).toContain(theme.selectionFill);
+});
+
+test("renders dashed border outline around the active spill range", () => {
+  const { context, frame, renderer, theme } = setup();
+
+  const dashes: number[][] = [];
+  const origSetLineDash = context.setLineDash.bind(context);
+  context.setLineDash = ((segments: number[]) => {
+    dashes.push([...segments]);
+    return origSetLineDash(segments);
+  }) as typeof context.setLineDash;
+
+  const ctxState = context as unknown as { lineWidth?: number | undefined };
+  const strokeRects: {
+    strokeStyle: string | CanvasGradient | CanvasPattern;
+    lineWidth: number | undefined;
+  }[] = [];
+  const origStrokeRect = context.strokeRect.bind(context);
+  context.strokeRect = ((x: number, y: number, w: number, h: number) => {
+    strokeRects.push({ strokeStyle: context.strokeStyle, lineWidth: ctxState.lineWidth });
+    return origStrokeRect(x, y, w, h);
+  }) as typeof context.strokeRect;
+
+  renderer.draw({
+    ...frame,
+    activeSpillRange: { firstRow: 1, lastRow: 3, firstCol: 1, lastCol: 2 },
+  });
+
+  expect(dashes).toContainEqual([4, 3]);
+  expect(
+    strokeRects.some(
+      (entry) => entry.strokeStyle === theme.spillBorderColor && entry.lineWidth === 1.5,
+    ),
+  ).toBe(true);
+});

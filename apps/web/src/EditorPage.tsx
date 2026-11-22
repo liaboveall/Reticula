@@ -1345,6 +1345,7 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
                 inspectedRef.current = null;
                 setInspected(null);
                 grid.setSheet(message.sheet);
+                grid.setActiveSpillRange(null);
                 if (collabTargetRef.current) {
                   sendPresenceNow(message.sheet.sheet);
                 }
@@ -1408,6 +1409,7 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
               };
               inspectedRef.current = info;
               setInspected(info);
+              grid.setActiveSpillRange(message.spillRange ?? null);
               break;
             }
             case "formulaAnalyzed": {

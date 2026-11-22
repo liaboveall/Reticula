@@ -19,6 +19,10 @@
   --grid-header-selected: #dbe7ff;
   --grid-selection: #1a5fd0;
   --grid-selection-fill: rgba(26, 95, 208, 0.12);
+  --grid-filter-header-text: #1a5fd0;
+  --grid-filter-icon: #59636e;
+  --grid-filter-icon-active: #1a5fd0;
+  --grid-spill-border: #1a5fd0;
   --grid-scrollbar-track: #f6f7f8;
   --grid-scrollbar-thumb: #b4bac1;
   --grid-scrollbar-thumb-active: #7d8590;
@@ -52,6 +56,10 @@
     --grid-header-selected: #1d3157;
     --grid-selection: #6ea1ff;
     --grid-selection-fill: rgba(110, 161, 255, 0.18);
+    --grid-filter-header-text: #6ea1ff;
+    --grid-filter-icon: #9aa3ad;
+    --grid-filter-icon-active: #6ea1ff;
+    --grid-spill-border: #6ea1ff;
     --grid-scrollbar-track: #1e2127;
     --grid-scrollbar-thumb: #4a515c;
     --grid-scrollbar-thumb-active: #7a8492;
