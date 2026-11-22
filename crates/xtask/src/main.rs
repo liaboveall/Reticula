@@ -39,7 +39,8 @@ Commands:
   codegen [--check]       Write the TypeScript files generated from the Rust sources;
                           --check only reports whether they are up to date.
   digest [--update]       Print the determinism digest; --update records it as expected.
-  compat [--freeze v1]    Verify frozen wire v1 SHA-256 hashes (or generate/freeze v1 fixtures).
+  compat [--freeze v1|v2|v3]
+                          Verify frozen wire v1, v2, and v3 SHA-256 hashes (or generate/freeze fixtures).
   diff [--engine rust|libreoffice|all] [--count <n>] [--quota-per-fn <n>] [--seed <n>] [--image <tag>] [--skip-image] [--dump-xlsx <dir>] [--archive] [--out <file>]
                           Differential evaluation against ironcalc_base, formualizer-eval, and/or headless LibreOffice Calc.
   fuzz [--cpu-seconds <s>] [--threads <n>] [--affinity <mask>] [--target <name>]

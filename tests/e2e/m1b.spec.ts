@@ -130,10 +130,17 @@ test("formula language service, F4 toggle, cross-sheet point-and-click, sheet de
   await page.keyboard.type("=SU");
   await expect(formulaInput).toHaveText("=SU");
   await expect(page.getByTestId("formula-completions")).toBeVisible();
-  await expect(page.getByTestId("completion-SUM")).toBeVisible();
+  const sumOption = page.getByTestId("completion-SUM");
+  await expect(sumOption).toBeVisible();
   await expect(page.getByTestId("completion-SQRT")).toHaveCount(0);
 
-  await page.keyboard.press("ArrowDown");
+  for (let i = 0; i < 8; i++) {
+    if ((await sumOption.getAttribute("aria-selected")) === "true") {
+      break;
+    }
+    await page.keyboard.press("ArrowDown");
+  }
+  await expect(sumOption).toHaveAttribute("aria-selected", "true");
   await page.keyboard.press("Tab");
   await expect(formulaInput).toHaveText("=SUM(");
   await expect(page.getByTestId("formula-signature")).toContainText("SUM");
