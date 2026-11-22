@@ -88,6 +88,10 @@ let collaborative = false;
 let activeCollab: CollabReplicaSession | null = null;
 let collabCheckpointTimer = 0;
 let collabRemoteCommitsSinceCheckpoint = 0;
+const LOCAL_PRESENCE_MIN_INTERVAL_MS = 80;
+let pendingLocalPresence: Extract<SyncCommand, { kind: "localPresence" }> | null = null;
+let localPresenceTimer: ReturnType<typeof setTimeout> | null = null;
+let lastLocalPresenceSentAt = 0;
 let lastSubscription: Extract<EngineCommand, { kind: "subscribe" }> | null = null;
 let activeSheetId = 0;
 let historyPlayer: HistoryPlayer | null = null;
@@ -249,6 +253,17 @@ function clearCollabCheckpointTimer(): void {
   }
 }
 
+function clearPendingLocalPresence(resetInterval = false): void {
+  if (localPresenceTimer !== null) {
+    clearTimeout(localPresenceTimer);
+    localPresenceTimer = null;
+  }
+  pendingLocalPresence = null;
+  if (resetInterval) {
+    lastLocalPresenceSentAt = 0;
+  }
+}
+
 async function flushCollabCheckpointNow(eng: Engine): Promise<void> {
   clearCollabCheckpointTimer();
   const session = activeCollab;
@@ -292,6 +307,7 @@ function scheduleCollabCheckpoint(): void {
 async function closeActiveDoc(persistFinalState: boolean): Promise<void> {
   clearWatermarkTimer();
   clearCollabCheckpointTimer();
+  clearPendingLocalPresence(true);
   abortActiveSnapshot();
   historyPreviewActive = false;
   historyPlayer?.free();
@@ -366,6 +382,7 @@ if (locksChannel) {
 scope.__reticulaOnWasmPanic = (message: string) => {
   stopped = true;
   clearCollabCheckpointTimer();
+  clearPendingLocalPresence(true);
   if (activeSnap) {
     activeSnap.sink.abort();
     activeSnap = null;
@@ -825,6 +842,31 @@ async function runSyncCommand(command: SyncCommand): Promise<void> {
       reason: "Open a collaborative workbook in a fresh worker.",
     });
     return;
+  }
+  if (command.kind === "disconnected") {
+    clearPendingLocalPresence(true);
+  } else if (command.kind === "localPresence") {
+    const now = performance.now();
+    const waitMs =
+      lastLocalPresenceSentAt === 0
+        ? 0
+        : LOCAL_PRESENCE_MIN_INTERVAL_MS - (now - lastLocalPresenceSentAt);
+    if (waitMs > 0) {
+      pendingLocalPresence = command;
+      if (localPresenceTimer === null) {
+        localPresenceTimer = setTimeout(() => {
+          localPresenceTimer = null;
+          const next = pendingLocalPresence;
+          pendingLocalPresence = null;
+          if (next) {
+            enqueueTask(() => runSyncCommand(next));
+          }
+        }, Math.ceil(waitMs));
+      }
+      return;
+    }
+    clearPendingLocalPresence(false);
+    lastLocalPresenceSentAt = now;
   }
   const event = engine.handleSync(command);
   if (event?.kind === "ready") collaborative = true;
