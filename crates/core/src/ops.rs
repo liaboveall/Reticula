@@ -11,6 +11,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -1063,6 +1064,95 @@ pub type WorkbookCellKey = (SheetId, RowId, ColId);
 
 /// Multi-sheet workbook owning sheets, formulas, range-endpoint index, ID
 /// allocator and memory estimate.
+#[derive(Debug)]
+struct LazyContentDigest {
+    ready: AtomicBool,
+    lo: AtomicU64,
+    hi: AtomicU64,
+    populated: AtomicU64,
+}
+
+impl Clone for LazyContentDigest {
+    fn clone(&self) -> Self {
+        if let Some((digest, populated)) = self.get_if_ready() {
+            Self::new_ready(digest, populated)
+        } else {
+            Self::new_lazy()
+        }
+    }
+}
+
+impl LazyContentDigest {
+    const fn new_lazy() -> Self {
+        Self {
+            ready: AtomicBool::new(false),
+            lo: AtomicU64::new(0),
+            hi: AtomicU64::new(0),
+            populated: AtomicU64::new(0),
+        }
+    }
+
+    const fn new_ready(digest: u128, populated: u64) -> Self {
+        Self {
+            ready: AtomicBool::new(true),
+            lo: AtomicU64::new((digest & 0xFFFF_FFFF_FFFF_FFFF) as u64),
+            hi: AtomicU64::new((digest >> 64) as u64),
+            populated: AtomicU64::new(populated),
+        }
+    }
+
+    fn get_if_ready(&self) -> Option<(u128, u64)> {
+        if !self.ready.load(Ordering::Acquire) {
+            return None;
+        }
+        let lo = u128::from(self.lo.load(Ordering::Relaxed));
+        let hi = u128::from(self.hi.load(Ordering::Relaxed));
+        let pop = self.populated.load(Ordering::Relaxed);
+        Some(((hi << 64) | lo, pop))
+    }
+
+    fn store_ready(&self, digest: u128, populated: u64) {
+        self.lo
+            .store((digest & 0xFFFF_FFFF_FFFF_FFFF) as u64, Ordering::Relaxed);
+        self.hi.store((digest >> 64) as u64, Ordering::Relaxed);
+        self.populated.store(populated, Ordering::Relaxed);
+        self.ready.store(true, Ordering::Release);
+    }
+
+    fn is_ready_mut(&mut self) -> bool {
+        *self.ready.get_mut()
+    }
+
+    fn invalidate(&mut self) {
+        *self.ready.get_mut() = false;
+    }
+
+    fn add_delta(&mut self, delta: u128) {
+        if !*self.ready.get_mut() {
+            return;
+        }
+        let cur = (u128::from(*self.hi.get_mut()) << 64) | u128::from(*self.lo.get_mut());
+        let next = cur.wrapping_add(delta);
+        *self.lo.get_mut() = (next & 0xFFFF_FFFF_FFFF_FFFF) as u64;
+        *self.hi.get_mut() = (next >> 64) as u64;
+    }
+
+    fn replace_term(&mut self, old: u128, new: u128) {
+        self.add_delta(new.wrapping_sub(old));
+    }
+
+    fn adjust_populated(&mut self, sub: u64, add: u64) {
+        if !*self.ready.get_mut() {
+            return;
+        }
+        let cur = *self.populated.get_mut();
+        *self.populated.get_mut() = cur.saturating_sub(sub).saturating_add(add);
+    }
+}
+
+/// Complete mutable workbook state holding worksheets, bound formulas,
+/// dependency endpoints for E25 anchor handoffs, the monotonic identity
+/// allocator and memory estimate.
 #[derive(Clone, Debug)]
 pub struct Workbook<F = RawFormula> {
     sheets: Vec<Sheet>,
@@ -1079,10 +1169,8 @@ pub struct Workbook<F = RawFormula> {
     allocator: IdAllocator,
     next_sheet_id: u32,
     seed_origin: Option<SeedOrigin>,
-    /// Incrementally maintained 128-bit collaborative content/membership digest.
-    content_digest: u128,
-    /// Incrementally maintained populated cell count (formulas + non-empty scalars).
-    populated_cells: u64,
+    /// Lazy + incrementally maintained 128-bit content/membership digest and populated count.
+    digest_cache: LazyContentDigest,
 }
 
 impl<F: FormulaPayload> Default for Workbook<F> {
@@ -1109,8 +1197,7 @@ impl<F: FormulaPayload> Workbook<F> {
             allocator: IdAllocator::local(),
             next_sheet_id: 1,
             seed_origin: None,
-            content_digest,
-            populated_cells,
+            digest_cache: LazyContentDigest::new_ready(content_digest, populated_cells),
         }
     }
 
@@ -1123,8 +1210,6 @@ impl<F: FormulaPayload> Workbook<F> {
         } else {
             1
         };
-        let (content_digest, populated_cells) =
-            sheet_content_and_scalar_count(&sheet, |_, _| false);
         Self {
             sheets: vec![sheet],
             formulas: BTreeMap::new(),
@@ -1136,8 +1221,7 @@ impl<F: FormulaPayload> Workbook<F> {
             allocator: IdAllocator::local(),
             next_sheet_id: next_id,
             seed_origin,
-            content_digest,
-            populated_cells,
+            digest_cache: LazyContentDigest::new_lazy(),
         }
     }
 
@@ -1244,7 +1328,7 @@ impl<F: FormulaPayload> Workbook<F> {
                 named_ranges_bytes.saturating_add(named_range_entry_bytes(nr_key, nr_def));
         }
 
-        let mut wb = Self {
+        let wb = Self {
             sheets,
             formulas,
             formulas_bytes,
@@ -1255,13 +1339,11 @@ impl<F: FormulaPayload> Workbook<F> {
             allocator,
             next_sheet_id,
             seed_origin,
-            content_digest: 0,
-            populated_cells: 0,
+            digest_cache: LazyContentDigest::new_lazy(),
         };
         if wb.estimated_bytes() > MAX_WORKBOOK_BYTES {
             return Err(OpError::MemoryLimitExceeded);
         }
-        wb.recompute_content_and_population();
         Ok(wb)
     }
 
@@ -1341,17 +1423,26 @@ impl<F: FormulaPayload> Workbook<F> {
         }
     }
 
+    fn ensure_digest_ready(&self) -> (u128, u64) {
+        if let Some(pair) = self.digest_cache.get_if_ready() {
+            return pair;
+        }
+        let (digest, count) = self.compute_content_and_population_from_scratch();
+        self.digest_cache.store_ready(digest, count);
+        (digest, count)
+    }
+
     /// Returns the incrementally maintained 128-bit collaborative content/membership digest.
     #[must_use]
-    pub const fn content_digest(&self) -> u128 {
-        self.content_digest
+    pub fn content_digest(&self) -> u128 {
+        self.ensure_digest_ready().0
     }
 
     /// Returns the incrementally maintained populated cell count (formulas plus
     /// non-empty scalar cells).
     #[must_use]
-    pub const fn populated_cell_count(&self) -> u64 {
-        self.populated_cells
+    pub fn populated_cell_count(&self) -> u64 {
+        self.ensure_digest_ready().1
     }
 
     /// Recomputes `(content_digest, populated_cells)` cleanly from full workbook state.
@@ -1364,14 +1455,26 @@ impl<F: FormulaPayload> Workbook<F> {
         let mut digest = 0_u128;
         let mut count = 0_u64;
         for sheet in &self.sheets {
-            let sid = sheet.id();
-            let (sd, sc) = sheet_content_and_scalar_count(sheet, |r, c| {
-                self.formulas.contains_key(&(sid, r, c))
-            });
+            let (sd, sc) = sheet_content_and_scalar_count(sheet, |_, _| false);
             digest = digest.wrapping_add(sd);
             count = count.saturating_add(sc);
         }
         for (&(sid, row, col), formula) in &self.formulas {
+            if let Some(sheet) = self.sheet(sid) {
+                let cached = sheet.value_by_id(row, col);
+                let cached_scalar = match cached {
+                    Value::Empty => None,
+                    Value::Number(n) => Some(CanonicalScalar::Number(n)),
+                    Value::Text(id) => Some(CanonicalScalar::Text(sheet.strings().get(id))),
+                    Value::Bool(flag) => Some(CanonicalScalar::Bool(flag)),
+                    Value::Error(err) => Some(CanonicalScalar::Error(err)),
+                    Value::Array(_) => Some(CanonicalScalar::Error(CalcError::Spill)),
+                };
+                if let Some(scalar) = cached_scalar {
+                    digest = digest.wrapping_sub(hash_scalar_cell(sid, row, col, scalar));
+                    count = count.saturating_sub(1);
+                }
+            }
             digest = digest.wrapping_add(hash_formula_cell(sid, row, col, formula));
             count = count.saturating_add(1);
         }
@@ -1388,12 +1491,6 @@ impl<F: FormulaPayload> Workbook<F> {
         (digest, count)
     }
 
-    fn recompute_content_and_population(&mut self) {
-        let (digest, count) = self.compute_content_and_population_from_scratch();
-        self.content_digest = digest;
-        self.populated_cells = count;
-    }
-
     /// Computes the 64-bit order digest covering sheet tab sequence and axis order.
     #[must_use]
     pub fn compute_order_digest(&self) -> u64 {
@@ -1404,7 +1501,7 @@ impl<F: FormulaPayload> Workbook<F> {
     /// state + `order` from tab/axis sequences, excluding cached formula eval).
     #[must_use]
     pub fn state_digest(&self) -> StateDigest {
-        StateDigest::from_parts(self.content_digest, self.compute_order_digest())
+        StateDigest::from_parts(self.ensure_digest_ready().0, self.compute_order_digest())
     }
 
     /// Stored formula map across the workbook.
@@ -1467,7 +1564,8 @@ impl<F: FormulaPayload> Workbook<F> {
         formula: F,
         cached: Value,
     ) -> bool {
-        let (old_h, old_pop) = {
+        let track = self.digest_cache.is_ready_mut();
+        let (old_h, old_pop) = if track {
             let Some(target) = self.sheet(sheet) else {
                 return false;
             };
@@ -1477,6 +1575,8 @@ impl<F: FormulaPayload> Workbook<F> {
                 let val = target.value_by_id(row, col);
                 scalar_cell_digest_and_pop(sheet, row, col, target, val)
             }
+        } else {
+            (0_u128, 0_u64)
         };
         let Some(target) = self.sheet_mut(sheet) else {
             return false;
@@ -1484,13 +1584,14 @@ impl<F: FormulaPayload> Workbook<F> {
         if !target.set_value_by_id(row, col, cached) {
             return false;
         }
-        let new_h = hash_formula_cell(sheet, row, col, &formula);
-        self.put_formula((sheet, row, col), formula);
-        self.content_digest = self.content_digest.wrapping_sub(old_h).wrapping_add(new_h);
-        self.populated_cells = self
-            .populated_cells
-            .saturating_sub(old_pop)
-            .saturating_add(1);
+        if track {
+            let new_h = hash_formula_cell(sheet, row, col, &formula);
+            self.put_formula((sheet, row, col), formula);
+            self.digest_cache.replace_term(old_h, new_h);
+            self.digest_cache.adjust_populated(old_pop, 1);
+        } else {
+            self.put_formula((sheet, row, col), formula);
+        }
         true
     }
 
@@ -1646,7 +1747,7 @@ impl<F: FormulaPayload> Workbook<F> {
         // 4. Compact string pools and recompute content/populated baseline
         // after tombstones/purged cells have been stripped.
         self.compact_strings();
-        self.recompute_content_and_population();
+        self.digest_cache.invalidate();
     }
 
     /// Reads the complete logical [`CellSnapshot`] of `(sheet, row, col)`.
@@ -1768,10 +1869,7 @@ impl<F: FormulaPayload> Workbook<F> {
                 let old_ax = axis_content_hash(sheet, AXIS_KIND_ROW, target.row_axis());
                 target.row_axis_mut().remove_inserted(ids)?;
                 let new_ax = axis_content_hash(sheet, AXIS_KIND_ROW, target.row_axis());
-                self.content_digest = self
-                    .content_digest
-                    .wrapping_sub(old_ax)
-                    .wrapping_add(new_ax);
+                self.digest_cache.replace_term(old_ax, new_ax);
                 Ok(())
             }
             InverseOp::RemoveInsertedCols { sheet, ids } => {
@@ -1779,10 +1877,7 @@ impl<F: FormulaPayload> Workbook<F> {
                 let old_ax = axis_content_hash(sheet, AXIS_KIND_COL, target.col_axis());
                 target.col_axis_mut().remove_inserted(ids)?;
                 let new_ax = axis_content_hash(sheet, AXIS_KIND_COL, target.col_axis());
-                self.content_digest = self
-                    .content_digest
-                    .wrapping_sub(old_ax)
-                    .wrapping_add(new_ax);
+                self.digest_cache.replace_term(old_ax, new_ax);
                 Ok(())
             }
             InverseOp::UndeleteRows { sheet, ids } => {
@@ -1790,10 +1885,7 @@ impl<F: FormulaPayload> Workbook<F> {
                 let old_ax = axis_content_hash(sheet, AXIS_KIND_ROW, target.row_axis());
                 target.row_axis_mut().undelete_runs(&ids)?;
                 let new_ax = axis_content_hash(sheet, AXIS_KIND_ROW, target.row_axis());
-                self.content_digest = self
-                    .content_digest
-                    .wrapping_sub(old_ax)
-                    .wrapping_add(new_ax);
+                self.digest_cache.replace_term(old_ax, new_ax);
                 Ok(())
             }
             InverseOp::UndeleteCols { sheet, ids } => {
@@ -1801,10 +1893,7 @@ impl<F: FormulaPayload> Workbook<F> {
                 let old_ax = axis_content_hash(sheet, AXIS_KIND_COL, target.col_axis());
                 target.col_axis_mut().undelete_runs(&ids)?;
                 let new_ax = axis_content_hash(sheet, AXIS_KIND_COL, target.col_axis());
-                self.content_digest = self
-                    .content_digest
-                    .wrapping_sub(old_ax)
-                    .wrapping_add(new_ax);
+                self.digest_cache.replace_term(old_ax, new_ax);
                 Ok(())
             }
             InverseOp::RedeleteRows { sheet, ids } => {
@@ -1812,10 +1901,7 @@ impl<F: FormulaPayload> Workbook<F> {
                 let old_ax = axis_content_hash(sheet, AXIS_KIND_ROW, target.row_axis());
                 target.row_axis_mut().delete_runs(&ids)?;
                 let new_ax = axis_content_hash(sheet, AXIS_KIND_ROW, target.row_axis());
-                self.content_digest = self
-                    .content_digest
-                    .wrapping_sub(old_ax)
-                    .wrapping_add(new_ax);
+                self.digest_cache.replace_term(old_ax, new_ax);
                 Ok(())
             }
             InverseOp::RedeleteCols { sheet, ids } => {
@@ -1823,10 +1909,7 @@ impl<F: FormulaPayload> Workbook<F> {
                 let old_ax = axis_content_hash(sheet, AXIS_KIND_COL, target.col_axis());
                 target.col_axis_mut().delete_runs(&ids)?;
                 let new_ax = axis_content_hash(sheet, AXIS_KIND_COL, target.col_axis());
-                self.content_digest = self
-                    .content_digest
-                    .wrapping_sub(old_ax)
-                    .wrapping_add(new_ax);
+                self.digest_cache.replace_term(old_ax, new_ax);
                 Ok(())
             }
             InverseOp::RestoreMovedRows {
@@ -1848,7 +1931,7 @@ impl<F: FormulaPayload> Workbook<F> {
                     self.put_formula(key, formula);
                 }
                 delta = delta.wrapping_add(self.restore_rewritten_names(rewritten_names));
-                self.content_digest = self.content_digest.wrapping_add(delta);
+                self.digest_cache.add_delta(delta);
                 Ok(())
             }
             InverseOp::RestoreMovedCols {
@@ -1870,7 +1953,7 @@ impl<F: FormulaPayload> Workbook<F> {
                     self.put_formula(key, formula);
                 }
                 delta = delta.wrapping_add(self.restore_rewritten_names(rewritten_names));
-                self.content_digest = self.content_digest.wrapping_add(delta);
+                self.digest_cache.add_delta(delta);
                 Ok(())
             }
             InverseOp::RestoreRowHeights { sheet, prior } => {
@@ -1882,7 +1965,7 @@ impl<F: FormulaPayload> Workbook<F> {
                     let new_h = hash_row_height(sheet, row, target.row_height_by_id(row));
                     delta = delta.wrapping_sub(old_h).wrapping_add(new_h);
                 }
-                self.content_digest = self.content_digest.wrapping_add(delta);
+                self.digest_cache.add_delta(delta);
                 Ok(())
             }
             InverseOp::RestoreColWidths { sheet, prior } => {
@@ -1894,7 +1977,7 @@ impl<F: FormulaPayload> Workbook<F> {
                     let new_h = hash_col_width(sheet, col, target.col_width_by_id(col));
                     delta = delta.wrapping_sub(old_h).wrapping_add(new_h);
                 }
-                self.content_digest = self.content_digest.wrapping_add(delta);
+                self.digest_cache.add_delta(delta);
                 Ok(())
             }
             InverseOp::RestoreFreeze {
@@ -1918,10 +2001,7 @@ impl<F: FormulaPayload> Workbook<F> {
                     frozen_rows,
                     frozen_cols,
                 );
-                self.content_digest = self
-                    .content_digest
-                    .wrapping_sub(old_meta)
-                    .wrapping_add(new_meta);
+                self.digest_cache.replace_term(old_meta, new_meta);
                 Ok(())
             }
             InverseOp::RestoreFormat { sheet, backup } => {
@@ -1974,7 +2054,7 @@ impl<F: FormulaPayload> Workbook<F> {
                         }
                     }
                 }
-                self.content_digest = self.content_digest.wrapping_add(delta);
+                self.digest_cache.add_delta(delta);
                 Ok(())
             }
             InverseOp::RemoveAddedSheet {
@@ -1995,7 +2075,7 @@ impl<F: FormulaPayload> Workbook<F> {
                 }
                 self.sheets.remove(idx);
                 self.next_sheet_id = prior_next_sheet_id;
-                self.recompute_content_and_population();
+                self.digest_cache.invalidate();
                 Ok(())
             }
             InverseOp::RestoreSheetName { sheet, prior_name } => {
@@ -2015,10 +2095,7 @@ impl<F: FormulaPayload> Workbook<F> {
                     target.frozen_rows(),
                     target.frozen_cols(),
                 );
-                self.content_digest = self
-                    .content_digest
-                    .wrapping_sub(old_meta)
-                    .wrapping_add(new_meta);
+                self.digest_cache.replace_term(old_meta, new_meta);
                 Ok(())
             }
             InverseOp::UndeleteSheet { sheet } => {
@@ -2040,10 +2117,7 @@ impl<F: FormulaPayload> Workbook<F> {
                     target.frozen_rows(),
                     target.frozen_cols(),
                 );
-                self.content_digest = self
-                    .content_digest
-                    .wrapping_sub(old_meta)
-                    .wrapping_add(new_meta);
+                self.digest_cache.replace_term(old_meta, new_meta);
                 Ok(())
             }
             InverseOp::RedeleteSheet { sheet, prior_name } => {
@@ -2066,10 +2140,7 @@ impl<F: FormulaPayload> Workbook<F> {
                     target.frozen_rows(),
                     target.frozen_cols(),
                 );
-                self.content_digest = self
-                    .content_digest
-                    .wrapping_sub(old_meta)
-                    .wrapping_add(new_meta);
+                self.digest_cache.replace_term(old_meta, new_meta);
                 Ok(())
             }
             InverseOp::RestoreSheetOrder { order } => {
@@ -2443,10 +2514,7 @@ impl<F: FormulaPayload> Workbook<F> {
             .row_axis_mut()
             .insert_after(after.map(|r| r.0), ids)?;
         let new_ax = axis_content_hash(sheet_id, AXIS_KIND_ROW, target.row_axis());
-        self.content_digest = self
-            .content_digest
-            .wrapping_sub(old_ax)
-            .wrapping_add(new_ax);
+        self.digest_cache.replace_term(old_ax, new_ax);
         self.seed_origin = None;
         Ok(InverseOp::RemoveInsertedRows {
             sheet: sheet_id,
@@ -2469,10 +2537,7 @@ impl<F: FormulaPayload> Workbook<F> {
             .col_axis_mut()
             .insert_after(after.map(|c| c.0), ids)?;
         let new_ax = axis_content_hash(sheet_id, AXIS_KIND_COL, target.col_axis());
-        self.content_digest = self
-            .content_digest
-            .wrapping_sub(old_ax)
-            .wrapping_add(new_ax);
+        self.digest_cache.replace_term(old_ax, new_ax);
         self.seed_origin = None;
         Ok(InverseOp::RemoveInsertedCols {
             sheet: sheet_id,
@@ -2489,10 +2554,7 @@ impl<F: FormulaPayload> Workbook<F> {
         let old_ax = axis_content_hash(sheet_id, AXIS_KIND_ROW, target.row_axis());
         target.row_axis_mut().delete_runs(&ids)?;
         let new_ax = axis_content_hash(sheet_id, AXIS_KIND_ROW, target.row_axis());
-        self.content_digest = self
-            .content_digest
-            .wrapping_sub(old_ax)
-            .wrapping_add(new_ax);
+        self.digest_cache.replace_term(old_ax, new_ax);
         self.seed_origin = None;
         Ok(InverseOp::UndeleteRows {
             sheet: sheet_id,
@@ -2509,10 +2571,7 @@ impl<F: FormulaPayload> Workbook<F> {
         let old_ax = axis_content_hash(sheet_id, AXIS_KIND_COL, target.col_axis());
         target.col_axis_mut().delete_runs(&ids)?;
         let new_ax = axis_content_hash(sheet_id, AXIS_KIND_COL, target.col_axis());
-        self.content_digest = self
-            .content_digest
-            .wrapping_sub(old_ax)
-            .wrapping_add(new_ax);
+        self.digest_cache.replace_term(old_ax, new_ax);
         self.seed_origin = None;
         Ok(InverseOp::UndeleteCols {
             sheet: sheet_id,
@@ -2529,10 +2588,7 @@ impl<F: FormulaPayload> Workbook<F> {
         let old_ax = axis_content_hash(sheet_id, AXIS_KIND_ROW, target.row_axis());
         target.row_axis_mut().undelete_runs(&ids)?;
         let new_ax = axis_content_hash(sheet_id, AXIS_KIND_ROW, target.row_axis());
-        self.content_digest = self
-            .content_digest
-            .wrapping_sub(old_ax)
-            .wrapping_add(new_ax);
+        self.digest_cache.replace_term(old_ax, new_ax);
         self.seed_origin = None;
         Ok(InverseOp::RedeleteRows {
             sheet: sheet_id,
@@ -2549,10 +2605,7 @@ impl<F: FormulaPayload> Workbook<F> {
         let old_ax = axis_content_hash(sheet_id, AXIS_KIND_COL, target.col_axis());
         target.col_axis_mut().undelete_runs(&ids)?;
         let new_ax = axis_content_hash(sheet_id, AXIS_KIND_COL, target.col_axis());
-        self.content_digest = self
-            .content_digest
-            .wrapping_sub(old_ax)
-            .wrapping_add(new_ax);
+        self.digest_cache.replace_term(old_ax, new_ax);
         self.seed_origin = None;
         Ok(InverseOp::RedeleteCols {
             sheet: sheet_id,
@@ -2613,11 +2666,8 @@ impl<F: FormulaPayload> Workbook<F> {
         let old_ax = axis_content_hash(sheet_id, AXIS_KIND_ROW, target.row_axis());
         let prior_runs = target.row_axis_mut().move_runs(ids, after.map(|r| r.0))?;
         let new_ax = axis_content_hash(sheet_id, AXIS_KIND_ROW, target.row_axis());
-        self.content_digest = self
-            .content_digest
-            .wrapping_sub(old_ax)
-            .wrapping_add(new_ax)
-            .wrapping_add(formula_delta);
+        self.digest_cache.replace_term(old_ax, new_ax);
+        self.digest_cache.add_delta(formula_delta);
         self.seed_origin = None;
 
         Ok(InverseOp::RestoreMovedRows {
@@ -2676,11 +2726,8 @@ impl<F: FormulaPayload> Workbook<F> {
         let old_ax = axis_content_hash(sheet_id, AXIS_KIND_COL, target.col_axis());
         let prior_runs = target.col_axis_mut().move_runs(ids, after.map(|c| c.0))?;
         let new_ax = axis_content_hash(sheet_id, AXIS_KIND_COL, target.col_axis());
-        self.content_digest = self
-            .content_digest
-            .wrapping_sub(old_ax)
-            .wrapping_add(new_ax)
-            .wrapping_add(formula_delta);
+        self.digest_cache.replace_term(old_ax, new_ax);
+        self.digest_cache.add_delta(formula_delta);
         self.seed_origin = None;
 
         Ok(InverseOp::RestoreMovedCols {
@@ -2833,7 +2880,7 @@ impl<F: FormulaPayload> Workbook<F> {
                     .wrapping_add(hash_row_height(sheet_id, row, next));
             }
         }
-        self.content_digest = self.content_digest.wrapping_add(delta);
+        self.digest_cache.add_delta(delta);
         self.seed_origin = None;
         Ok(InverseOp::RestoreRowHeights {
             sheet: sheet_id,
@@ -2877,7 +2924,7 @@ impl<F: FormulaPayload> Workbook<F> {
                     .wrapping_add(hash_col_width(sheet_id, col, next));
             }
         }
-        self.content_digest = self.content_digest.wrapping_add(delta);
+        self.digest_cache.add_delta(delta);
         self.seed_origin = None;
         Ok(InverseOp::RestoreColWidths {
             sheet: sheet_id,
@@ -2912,10 +2959,7 @@ impl<F: FormulaPayload> Workbook<F> {
             frozen_rows,
             frozen_cols,
         );
-        self.content_digest = self
-            .content_digest
-            .wrapping_sub(old_meta)
-            .wrapping_add(new_meta);
+        self.digest_cache.replace_term(old_meta, new_meta);
         self.seed_origin = None;
         Ok(InverseOp::RestoreFreeze {
             sheet: sheet_id,
@@ -3057,7 +3101,7 @@ impl<F: FormulaPayload> Workbook<F> {
             }
         };
 
-        self.content_digest = self.content_digest.wrapping_add(delta);
+        self.digest_cache.add_delta(delta);
         self.seed_origin = None;
         Ok(InverseOp::RestoreFormat {
             sheet: sheet_id,
@@ -3210,24 +3254,27 @@ impl<F: FormulaPayload> Workbook<F> {
         };
 
         self.seed_origin = None;
+        let track_digest = self.digest_cache.is_ready_mut();
         let mut delta = 0_u128;
         let mut pop_minus = 0_u64;
-        for snap in &prior_non_empty {
-            match &snap.input {
-                CellInput::Empty => {}
-                CellInput::Scalar(s) => {
-                    delta = delta.wrapping_sub(hash_scalar_cell(
-                        sheet_id,
-                        snap.row,
-                        snap.col,
-                        scalar_value_canonical(s),
-                    ));
-                    pop_minus = pop_minus.saturating_add(1);
-                }
-                CellInput::Formula { formula, .. } => {
-                    delta = delta
-                        .wrapping_sub(hash_formula_cell(sheet_id, snap.row, snap.col, formula));
-                    pop_minus = pop_minus.saturating_add(1);
+        if track_digest {
+            for snap in &prior_non_empty {
+                match &snap.input {
+                    CellInput::Empty => {}
+                    CellInput::Scalar(s) => {
+                        delta = delta.wrapping_sub(hash_scalar_cell(
+                            sheet_id,
+                            snap.row,
+                            snap.col,
+                            scalar_value_canonical(s),
+                        ));
+                        pop_minus = pop_minus.saturating_add(1);
+                    }
+                    CellInput::Formula { formula, .. } => {
+                        delta = delta
+                            .wrapping_sub(hash_formula_cell(sheet_id, snap.row, snap.col, formula));
+                        pop_minus = pop_minus.saturating_add(1);
+                    }
                 }
             }
         }
@@ -3244,19 +3291,20 @@ impl<F: FormulaPayload> Workbook<F> {
                     for raw_r in r_run.iter() {
                         let row = RowId(raw_r);
                         let expanded = F::expand_template(template, row, col);
-                        delta =
-                            delta.wrapping_add(hash_formula_cell(sheet_id, row, col, &expanded));
-                        pop_plus = pop_plus.saturating_add(1);
+                        if track_digest {
+                            delta = delta
+                                .wrapping_add(hash_formula_cell(sheet_id, row, col, &expanded));
+                            pop_plus = pop_plus.saturating_add(1);
+                        }
                         self.put_formula((sheet_id, row, col), expanded);
                     }
                 }
             }
         }
-        self.content_digest = self.content_digest.wrapping_add(delta);
-        self.populated_cells = self
-            .populated_cells
-            .saturating_sub(pop_minus)
-            .saturating_add(pop_plus);
+        if track_digest {
+            self.digest_cache.add_delta(delta);
+            self.digest_cache.adjust_populated(pop_minus, pop_plus);
+        }
 
         Ok(InverseOp::RestoreFilledRange {
             sheet: sheet_id,
@@ -3298,7 +3346,7 @@ impl<F: FormulaPayload> Workbook<F> {
         let new_sheet = Sheet::standard(sheet_id, unique_name);
         let (sheet_digest, _) = sheet_content_and_scalar_count(&new_sheet, |_, _| false);
         self.sheets.insert(insert_idx, new_sheet);
-        self.content_digest = self.content_digest.wrapping_add(sheet_digest);
+        self.digest_cache.add_delta(sheet_digest);
         self.seed_origin = None;
         Ok(InverseOp::RemoveAddedSheet {
             sheet: sheet_id,
@@ -3333,10 +3381,7 @@ impl<F: FormulaPayload> Workbook<F> {
             target.frozen_rows(),
             target.frozen_cols(),
         );
-        self.content_digest = self
-            .content_digest
-            .wrapping_sub(old_meta)
-            .wrapping_add(new_meta);
+        self.digest_cache.replace_term(old_meta, new_meta);
         self.seed_origin = None;
         Ok(InverseOp::RestoreSheetName {
             sheet: sheet_id,
@@ -3371,10 +3416,7 @@ impl<F: FormulaPayload> Workbook<F> {
             target.frozen_rows(),
             target.frozen_cols(),
         );
-        self.content_digest = self
-            .content_digest
-            .wrapping_sub(old_meta)
-            .wrapping_add(new_meta);
+        self.digest_cache.replace_term(old_meta, new_meta);
         self.seed_origin = None;
         Ok(InverseOp::UndeleteSheet { sheet: sheet_id })
     }
@@ -3411,10 +3453,7 @@ impl<F: FormulaPayload> Workbook<F> {
             target.frozen_rows(),
             target.frozen_cols(),
         );
-        self.content_digest = self
-            .content_digest
-            .wrapping_sub(old_meta)
-            .wrapping_add(new_meta);
+        self.digest_cache.replace_term(old_meta, new_meta);
         self.seed_origin = None;
         Ok(InverseOp::RedeleteSheet {
             sheet: sheet_id,
@@ -3577,7 +3616,8 @@ impl<F: FormulaPayload> Workbook<F> {
         input: CellInput<F>,
         format: FormatPatch,
     ) -> Result<(), OpError> {
-        let (old_cell_h, old_pop, old_fmt_h) = {
+        let track = self.digest_cache.is_ready_mut();
+        let (old_cell_h, old_pop, old_fmt_h) = if track {
             let sheet = self.sheet(sheet_id).ok_or(OpError::SheetNotFound)?;
             let (ch, pop) = if let Some(old_f) = self.formulas.get(&(sheet_id, row, col)) {
                 (hash_formula_cell(sheet_id, row, col, old_f), 1_u64)
@@ -3591,6 +3631,8 @@ impl<F: FormulaPayload> Workbook<F> {
                 hash_cell_format(sheet_id, row, col, sheet.cell_format_by_id(row, col))
             };
             (ch, pop, fh)
+        } else {
+            (0_u128, 0_u64, 0_u128)
         };
 
         let (new_cell_h, new_pop) = match input {
@@ -3603,7 +3645,11 @@ impl<F: FormulaPayload> Workbook<F> {
             }
             CellInput::Scalar(scalar) => {
                 self.take_formula((sheet_id, row, col));
-                let nh = hash_scalar_cell(sheet_id, row, col, scalar_value_canonical(&scalar));
+                let nh = if track {
+                    hash_scalar_cell(sheet_id, row, col, scalar_value_canonical(&scalar))
+                } else {
+                    0
+                };
                 let sheet = self.sheet_mut(sheet_id).ok_or(OpError::SheetNotFound)?;
                 let value = intern_scalar(sheet, scalar)?;
                 sheet.set_value_by_id(row, col, value);
@@ -3611,7 +3657,11 @@ impl<F: FormulaPayload> Workbook<F> {
                 (nh, 1_u64)
             }
             CellInput::Formula { formula, cached } => {
-                let nh = hash_formula_cell(sheet_id, row, col, &formula);
+                let nh = if track {
+                    hash_formula_cell(sheet_id, row, col, &formula)
+                } else {
+                    0
+                };
                 let sheet = self.sheet_mut(sheet_id).ok_or(OpError::SheetNotFound)?;
                 let cached_val = match cached {
                     None => Value::Empty,
@@ -3624,23 +3674,19 @@ impl<F: FormulaPayload> Workbook<F> {
             }
         };
 
-        let new_fmt_h = if format == FormatPatch::Keep {
-            0
-        } else {
-            let sheet = self.sheet(sheet_id).ok_or(OpError::SheetNotFound)?;
-            hash_cell_format(sheet_id, row, col, sheet.cell_format_by_id(row, col))
-        };
-
-        self.content_digest = self
-            .content_digest
-            .wrapping_sub(old_cell_h)
-            .wrapping_add(new_cell_h)
-            .wrapping_sub(old_fmt_h)
-            .wrapping_add(new_fmt_h);
-        self.populated_cells = self
-            .populated_cells
-            .saturating_sub(old_pop)
-            .saturating_add(new_pop);
+        if track {
+            let new_fmt_h = if format == FormatPatch::Keep {
+                0
+            } else {
+                let sheet = self.sheet(sheet_id).ok_or(OpError::SheetNotFound)?;
+                hash_cell_format(sheet_id, row, col, sheet.cell_format_by_id(row, col))
+            };
+            self.digest_cache.replace_term(
+                old_cell_h.wrapping_add(old_fmt_h),
+                new_cell_h.wrapping_add(new_fmt_h),
+            );
+            self.digest_cache.adjust_populated(old_pop, new_pop);
+        }
         Ok(())
     }
 
@@ -3699,7 +3745,7 @@ impl<F: FormulaPayload> Workbook<F> {
             .named_ranges_bytes
             .saturating_sub(old_bytes)
             .saturating_add(new_bytes);
-        self.content_digest = self.content_digest.wrapping_sub(old_h).wrapping_add(new_h);
+        self.digest_cache.replace_term(old_h, new_h);
         self.seed_origin = None;
 
         Ok(InverseOp::RestoreNamedRange { key, prior })
@@ -3718,7 +3764,7 @@ impl<F: FormulaPayload> Workbook<F> {
         let old_bytes = named_range_entry_bytes(&key, &prior);
         let old_h = named_range_digest(&key, &prior);
         self.named_ranges_bytes = self.named_ranges_bytes.saturating_sub(old_bytes);
-        self.content_digest = self.content_digest.wrapping_sub(old_h);
+        self.digest_cache.add_delta(0_u128.wrapping_sub(old_h));
         self.seed_origin = None;
         Ok(InverseOp::RestoreNamedRange {
             key,
@@ -3748,7 +3794,7 @@ impl<F: FormulaPayload> Workbook<F> {
             delta = delta.wrapping_add(named_range_digest(&key, &restored));
             self.named_ranges.insert(key, restored);
         }
-        self.content_digest = self.content_digest.wrapping_add(delta);
+        self.digest_cache.add_delta(delta);
         Ok(())
     }
 
@@ -4247,7 +4293,7 @@ impl<F: FormulaPayload> Workbook<F> {
                 rewritten_names.push((nr_key, prior_f));
             }
         }
-        self.content_digest = self.content_digest.wrapping_add(formula_delta);
+        self.digest_cache.add_delta(formula_delta);
 
         Ok(InverseOp::RestoreMovedCells {
             prior_cells,
@@ -4274,7 +4320,7 @@ impl<F: FormulaPayload> Workbook<F> {
             self.put_formula(key, prior_f);
         }
         delta = delta.wrapping_add(self.restore_rewritten_names(rewritten_names));
-        self.content_digest = self.content_digest.wrapping_add(delta);
+        self.digest_cache.add_delta(delta);
         Ok(())
     }
 
@@ -4312,10 +4358,7 @@ impl<F: FormulaPayload> Workbook<F> {
             let new_h = hash_cell_style(sheet_id, backup.row, backup.col, backup.style);
             (old_h, new_h)
         };
-        self.content_digest = self
-            .content_digest
-            .wrapping_sub(old_sh)
-            .wrapping_add(new_sh);
+        self.digest_cache.replace_term(old_sh, new_sh);
         self.write_validated_cell(sheet_id, backup.row, backup.col, backup.input, format_patch)
     }
 }
@@ -5710,5 +5753,131 @@ mod tests {
         );
         wb.apply_inverse(inv_cross).unwrap();
         assert_eq!(wb.logical_digest(), d_before_perm);
+    }
+
+    #[test]
+    fn from_parts_lazy_digest_matches_scratch_before_and_after_mutations() {
+        use alloc::collections::BTreeMap;
+
+        use super::{NamedRangeDef, NamedRangeKey};
+        use crate::id::IdAllocator;
+        use crate::sheet::Sheet;
+
+        let make_formula = |src: &str| RawFormula {
+            source: String::from(src),
+            mode: FormulaMode::Dynamic,
+        };
+
+        let s0 = SheetId(0);
+        let mut sheet = Sheet::standard(s0, String::from("Sheet1"));
+        let err_text = sheet.add_string("cached_txt").unwrap();
+        let pure_text = sheet.add_string("scalar_txt").unwrap();
+        // Pure scalar cell + 5 formula cells covering Number, Text, Bool, Error, Empty caches.
+        sheet.set_value_by_id(RowId(0), ColId(0), Value::Number(7.5));
+        sheet.set_value_by_id(RowId(0), ColId(1), Value::Text(pure_text));
+        sheet.set_value_by_id(RowId(1), ColId(0), Value::Number(99.0));
+        sheet.set_value_by_id(RowId(2), ColId(0), Value::Text(err_text));
+        sheet.set_value_by_id(RowId(3), ColId(0), Value::Bool(true));
+        sheet.set_value_by_id(RowId(4), ColId(0), Value::Error(CalcError::Div0));
+        // RowId(5), ColId(0) remains Value::Empty cache.
+
+        let mut formulas = BTreeMap::new();
+        for (idx, text) in [
+            (1_u64, "=1+2"),
+            (2, "=\"a\""),
+            (3, "=TRUE"),
+            (4, "=1/0"),
+            (5, "=9"),
+        ] {
+            formulas.insert((s0, RowId(idx), ColId(0)), make_formula(text));
+        }
+
+        let mut names = BTreeMap::new();
+        names.insert(
+            NamedRangeKey::new(None, "Rate"),
+            NamedRangeDef {
+                name: String::from("Rate"),
+                formula: make_formula("=0.1"),
+                comment: Some(String::from("tax")),
+                hidden: false,
+            },
+        );
+
+        let mut wb_a = Workbook::from_parts_with_names(
+            vec![sheet.clone()],
+            formulas.clone(),
+            names.clone(),
+            IdAllocator::local(),
+            1,
+            None,
+        )
+        .unwrap();
+        let mut wb_b = Workbook::from_parts_with_names(
+            vec![sheet],
+            formulas,
+            names,
+            IdAllocator::local(),
+            1,
+            None,
+        )
+        .unwrap();
+
+        // Path A: materialize lazy digest BEFORE mutating.
+        assert_eq!(
+            wb_a.content_digest(),
+            wb_a.compute_content_digest_from_scratch()
+        );
+        assert_eq!(wb_a.populated_cell_count(), 7);
+
+        let edits = vec![
+            CellEdit {
+                row: RowId(0),
+                col: ColId(0),
+                input: CellInput::Empty,
+                format: FormatPatch::Keep,
+            },
+            CellEdit {
+                row: RowId(6),
+                col: ColId(0),
+                input: CellInput::Scalar(ScalarValue::Number(12.0)),
+                format: FormatPatch::Keep,
+            },
+            CellEdit {
+                row: RowId(1),
+                col: ColId(0),
+                input: CellInput::Formula {
+                    formula: make_formula("=42"),
+                    cached: None,
+                },
+                format: FormatPatch::Keep,
+            },
+        ];
+        wb_a.apply(Op::SetCells {
+            sheet: s0,
+            edits: edits.clone(),
+        })
+        .unwrap();
+        wb_a.apply(Op::RenameSheet {
+            sheet: s0,
+            name: String::from("Data"),
+        })
+        .unwrap();
+
+        // Path B: mutate BEFORE ever reading digest/count.
+        wb_b.apply(Op::SetCells { sheet: s0, edits }).unwrap();
+        wb_b.apply(Op::RenameSheet {
+            sheet: s0,
+            name: String::from("Data"),
+        })
+        .unwrap();
+
+        assert_eq!(
+            wb_b.content_digest(),
+            wb_b.compute_content_digest_from_scratch()
+        );
+        assert_eq!(wb_b.content_digest(), wb_a.content_digest());
+        assert_eq!(wb_b.state_digest(), wb_a.state_digest());
+        assert_eq!(wb_b.populated_cell_count(), wb_a.populated_cell_count());
+        assert_eq!(wb_b.populated_cell_count(), 7);
     }
 }

@@ -295,7 +295,7 @@ impl SnapshotEncoder {
             .iter()
             .map(|(k, v)| (k.scope, v.clone()))
             .collect();
-        let has_v3_formulas = workbook.formulas().values().any(formula_uses_v3);
+        let has_v3_formulas = false;
         let seed_origin = workbook.seed_origin().map(WireSeedOriginV1::from);
         let section_count: usize = 6_usize
             .saturating_add(usize::from(seed_origin.is_some()))
