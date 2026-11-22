@@ -44,6 +44,9 @@ test.describe("M2b governance, workbooks, history, and account lifecycle", () =>
       await expect(page.getByTestId("engine-status")).toHaveText("ready");
       const backend = await page.evaluate(() => window.__reticula?.docStatus().storageBackend);
       await editCell(page, 0, 0, "A1", "LocalSeed");
+      await expect
+        .poll(() => page.evaluate(() => window.__reticula?.textAt(0, 0)), { timeout: 5_000 })
+        .toBe("LocalSeed");
       await page.evaluate(async () => {
         await window.__reticula?.compactSnapshot();
         await window.__reticula?.flushAndClose();

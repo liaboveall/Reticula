@@ -3078,7 +3078,7 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
         disabled={
           effectiveReadOnly ||
           readySheet === null ||
-          (selection === null && !editSessionRef.current)
+          ((selection === null || selection.rowId === null) && !editSessionRef.current)
         }
         isEditing={editingText !== null}
         isSpillShadow={matchingInspected?.isSpillShadow === true}

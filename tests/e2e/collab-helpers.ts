@@ -228,6 +228,7 @@ export async function editCell(
   address: string,
   raw: string,
 ): Promise<void> {
+  await settled(page);
   await page.evaluate(
     ([r, c]) => {
       window.__reticula?.select(r, c);
