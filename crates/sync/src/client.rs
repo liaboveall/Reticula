@@ -16,24 +16,25 @@ use reticula_core::id::{
 use reticula_core::ops::{InverseOp, Op, OpError, Workbook};
 use reticula_core::state_digest::StateDigest;
 use reticula_formula::binder::BoundFormula;
-use reticula_wire::convert_v2::{ops_from_wire_txn_v2, ops_to_wire_txn_v2};
-use reticula_wire::v2::{
-    SYNC_PROTOCOL_VERSION, WireCatchupV1, WireCommittedTxnV2, WirePendingTxnV2, WireRejectReasonV1,
-    WireStateDigestV1, WireSyncFrameV1,
+use reticula_wire::convert_v3::{ops_from_wire_txn_v3, ops_to_wire_txn_v3};
+use reticula_wire::v2::{WireRejectReasonV1, WireStateDigestV1};
+use reticula_wire::v3::{
+    SYNC_PROTOCOL_VERSION_V2, WireCatchupV2, WireCommittedTxnV3, WirePendingTxnV3, WireSyncFrameV2,
 };
 
 use crate::types::{
-    ClientAction, ConnectionState, DEFAULT_MAX_PUSH_BATCH, DEFAULT_MAX_PUSH_BYTES,
-    ReplicaWatermark, VIEWER_REPLICA, apply_ops_atomic, rewind_inverses_checked,
+    ClientAction, CommittedPermute, ConnectionState, DEFAULT_MAX_PUSH_BATCH,
+    DEFAULT_MAX_PUSH_BYTES, ReplicaWatermark, VIEWER_REPLICA, apply_ops_atomic,
+    rewind_inverses_checked,
 };
-use crate::validate::{RemapState, max_id_counter_in_ops};
+use crate::validate::{RemapState, max_id_counter_in_ops, transform_ops_through_permute};
 
 // Version byte, Push variant tag and the length of a batch of at most 64 entries.
 const PUSH_FRAME_OVERHEAD: usize = 3;
 
 #[derive(Clone, Debug)]
 struct PendingEntry {
-    wire: WirePendingTxnV2,
+    wire: WirePendingTxnV3,
     ops: Vec<Op<BoundFormula>>,
     inverses: Vec<InverseOp<BoundFormula>>,
     applied_on_visible: bool,
@@ -62,7 +63,8 @@ pub struct ClientSyncMachine {
     confirmed: Workbook<BoundFormula>,
     visible: Workbook<BoundFormula>,
     pending: VecDeque<PendingEntry>,
-    buffered_commits: Vec<WireCommittedTxnV2>,
+    buffered_commits: Vec<WireCommittedTxnV3>,
+    confirmed_permutes: Vec<CommittedPermute>,
     pending_welcome: Option<WelcomeProgress>,
     confirmed_seq: u64,
     last_acked_client_seq: u64,
@@ -91,6 +93,7 @@ impl ClientSyncMachine {
             visible,
             pending: VecDeque::new(),
             buffered_commits: Vec::new(),
+            confirmed_permutes: Vec::new(),
             pending_welcome: None,
             confirmed_seq: 0,
             last_acked_client_seq: 0,
@@ -105,10 +108,11 @@ impl ClientSyncMachine {
     }
 
     /// Reconstructs client state after tab restart / OPFS reload (`base` snapshot
-    /// at `confirmed_seq`, restored `pending.wal` records, and saved replica identity).
+    /// at `confirmed_seq`, persisted E16 `confirmed_permutes`, restored `pending.wal`
+    /// records, and saved replica identity).
     #[expect(
         clippy::too_many_arguments,
-        reason = "rehydrates full client state from OPFS snapshot + pending WAL without I/O"
+        reason = "rehydrates full client state from OPFS snapshot + permute log + pending WAL without I/O"
     )]
     #[must_use]
     pub fn from_persisted(
@@ -119,7 +123,8 @@ impl ClientSyncMachine {
         confirmed_seq: u64,
         last_acked_client_seq: u64,
         confirmed: Workbook<BoundFormula>,
-        persisted_pending: Vec<WirePendingTxnV2>,
+        confirmed_permutes: Vec<CommittedPermute>,
+        persisted_pending: Vec<WirePendingTxnV3>,
         next_id_counter_hint: u32,
     ) -> Self {
         let mut visible = confirmed.clone();
@@ -134,14 +139,21 @@ impl ClientSyncMachine {
 
         for wire in persisted_pending {
             highest_seq = highest_seq.max(wire.client_seq);
-            let Ok((_, ops)) = ops_from_wire_txn_v2(wire.txn.clone()) else {
+            let Ok((_, ops)) = ops_from_wire_txn_v3(wire.txn.clone()) else {
                 continue;
             };
             if let Some(r) = replica {
                 highest_id = highest_id.max(max_id_counter_in_ops(epoch, r, &ops));
                 max_sheet_c = max_sheet_c.max(max_sheet_counter_in_ops(&ops, epoch, r));
             }
-            let (inverses, applied) = match apply_ops_atomic(&mut visible, &ops) {
+            let transformed = transform_ops_through_permute(
+                &ops,
+                &confirmed_permutes,
+                wire.base_server_seq,
+                wire.replica,
+                wire.client_seq,
+            );
+            let (inverses, applied) = match apply_ops_atomic(&mut visible, &transformed) {
                 Ok(invs) => (invs, true),
                 Err(_) => (Vec::new(), false),
             };
@@ -170,6 +182,7 @@ impl ClientSyncMachine {
             visible,
             pending: queue,
             buffered_commits: Vec::new(),
+            confirmed_permutes,
             pending_welcome: None,
             confirmed_seq,
             last_acked_client_seq,
@@ -249,10 +262,16 @@ impl ClientSyncMachine {
         self.pending.len()
     }
 
-    /// Snapshot of currently pending [`WirePendingTxnV2`] entries in FIFO order.
+    /// Snapshot of currently pending [`WirePendingTxnV3`] entries in FIFO order.
     #[must_use]
-    pub fn pending_wire_txns(&self) -> Vec<WirePendingTxnV2> {
+    pub fn pending_wire_txns(&self) -> Vec<WirePendingTxnV3> {
         self.pending.iter().map(|e| e.wire.clone()).collect()
+    }
+
+    /// Persisted E16 permutation history through `confirmed_seq`.
+    #[must_use]
+    pub fn confirmed_permutes(&self) -> &[CommittedPermute] {
+        &self.confirmed_permutes
     }
 
     /// Read-only view of the optimistic `visible` workbook.
@@ -306,8 +325,8 @@ impl ClientSyncMachine {
         self.connection_state = ConnectionState::Handshaking;
         self.pending_welcome = None;
         self.buffered_commits.clear();
-        vec![ClientAction::SendFrame(WireSyncFrameV1::Hello {
-            protocol_version: SYNC_PROTOCOL_VERSION,
+        vec![ClientAction::SendFrame(WireSyncFrameV2::Hello {
+            protocol_version: SYNC_PROTOCOL_VERSION_V2,
             doc_id: self.doc_id,
             branch_id: self.branch_id,
             replica: self.replica,
@@ -329,6 +348,7 @@ impl ClientSyncMachine {
         self.on_disconnected();
         self.confirmed = Workbook::new();
         self.confirmed_seq = 0;
+        self.confirmed_permutes.clear();
         self.replay_all_pending_fresh();
     }
 
@@ -344,12 +364,12 @@ impl ClientSyncMachine {
         if self.read_only {
             return Err(OpError::ReadOnly);
         }
-        let wire_txn = ops_to_wire_txn_v2(label, &ops).map_err(|_| OpError::InvalidFormula)?;
+        let wire_txn = ops_to_wire_txn_v3(label, &ops).map_err(|_| OpError::InvalidFormula)?;
         let inverses = apply_ops_atomic(&mut self.visible, &ops)?;
         let client_seq = self.next_client_seq;
         self.next_client_seq = client_seq.saturating_add(1);
         let rep = self.replica.unwrap_or(1);
-        let wire = WirePendingTxnV2 {
+        let wire = WirePendingTxnV3 {
             replica: rep,
             client_seq,
             base_server_seq: self.confirmed_seq,
@@ -371,7 +391,7 @@ impl ClientSyncMachine {
         ];
         if self.connection_state == ConnectionState::Online {
             self.last_pushed_client_seq = client_seq;
-            actions.push(ClientAction::SendFrame(WireSyncFrameV1::Push {
+            actions.push(ClientAction::SendFrame(WireSyncFrameV2::Push {
                 txns: vec![wire],
             }));
         }
@@ -379,8 +399,8 @@ impl ClientSyncMachine {
     }
 
     /// Handles a server `Welcome` frame (`epoch`, watermarks, and inline txns vs snapshot).
-    pub fn on_welcome(&mut self, frame: WireSyncFrameV1) -> Vec<ClientAction> {
-        let WireSyncFrameV1::Welcome {
+    pub fn on_welcome(&mut self, frame: WireSyncFrameV2) -> Vec<ClientAction> {
+        let WireSyncFrameV2::Welcome {
             epoch,
             head_seq: _,
             replica,
@@ -408,6 +428,7 @@ impl ClientSyncMachine {
             self.confirmed = Workbook::new();
             self.visible = self.confirmed.clone();
             self.confirmed_seq = 0;
+            self.confirmed_permutes.clear();
             self.last_acked_client_seq = 0;
             self.next_sheet_counter = 1;
         }
@@ -418,7 +439,7 @@ impl ClientSyncMachine {
         self.last_pushed_client_seq = 0;
 
         match catchup {
-            WireCatchupV1::SnapshotRequired { snapshot_seq, url } => {
+            WireCatchupV2::SnapshotRequired { snapshot_seq, url } => {
                 if is_viewer {
                     self.rescue_pending_for_viewer(&mut actions);
                     self.last_acked_client_seq = 0;
@@ -456,7 +477,7 @@ impl ClientSyncMachine {
                 actions.push(ClientAction::RequestSnapshot { snapshot_seq, url });
                 actions
             }
-            WireCatchupV1::Txns { from_seq, txns } => {
+            WireCatchupV2::Txns { from_seq, txns } => {
                 let expected_from = self.confirmed_seq.saturating_add(1);
                 if from_seq != expected_from {
                     if epoch_changed {
@@ -514,13 +535,14 @@ impl ClientSyncMachine {
     }
 
     /// Completes snapshot catch-up after downloading `snapshot_wb` at `snapshot_seq`
-    /// plus `watermarks` and `tail_txns` (`seq > snapshot_seq`).
+    /// plus `watermarks`, E16 `confirmed_permutes`, and `tail_txns` (`seq > snapshot_seq`).
     pub fn install_snapshot(
         &mut self,
         snapshot_seq: u64,
         snapshot_wb: Workbook<BoundFormula>,
         watermarks: &[ReplicaWatermark],
-        tail_txns: Vec<WireCommittedTxnV2>,
+        confirmed_permutes: Vec<CommittedPermute>,
+        tail_txns: Vec<WireCommittedTxnV3>,
     ) -> Vec<ClientAction> {
         let Some(progress) = self.pending_welcome.take() else {
             return Vec::new();
@@ -547,6 +569,7 @@ impl ClientSyncMachine {
 
         self.confirmed = snapshot_wb;
         self.confirmed_seq = snapshot_seq;
+        self.confirmed_permutes = confirmed_permutes;
         self.epoch = progress.epoch;
         self.replica = (!is_viewer).then_some(progress.replica);
         self.read_only = is_viewer;
@@ -630,7 +653,7 @@ impl ClientSyncMachine {
     }
 
     /// Processes an incoming live `Commit` frame from the server.
-    pub fn on_commit(&mut self, commit: WireCommittedTxnV2) -> Vec<ClientAction> {
+    pub fn on_commit(&mut self, commit: WireCommittedTxnV3) -> Vec<ClientAction> {
         if matches!(
             self.connection_state,
             ConnectionState::Offline | ConnectionState::Handshaking
@@ -650,15 +673,10 @@ impl ClientSyncMachine {
             return vec![ClientAction::RequestReconnect];
         }
 
-        let is_own_front = self.replica == Some(commit.replica)
-            && self.pending.front().is_some_and(|front| {
-                !front.unverified_offline_edit
-                    && front.wire.client_seq == commit.client_seq
-                    && front.wire.txn == commit.txn
-            });
+        let is_own_front = self.matches_own_front(&commit);
 
         if is_own_front {
-            let Ok((_, ops)) = ops_from_wire_txn_v2(commit.txn) else {
+            let Ok((_, ops)) = ops_from_wire_txn_v3(commit.txn.clone()) else {
                 return vec![ClientAction::RequestReconnect];
             };
             if apply_ops_atomic(&mut self.confirmed, &ops).is_err() {
@@ -666,6 +684,7 @@ impl ClientSyncMachine {
             }
             self.confirmed_seq = commit.seq;
             self.last_acked_client_seq = self.last_acked_client_seq.max(commit.client_seq);
+            Self::record_confirmed_permutes(&mut self.confirmed_permutes, &commit, &ops);
             let popped = self.pending.pop_front();
             let mut actions = vec![ClientAction::PersistTruncatedPending(
                 self.pending_wire_txns(),
@@ -677,16 +696,11 @@ impl ClientSyncMachine {
             return actions;
         }
 
-        // Foreign (or mismatched tail-loss) commit: the slow path. Rewinding
-        // the pending transactions brings the visible state back to the
-        // confirmed one, so the remote transaction is applied to both and the
-        // pending ones are replayed in place. Only when the rewind did not
-        // come back exactly (an inverse failed, or the digests differ) is the
-        // confirmed state copied instead, which on a large workbook costs far
-        // more than the rewind and replay themselves (benchmark B9).
+        // Foreign (or mismatched tail-loss) commit: rewind pending, apply
+        // commit to `confirmed`, and replay (or rebuild if permutes touched visible).
         let rewound = self.rewind_all_pending()
             && self.visible.state_digest() == self.confirmed.state_digest();
-        let Ok((_, ops)) = ops_from_wire_txn_v2(commit.txn) else {
+        let Ok((_, ops)) = ops_from_wire_txn_v3(commit.txn.clone()) else {
             self.replay_all_pending_fresh();
             return vec![ClientAction::RequestReconnect];
         };
@@ -695,6 +709,7 @@ impl ClientSyncMachine {
             return vec![ClientAction::RequestReconnect];
         }
         self.confirmed_seq = commit.seq;
+        Self::record_confirmed_permutes(&mut self.confirmed_permutes, &commit, &ops);
         if rewound && apply_ops_atomic(&mut self.visible, &ops).is_ok() {
             self.replay_pending_in_place();
         } else {
@@ -791,9 +806,42 @@ impl ClientSyncMachine {
 
     // ------------------------------------------------------------ internal helpers
 
+    fn matches_own_front(&self, commit: &WireCommittedTxnV3) -> bool {
+        self.replica == Some(commit.replica)
+            && self.pending.front().is_some_and(|front| {
+                !front.unverified_offline_edit
+                    && front.wire.client_seq == commit.client_seq
+                    && (front.wire.txn == commit.txn || {
+                        let transformed = transform_ops_through_permute(
+                            &front.ops,
+                            &self.confirmed_permutes,
+                            front.wire.base_server_seq,
+                            front.wire.replica,
+                            front.wire.client_seq,
+                        );
+                        ops_to_wire_txn_v3(front.wire.txn.label.clone(), &transformed)
+                            .is_ok_and(|w| w == commit.txn)
+                    })
+            })
+    }
+
+    fn record_confirmed_permutes(
+        permutes: &mut Vec<CommittedPermute>,
+        commit: &WireCommittedTxnV3,
+        ops: &[Op<BoundFormula>],
+    ) {
+        for op in ops {
+            if let Some(cp) =
+                CommittedPermute::from_op(commit.seq, commit.replica, commit.client_seq, op)
+            {
+                permutes.push(cp);
+            }
+        }
+    }
+
     fn apply_confirmed_commit(
         &mut self,
-        commit: &WireCommittedTxnV2,
+        commit: &WireCommittedTxnV3,
         pending_modified: &mut bool,
     ) -> bool {
         if commit.seq <= self.confirmed_seq {
@@ -802,20 +850,16 @@ impl ClientSyncMachine {
         if commit.seq != self.confirmed_seq.saturating_add(1) {
             return false;
         }
-        let Ok((_, ops)) = ops_from_wire_txn_v2(commit.txn.clone()) else {
+        let is_own_front = self.matches_own_front(commit);
+        let Ok((_, ops)) = ops_from_wire_txn_v3(commit.txn.clone()) else {
             return false;
         };
         if apply_ops_atomic(&mut self.confirmed, &ops).is_err() {
             return false;
         }
         self.confirmed_seq = commit.seq;
+        Self::record_confirmed_permutes(&mut self.confirmed_permutes, commit, &ops);
 
-        let is_own_front = self.replica == Some(commit.replica)
-            && self.pending.front().is_some_and(|front| {
-                !front.unverified_offline_edit
-                    && front.wire.client_seq == commit.client_seq
-                    && front.wire.txn == commit.txn
-            });
         if is_own_front {
             let _ = self.pending.pop_front();
             self.last_acked_client_seq = self.last_acked_client_seq.max(commit.client_seq);
@@ -894,10 +938,22 @@ impl ClientSyncMachine {
                         remapped_ops.push(m);
                     }
                 }
-                let Ok(txn) = ops_to_wire_txn_v2(entry.wire.txn.label, &remapped_ops) else {
+                let (eff_rep, eff_cs) = if force_remap_all || entry.unverified_offline_edit {
+                    (0, 0)
+                } else {
+                    (entry.wire.replica, entry.wire.client_seq)
+                };
+                let transformed_ops = transform_ops_through_permute(
+                    &remapped_ops,
+                    &self.confirmed_permutes,
+                    entry.wire.base_server_seq,
+                    eff_rep,
+                    eff_cs,
+                );
+                let Ok(txn) = ops_to_wire_txn_v3(entry.wire.txn.label, &transformed_ops) else {
                     continue;
                 };
-                let wire = WirePendingTxnV2 {
+                let wire = WirePendingTxnV3 {
                     replica,
                     client_seq: cs,
                     base_server_seq: self.confirmed_seq,
@@ -907,7 +963,7 @@ impl ClientSyncMachine {
                 cs = cs.saturating_add(1);
                 self.pending.push_back(PendingEntry {
                     wire,
-                    ops: remapped_ops,
+                    ops: transformed_ops,
                     inverses: Vec::new(),
                     applied_on_visible: false,
                     unverified_offline_edit: false,
@@ -965,7 +1021,14 @@ impl ClientSyncMachine {
     /// Applies every pending transaction to the visible state as it stands.
     fn replay_pending_in_place(&mut self) {
         for entry in &mut self.pending {
-            match apply_ops_atomic(&mut self.visible, &entry.ops) {
+            let transformed = transform_ops_through_permute(
+                &entry.ops,
+                &self.confirmed_permutes,
+                entry.wire.base_server_seq,
+                entry.wire.replica,
+                entry.wire.client_seq,
+            );
+            match apply_ops_atomic(&mut self.visible, &transformed) {
                 Ok(invs) => {
                     entry.inverses = invs;
                     entry.applied_on_visible = true;
@@ -991,7 +1054,7 @@ impl ClientSyncMachine {
                     || batch_bytes.saturating_add(entry_bytes)
                         > DEFAULT_MAX_PUSH_BYTES.saturating_sub(PUSH_FRAME_OVERHEAD))
             {
-                actions.push(ClientAction::SendFrame(WireSyncFrameV1::Push {
+                actions.push(ClientAction::SendFrame(WireSyncFrameV2::Push {
                     txns: core::mem::take(&mut batch),
                 }));
                 batch_bytes = 0;
@@ -1001,7 +1064,7 @@ impl ClientSyncMachine {
             batch_bytes = batch_bytes.saturating_add(entry_bytes);
         }
         if !batch.is_empty() {
-            actions.push(ClientAction::SendFrame(WireSyncFrameV1::Push {
+            actions.push(ClientAction::SendFrame(WireSyncFrameV2::Push {
                 txns: batch,
             }));
         }
@@ -1013,7 +1076,7 @@ impl ClientSyncMachine {
             return;
         }
         self.rewind_all_pending();
-        let txns: Vec<WirePendingTxnV2> = self.pending.drain(..).map(|e| e.wire).collect();
+        let txns: Vec<WirePendingTxnV3> = self.pending.drain(..).map(|e| e.wire).collect();
         let from_client_seq = txns.first().map_or(1, |t| t.client_seq);
         actions.push(ClientAction::SaveUnsyncedLocal {
             from_client_seq,
@@ -1026,16 +1089,25 @@ impl ClientSyncMachine {
 }
 
 /// Computes `replay(confirmed, pending)` cleanly onto a fresh clone of
-/// `confirmed` (used by tests and deterministic simulation to verify Invariant #1).
+/// `confirmed` applying E16 `confirmed_permutes` (used by tests and deterministic
+/// simulation to verify Invariant #1).
 #[must_use]
 pub fn replay_pending_onto(
     confirmed: &Workbook<BoundFormula>,
-    pending: &[WirePendingTxnV2],
+    pending: &[WirePendingTxnV3],
+    confirmed_permutes: &[CommittedPermute],
 ) -> Workbook<BoundFormula> {
     let mut wb = confirmed.clone();
     for item in pending {
-        if let Ok((_, ops)) = ops_from_wire_txn_v2(item.txn.clone()) {
-            let _ = apply_ops_atomic(&mut wb, &ops);
+        if let Ok((_, ops)) = ops_from_wire_txn_v3(item.txn.clone()) {
+            let transformed = transform_ops_through_permute(
+                &ops,
+                confirmed_permutes,
+                item.base_server_seq,
+                item.replica,
+                item.client_seq,
+            );
+            let _ = apply_ops_atomic(&mut wb, &transformed);
         }
     }
     wb

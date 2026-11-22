@@ -114,11 +114,15 @@ fn main() -> ExitCode {
         report.threads
     );
     println!(
-        "  faults: edits={}, if={}, formulas={}, moves={}, sheets={}, reorder={}, slow_disc={}, snap_catchup={}, crashes={}, opfs_loss={}, srv_crash={}, epoch_restore={}, downgrades={}, rejects={}, dup_acks={}, rogue_rej={}, two_tab={}",
+        "  faults: edits={}, if={}, formulas={}, moves={}, permutes={}, move_cells={}, names={}, e16_xform={}, sheets={}, reorder={}, slow_disc={}, snap_catchup={}, crashes={}, opfs_loss={}, srv_crash={}, epoch_restore={}, downgrades={}, rejects={}, dup_acks={}, rogue_rej={}, two_tab={}",
         report.faults.local_edits,
         report.faults.set_cells_if_ops,
         report.faults.formula_ops,
         report.faults.move_row_col_ops,
+        report.faults.permute_content_ops,
+        report.faults.move_cells_ops,
+        report.faults.named_range_ops,
+        report.faults.e16_transformed_edits,
         report.faults.structural_sheet_ops,
         report.faults.reordered_deliveries,
         report.faults.slow_receiver_disconnects,

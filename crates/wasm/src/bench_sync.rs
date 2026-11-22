@@ -18,10 +18,10 @@ use reticula_core::ops::{CellEdit, CellInput, FormatPatch, Op, ScalarValue, Work
 use reticula_formula::binder::BoundFormula;
 use reticula_formula::engine::FormulaEngine;
 use reticula_sync::{ClientAction, ClientSyncMachine};
-use reticula_wire::convert_v2::ops_to_wire_txn_v2;
+use reticula_wire::convert_v3::ops_to_wire_txn_v3;
 use reticula_wire::snapshot::encode_snapshot_v1;
-use reticula_wire::sync_frame::encode_sync_frame;
-use reticula_wire::v2::{WireCatchupV1, WireCommittedTxnV2, WireSyncFrameV1};
+use reticula_wire::sync_frame::encode_sync_frame_v2;
+use reticula_wire::v3::{WireCatchupV2, WireCommittedTxnV3, WireSyncFrameV2};
 use wasm_bindgen::prelude::*;
 
 use crate::collab::{SyncCheckpointInfo, SyncCommand};
@@ -109,20 +109,20 @@ fn base_workbook() -> Workbook<BoundFormula> {
 }
 
 /// The `n`-th remote commit: one cell of column A, below every pending edit.
-fn remote_commit(seq: u64, n: u64) -> WireCommittedTxnV2 {
+fn remote_commit(seq: u64, n: u64) -> WireCommittedTxnV3 {
     let row = 50_000 + u32::try_from(n % 40_000).unwrap_or(0);
     let value = f64::from(u32::try_from(n % 1_000).unwrap_or(0));
-    WireCommittedTxnV2 {
+    WireCommittedTxnV3 {
         seq,
         replica: REMOTE_REPLICA,
         client_seq: n,
         user_id: REMOTE_USER,
         timestamp_ms: 0,
-        txn: ops_to_wire_txn_v2(
+        txn: ops_to_wire_txn_v3(
             "Remote edit".into(),
             &[set_cells(vec![number(row, COL_A, value)])],
         )
-        .expect("bench op fits wire v2"),
+        .expect("bench op fits wire v3"),
     }
 }
 
@@ -173,6 +173,7 @@ impl SyncBench {
             0,
             workbook.clone(),
             Vec::new(),
+            Vec::new(),
             0,
         );
         let _ = machine.on_connected();
@@ -213,7 +214,7 @@ impl SyncBench {
         });
         let _ = engine.handle_sync_command(SyncCommand::Connected);
         let _ = engine.handle_sync_command(SyncCommand::Receive {
-            frame: encode_sync_frame(&welcome(1)).expect("welcome encodes"),
+            frame: encode_sync_frame_v2(&welcome(1)).expect("welcome encodes"),
         });
         for ops in &txns {
             engine
@@ -280,7 +281,7 @@ impl SyncBench {
     pub fn step_engine(&mut self) -> f64 {
         self.engine_seq += 1;
         self.remote_count += 1;
-        let frame = encode_sync_frame(&WireSyncFrameV1::Commit {
+        let frame = encode_sync_frame_v2(&WireSyncFrameV2::Commit {
             seq: self.engine_seq,
             replica: REMOTE_REPLICA,
             client_seq: self.remote_count,
@@ -337,14 +338,14 @@ impl SyncBench {
     }
 }
 
-fn welcome(head_seq: u64) -> WireSyncFrameV1 {
-    WireSyncFrameV1::Welcome {
+fn welcome(head_seq: u64) -> WireSyncFrameV2 {
+    WireSyncFrameV2::Welcome {
         epoch: 0,
         head_seq,
         replica: LOCAL_REPLICA,
         last_client_seq: 0,
         max_id_counter: 0,
-        catchup: WireCatchupV1::Txns {
+        catchup: WireCatchupV2::Txns {
             from_seq: head_seq + 1,
             txns: Vec::new(),
         },

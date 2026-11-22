@@ -1,17 +1,19 @@
 use reticula_core::id::{ColId, RowId, SheetId, pack_id};
 use reticula_core::ops::{CellEdit, CellInput, FormatPatch, Op, ScalarValue};
-use reticula_server::docs::{DocRooms, RoomConnection};
+use reticula_core::value::Value;
+use reticula_server::docs::{DocRooms, RoomConnection, RoomError};
 use reticula_server::store::{BatchEntry, MAIN_BRANCH, Store, StoreError};
 use reticula_sync::{MemberRole, ServerDocMachine, StagedTxn, TryApplyOutcome};
-use reticula_wire::convert_v2::ops_to_wire_txn_v2;
-use reticula_wire::sync_frame::decode_sync_frame;
-use reticula_wire::v2::{SYNC_PROTOCOL_VERSION, WirePendingTxnV2, WireSyncFrameV1};
+use reticula_wire::convert_v3::ops_to_wire_txn_v3;
+use reticula_wire::sync_frame::{decode_sync_frame, decode_sync_frame_v2};
+use reticula_wire::v2::{SYNC_PROTOCOL_VERSION, WireRejectReasonV1, WireSyncFrameV1};
+use reticula_wire::v3::{SYNC_PROTOCOL_VERSION_V2, WirePendingTxnV3, WireSyncFrameV2};
 use sqlx::PgPool;
 use tokio::time::{Duration, timeout};
 use uuid::Uuid;
 
-fn pending_edit(replica: u32, client_seq: u64, base_server_seq: u64) -> WirePendingTxnV2 {
-    let txn = ops_to_wire_txn_v2(
+fn pending_edit(replica: u32, client_seq: u64, base_server_seq: u64) -> WirePendingTxnV3 {
+    let txn = ops_to_wire_txn_v3(
         format!("Edit {client_seq}"),
         &[Op::SetCells {
             sheet: SheetId(0),
@@ -24,12 +26,28 @@ fn pending_edit(replica: u32, client_seq: u64, base_server_seq: u64) -> WirePend
         }],
     )
     .unwrap();
-    WirePendingTxnV2 {
+    WirePendingTxnV3 {
         replica,
         client_seq,
         base_server_seq,
         timestamp_ms: 0,
         txn,
+    }
+}
+
+fn pending_ops_txn(
+    replica: u32,
+    client_seq: u64,
+    base_server_seq: u64,
+    label: &str,
+    ops: &[Op<reticula_formula::binder::BoundFormula>],
+) -> WirePendingTxnV3 {
+    WirePendingTxnV3 {
+        replica,
+        client_seq,
+        base_server_seq,
+        timestamp_ms: 0,
+        txn: ops_to_wire_txn_v3(label.to_owned(), ops).unwrap(),
     }
 }
 
@@ -50,15 +68,33 @@ fn stage(machine: &mut ServerDocMachine, user: Uuid, replica: u32, client_seq: u
     }
 }
 
-async fn read_frame(connection: &mut RoomConnection) -> Option<WireSyncFrameV1> {
+async fn read_frame(connection: &mut RoomConnection) -> Option<WireSyncFrameV2> {
+    timeout(Duration::from_secs(5), connection.recv())
+        .await
+        .unwrap()
+        .map(|bytes| decode_sync_frame_v2(&bytes).unwrap())
+}
+
+async fn read_v1_frame(connection: &mut RoomConnection) -> Option<WireSyncFrameV1> {
     timeout(Duration::from_secs(5), connection.recv())
         .await
         .unwrap()
         .map(|bytes| decode_sync_frame(&bytes).unwrap())
 }
 
-fn hello(doc: Uuid, replica: Option<u32>, last_applied_seq: u64) -> WireSyncFrameV1 {
-    WireSyncFrameV1::Hello {
+fn hello(doc: Uuid, replica: Option<u32>, last_applied_seq: u64) -> WireSyncFrameV2 {
+    WireSyncFrameV2::Hello {
+        protocol_version: SYNC_PROTOCOL_VERSION_V2,
+        doc_id: doc.into_bytes(),
+        branch_id: MAIN_BRANCH.into_bytes(),
+        replica,
+        last_applied_seq,
+        known_epoch: 0,
+    }
+}
+
+fn hello_v1(doc: Uuid, replica: Option<u32>, last_applied_seq: u64) -> WireSyncFrameV2 {
+    WireSyncFrameV2::Hello {
         protocol_version: SYNC_PROTOCOL_VERSION,
         doc_id: doc.into_bytes(),
         branch_id: MAIN_BRANCH.into_bytes(),
@@ -118,15 +154,15 @@ async fn actor_acks_committed_rows_and_isolates_a_failed_room() {
         .unwrap();
     assert!(matches!(
         read_frame(&mut sender).await,
-        Some(WireSyncFrameV1::Welcome { replica: 1, .. })
+        Some(WireSyncFrameV2::Welcome { replica: 1, .. })
     ));
     assert!(matches!(
         read_frame(&mut observer).await,
-        Some(WireSyncFrameV1::Welcome { replica: 2, .. })
+        Some(WireSyncFrameV2::Welcome { replica: 2, .. })
     ));
     assert!(matches!(
         read_frame(&mut independent).await,
-        Some(WireSyncFrameV1::Welcome { .. })
+        Some(WireSyncFrameV2::Welcome { .. })
     ));
 
     sender
@@ -136,7 +172,7 @@ async fn actor_acks_committed_rows_and_isolates_a_failed_room() {
     let first_ack = read_frame(&mut sender).await.unwrap();
     assert!(matches!(
         first_ack,
-        WireSyncFrameV1::Ack {
+        WireSyncFrameV2::Ack {
             seq: 1,
             client_seq: 1,
             ..
@@ -145,23 +181,23 @@ async fn actor_acks_committed_rows_and_isolates_a_failed_room() {
     assert_eq!(store.load_machine(doc).await.unwrap().head_seq(), 2);
     assert!(matches!(
         read_frame(&mut sender).await,
-        Some(WireSyncFrameV1::Commit { seq: 1, .. })
+        Some(WireSyncFrameV2::Commit { seq: 1, .. })
     ));
     assert!(matches!(
         read_frame(&mut sender).await,
-        Some(WireSyncFrameV1::Ack { seq: 2, .. })
+        Some(WireSyncFrameV2::Ack { seq: 2, .. })
     ));
     assert!(matches!(
         read_frame(&mut sender).await,
-        Some(WireSyncFrameV1::Commit { seq: 2, .. })
+        Some(WireSyncFrameV2::Commit { seq: 2, .. })
     ));
     assert!(matches!(
         read_frame(&mut observer).await,
-        Some(WireSyncFrameV1::Commit { seq: 1, .. })
+        Some(WireSyncFrameV2::Commit { seq: 1, .. })
     ));
     assert!(matches!(
         read_frame(&mut observer).await,
-        Some(WireSyncFrameV1::Commit { seq: 2, .. })
+        Some(WireSyncFrameV2::Commit { seq: 2, .. })
     ));
 
     let mut other_writer = store.load_machine(doc).await.unwrap();
@@ -189,7 +225,7 @@ async fn actor_acks_committed_rows_and_isolates_a_failed_room() {
         .unwrap();
     assert!(matches!(
         read_frame(&mut independent).await,
-        Some(WireSyncFrameV1::Ack { seq: 1, .. })
+        Some(WireSyncFrameV2::Ack { seq: 1, .. })
     ));
     let mut reconnected = registry
         .join(
@@ -203,7 +239,7 @@ async fn actor_acks_committed_rows_and_isolates_a_failed_room() {
         .unwrap();
     assert!(matches!(
         read_frame(&mut reconnected).await,
-        Some(WireSyncFrameV1::Welcome {
+        Some(WireSyncFrameV2::Welcome {
             head_seq: 3,
             last_client_seq: 2,
             ..
@@ -354,5 +390,306 @@ async fn commits_multiple_replicas_atomically_and_recovers_snapshot_plus_log() {
     assert!(matches!(
         store.load_machine(doc).await,
         Err(StoreError::Invalid("snapshot checksum or length"))
+    ));
+}
+
+#[tokio::test]
+#[ignore = "requires an isolated PostgreSQL database in RETICULA_TEST_DATABASE_URL"]
+async fn e16_permute_survives_snapshot_and_cold_restart() {
+    let url = std::env::var("RETICULA_TEST_DATABASE_URL").unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::connect(&url, dir.path().to_path_buf())
+        .await
+        .unwrap();
+    let db = PgPool::connect(&url).await.unwrap();
+    let alice = Uuid::new_v4();
+    let bob = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO users (id, name, avatar_url) VALUES ($1, 'Alice', ''), ($2, 'Bob', '')",
+    )
+    .bind(alice)
+    .bind(bob)
+    .execute(&db)
+    .await
+    .unwrap();
+    let doc = store
+        .create_workbook(alice, "Sort restart sheet")
+        .await
+        .unwrap();
+    let mut machine = store.load_machine(doc).await.unwrap();
+    let bob_replica = machine.allocate_replica(bob.into_bytes()).unwrap();
+    assert_eq!(bob_replica, 2);
+    store.register_replica(doc, bob, bob_replica).await.unwrap();
+
+    let rows = vec![RowId(1), RowId(2), RowId(3)];
+    let cols = vec![ColId(1)];
+    let init_txn = pending_ops_txn(
+        1,
+        1,
+        0,
+        "Seed rows",
+        &[Op::SetCells {
+            sheet: SheetId(0),
+            edits: vec![
+                CellEdit {
+                    row: RowId(1),
+                    col: ColId(1),
+                    input: CellInput::Scalar(ScalarValue::Number(10.0)),
+                    format: FormatPatch::Keep,
+                },
+                CellEdit {
+                    row: RowId(2),
+                    col: ColId(1),
+                    input: CellInput::Scalar(ScalarValue::Number(20.0)),
+                    format: FormatPatch::Keep,
+                },
+                CellEdit {
+                    row: RowId(3),
+                    col: ColId(1),
+                    input: CellInput::Scalar(ScalarValue::Number(30.0)),
+                    format: FormatPatch::Keep,
+                },
+            ],
+        }],
+    );
+    let TryApplyOutcome::Staged(s1) = machine
+        .validate_and_try_apply(
+            alice.into_bytes(),
+            Some(MemberRole::Owner),
+            1,
+            init_txn,
+            100,
+        )
+        .unwrap()
+    else {
+        panic!("expected Staged s1");
+    };
+    let sort_txn = pending_ops_txn(
+        1,
+        2,
+        1,
+        "Permute",
+        &[Op::PermuteContent {
+            sheet: SheetId(0),
+            rows,
+            cols,
+            row_perm: vec![2, 0, 1],
+        }],
+    );
+    let TryApplyOutcome::Staged(s2) = machine
+        .validate_and_try_apply(
+            alice.into_bytes(),
+            Some(MemberRole::Owner),
+            1,
+            sort_txn,
+            200,
+        )
+        .unwrap()
+    else {
+        panic!("expected Staged s2");
+    };
+    store
+        .commit_batch(
+            doc,
+            0,
+            &[
+                BatchEntry {
+                    staged: &s1,
+                    base_seq: 0,
+                },
+                BatchEntry {
+                    staged: &s2,
+                    base_seq: 1,
+                },
+            ],
+            machine.workbook().estimated_bytes(),
+        )
+        .await
+        .unwrap();
+    machine.commit_staged(s1);
+    machine.commit_staged(s2);
+    let snap = store.write_snapshot(&machine).await.unwrap();
+    assert_eq!(snap.seq(), 2);
+
+    // Cold restart from snapshot with SECTION_PERMUTE_LOG_V1 (no WAL tail needed).
+    let mut cold = store.load_machine(doc).await.unwrap();
+    assert_eq!(cold.committed_permutes().len(), 1);
+
+    // Late offline Bob (base_server_seq = 1 < permute seq 2) targets old RowId(1) (value 10).
+    let late_bob = pending_ops_txn(
+        bob_replica,
+        1,
+        1,
+        "Offline edit on original A1",
+        &[Op::SetCells {
+            sheet: SheetId(0),
+            edits: vec![CellEdit {
+                row: RowId(1),
+                col: ColId(1),
+                input: CellInput::Scalar(ScalarValue::Number(99.0)),
+                format: FormatPatch::Keep,
+            }],
+        }],
+    );
+    let TryApplyOutcome::Staged(s3) = cold
+        .validate_and_try_apply(
+            bob.into_bytes(),
+            Some(MemberRole::Editor),
+            bob_replica,
+            late_bob,
+            300,
+        )
+        .unwrap()
+    else {
+        panic!("expected Staged s3");
+    };
+    store
+        .commit_batch(
+            doc,
+            0,
+            &[BatchEntry {
+                staged: &s3,
+                base_seq: 1,
+            }],
+            cold.workbook().estimated_bytes(),
+        )
+        .await
+        .unwrap();
+    cold.commit_staged(s3);
+
+    let final_machine = store.load_machine(doc).await.unwrap();
+    let sheet = final_machine.workbook().sheet(SheetId(0)).unwrap();
+    // perm[0] = 2 -> old RowId(3)=30 moved to RowId(1)
+    // perm[1] = 0 -> old RowId(1)=10 moved to RowId(2) -> Bob's edit lands here!
+    assert_eq!(sheet.value_by_id(RowId(1), ColId(1)), Value::Number(30.0));
+    assert_eq!(sheet.value_by_id(RowId(2), ColId(1)), Value::Number(99.0));
+    assert_eq!(sheet.value_by_id(RowId(3), ColId(1)), Value::Number(20.0));
+}
+
+#[tokio::test]
+#[ignore = "requires an isolated PostgreSQL database in RETICULA_TEST_DATABASE_URL"]
+async fn legacy_v1_client_receives_v1_commits_and_upgrade_required_on_v3_op() {
+    let url = std::env::var("RETICULA_TEST_DATABASE_URL").unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::connect(&url, dir.path().to_path_buf())
+        .await
+        .unwrap();
+    let db = PgPool::connect(&url).await.unwrap();
+    let owner = Uuid::new_v4();
+    sqlx::query("INSERT INTO users (id, name, avatar_url) VALUES ($1, 'Owner', '')")
+        .bind(owner)
+        .execute(&db)
+        .await
+        .unwrap();
+    let doc = store.create_workbook(owner, "Mixed v1/v2").await.unwrap();
+    let registry = DocRooms::new(store.clone());
+
+    let mut v2_conn = registry
+        .join(
+            doc,
+            owner,
+            MemberRole::Owner,
+            "Alice v2".into(),
+            hello(doc, Some(1), 0),
+        )
+        .await
+        .unwrap();
+    let mut v1_conn = registry
+        .join(
+            doc,
+            owner,
+            MemberRole::Owner,
+            "Alice v1".into(),
+            hello_v1(doc, None, 0),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        read_frame(&mut v2_conn).await,
+        Some(WireSyncFrameV2::Welcome { replica: 1, .. })
+    ));
+    assert!(matches!(
+        read_v1_frame(&mut v1_conn).await,
+        Some(WireSyncFrameV1::Welcome { replica: 2, .. })
+    ));
+
+    // Commit a v1-compatible SetCells op: both v2 and v1 receive it cleanly.
+    v2_conn
+        .push(vec![pending_edit(1, 1, 0)], 128)
+        .await
+        .unwrap();
+    assert!(matches!(
+        read_frame(&mut v2_conn).await,
+        Some(WireSyncFrameV2::Ack { seq: 1, .. })
+    ));
+    assert!(matches!(
+        read_frame(&mut v2_conn).await,
+        Some(WireSyncFrameV2::Commit { seq: 1, .. })
+    ));
+    assert!(matches!(
+        read_v1_frame(&mut v1_conn).await,
+        Some(WireSyncFrameV1::Commit { seq: 1, .. })
+    ));
+
+    // Commit a v3-only PermuteContent op: v2 succeeds, v1 gets UpgradeRequired & disconnects.
+    let permute_txn = pending_ops_txn(
+        1,
+        2,
+        1,
+        "Sort",
+        &[Op::PermuteContent {
+            sheet: SheetId(0),
+            rows: vec![RowId(1), RowId(2)],
+            cols: vec![ColId(1)],
+            row_perm: vec![1, 0],
+        }],
+    );
+    v2_conn.push(vec![permute_txn], 128).await.unwrap();
+    assert!(matches!(
+        read_frame(&mut v2_conn).await,
+        Some(WireSyncFrameV2::Ack { seq: 2, .. })
+    ));
+    assert!(matches!(
+        read_frame(&mut v2_conn).await,
+        Some(WireSyncFrameV2::Commit { seq: 2, .. })
+    ));
+    assert_eq!(
+        read_v1_frame(&mut v1_conn).await,
+        Some(WireSyncFrameV1::Reject {
+            client_seq: 0,
+            reason: WireRejectReasonV1::UpgradeRequired,
+        })
+    );
+    assert_eq!(read_v1_frame(&mut v1_conn).await, None);
+
+    // Reconnecting as v1 when inline catchup crosses PermuteContent rejects with UpgradeRequired.
+    let err = registry
+        .join(
+            doc,
+            owner,
+            MemberRole::Owner,
+            "Alice v1".into(),
+            hello_v1(doc, Some(2), 1),
+        )
+        .await;
+    assert!(matches!(
+        err,
+        Err(RoomError::Rejected(WireRejectReasonV1::UpgradeRequired))
+    ));
+
+    // Upgrading to v2 catches up across seq 2 cleanly.
+    let mut upgraded = registry
+        .join(
+            doc,
+            owner,
+            MemberRole::Owner,
+            "Alice v2".into(),
+            hello(doc, Some(2), 1),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        read_frame(&mut upgraded).await,
+        Some(WireSyncFrameV2::Welcome { head_seq: 2, .. })
     ));
 }

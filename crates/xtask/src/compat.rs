@@ -18,19 +18,29 @@ use reticula_core::ops::{
 };
 use reticula_core::sheet::Sheet;
 use reticula_core::style::{BorderWeight, ColorPatch, ColorValue, HorizontalAlign, StylePatch};
-use reticula_formula::binder::{BoundFormula, templatize_formula};
+use reticula_formula::binder::{BoundExpr, BoundFormula, templatize_formula};
 use reticula_formula::engine::FormulaEngine;
-use reticula_wire::snapshot::{decode_snapshot_any, encode_snapshot_v1};
-use reticula_wire::sync_frame::{decode_sync_frame, encode_sync_frame};
+use reticula_wire::snapshot::{
+    decode_snapshot_any, encode_snapshot_v1, encode_snapshot_with_permutes,
+};
+use reticula_wire::sync_frame::{
+    decode_sync_frame, decode_sync_frame_any, decode_sync_frame_v2, encode_sync_frame,
+    encode_sync_frame_v2,
+};
 use reticula_wire::v1::{WireOpV1, WireReplicaWatermarkV1, WireWalRecordV1};
 use reticula_wire::v2::{
     SYNC_PROTOCOL_VERSION, WireCatchupV1, WireCommittedTxnV2, WireOpV2, WirePendingTxnV2,
     WirePresenceRangeV1, WirePresenceV1, WireRejectReasonV1, WireStateDigestV1, WireSyncFrameV1,
     WireTxnV2, WireWalRecordV2,
 };
+use reticula_wire::v3::{
+    SYNC_PROTOCOL_VERSION_V2, WireCatchupV2, WireCommittedPermuteV3, WireCommittedTxnV3, WireOpV3,
+    WirePendingTxnV3, WireSyncFrameV2, WireTxnV3, WireWalRecordV3,
+};
 use reticula_wire::wal::{
-    encode_wal_complete, encode_wal_complete_v2, replay_wal_records, replay_wal_records_v2,
-    scan_wal, scan_wal_any,
+    encode_wal_complete, encode_wal_complete_v2, encode_wal_complete_v3, replay_wal_records,
+    replay_wal_records_v2, replay_wal_records_v3, scan_wal, scan_wal_any, scan_wal_any_v3,
+    scan_wal_v3,
 };
 
 use crate::util::{self, Flags, Result};
@@ -52,13 +62,22 @@ const FROZEN_V2_FILES: [&str; 5] = [
     "tests/compat/v2/sync_frames.bin",
 ];
 
+const FROZEN_V3_FILES: [&str; 5] = [
+    "crates/wire/src/v3.rs",
+    "tests/compat/v3/base.rtclsnap",
+    "tests/compat/v3/expected_digest.txt",
+    "tests/compat/v3/replay.rtclwal",
+    "tests/compat/v3/sync_frames.bin",
+];
+
 pub fn run(flags: &Flags) -> Result {
     if let Some(ver) = flags.get("freeze") {
         return match ver {
             "v1" => freeze_v1(),
             "v2" => freeze_v2(),
+            "v3" => freeze_v3(),
             other => Err(format!(
-                "unknown wire version `{other}` (supported: `v1`, `v2`)"
+                "unknown wire version `{other}` (supported: `v1`, `v2`, `v3`)"
             )),
         };
     }
@@ -66,7 +85,7 @@ pub fn run(flags: &Flags) -> Result {
 }
 
 pub fn check() -> Result {
-    util::step("frozen wire compatibility hashes (v1 + v2)");
+    util::step("frozen wire compatibility hashes (v1 + v2 + v3)");
     let root = util::root();
     let hashes_path = root.join(HASHES_FILE);
     let content = fs::read_to_string(&hashes_path).map_err(|e| {
@@ -92,7 +111,11 @@ pub fn check() -> Result {
         entries.push((hex.trim().to_owned(), rel_path.trim().to_owned()));
     }
 
-    for required in FROZEN_V1_FILES.iter().chain(FROZEN_V2_FILES.iter()) {
+    for required in FROZEN_V1_FILES
+        .iter()
+        .chain(FROZEN_V2_FILES.iter())
+        .chain(FROZEN_V3_FILES.iter())
+    {
         if !entries.iter().any(|(_, p)| p == required) {
             return Err(format!(
                 "{HASHES_FILE} is missing required frozen file `{required}`"
@@ -620,6 +643,386 @@ fn freeze_v2() -> Result {
 
     println!(
         "wrote tests/compat/v2/ (base={}B, wal={}B, sync_frames={}B, digest={logical_hex})",
+        snap_bytes.len(),
+        wal_bytes.len(),
+        sync_bin.len()
+    );
+    Ok(())
+}
+
+fn freeze_v3() -> Result {
+    util::step("generating tests/compat/v3 fixtures and updating hashes.txt");
+    let root = util::root();
+    let hashes_path = root.join(HASHES_FILE);
+    let existing_hashes = fs::read_to_string(&hashes_path).map_err(|e| {
+        format!(
+            "cannot read {}: {e} (v1 and v2 must be frozen before freezing v3)",
+            hashes_path.display()
+        )
+    })?;
+
+    let mut preserved_section = String::new();
+    for line in existing_hashes.lines() {
+        let trimmed = line.trim();
+        if trimmed.contains("wire v3") || FROZEN_V3_FILES.iter().any(|p| trimmed.ends_with(p)) {
+            continue;
+        }
+        if let Some((hex, rel)) = trimmed.split_once("  ")
+            && (FROZEN_V1_FILES.contains(&rel.trim()) || FROZEN_V2_FILES.contains(&rel.trim()))
+        {
+            let actual = hash_repo_file(&root.join(rel.trim()))?;
+            if actual != hex.trim() {
+                return Err(format!(
+                    "frozen file `{}` hash drifted before freeze v3 (expected {}, got {actual})",
+                    rel.trim(),
+                    hex.trim()
+                ));
+            }
+        }
+        preserved_section.push_str(line);
+        preserved_section.push('\n');
+    }
+
+    let dir = root.join("tests/compat/v3");
+    fs::create_dir_all(&dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
+
+    let s0 = SheetId(0);
+    let replica1 = pack_replica_id(0, 1).ok_or_else(|| "pack_replica_id failed".to_owned())?;
+    let base_sheet = Sheet::with_axes(s0, String::from("Sheet1"), 32, 8);
+    let mut eng = FormulaEngine::from_workbook_clean(Workbook::from_sheet(base_sheet, None));
+    for (r, raw) in ["10", "20", "30", "40"].iter().enumerate() {
+        eng.edit_cell_raw(s0, RowId(r as u64), ColId(0), raw)
+            .map_err(|e| format!("seed A: {e:?}"))?;
+    }
+    let f_rate = BoundFormula::parse_and_bind("=0.15", FormulaMode::Dynamic, eng.workbook(), s0)
+        .map_err(|e| format!("Rate formula: {e:?}"))?;
+    let f_local_max =
+        BoundFormula::parse_and_bind("=MAX(A1:A4)", FormulaMode::Dynamic, eng.workbook(), s0)
+            .map_err(|e| format!("LocalMax formula: {e:?}"))?;
+    eng.apply_op(Op::DefineNamedRange {
+        scope: None,
+        name: String::from("Rate"),
+        formula: f_rate,
+        comment: Some(String::from("Workbook rate")),
+        hidden: false,
+    })
+    .map_err(|e| format!("DefineNamedRange Rate: {e:?}"))?;
+    eng.apply_op(Op::DefineNamedRange {
+        scope: Some(s0),
+        name: String::from("LocalMax"),
+        formula: f_local_max,
+        comment: None,
+        hidden: true,
+    })
+    .map_err(|e| format!("DefineNamedRange LocalMax: {e:?}"))?;
+
+    eng.edit_cell_raw(s0, RowId(0), ColId(1), "=SEQUENCE(3,1,1,1)")
+        .map_err(|e| format!("seed B1: {e:?}"))?;
+    eng.edit_cell_raw(s0, RowId(1), ColId(1), "=SUM(B1#)")
+        .map_err(|e| format!("seed B2: {e:?}"))?;
+    eng.edit_cell_raw(s0, RowId(0), ColId(2), "=Rate")
+        .map_err(|e| format!("seed C1: {e:?}"))?;
+    eng.edit_cell_raw(s0, RowId(1), ColId(2), "=Sheet1!LocalMax")
+        .map_err(|e| format!("seed C2: {e:?}"))?;
+    eng.edit_cell_raw(s0, RowId(0), ColId(3), "=IF(A1>0,,99)")
+        .map_err(|e| format!("seed D1: {e:?}"))?;
+    eng.apply_op(Op::SetCells {
+        sheet: s0,
+        edits: vec![
+            CellEdit {
+                row: RowId(1),
+                col: ColId(3),
+                input: CellInput::Formula {
+                    formula: BoundFormula {
+                        mode: FormulaMode::Dynamic,
+                        root: BoundExpr::PreservedCached {
+                            raw: String::from("=FUTURE_FN(1)"),
+                            cached: ScalarValue::Number(42.5),
+                        },
+                    },
+                    cached: Some(ScalarValue::Number(42.5)),
+                },
+                format: FormatPatch::Keep,
+            },
+            CellEdit {
+                row: RowId(2),
+                col: ColId(3),
+                input: CellInput::Formula {
+                    formula: BoundFormula {
+                        mode: FormulaMode::Dynamic,
+                        root: BoundExpr::Opaque {
+                            raw: String::from("=Table1[Amount]"),
+                        },
+                    },
+                    cached: Some(ScalarValue::Number(7.5)),
+                },
+                format: FormatPatch::Keep,
+            },
+        ],
+    })
+    .map_err(|e| format!("seed D2/D3: {e:?}"))?;
+    eng.recalc_all();
+
+    let watermarks = [WireReplicaWatermarkV1 {
+        replica: replica1,
+        last_client_seq: 4,
+        max_id_counter: 1,
+    }];
+    let permutes = [WireCommittedPermuteV3 {
+        seq: 4,
+        replica: replica1,
+        client_seq: 4,
+        sheet: s0.0,
+        cols: vec![0],
+        row_pairs: vec![(0, 1), (1, 0)],
+    }];
+    let snap_bytes = encode_snapshot_with_permutes(eng.workbook(), &watermarks, &permutes)
+        .map_err(|e| format!("encode_snapshot_with_permutes: {e:?}"))?;
+
+    let permute_op = Op::PermuteContent {
+        sheet: s0,
+        rows: vec![RowId(0), RowId(1), RowId(2)],
+        cols: vec![ColId(0)],
+        row_perm: vec![2, 0, 1],
+    };
+    let move_op = Op::MoveCells {
+        src_sheet: s0,
+        src_rows: vec![RowId(3)],
+        src_cols: vec![ColId(0)],
+        dst_sheet: s0,
+        dst_rows: vec![RowId(3)],
+        dst_cols: vec![ColId(2)],
+    };
+    let f_tax = BoundFormula::parse_and_bind("=C4*0.2", FormulaMode::Dynamic, eng.workbook(), s0)
+        .map_err(|e| format!("Tax formula: {e:?}"))?;
+    let define_tax_op = Op::DefineNamedRange {
+        scope: Some(s0),
+        name: String::from("Tax"),
+        formula: f_tax,
+        comment: Some(String::from("Local tax")),
+        hidden: false,
+    };
+    let f_spill = BoundFormula::parse_and_bind("=B1#", FormulaMode::Dynamic, eng.workbook(), s0)
+        .map_err(|e| format!("Spill formula: {e:?}"))?;
+    let delete_and_spill_ops = [
+        Op::DeleteNamedRange {
+            scope: None,
+            name: String::from("Rate"),
+        },
+        Op::SetCells {
+            sheet: s0,
+            edits: vec![CellEdit {
+                row: RowId(0),
+                col: ColId(4),
+                input: CellInput::Formula {
+                    formula: f_spill,
+                    cached: None,
+                },
+                format: FormatPatch::Set(NumberFormat::Fixed2),
+            }],
+        },
+    ];
+
+    let wal_records = vec![
+        WireWalRecordV3 {
+            seq: 5,
+            timestamp_ms: 1_765_000_000_005,
+            label: String::from("Sort A1:A3"),
+            ops: vec![WireOpV3::try_from(&permute_op).map_err(|e| format!("WireOpV3: {e:?}"))?],
+        },
+        WireWalRecordV3 {
+            seq: 6,
+            timestamp_ms: 1_765_000_000_006,
+            label: String::from("Move A4 to C4"),
+            ops: vec![WireOpV3::try_from(&move_op).map_err(|e| format!("WireOpV3: {e:?}"))?],
+        },
+        WireWalRecordV3 {
+            seq: 7,
+            timestamp_ms: 1_765_000_000_007,
+            label: String::from("Define Tax"),
+            ops: vec![WireOpV3::try_from(&define_tax_op).map_err(|e| format!("WireOpV3: {e:?}"))?],
+        },
+        WireWalRecordV3 {
+            seq: 8,
+            timestamp_ms: 1_765_000_000_008,
+            label: String::from("Delete Rate & spill ref"),
+            ops: delete_and_spill_ops
+                .iter()
+                .map(WireOpV3::try_from)
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|e| format!("WireOpV3: {e:?}"))?,
+        },
+    ];
+    let wal_bytes = encode_wal_complete_v3(4, &wal_records)
+        .map_err(|e| format!("encode_wal_complete_v3: {e:?}"))?;
+
+    let mut verify_decoded =
+        decode_snapshot_any(&snap_bytes).map_err(|e| format!("decode v3 snap: {e:?}"))?;
+    let scan = scan_wal_v3(&wal_bytes, 4, 8).map_err(|e| format!("scan_wal_v3: {e:?}"))?;
+    let scan_any =
+        scan_wal_any_v3(&wal_bytes, 4, 8).map_err(|e| format!("scan_wal_any_v3: {e:?}"))?;
+    if scan_any != scan {
+        return Err("scan_wal_any_v3 mismatch on v3 fixture".to_owned());
+    }
+    replay_wal_records_v3(&mut verify_decoded.engine, &scan.records, 0, true)
+        .map_err(|e| format!("replay_wal_records_v3: {e:?}"))?;
+
+    let logical_hex =
+        String::from_utf8_lossy(&to_hex(verify_decoded.engine.workbook().logical_digest()))
+            .into_owned();
+    let sd = verify_decoded.engine.workbook().state_digest();
+    let lo_hex = String::from_utf8_lossy(&to_hex(sd.content_lo)).into_owned();
+    let hi_hex = String::from_utf8_lossy(&to_hex(sd.content_hi)).into_owned();
+    let ord_hex = String::from_utf8_lossy(&to_hex(sd.order)).into_owned();
+    let expected_txt = format!(
+        "{logical_hex}\nv{}:{lo_hex}:{hi_hex}:{ord_hex}\n",
+        sd.version
+    );
+
+    let frames = vec![
+        WireSyncFrameV2::Hello {
+            protocol_version: SYNC_PROTOCOL_VERSION_V2,
+            doc_id: [0x33; 16],
+            branch_id: [0_u8; 16],
+            replica: Some(replica1),
+            last_applied_seq: 4,
+            known_epoch: 0,
+        },
+        WireSyncFrameV2::Welcome {
+            epoch: 0,
+            head_seq: 8,
+            replica: replica1,
+            last_client_seq: 4,
+            max_id_counter: 1,
+            catchup: WireCatchupV2::Txns {
+                from_seq: 5,
+                txns: vec![WireCommittedTxnV3 {
+                    seq: 5,
+                    replica: replica1,
+                    client_seq: 5,
+                    user_id: [0x44; 16],
+                    timestamp_ms: 1_765_000_000_005,
+                    txn: WireTxnV3 {
+                        label: String::from("Sort A1:A3"),
+                        ops: vec![
+                            WireOpV3::try_from(&permute_op)
+                                .map_err(|e| format!("WireOpV3: {e:?}"))?,
+                        ],
+                    },
+                }],
+            },
+        },
+        WireSyncFrameV2::Welcome {
+            epoch: 1,
+            head_seq: 8,
+            replica: pack_replica_id(1, 2).unwrap_or(1),
+            last_client_seq: 0,
+            max_id_counter: 0,
+            catchup: WireCatchupV2::SnapshotRequired {
+                snapshot_seq: 4,
+                url: String::from("/api/workbooks/33333333/snapshots/4"),
+            },
+        },
+        WireSyncFrameV2::Push {
+            txns: vec![WirePendingTxnV3 {
+                replica: replica1,
+                client_seq: 6,
+                base_server_seq: 5,
+                timestamp_ms: 1_765_000_000_006,
+                txn: WireTxnV3 {
+                    label: String::from("Move A4 to C4"),
+                    ops: vec![
+                        WireOpV3::try_from(&move_op).map_err(|e| format!("WireOpV3: {e:?}"))?,
+                    ],
+                },
+            }],
+        },
+        WireSyncFrameV2::Ack {
+            replica: replica1,
+            client_seq: 6,
+            seq: 6,
+            timestamp_ms: 1_765_000_000_006,
+        },
+        WireSyncFrameV2::Reject {
+            client_seq: 7,
+            reason: WireRejectReasonV1::UpgradeRequired,
+        },
+        WireSyncFrameV2::Commit {
+            seq: 7,
+            replica: replica1,
+            client_seq: 7,
+            user_id: [0x44; 16],
+            timestamp_ms: 1_765_000_000_007,
+            txn: WireTxnV3 {
+                label: String::from("Define Tax"),
+                ops: vec![
+                    WireOpV3::try_from(&define_tax_op).map_err(|e| format!("WireOpV3: {e:?}"))?,
+                ],
+            },
+        },
+        WireSyncFrameV2::Digest {
+            seq: 8,
+            state_digest: WireStateDigestV1::from(sd),
+        },
+        WireSyncFrameV2::Presence(WirePresenceV1 {
+            replica: replica1,
+            user_id: [0x44; 16],
+            display_name: String::from("Alice"),
+            color_slot: 1,
+            sheet_id: s0.0,
+            cursor_row: 0,
+            cursor_col: 4,
+            selection: Some(WirePresenceRangeV1 {
+                start_row: 0,
+                start_col: 0,
+                end_row: 2,
+                end_col: 4,
+            }),
+        }),
+        WireSyncFrameV2::Ping(67890),
+        WireSyncFrameV2::Pong(67890),
+    ];
+
+    let mut sync_bin = Vec::new();
+    for frame in &frames {
+        let packet =
+            encode_sync_frame_v2(frame).map_err(|e| format!("encode_sync_frame_v2: {e:?}"))?;
+        let roundtrip =
+            decode_sync_frame_v2(&packet).map_err(|e| format!("decode_sync_frame_v2: {e:?}"))?;
+        if &roundtrip != frame {
+            return Err("sync v2 frame round-trip mismatch".to_owned());
+        }
+        let (_, any_rt) =
+            decode_sync_frame_any(&packet).map_err(|e| format!("decode_sync_frame_any: {e:?}"))?;
+        if &any_rt != frame {
+            return Err("sync v2 any decode mismatch".to_owned());
+        }
+        let len_u32 = u32::try_from(packet.len()).map_err(|_| "frame len overflow".to_owned())?;
+        sync_bin.extend_from_slice(&len_u32.to_le_bytes());
+        sync_bin.extend_from_slice(&packet);
+    }
+
+    fs::write(dir.join("base.rtclsnap"), &snap_bytes)
+        .map_err(|e| format!("write v3 base.rtclsnap: {e}"))?;
+    fs::write(dir.join("replay.rtclwal"), &wal_bytes)
+        .map_err(|e| format!("write v3 replay.rtclwal: {e}"))?;
+    fs::write(dir.join("expected_digest.txt"), &expected_txt)
+        .map_err(|e| format!("write v3 expected_digest.txt: {e}"))?;
+    fs::write(dir.join("sync_frames.bin"), &sync_bin)
+        .map_err(|e| format!("write v3 sync_frames.bin: {e}"))?;
+
+    let mut out_hashes = preserved_section;
+    out_hashes.push_str(
+        "# Frozen SHA-256 manifest for wire v3 schema, sync protocol v2 frames and fixtures (D-020).\n",
+    );
+    for rel in FROZEN_V3_FILES {
+        let h = hash_repo_file(&root.join(rel))?;
+        out_hashes.push_str(&format!("{h}  {rel}\n"));
+    }
+    fs::write(&hashes_path, out_hashes).map_err(|e| format!("write {HASHES_FILE}: {e}"))?;
+
+    println!(
+        "wrote tests/compat/v3/ (base={}B, wal={}B, sync_frames={}B, digest={logical_hex})",
         snap_bytes.len(),
         wal_bytes.len(),
         sync_bin.len()

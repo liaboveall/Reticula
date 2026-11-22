@@ -11,9 +11,10 @@ use reticula_core::ops::{InverseOp, Op, Workbook};
 use reticula_core::viewport::{self, Page, PageRange};
 use reticula_formula::binder::BoundFormula;
 use reticula_formula::engine::FormulaEngine;
-use reticula_wire::convert_v2::ops_from_wire_txn_v2;
+use reticula_wire::convert_v3::ops_from_wire_txn_v3;
 use reticula_wire::snapshot::decode_snapshot_any;
 use reticula_wire::v2::WireCommittedTxnV2;
+use reticula_wire::v3::WireCommittedTxnV3;
 use tsify::Ts;
 use wasm_bindgen::prelude::*;
 
@@ -28,7 +29,7 @@ pub struct HistoryPlayer {
     base_seq: u64,
     current_seq: u64,
     active_sheet: SheetId,
-    txns: Vec<WireCommittedTxnV2>,
+    txns: Vec<WireCommittedTxnV3>,
     applied_inverses: Vec<(u64, Vec<InverseOp<BoundFormula>>)>,
     text_scratch: String,
     due_pages: VecDeque<(SheetId, u32, Page)>,
@@ -238,8 +239,12 @@ impl HistoryPlayer {
     }
 
     pub fn append_txns_bytes(&mut self, postcard_bytes: &[u8]) -> Result<u64, String> {
-        let batch: Vec<WireCommittedTxnV2> = postcard::from_bytes(postcard_bytes)
-            .map_err(|_| String::from("could not decode history transaction batch"))?;
+        let batch: Vec<WireCommittedTxnV3> = match postcard::from_bytes(postcard_bytes) {
+            Ok(txns) => txns,
+            Err(_) => postcard::from_bytes::<Vec<WireCommittedTxnV2>>(postcard_bytes)
+                .map(|legacy| legacy.into_iter().map(WireCommittedTxnV3::from).collect())
+                .map_err(|_| String::from("could not decode history transaction batch"))?,
+        };
         for txn in batch {
             let max_seq = self.max_loaded_seq();
             if txn.seq <= max_seq {
@@ -383,7 +388,7 @@ impl HistoryPlayer {
                 .txns
                 .get(idx)
                 .ok_or_else(|| String::from("missing transaction in history slice"))?;
-            let (_, ops): (_, Vec<Op<BoundFormula>>) = ops_from_wire_txn_v2(txn.txn.clone())
+            let (_, ops): (_, Vec<Op<BoundFormula>>) = ops_from_wire_txn_v3(txn.txn.clone())
                 .map_err(|err| format!("failed to decode history txn #{}: {err:?}", txn.seq))?;
             let invs = self
                 .engine

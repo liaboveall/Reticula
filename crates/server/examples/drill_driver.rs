@@ -16,10 +16,10 @@ use reticula_core::id::{ColId, RowId, SheetId, unpack_id, unpack_replica_id};
 use reticula_core::ops::{CellEdit, CellInput, FormatPatch, Op, ScalarValue, Workbook};
 use reticula_core::state_digest::StateDigest;
 use reticula_formula::binder::BoundFormula;
-use reticula_sync::{ClientAction, ClientSyncMachine, ReplicaWatermark};
+use reticula_sync::{ClientAction, ClientSyncMachine, CommittedPermute, ReplicaWatermark};
 use reticula_wire::snapshot::{decode_snapshot_any, encode_snapshot_v1};
-use reticula_wire::sync_frame::{decode_sync_frame, encode_sync_frame};
-use reticula_wire::v2::{WireCommittedTxnV2, WireOpV2, WirePendingTxnV2, WireSyncFrameV1};
+use reticula_wire::sync_frame::{decode_sync_frame_v2, encode_sync_frame_v2};
+use reticula_wire::v3::{WireCommittedTxnV3, WireOpV3, WirePendingTxnV3, WireSyncFrameV2};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -62,7 +62,7 @@ struct SavedClientState {
     last_acked_client_seq: u64,
     next_id_counter: u32,
     confirmed_snapshot: Vec<u8>,
-    pending: Vec<WirePendingTxnV2>,
+    pending: Vec<WirePendingTxnV3>,
 }
 
 struct Args {
@@ -285,13 +285,13 @@ async fn fetch_all_tail_txns(
     doc: Uuid,
     cookie: &str,
     after_seq: u64,
-) -> AppResult<Vec<WireCommittedTxnV2>> {
+) -> AppResult<Vec<WireCommittedTxnV3>> {
     let mut out = Vec::new();
     let mut cursor = after_seq;
     loop {
         let path = format!("/api/workbooks/{doc}/txns?after_seq={cursor}&limit=500");
         let bytes = fetch_bytes(client, base_url, &path, cookie).await?;
-        let batch: Vec<WireCommittedTxnV2> =
+        let batch: Vec<WireCommittedTxnV3> =
             postcard::from_bytes(&bytes).map_err(|e| format!("decode txns batch: {e}"))?;
         if batch.is_empty() {
             break;
@@ -331,20 +331,21 @@ async fn ws_connect(base_url: &str, doc: Uuid, cookie: &str) -> AppResult<Socket
     Ok(socket)
 }
 
-async fn send_frame(socket: &mut Socket, frame: &WireSyncFrameV1) -> AppResult<()> {
-    let bytes = encode_sync_frame(frame).map_err(|e| format!("encode frame: {e:?}"))?;
+async fn send_frame(socket: &mut Socket, frame: &WireSyncFrameV2) -> AppResult<()> {
+    let bytes = encode_sync_frame_v2(frame).map_err(|e| format!("encode frame: {e:?}"))?;
     timeout(IO_TIMEOUT, socket.send(Message::Binary(bytes.into())))
         .await
         .map_err(|_| String::from("ws send timeout"))?
         .map_err(|e| format!("ws send: {e}"))
 }
 
-async fn recv_frame(socket: &mut Socket) -> AppResult<WireSyncFrameV1> {
+async fn recv_frame(socket: &mut Socket) -> AppResult<WireSyncFrameV2> {
     timeout(IO_TIMEOUT, async {
         while let Some(msg) = socket.next().await {
             match msg {
                 Ok(Message::Binary(bytes)) => {
-                    return decode_sync_frame(&bytes).map_err(|e| format!("decode frame: {e:?}"));
+                    return decode_sync_frame_v2(&bytes)
+                        .map_err(|e| format!("decode frame: {e:?}"));
                 }
                 Ok(Message::Close(frame)) => {
                     return Err(format!("ws closed cleanly: {frame:?}"));
@@ -362,7 +363,7 @@ async fn recv_frame(socket: &mut Socket) -> AppResult<WireSyncFrameV1> {
 struct SyncDriveReport {
     epoch_changed: Option<(u8, u8)>,
     pre_pending_digest: Option<StateDigest>,
-    committed_ops: Vec<WireOpV2>,
+    committed_ops: Vec<WireOpV3>,
 }
 
 #[derive(Clone, Copy)]
@@ -412,12 +413,17 @@ async fn run_client_actions(
                         max_id_counter: wm.max_id_counter,
                     })
                     .collect();
+                let permutes: Vec<CommittedPermute> = decoded
+                    .permutes
+                    .iter()
+                    .map(CommittedPermute::from)
+                    .collect();
                 let snap_wb = decoded.engine.workbook().clone();
                 let tail =
                     fetch_all_tail_txns(ctx.http, ctx.base_url, ctx.doc, ctx.cookie, snapshot_seq)
                         .await?;
                 let next_actions =
-                    machine.install_snapshot(snapshot_seq, snap_wb, &watermarks, tail);
+                    machine.install_snapshot(snapshot_seq, snap_wb, &watermarks, permutes, tail);
                 report.pre_pending_digest = Some(machine.confirmed().state_digest());
                 queue.extend(next_actions);
             }
@@ -471,8 +477,8 @@ async fn wait_until_settled(
         }
         let frame = recv_frame(socket).await?;
         let actions = match frame {
-            WireSyncFrameV1::Welcome { .. } => machine.on_welcome(frame),
-            WireSyncFrameV1::Ack {
+            WireSyncFrameV2::Welcome { .. } => machine.on_welcome(frame),
+            WireSyncFrameV2::Ack {
                 replica,
                 client_seq,
                 ..
@@ -480,12 +486,12 @@ async fn wait_until_settled(
                 machine.on_ack(replica, client_seq);
                 Vec::new()
             }
-            WireSyncFrameV1::Reject { client_seq, reason } => {
+            WireSyncFrameV2::Reject { client_seq, reason } => {
                 return Err(format!(
                     "unexpected Reject for client_seq={client_seq}: {reason:?}"
                 ));
             }
-            WireSyncFrameV1::Commit {
+            WireSyncFrameV2::Commit {
                 seq,
                 replica,
                 client_seq,
@@ -494,7 +500,7 @@ async fn wait_until_settled(
                 txn,
             } => {
                 report.committed_ops.extend(txn.ops.clone());
-                machine.on_commit(WireCommittedTxnV2 {
+                machine.on_commit(WireCommittedTxnV3 {
                     seq,
                     replica,
                     client_seq,
@@ -503,13 +509,13 @@ async fn wait_until_settled(
                     txn,
                 })
             }
-            WireSyncFrameV1::Digest { seq, state_digest } => machine.on_digest(seq, state_digest),
-            WireSyncFrameV1::Ping(n) => {
-                send_frame(socket, &WireSyncFrameV1::Pong(n)).await?;
+            WireSyncFrameV2::Digest { seq, state_digest } => machine.on_digest(seq, state_digest),
+            WireSyncFrameV2::Ping(n) => {
+                send_frame(socket, &WireSyncFrameV2::Pong(n)).await?;
                 Vec::new()
             }
-            WireSyncFrameV1::Presence(_) | WireSyncFrameV1::Pong(_) => Vec::new(),
-            WireSyncFrameV1::Hello { .. } | WireSyncFrameV1::Push { .. } => Vec::new(),
+            WireSyncFrameV2::Presence(_) | WireSyncFrameV2::Pong(_) => Vec::new(),
+            WireSyncFrameV2::Hello { .. } | WireSyncFrameV2::Push { .. } => Vec::new(),
         };
         run_client_actions(ctx, socket, machine, actions, report).await?;
     }
@@ -522,7 +528,7 @@ fn push_batched_cells(
     row_offset: u64,
     col: u64,
     value_offset: f64,
-) -> AppResult<Vec<WireSyncFrameV1>> {
+) -> AppResult<Vec<WireSyncFrameV2>> {
     let mut txns = Vec::with_capacity(count);
     for i in 0..count {
         let op = Op::SetCells {
@@ -538,14 +544,14 @@ fn push_batched_cells(
             .push_local(format!("Edit {i}"), vec![op], 1_700_000_000_000 + i as u64)
             .map_err(|e| format!("push_local: {e:?}"))?;
         for action in actions {
-            if let ClientAction::SendFrame(WireSyncFrameV1::Push { txns: chunk }) = action {
+            if let ClientAction::SendFrame(WireSyncFrameV2::Push { txns: chunk }) = action {
                 txns.extend(chunk);
             }
         }
     }
     let frames = txns
         .chunks(50)
-        .map(|chunk| WireSyncFrameV1::Push {
+        .map(|chunk| WireSyncFrameV2::Push {
             txns: chunk.to_vec(),
         })
         .collect();
@@ -952,6 +958,11 @@ async fn verify_restore(args: &Args) -> AppResult<()> {
         saved.confirmed_seq,
         saved.last_acked_client_seq,
         decoded_t1.engine.workbook().clone(),
+        decoded_t1
+            .permutes
+            .iter()
+            .map(CommittedPermute::from)
+            .collect(),
         saved.pending,
         saved.next_id_counter,
     );
@@ -989,7 +1000,7 @@ async fn verify_restore(args: &Args) -> AppResult<()> {
 
     let mut saw_epoch1_row = false;
     for op in &rep_alice.committed_ops {
-        if let WireOpV2::InsertRows { ids, .. } = op {
+        if let WireOpV3::InsertRows { ids, .. } = op {
             let (row_epoch, row_rep, _) = unpack_id(ids.first_id);
             if row_epoch != 1 || row_rep != alice_new_rep {
                 return Err(format!(

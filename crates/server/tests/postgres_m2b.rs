@@ -27,10 +27,11 @@ use reticula_server::store::{
     Store, StoreError,
 };
 use reticula_sync::MemberRole;
-use reticula_wire::convert_v2::ops_to_wire_txn_v2;
+use reticula_wire::convert_v3::ops_to_wire_txn_v3;
 use reticula_wire::snapshot::{encode_seed_stub_v1, encode_snapshot_v1};
-use reticula_wire::sync_frame::{decode_sync_frame, encode_sync_frame};
-use reticula_wire::v2::{WirePendingTxnV2, WirePresenceV1, WireRejectReasonV1, WireSyncFrameV1};
+use reticula_wire::sync_frame::{decode_sync_frame_v2, encode_sync_frame_v2};
+use reticula_wire::v2::{WirePresenceV1, WireRejectReasonV1};
+use reticula_wire::v3::{SYNC_PROTOCOL_VERSION_V2, WirePendingTxnV3, WireSyncFrameV2};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sqlx::postgres::PgPoolOptions;
@@ -348,9 +349,9 @@ impl TestServer {
     }
 }
 
-fn hello_frame(doc: Uuid, replica: Option<u32>, seq: u64) -> WireSyncFrameV1 {
-    WireSyncFrameV1::Hello {
-        protocol_version: 1,
+fn hello_frame(doc: Uuid, replica: Option<u32>, seq: u64) -> WireSyncFrameV2 {
+    WireSyncFrameV2::Hello {
+        protocol_version: SYNC_PROTOCOL_VERSION_V2,
         doc_id: doc.into_bytes(),
         branch_id: MAIN_BRANCH.into_bytes(),
         replica,
@@ -359,21 +360,21 @@ fn hello_frame(doc: Uuid, replica: Option<u32>, seq: u64) -> WireSyncFrameV1 {
     }
 }
 
-async fn send(socket: &mut Socket, frame: &WireSyncFrameV1) {
+async fn send(socket: &mut Socket, frame: &WireSyncFrameV2) {
     timeout(
         WAIT,
-        socket.send(Message::Binary(encode_sync_frame(frame).unwrap().into())),
+        socket.send(Message::Binary(encode_sync_frame_v2(frame).unwrap().into())),
     )
     .await
     .unwrap()
     .unwrap();
 }
 
-async fn recv(socket: &mut Socket) -> WireSyncFrameV1 {
+async fn recv(socket: &mut Socket) -> WireSyncFrameV2 {
     timeout(WAIT, async {
         while let Some(msg) = socket.next().await {
             if let Message::Binary(bytes) = msg.unwrap() {
-                return decode_sync_frame(&bytes).unwrap();
+                return decode_sync_frame_v2(&bytes).unwrap();
             }
         }
         panic!("WebSocket closed before binary frame");
@@ -395,13 +396,13 @@ async fn recv_close_code(socket: &mut Socket) -> u16 {
     .unwrap()
 }
 
-fn edit_txn(replica: u32, client_seq: u64, base_server_seq: u64, val: f64) -> WirePendingTxnV2 {
-    WirePendingTxnV2 {
+fn edit_txn(replica: u32, client_seq: u64, base_server_seq: u64, val: f64) -> WirePendingTxnV3 {
+    WirePendingTxnV3 {
         replica,
         client_seq,
         base_server_seq,
         timestamp_ms: 0,
-        txn: ops_to_wire_txn_v2(
+        txn: ops_to_wire_txn_v3(
             format!("Edit {client_seq}"),
             &[Op::SetCells {
                 sheet: SheetId(0),
@@ -567,18 +568,18 @@ async fn permission_matrix_six_identities() {
     let owner_rep = welcome_replica(&owner_welcome);
     send(
         &mut owner_ws,
-        &WireSyncFrameV1::Push {
+        &WireSyncFrameV2::Push {
             txns: vec![edit_txn(owner_rep, 1, 0, 11.0)],
         },
     )
     .await;
     assert!(matches!(
         recv(&mut owner_ws).await,
-        WireSyncFrameV1::Ack { seq: 1, .. }
+        WireSyncFrameV2::Ack { seq: 1, .. }
     ));
     assert!(matches!(
         recv(&mut owner_ws).await,
-        WireSyncFrameV1::Commit { seq: 1, .. }
+        WireSyncFrameV2::Commit { seq: 1, .. }
     ));
 
     let v_resp = server
@@ -1112,21 +1113,21 @@ async fn permission_matrix_six_identities() {
     assert_eq!(welcome_replica(&anon_welcome), 0);
     send(
         &mut anon_ws,
-        &WireSyncFrameV1::Push {
+        &WireSyncFrameV2::Push {
             txns: vec![edit_txn(0, 1, 1, 9.0)],
         },
     )
     .await;
     assert!(matches!(
         recv(&mut anon_ws).await,
-        WireSyncFrameV1::Reject {
+        WireSyncFrameV2::Reject {
             reason: WireRejectReasonV1::Forbidden,
             ..
         }
     ));
     send(
         &mut anon_ws,
-        &WireSyncFrameV1::Presence(WirePresenceV1 {
+        &WireSyncFrameV2::Presence(WirePresenceV1 {
             replica: 0,
             user_id: [0; 16],
             display_name: String::new(),
@@ -1155,14 +1156,14 @@ async fn permission_matrix_six_identities() {
     assert_eq!(welcome_replica(&viewer_welcome), 0);
     send(
         &mut viewer_ws,
-        &WireSyncFrameV1::Push {
+        &WireSyncFrameV2::Push {
             txns: vec![edit_txn(0, 1, 1, 9.0)],
         },
     )
     .await;
     assert!(matches!(
         recv(&mut viewer_ws).await,
-        WireSyncFrameV1::Reject {
+        WireSyncFrameV2::Reject {
             reason: WireRejectReasonV1::Forbidden,
             ..
         }
@@ -1180,27 +1181,27 @@ async fn permission_matrix_six_identities() {
     assert_ne!(ed_rep, 0);
     send(
         &mut editor_ws,
-        &WireSyncFrameV1::Push {
+        &WireSyncFrameV2::Push {
             txns: vec![edit_txn(ed_rep, 1, 1, 22.0)],
         },
     )
     .await;
     assert!(matches!(
         recv(&mut editor_ws).await,
-        WireSyncFrameV1::Ack { seq: 2, .. }
+        WireSyncFrameV2::Ack { seq: 2, .. }
     ));
     assert!(matches!(
         recv(&mut editor_ws).await,
-        WireSyncFrameV1::Commit { seq: 2, .. }
+        WireSyncFrameV2::Commit { seq: 2, .. }
     ));
     assert!(matches!(
         recv(&mut owner_ws).await,
-        WireSyncFrameV1::Commit { seq: 2, .. }
+        WireSyncFrameV2::Commit { seq: 2, .. }
     ));
 
     send(
         &mut editor_ws,
-        &WireSyncFrameV1::Presence(WirePresenceV1 {
+        &WireSyncFrameV2::Presence(WirePresenceV1 {
             replica: ed_rep,
             user_id: [0; 16],
             display_name: String::new(),
@@ -1213,7 +1214,7 @@ async fn permission_matrix_six_identities() {
     )
     .await;
     assert!(
-        matches!(recv(&mut owner_ws).await, WireSyncFrameV1::Presence(p) if p.cursor_row == 3 && p.cursor_col == 4)
+        matches!(recv(&mut owner_ws).await, WireSyncFrameV2::Presence(p) if p.cursor_row == 3 && p.cursor_col == 4)
     );
     drop(editor_ws);
     drop(owner_ws);
@@ -1313,18 +1314,18 @@ async fn live_downgrade_revocation_and_duplicate_replica() {
     let ed_rep = welcome_replica(&ed_welcome);
     send(
         &mut ed_ws,
-        &WireSyncFrameV1::Push {
+        &WireSyncFrameV2::Push {
             txns: vec![edit_txn(ed_rep, 1, 0, 5.0)],
         },
     )
     .await;
     assert!(matches!(
         recv(&mut ed_ws).await,
-        WireSyncFrameV1::Ack { seq: 1, .. }
+        WireSyncFrameV2::Ack { seq: 1, .. }
     ));
     assert!(matches!(
         recv(&mut ed_ws).await,
-        WireSyncFrameV1::Commit { seq: 1, .. }
+        WireSyncFrameV2::Commit { seq: 1, .. }
     ));
 
     // Downgrade Editor -> Viewer while WS stays open.
@@ -1342,14 +1343,14 @@ async fn live_downgrade_revocation_and_duplicate_replica() {
     );
     send(
         &mut ed_ws,
-        &WireSyncFrameV1::Push {
+        &WireSyncFrameV2::Push {
             txns: vec![edit_txn(ed_rep, 2, 1, 6.0)],
         },
     )
     .await;
     assert!(matches!(
         recv(&mut ed_ws).await,
-        WireSyncFrameV1::Reject {
+        WireSyncFrameV2::Reject {
             reason: WireRejectReasonV1::Forbidden,
             ..
         }
@@ -1755,17 +1756,17 @@ async fn quotas_hard_disk_limit_and_snapshot_retention_pruning() {
         for cseq in 1..=20 {
             send(
                 &mut ws,
-                &WireSyncFrameV1::Push {
+                &WireSyncFrameV2::Push {
                     txns: vec![edit_txn(rep, cseq, seq, cseq as f64)],
                 },
             )
             .await;
             match recv(&mut ws).await {
-                WireSyncFrameV1::Ack { seq: ack_seq, .. } => {
+                WireSyncFrameV2::Ack { seq: ack_seq, .. } => {
                     seq = ack_seq;
                     assert!(matches!(
                         recv(&mut ws).await,
-                        WireSyncFrameV1::Commit { .. }
+                        WireSyncFrameV2::Commit { .. }
                     ));
                     if server.store.disk_over_hard_limit() {
                         assert_eq!(
@@ -1782,14 +1783,14 @@ async fn quotas_hard_disk_limit_and_snapshot_retention_pruning() {
                         );
                         send(
                             &mut ws,
-                            &WireSyncFrameV1::Push {
+                            &WireSyncFrameV2::Push {
                                 txns: vec![edit_txn(rep, cseq + 1, seq, 99.0)],
                             },
                         )
                         .await;
                         assert!(matches!(
                             recv(&mut ws).await,
-                            WireSyncFrameV1::Reject {
+                            WireSyncFrameV2::Reject {
                                 reason: WireRejectReasonV1::QuotaExceeded,
                                 ..
                             }
@@ -1831,14 +1832,14 @@ async fn quotas_hard_disk_limit_and_snapshot_retention_pruning() {
         for cseq in 1..=9_u64 {
             send(
                 &mut ws,
-                &WireSyncFrameV1::Push {
+                &WireSyncFrameV2::Push {
                     txns: vec![edit_txn(rep, cseq, cseq - 1, cseq as f64)],
                 },
             )
             .await;
-            assert!(matches!(recv(&mut ws).await, WireSyncFrameV1::Ack { seq, .. } if seq == cseq));
+            assert!(matches!(recv(&mut ws).await, WireSyncFrameV2::Ack { seq, .. } if seq == cseq));
             assert!(
-                matches!(recv(&mut ws).await, WireSyncFrameV1::Commit { seq, .. } if seq == cseq)
+                matches!(recv(&mut ws).await, WireSyncFrameV2::Commit { seq, .. } if seq == cseq)
             );
             let m = server.store.load_machine(doc).await.unwrap();
             let s = server.store.write_snapshot(&m).await.unwrap();
@@ -1938,18 +1939,18 @@ async fn delete_account_preserves_collaborator_history() {
     let bob_rep = welcome_replica(&bob_welcome);
     send(
         &mut bob_ws,
-        &WireSyncFrameV1::Push {
+        &WireSyncFrameV2::Push {
             txns: vec![edit_txn(bob_rep, 1, 0, 77.0)],
         },
     )
     .await;
     assert!(matches!(
         recv(&mut bob_ws).await,
-        WireSyncFrameV1::Ack { seq: 1, .. }
+        WireSyncFrameV2::Ack { seq: 1, .. }
     ));
     assert!(matches!(
         recv(&mut bob_ws).await,
-        WireSyncFrameV1::Commit { seq: 1, .. }
+        WireSyncFrameV2::Commit { seq: 1, .. }
     ));
 
     assert_eq!(
@@ -2129,18 +2130,18 @@ async fn metrics_loopback_gate_and_write_rate_limit() {
     let rep = welcome_replica(&welcome);
     send(
         &mut ws,
-        &WireSyncFrameV1::Push {
+        &WireSyncFrameV2::Push {
             txns: vec![edit_txn(rep, 1, 0, 1.0)],
         },
     )
     .await;
     assert!(matches!(
         recv(&mut ws).await,
-        WireSyncFrameV1::Ack { seq: 1, .. }
+        WireSyncFrameV2::Ack { seq: 1, .. }
     ));
     assert!(matches!(
         recv(&mut ws).await,
-        WireSyncFrameV1::Commit { seq: 1, .. }
+        WireSyncFrameV2::Commit { seq: 1, .. }
     ));
 
     let metrics_resp = server
@@ -2211,15 +2212,15 @@ async fn load_machine_missing_snapshot_fallback_and_corruption_detection() {
     for cseq in 1..=2_u64 {
         send(
             &mut ws,
-            &WireSyncFrameV1::Push {
+            &WireSyncFrameV2::Push {
                 txns: vec![edit_txn(rep, cseq, cseq - 1, 100.0 + cseq as f64)],
             },
         )
         .await;
-        assert!(matches!(recv(&mut ws).await, WireSyncFrameV1::Ack { .. }));
+        assert!(matches!(recv(&mut ws).await, WireSyncFrameV2::Ack { .. }));
         assert!(matches!(
             recv(&mut ws).await,
-            WireSyncFrameV1::Commit { .. }
+            WireSyncFrameV2::Commit { .. }
         ));
     }
 
@@ -2229,15 +2230,15 @@ async fn load_machine_missing_snapshot_fallback_and_corruption_detection() {
 
     send(
         &mut ws,
-        &WireSyncFrameV1::Push {
+        &WireSyncFrameV2::Push {
             txns: vec![edit_txn(rep, 3, 2, 103.0)],
         },
     )
     .await;
-    assert!(matches!(recv(&mut ws).await, WireSyncFrameV1::Ack { .. }));
+    assert!(matches!(recv(&mut ws).await, WireSyncFrameV2::Ack { .. }));
     assert!(matches!(
         recv(&mut ws).await,
-        WireSyncFrameV1::Commit { .. }
+        WireSyncFrameV2::Commit { .. }
     ));
     drop(ws);
 
@@ -2287,7 +2288,7 @@ trait SocketExt {
         doc: Uuid,
         replica: Option<u32>,
         seq: u64,
-    ) -> (Socket, WireSyncFrameV1);
+    ) -> (Socket, WireSyncFrameV2);
 }
 
 impl SocketExt for Socket {
@@ -2296,16 +2297,16 @@ impl SocketExt for Socket {
         doc: Uuid,
         replica: Option<u32>,
         seq: u64,
-    ) -> (Socket, WireSyncFrameV1) {
+    ) -> (Socket, WireSyncFrameV2) {
         send(&mut self, &hello_frame(doc, replica, seq)).await;
         let welcome = recv(&mut self).await;
         (self, welcome)
     }
 }
 
-fn welcome_replica(frame: &WireSyncFrameV1) -> u32 {
+fn welcome_replica(frame: &WireSyncFrameV2) -> u32 {
     match frame {
-        WireSyncFrameV1::Welcome { replica, .. } => *replica,
+        WireSyncFrameV2::Welcome { replica, .. } => *replica,
         other => panic!("expected Welcome frame, got {other:?}"),
     }
 }

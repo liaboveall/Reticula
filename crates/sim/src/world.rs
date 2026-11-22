@@ -9,19 +9,20 @@ use reticula_core::rng::Rng;
 use reticula_core::state_digest::StateDigest;
 use reticula_formula::binder::BoundFormula;
 use reticula_sync::{
-    ClientAction, ClientSyncMachine, ConnectionState, MemberRole, ReplicaWatermark,
-    ServerDocMachine, ServerLimits, VIEWER_REPLICA, replay_pending_onto,
+    ClientAction, ClientSyncMachine, CommittedPermute, ConnectionState, MemberRole,
+    ReplicaWatermark, ServerDocMachine, ServerLimits, VIEWER_REPLICA, replay_pending_onto,
 };
-use reticula_wire::convert_v2::{ops_from_wire_txn_v2, ops_to_wire_txn_v2};
-use reticula_wire::snapshot::{decode_snapshot_any, encode_snapshot_v1};
-use reticula_wire::sync_frame::{decode_sync_frame, encode_sync_frame};
+use reticula_wire::convert_v3::{ops_from_wire_txn_v3, ops_to_wire_txn_v3};
+use reticula_wire::snapshot::{decode_snapshot_any, encode_snapshot_with_permutes};
+use reticula_wire::sync_frame::{decode_sync_frame_v2, encode_sync_frame_v2};
 use reticula_wire::v1::WireReplicaWatermarkV1;
-use reticula_wire::v2::{
-    SYNC_PROTOCOL_VERSION, WireCommittedTxnV2, WirePendingTxnV2, WireRejectReasonV1,
-    WireSyncFrameV1, WireWalRecordV2,
+use reticula_wire::v2::WireRejectReasonV1;
+use reticula_wire::v3::{
+    SYNC_PROTOCOL_VERSION_V2, WireCommittedPermuteV3, WireCommittedTxnV3, WirePendingTxnV3,
+    WireSyncFrameV2, WireWalRecordV3,
 };
 use reticula_wire::wal::{
-    encode_pending_wal_complete, encode_wal_complete_v2, scan_pending_wal, scan_wal_v2,
+    encode_pending_wal_complete_v2, encode_wal_complete_v3, scan_pending_wal_any, scan_wal_v3,
 };
 use serde::Serialize;
 
@@ -45,6 +46,10 @@ pub struct FaultCounts {
     pub set_cells_if_ops: u64,
     pub formula_ops: u64,
     pub move_row_col_ops: u64,
+    pub permute_content_ops: u64,
+    pub move_cells_ops: u64,
+    pub named_range_ops: u64,
+    pub e16_transformed_edits: u64,
     pub structural_sheet_ops: u64,
     pub reordered_deliveries: u64,
     pub slow_receiver_disconnects: u64,
@@ -67,6 +72,10 @@ impl FaultCounts {
         self.set_cells_if_ops += other.set_cells_if_ops;
         self.formula_ops += other.formula_ops;
         self.move_row_col_ops += other.move_row_col_ops;
+        self.permute_content_ops += other.permute_content_ops;
+        self.move_cells_ops += other.move_cells_ops;
+        self.named_range_ops += other.named_range_ops;
+        self.e16_transformed_edits += other.e16_transformed_edits;
         self.structural_sheet_ops += other.structural_sheet_ops;
         self.reordered_deliveries += other.reordered_deliveries;
         self.slow_receiver_disconnects += other.slow_receiver_disconnects;
@@ -109,8 +118,8 @@ struct BackupPoint {
     snapshot_seq: u64,
     snapshot_bytes: Vec<u8>,
     snapshot_watermarks: Vec<ReplicaWatermark>,
-    tail_commits: Vec<WireCommittedTxnV2>,
-    full_history: Vec<WireCommittedTxnV2>,
+    tail_commits: Vec<WireCommittedTxnV3>,
+    full_history: Vec<WireCommittedTxnV3>,
     digest_history: BTreeMap<u64, StateDigest>,
     durable_replicas: BTreeMap<u32, ReplicaWatermark>,
     snapshots_by_seq: BTreeMap<u64, StoredSnapshot>,
@@ -123,7 +132,8 @@ struct OpfsCheckpoint {
     confirmed_seq: u64,
     last_acked_client_seq: u64,
     confirmed: Workbook<BoundFormula>,
-    pending: Vec<WirePendingTxnV2>,
+    confirmed_permutes: Vec<CommittedPermute>,
+    pending: Vec<WirePendingTxnV3>,
     next_id_counter_hint: u32,
     authored_count: u64,
 }
@@ -135,10 +145,11 @@ struct ClientStorage {
     confirmed_seq: u64,
     last_acked_client_seq: u64,
     confirmed: Workbook<BoundFormula>,
-    pending: Vec<WirePendingTxnV2>,
+    confirmed_permutes: Vec<CommittedPermute>,
+    pending: Vec<WirePendingTxnV3>,
     next_id_counter_hint: u32,
-    saved_unsynced_local: Vec<WirePendingTxnV2>,
-    expected_rejected: Vec<WirePendingTxnV2>,
+    saved_unsynced_local: Vec<WirePendingTxnV3>,
+    expected_rejected: Vec<WirePendingTxnV3>,
     authored_count: u64,
     history: VecDeque<OpfsCheckpoint>,
 }
@@ -152,6 +163,7 @@ impl ClientStorage {
             confirmed_seq: 0,
             last_acked_client_seq: 0,
             confirmed,
+            confirmed_permutes: Vec::new(),
             pending: Vec::new(),
             next_id_counter_hint: 1,
             saved_unsynced_local: Vec::new(),
@@ -168,6 +180,7 @@ impl ClientStorage {
             confirmed_seq: self.confirmed_seq,
             last_acked_client_seq: self.last_acked_client_seq,
             confirmed: self.confirmed.clone(),
+            confirmed_permutes: self.confirmed_permutes.clone(),
             pending: self.pending.clone(),
             next_id_counter_hint: self.next_id_counter_hint,
             authored_count: self.authored_count,
@@ -253,10 +266,10 @@ pub struct SimWorld {
     timestamp_ms: u64,
     server_conn_subscribed: BTreeMap<usize, u64>,
     snapshots_by_seq: BTreeMap<u64, StoredSnapshot>,
-    current_epoch_log: Vec<WireCommittedTxnV2>,
+    current_epoch_log: Vec<WireCommittedTxnV3>,
     epoch_digest_history: BTreeMap<u64, StateDigest>,
     durable_snapshot: Option<StoredSnapshot>,
-    durable_tail_commits: Vec<WireCommittedTxnV2>,
+    durable_tail_commits: Vec<WireCommittedTxnV3>,
     durable_replicas: BTreeMap<u32, ReplicaWatermark>,
     durable_next_per_epoch_replica: u16,
     backups: Vec<BackupPoint>,
@@ -511,6 +524,15 @@ impl SimWorld {
         if gen_txn.used_move {
             self.faults.move_row_col_ops += 1;
         }
+        if gen_txn.used_permute {
+            self.faults.permute_content_ops += 1;
+        }
+        if gen_txn.used_move_cells {
+            self.faults.move_cells_ops += 1;
+        }
+        if gen_txn.used_named_range {
+            self.faults.named_range_ops += 1;
+        }
         if gen_txn.used_sheet_op {
             self.faults.structural_sheet_ops += 1;
         }
@@ -519,21 +541,21 @@ impl SimWorld {
         self.apply_client_actions(client_idx, actions);
     }
 
-    fn enqueue_c2s(&mut self, client_idx: usize, frame: &WireSyncFrameV1) {
+    fn enqueue_c2s(&mut self, client_idx: usize, frame: &WireSyncFrameV2) {
         let Some(conn_id) = self.clients[client_idx].active_conn else {
             return;
         };
-        let bytes = encode_sync_frame(frame).expect("generated client frame must encode");
+        let bytes = encode_sync_frame_v2(frame).expect("generated client frame must encode");
         self.clients[client_idx]
             .c2s_queue
             .push_back((conn_id, bytes));
     }
 
-    fn enqueue_s2c(&mut self, client_idx: usize, conn_id: u64, frame: &WireSyncFrameV1) {
+    fn enqueue_s2c(&mut self, client_idx: usize, conn_id: u64, frame: &WireSyncFrameV2) {
         if self.clients[client_idx].active_conn != Some(conn_id) {
             return;
         }
-        let bytes = encode_sync_frame(frame).expect("generated server frame must encode");
+        let bytes = encode_sync_frame_v2(frame).expect("generated server frame must encode");
         self.clients[client_idx]
             .s2c_queue
             .push_back((conn_id, bytes));
@@ -554,7 +576,7 @@ impl SimWorld {
                     self.sync_storage_confirmed_and_pending(client_idx, rem);
                 }
                 ClientAction::SendFrame(frame) => {
-                    if matches!(frame, WireSyncFrameV1::Push { .. }) {
+                    if matches!(frame, WireSyncFrameV2::Push { .. }) {
                         // Durable-before-send invariant check when called synchronously in push_local.
                         let _ = saw_persist_before_send;
                     }
@@ -598,7 +620,7 @@ impl SimWorld {
     fn sync_storage_confirmed_and_pending(
         &mut self,
         client_idx: usize,
-        pending: Vec<WirePendingTxnV2>,
+        pending: Vec<WirePendingTxnV3>,
     ) {
         let c = &mut self.clients[client_idx];
         c.storage.pending = pending;
@@ -609,6 +631,7 @@ impl SimWorld {
             c.storage.epoch = c.machine.epoch();
             c.storage.replica = c.machine.replica();
             c.storage.confirmed = c.machine.confirmed().clone();
+            c.storage.confirmed_permutes = c.machine.confirmed_permutes().to_vec();
             c.storage.confirmed_seq = c.machine.confirmed_seq();
             c.storage.last_acked_client_seq = c.machine.last_acked_client_seq();
             c.storage.next_id_counter_hint = compute_next_id_hint(
@@ -640,16 +663,16 @@ impl SimWorld {
             if self.clients[client_idx].active_conn != Some(conn_id) {
                 continue;
             }
-            let frame = decode_sync_frame(&raw)
+            let frame = decode_sync_frame_v2(&raw)
                 .map_err(|e| format!("failed to decode client sync frame: {e:?}"))?;
             match frame {
-                WireSyncFrameV1::Hello { .. } => {
+                WireSyncFrameV2::Hello { .. } => {
                     let user_id = self.clients[client_idx].user_id;
                     let role = self.clients[client_idx].role;
                     match self.server.on_hello(user_id, role, &frame) {
                         Ok(welcome) => {
                             let (welcome_epoch, assigned_rep, welcome_head) = match &welcome {
-                                WireSyncFrameV1::Welcome {
+                                WireSyncFrameV2::Welcome {
                                     epoch,
                                     replica,
                                     head_seq,
@@ -677,7 +700,7 @@ impl SimWorld {
                             self.enqueue_s2c(
                                 client_idx,
                                 conn_id,
-                                &WireSyncFrameV1::Reject {
+                                &WireSyncFrameV2::Reject {
                                     client_seq: 0,
                                     reason,
                                 },
@@ -687,13 +710,13 @@ impl SimWorld {
                         }
                     }
                 }
-                WireSyncFrameV1::Push { txns } => {
+                WireSyncFrameV2::Push { txns } => {
                     if let Err(reason) = self.server.validate_push_batch(&txns, raw.len()) {
                         if let Some(first) = txns.first() {
                             self.enqueue_s2c(
                                 client_idx,
                                 conn_id,
-                                &WireSyncFrameV1::Reject {
+                                &WireSyncFrameV2::Reject {
                                     client_seq: first.client_seq,
                                     reason,
                                 },
@@ -710,6 +733,7 @@ impl SimWorld {
 
                     for pending in txns {
                         let cseq = pending.client_seq;
+                        let pre_ops = pending.txn.ops.clone();
                         match self.server.apply_and_commit(
                             user_id,
                             role,
@@ -718,14 +742,19 @@ impl SimWorld {
                             self.timestamp_ms,
                         ) {
                             Ok(reticula_sync::ApplyResult::Committed(commit)) => {
+                                if !self.server.committed_permutes().is_empty()
+                                    && commit.txn.ops != pre_ops
+                                {
+                                    self.faults.e16_transformed_edits += 1;
+                                }
                                 self.record_new_commit(&commit)?;
-                                let ack = WireSyncFrameV1::Ack {
+                                let ack = WireSyncFrameV2::Ack {
                                     replica: commit.replica,
                                     client_seq: commit.client_seq,
                                     seq: commit.seq,
                                     timestamp_ms: commit.timestamp_ms,
                                 };
-                                let bcast = WireSyncFrameV1::Commit {
+                                let bcast = WireSyncFrameV2::Commit {
                                     seq: commit.seq,
                                     replica: commit.replica,
                                     client_seq: commit.client_seq,
@@ -761,7 +790,7 @@ impl SimWorld {
                                 self.enqueue_s2c(
                                     client_idx,
                                     conn_id,
-                                    &WireSyncFrameV1::Ack {
+                                    &WireSyncFrameV2::Ack {
                                         replica,
                                         client_seq,
                                         seq,
@@ -773,7 +802,7 @@ impl SimWorld {
                                 self.enqueue_s2c(
                                     client_idx,
                                     conn_id,
-                                    &WireSyncFrameV1::Reject {
+                                    &WireSyncFrameV2::Reject {
                                         client_seq: cseq,
                                         reason,
                                     },
@@ -789,7 +818,7 @@ impl SimWorld {
         Ok(())
     }
 
-    fn broadcast_commit(&mut self, commit_frame: &WireSyncFrameV1) {
+    fn broadcast_commit(&mut self, commit_frame: &WireSyncFrameV2) {
         let targets: Vec<(usize, u64)> = self
             .server_conn_subscribed
             .iter()
@@ -805,8 +834,8 @@ impl SimWorld {
         self.broadcast_commit(&frame);
     }
 
-    fn record_new_commit(&mut self, commit: &WireCommittedTxnV2) -> Result<(), String> {
-        let (_, ops) = ops_from_wire_txn_v2(commit.txn.clone())
+    fn record_new_commit(&mut self, commit: &WireCommittedTxnV3) -> Result<(), String> {
+        let (_, ops) = ops_from_wire_txn_v3(commit.txn.clone())
             .map_err(|e| format!("committed txn failed wire decode: {e:?}"))?;
         record_unique_ids(
             &ops,
@@ -835,13 +864,13 @@ impl SimWorld {
             if self.clients[client_idx].active_conn != Some(conn_id) {
                 continue;
             }
-            let frame = decode_sync_frame(&raw)
+            let frame = decode_sync_frame_v2(&raw)
                 .map_err(|e| format!("failed to decode server sync frame: {e:?}"))?;
             let actions = match frame {
-                WireSyncFrameV1::Welcome { .. } => {
+                WireSyncFrameV2::Welcome { .. } => {
                     self.clients[client_idx].machine.on_welcome(frame)
                 }
-                WireSyncFrameV1::Commit {
+                WireSyncFrameV2::Commit {
                     seq,
                     replica,
                     client_seq,
@@ -850,7 +879,7 @@ impl SimWorld {
                     txn,
                 } => self.clients[client_idx]
                     .machine
-                    .on_commit(WireCommittedTxnV2 {
+                    .on_commit(WireCommittedTxnV3 {
                         seq,
                         replica,
                         client_seq,
@@ -858,7 +887,7 @@ impl SimWorld {
                         timestamp_ms,
                         txn,
                     }),
-                WireSyncFrameV1::Ack {
+                WireSyncFrameV2::Ack {
                     replica,
                     client_seq,
                     ..
@@ -867,7 +896,7 @@ impl SimWorld {
                     self.sync_storage_if_consistent(client_idx);
                     Vec::new()
                 }
-                WireSyncFrameV1::Reject { client_seq, reason } => {
+                WireSyncFrameV2::Reject { client_seq, reason } => {
                     if client_seq == 0 && reason == WireRejectReasonV1::Forbidden {
                         // Hello was rejected (member revoked) -> disconnect cleanly.
                         self.disconnect_client(client_idx);
@@ -894,10 +923,10 @@ impl SimWorld {
                             .on_reject(client_seq, reason)
                     }
                 }
-                WireSyncFrameV1::Digest { seq, state_digest } => self.clients[client_idx]
+                WireSyncFrameV2::Digest { seq, state_digest } => self.clients[client_idx]
                     .machine
                     .on_digest(seq, state_digest),
-                WireSyncFrameV1::Pong(_) | WireSyncFrameV1::Presence(_) => Vec::new(),
+                WireSyncFrameV2::Pong(_) | WireSyncFrameV2::Presence(_) => Vec::new(),
                 _ => Vec::new(),
             };
             if !actions.is_empty() {
@@ -917,8 +946,8 @@ impl SimWorld {
         }
         self.clients[client_idx].pending_snapshot_req = None;
 
-        let (snap_wb, snap_wms) = if snapshot_seq == 0 {
-            (Workbook::new(), Vec::new())
+        let (snap_wb, snap_wms, snap_permutes) = if snapshot_seq == 0 {
+            (Workbook::new(), Vec::new(), Vec::new())
         } else {
             let stored = self
                 .snapshots_by_seq
@@ -926,13 +955,22 @@ impl SimWorld {
                 .ok_or_else(|| format!("missing stored snapshot at snapshot_seq={snapshot_seq}"))?;
             let decoded = decode_snapshot_any(&stored.bytes)
                 .map_err(|e| format!("failed to decode snapshot {snapshot_seq}: {e:?}"))?;
-            (decoded.engine.workbook().clone(), stored.watermarks.clone())
+            let permutes = decoded
+                .permutes
+                .iter()
+                .map(CommittedPermute::from)
+                .collect();
+            (
+                decoded.engine.workbook().clone(),
+                stored.watermarks.clone(),
+                permutes,
+            )
         };
 
         let welcome_head = self.clients[client_idx]
             .welcome_head_seq
             .unwrap_or_else(|| self.server.head_seq());
-        let tail_txns: Vec<WireCommittedTxnV2> = self
+        let tail_txns: Vec<WireCommittedTxnV3> = self
             .current_epoch_log
             .iter()
             .filter(|t| t.seq > snapshot_seq && t.seq <= welcome_head)
@@ -943,6 +981,7 @@ impl SimWorld {
             snapshot_seq,
             snap_wb,
             &snap_wms,
+            snap_permutes,
             tail_txns,
         );
         self.apply_client_actions(client_idx, actions);
@@ -994,15 +1033,25 @@ impl SimWorld {
                 }]
             })
             .unwrap_or_default();
-        let snap_bytes = encode_snapshot_v1(&st.confirmed, &wire_wms)
+        let wire_permutes: Vec<WireCommittedPermuteV3> = st
+            .confirmed_permutes
+            .iter()
+            .map(WireCommittedPermuteV3::from)
+            .collect();
+        let snap_bytes = encode_snapshot_with_permutes(&st.confirmed, &wire_wms, &wire_permutes)
             .map_err(|e| format!("client OPFS snapshot encode failed: {e:?}"))?;
-        let wal_bytes = encode_pending_wal_complete(&st.pending)
+        let wal_bytes = encode_pending_wal_complete_v2(&st.pending)
             .map_err(|e| format!("client pending WAL encode failed: {e:?}"))?;
 
         let decoded_snap = decode_snapshot_any(&snap_bytes)
             .map_err(|e| format!("client OPFS snapshot decode failed: {e:?}"))?;
-        let wal_scan = scan_pending_wal(&wal_bytes)
+        let wal_scan = scan_pending_wal_any(&wal_bytes)
             .map_err(|e| format!("client pending WAL scan failed: {e:?}"))?;
+        let confirmed_permutes = decoded_snap
+            .permutes
+            .iter()
+            .map(CommittedPermute::from)
+            .collect();
 
         self.clients[client_idx].machine = ClientSyncMachine::from_persisted(
             SIM_DOC_ID,
@@ -1012,6 +1061,7 @@ impl SimWorld {
             st.confirmed_seq,
             st.last_acked_client_seq,
             decoded_snap.engine.workbook().clone(),
+            confirmed_permutes,
             wal_scan.records,
             st.next_id_counter_hint,
         );
@@ -1062,58 +1112,77 @@ impl SimWorld {
             })
             .cloned();
 
-        let (base_epoch, base_rep, base_seq, base_cs, base_wb, synthetic_pending, base_hint) =
-            if let Some(cp) = old_cp {
-                let mut records = cp.pending;
-                let keep = records.len().saturating_sub(drop_count.min(records.len()));
-                records.truncate(keep);
-                (
-                    cp.epoch,
-                    cp.replica,
-                    cp.confirmed_seq,
-                    cp.last_acked_client_seq,
-                    cp.confirmed,
-                    records,
-                    cp.next_id_counter_hint.min(1),
-                )
-            } else {
-                // Build a byte-truncated pending WAL starting from seq=0 before commits.
-                let committed_by_rep: Vec<WirePendingTxnV2> = self
-                    .current_epoch_log
-                    .iter()
-                    .filter(|t| t.replica == rep)
-                    .map(|t| WirePendingTxnV2 {
-                        replica: t.replica,
-                        client_seq: t.client_seq,
-                        base_server_seq: 0,
-                        timestamp_ms: t.timestamp_ms,
-                        txn: t.txn.clone(),
-                    })
-                    .collect();
-                let encoded = encode_pending_wal_complete(&committed_by_rep)
-                    .map_err(|e| format!("tail-loss WAL encode failed: {e:?}"))?;
-                let cut = encoded.len().saturating_sub(3.max(drop_count * 4)).max(16);
-                let scanned = scan_pending_wal(&encoded[..cut])
-                    .map_err(|e| format!("tail-loss WAL scan failed: {e:?}"))?;
-                (
-                    self.server.epoch(),
-                    Some(rep),
-                    0_u64,
-                    0_u64,
-                    Workbook::new(),
-                    scanned.records,
-                    1_u32,
-                )
-            };
+        let (
+            base_epoch,
+            base_rep,
+            base_seq,
+            base_cs,
+            base_wb,
+            base_permutes,
+            synthetic_pending,
+            base_hint,
+        ) = if let Some(cp) = old_cp {
+            let mut records = cp.pending;
+            let keep = records.len().saturating_sub(drop_count.min(records.len()));
+            records.truncate(keep);
+            (
+                cp.epoch,
+                cp.replica,
+                cp.confirmed_seq,
+                cp.last_acked_client_seq,
+                cp.confirmed,
+                cp.confirmed_permutes,
+                records,
+                cp.next_id_counter_hint.min(1),
+            )
+        } else {
+            // Build a byte-truncated pending WAL starting from seq=0 before commits.
+            let committed_by_rep: Vec<WirePendingTxnV3> = self
+                .current_epoch_log
+                .iter()
+                .filter(|t| t.replica == rep)
+                .map(|t| WirePendingTxnV3 {
+                    replica: t.replica,
+                    client_seq: t.client_seq,
+                    base_server_seq: 0,
+                    timestamp_ms: t.timestamp_ms,
+                    txn: t.txn.clone(),
+                })
+                .collect();
+            let encoded = encode_pending_wal_complete_v2(&committed_by_rep)
+                .map_err(|e| format!("tail-loss WAL encode failed: {e:?}"))?;
+            let cut = encoded.len().saturating_sub(3.max(drop_count * 4)).max(16);
+            let scanned = scan_pending_wal_any(&encoded[..cut])
+                .map_err(|e| format!("tail-loss WAL scan failed: {e:?}"))?;
+            (
+                self.server.epoch(),
+                Some(rep),
+                0_u64,
+                0_u64,
+                Workbook::new(),
+                Vec::new(),
+                scanned.records,
+                1_u32,
+            )
+        };
 
-        let snap_bytes = encode_snapshot_v1(&base_wb, &[])
+        let wire_permutes: Vec<WireCommittedPermuteV3> = base_permutes
+            .iter()
+            .map(WireCommittedPermuteV3::from)
+            .collect();
+        let snap_bytes = encode_snapshot_with_permutes(&base_wb, &[], &wire_permutes)
             .map_err(|e| format!("tail-loss snapshot encode failed: {e:?}"))?;
         let decoded = decode_snapshot_any(&snap_bytes)
             .map_err(|e| format!("tail-loss snapshot decode failed: {e:?}"))?;
-        let wal_bytes = encode_pending_wal_complete(&synthetic_pending)
+        let wal_bytes = encode_pending_wal_complete_v2(&synthetic_pending)
             .map_err(|e| format!("tail-loss pending encode failed: {e:?}"))?;
-        let wal_scan = scan_pending_wal(&wal_bytes)
+        let wal_scan = scan_pending_wal_any(&wal_bytes)
             .map_err(|e| format!("tail-loss pending decode failed: {e:?}"))?;
+        let restored_permutes = decoded
+            .permutes
+            .iter()
+            .map(CommittedPermute::from)
+            .collect();
 
         c.machine = ClientSyncMachine::from_persisted(
             SIM_DOC_ID,
@@ -1123,6 +1192,7 @@ impl SimWorld {
             base_seq,
             base_cs,
             decoded.engine.workbook().clone(),
+            restored_permutes,
             wal_scan.records,
             base_hint,
         );
@@ -1151,8 +1221,15 @@ impl SimWorld {
         }
         let wms = self.server.watermarks();
         let wire_wms = to_wire_watermarks(&wms);
-        let bytes = encode_snapshot_v1(self.server.workbook(), &wire_wms)
-            .map_err(|e| format!("server snapshot encode failed: {e:?}"))?;
+        let wire_permutes: Vec<WireCommittedPermuteV3> = self
+            .server
+            .committed_permutes()
+            .iter()
+            .map(WireCommittedPermuteV3::from)
+            .collect();
+        let bytes =
+            encode_snapshot_with_permutes(self.server.workbook(), &wire_wms, &wire_permutes)
+                .map_err(|e| format!("server snapshot encode failed: {e:?}"))?;
         let stored = StoredSnapshot {
             seq,
             bytes,
@@ -1177,34 +1254,41 @@ impl SimWorld {
         }
         self.faults.server_crashes += 1;
 
-        let (snap_seq, base_wb, snap_wms) = if let Some(stored) = &self.durable_snapshot {
-            let decoded = decode_snapshot_any(&stored.bytes)
-                .map_err(|e| format!("server snapshot decode failed: {e:?}"))?;
-            (
-                stored.seq,
-                decoded.engine.workbook().clone(),
-                stored.watermarks.clone(),
-            )
-        } else {
-            (0_u64, Workbook::new(), Vec::new())
-        };
+        let (snap_seq, base_wb, snap_wms, snap_permutes) =
+            if let Some(stored) = &self.durable_snapshot {
+                let decoded = decode_snapshot_any(&stored.bytes)
+                    .map_err(|e| format!("server snapshot decode failed: {e:?}"))?;
+                let permutes = decoded
+                    .permutes
+                    .iter()
+                    .map(CommittedPermute::from)
+                    .collect();
+                (
+                    stored.seq,
+                    decoded.engine.workbook().clone(),
+                    stored.watermarks.clone(),
+                    permutes,
+                )
+            } else {
+                (0_u64, Workbook::new(), Vec::new(), Vec::new())
+            };
 
-        // Round-trip the durable tail commit payloads through real RTCLWAL2 bytes on crash recovery.
+        // Round-trip the durable tail commit payloads through real RTCLWAL3 bytes on crash recovery.
         if !self.durable_tail_commits.is_empty() {
-            let wal_records: Vec<WireWalRecordV2> = self
+            let wal_records: Vec<WireWalRecordV3> = self
                 .durable_tail_commits
                 .iter()
-                .map(|c| WireWalRecordV2 {
+                .map(|c| WireWalRecordV3 {
                     seq: c.seq,
                     timestamp_ms: c.timestamp_ms,
                     label: c.txn.label.clone(),
                     ops: c.txn.ops.clone(),
                 })
                 .collect();
-            let wal_bytes = encode_wal_complete_v2(snap_seq, &wal_records)
+            let wal_bytes = encode_wal_complete_v3(snap_seq, &wal_records)
                 .map_err(|e| format!("server WAL encode failed: {e:?}"))?;
             let last_wal_seq = wal_records.last().map_or(snap_seq, |r| r.seq);
-            let scanned = scan_wal_v2(&wal_bytes, snap_seq, last_wal_seq)
+            let scanned = scan_wal_v3(&wal_bytes, snap_seq, last_wal_seq)
                 .map_err(|e| format!("server WAL scan failed: {e:?}"))?;
             if scanned.records.len() != wal_records.len() {
                 return Err(String::from("server WAL round-trip record count mismatch"));
@@ -1229,6 +1313,7 @@ impl SimWorld {
             base_wb,
             self.durable_next_per_epoch_replica,
             combined_wms.into_values().collect(),
+            snap_permutes,
             self.durable_tail_commits.clone(),
             self.active_server_limits(),
         )
@@ -1248,8 +1333,15 @@ impl SimWorld {
         let head_seq = self.server.head_seq();
         let wms = self.server.watermarks();
         let wire_wms = to_wire_watermarks(&wms);
-        let snap_bytes = encode_snapshot_v1(self.server.workbook(), &wire_wms)
-            .map_err(|e| format!("backup checkpoint snapshot encode failed: {e:?}"))?;
+        let wire_permutes: Vec<WireCommittedPermuteV3> = self
+            .server
+            .committed_permutes()
+            .iter()
+            .map(WireCommittedPermuteV3::from)
+            .collect();
+        let snap_bytes =
+            encode_snapshot_with_permutes(self.server.workbook(), &wire_wms, &wire_permutes)
+                .map_err(|e| format!("backup checkpoint snapshot encode failed: {e:?}"))?;
         let mut snapshots_copy = self.snapshots_by_seq.clone();
         if head_seq > 0 {
             snapshots_copy.insert(
@@ -1296,12 +1388,17 @@ impl SimWorld {
         }
         self.faults.epoch_backup_restores += 1;
 
-        let base_wb = if bp.snapshot_seq == 0 {
-            Workbook::new()
+        let (base_wb, snap_permutes) = if bp.snapshot_seq == 0 {
+            (Workbook::new(), Vec::new())
         } else {
             let decoded = decode_snapshot_any(&bp.snapshot_bytes)
                 .map_err(|e| format!("backup snapshot decode failed: {e:?}"))?;
-            decoded.engine.workbook().clone()
+            let permutes = decoded
+                .permutes
+                .iter()
+                .map(CommittedPermute::from)
+                .collect();
+            (decoded.engine.workbook().clone(), permutes)
         };
 
         self.server = ServerDocMachine::from_snapshot_and_log(
@@ -1313,6 +1410,7 @@ impl SimWorld {
             base_wb,
             1,
             bp.snapshot_watermarks.clone(),
+            snap_permutes,
             bp.tail_commits.clone(),
             self.active_server_limits(),
         )
@@ -1380,23 +1478,31 @@ impl SimWorld {
     }
 
     fn reload_server_limits(&mut self, limits: ServerLimits) {
-        let (snap_seq, base_wb, snap_wms) = if let Some(stored) = &self.durable_snapshot {
-            if let Ok(decoded) = decode_snapshot_any(&stored.bytes) {
-                (
-                    stored.seq,
-                    decoded.engine.workbook().clone(),
-                    stored.watermarks.clone(),
-                )
+        let (snap_seq, base_wb, snap_wms, snap_permutes) =
+            if let Some(stored) = &self.durable_snapshot {
+                if let Ok(decoded) = decode_snapshot_any(&stored.bytes) {
+                    let permutes = decoded
+                        .permutes
+                        .iter()
+                        .map(CommittedPermute::from)
+                        .collect();
+                    (
+                        stored.seq,
+                        decoded.engine.workbook().clone(),
+                        stored.watermarks.clone(),
+                        permutes,
+                    )
+                } else {
+                    (
+                        self.server.head_seq(),
+                        self.server.workbook().clone(),
+                        self.server.watermarks(),
+                        self.server.committed_permutes().to_vec(),
+                    )
+                }
             } else {
-                (
-                    self.server.head_seq(),
-                    self.server.workbook().clone(),
-                    self.server.watermarks(),
-                )
-            }
-        } else {
-            (0, Workbook::new(), Vec::new())
-        };
+                (0, Workbook::new(), Vec::new(), Vec::new())
+            };
         let mut combined_wms: BTreeMap<u32, ReplicaWatermark> =
             snap_wms.into_iter().map(|w| (w.replica, w)).collect();
         for (&r, &wm) in &self.durable_replicas {
@@ -1411,6 +1517,7 @@ impl SimWorld {
             base_wb,
             self.durable_next_per_epoch_replica,
             combined_wms.into_values().collect(),
+            snap_permutes,
             self.durable_tail_commits.clone(),
             limits,
         ) {
@@ -1436,31 +1543,31 @@ impl SimWorld {
             }
         } else if kind == RogueKind::OversizedPushBatch {
             let count = self.server_limits.max_push_batch.saturating_add(1);
-            let mut txns: Vec<WirePendingTxnV2> = Vec::with_capacity(count);
+            let mut txns: Vec<WirePendingTxnV3> = Vec::with_capacity(count);
             for i in 1..=count {
-                txns.push(WirePendingTxnV2 {
+                txns.push(WirePendingTxnV3 {
                     replica: 1,
                     client_seq: i as u64,
                     base_server_seq: 0,
                     timestamp_ms: 1,
-                    txn: ops_to_wire_txn_v2(String::from("over"), &[])
-                        .map_err(|e| format!("ops_to_wire_txn_v2: {e:?}"))?,
+                    txn: ops_to_wire_txn_v3(String::from("over"), &[])
+                        .map_err(|e| format!("ops_to_wire_txn_v3: {e:?}"))?,
                 });
             }
-            let push = WireSyncFrameV1::Push { txns: txns.clone() };
-            let raw = encode_sync_frame(&push).unwrap_or_default();
+            let push = WireSyncFrameV2::Push { txns: txns.clone() };
+            let raw = encode_sync_frame_v2(&push).unwrap_or_default();
             if self.server.validate_push_batch(&txns, raw.len()).is_ok() {
                 return Err(String::from(
                     "oversized Push batch was unexpectedly accepted",
                 ));
             }
         } else if kind == RogueKind::ViewerPush {
-            let rogue_pending = WirePendingTxnV2 {
+            let rogue_pending = WirePendingTxnV3 {
                 replica: VIEWER_REPLICA,
                 client_seq: 1,
                 base_server_seq: self.server.head_seq(),
                 timestamp_ms: self.timestamp_ms,
-                txn: ops_to_wire_txn_v2(
+                txn: ops_to_wire_txn_v3(
                     String::from("viewer_rogue"),
                     &[Op::SetFreeze {
                         sheet: SheetId(0),
@@ -1468,7 +1575,7 @@ impl SimWorld {
                         frozen_cols: 0,
                     }],
                 )
-                .map_err(|e| format!("ops_to_wire_txn_v2: {e:?}"))?,
+                .map_err(|e| format!("ops_to_wire_txn_v3: {e:?}"))?,
             };
             let res = self.server.apply_and_commit(
                 USER_D,
@@ -1556,15 +1663,15 @@ impl SimWorld {
             });
 
         if let Some((target_idx, conn_id, rep, prev)) = candidate {
-            let dup = WirePendingTxnV2 {
+            let dup = WirePendingTxnV3 {
                 replica: rep,
                 client_seq: prev.client_seq,
                 base_server_seq: self.clients[target_idx].machine.confirmed_seq(),
                 timestamp_ms: self.timestamp_ms,
                 txn: prev.txn,
             };
-            let frame = WireSyncFrameV1::Push { txns: vec![dup] };
-            let bytes = encode_sync_frame(&frame).expect("dup push encodes");
+            let frame = WireSyncFrameV2::Push { txns: vec![dup] };
+            let bytes = encode_sync_frame_v2(&frame).expect("dup push encodes");
             self.clients[target_idx]
                 .c2s_queue
                 .push_back((conn_id, bytes));
@@ -1602,9 +1709,13 @@ impl SimWorld {
         }
 
         for (idx, c) in self.clients.iter().enumerate() {
-            // Invariant #1: visible == replay(confirmed + pending) on every client step.
+            // Invariant #1: visible == replay(confirmed + pending, confirmed_permutes) on every client step.
             let pending = c.machine.pending_wire_txns();
-            let expected_visible = replay_pending_onto(c.machine.confirmed(), &pending);
+            let expected_visible = replay_pending_onto(
+                c.machine.confirmed(),
+                &pending,
+                c.machine.confirmed_permutes(),
+            );
             if c.machine.visible().state_digest() != expected_visible.state_digest() {
                 return Err(format!(
                     "Invariant #1 violated on client {idx}: visible != replay(confirmed + pending)"
@@ -1625,6 +1736,7 @@ impl SimWorld {
                 }
 
                 // Invariant #4: confirmed.state_digest() == server_digest_history[confirmed_seq]
+                // Invariant #11 (step): client confirmed_permutes matches server committed_permutes prefix <= confirmed_seq.
                 if !matches!(
                     c.machine.connection_state(),
                     ConnectionState::AwaitingSnapshot { .. }
@@ -1640,6 +1752,18 @@ impl SimWorld {
                             "Invariant #4 violated on client {idx}: confirmed StateDigest mismatch at seq={cseq}"
                         ));
                     }
+                    let expected_permutes: Vec<CommittedPermute> = self
+                        .server
+                        .committed_permutes()
+                        .iter()
+                        .filter(|p| p.seq <= cseq)
+                        .cloned()
+                        .collect();
+                    if c.machine.confirmed_permutes() != expected_permutes.as_slice() {
+                        return Err(format!(
+                            "Invariant #11 violated on client {idx}: confirmed_permutes mismatch at seq={cseq}"
+                        ));
+                    }
                 }
             }
         }
@@ -1651,7 +1775,7 @@ impl SimWorld {
         let server_digest = server_wb.state_digest();
         let server_logical = server_wb.logical_digest();
         let digest_frame = self.server.digest_frame();
-        let WireSyncFrameV1::Digest { seq, state_digest } = digest_frame else {
+        let WireSyncFrameV2::Digest { seq, state_digest } = digest_frame else {
             return Err(String::from("server digest_frame was not Digest"));
         };
 
@@ -1707,11 +1831,18 @@ impl SimWorld {
         }
 
         // Invariant #9: full epoch log replay matches server, AND latest snapshot + tail replay matches server.
+        // Invariant #11 (quiescence): server committed_permutes matches full epoch log and survives snapshot + tail reload.
         let mut full_replay = Workbook::<BoundFormula>::new();
+        let mut expected_log_permutes = Vec::new();
         for commit in &self.current_epoch_log {
-            let (_, ops) = ops_from_wire_txn_v2(commit.txn.clone())
+            let (_, ops) = ops_from_wire_txn_v3(commit.txn.clone())
                 .map_err(|e| format!("full log decode failed: {e:?}"))?;
             for op in ops {
+                if let Some(cp) =
+                    CommittedPermute::from_op(commit.seq, commit.replica, commit.client_seq, &op)
+                {
+                    expected_log_permutes.push(cp);
+                }
                 full_replay
                     .apply(op)
                     .map_err(|e| format!("full log replay failed at seq={}: {e:?}", commit.seq))?;
@@ -1724,13 +1855,30 @@ impl SimWorld {
                 "Invariant #9 violated: full epoch log replay disagrees with server workbook",
             ));
         }
+        if self.server.committed_permutes() != expected_log_permutes.as_slice() {
+            return Err(String::from(
+                "Invariant #11 violated: server committed_permutes disagrees with epoch log",
+            ));
+        }
 
         if let Some(stored) = self.snapshots_by_seq.values().next_back() {
             let decoded = decode_snapshot_any(&stored.bytes)
                 .map_err(|e| format!("snapshot catchup equivalence decode failed: {e:?}"))?;
-            let mut snap_replay = decoded.engine.workbook().clone();
-            for commit in self.current_epoch_log.iter().filter(|t| t.seq > stored.seq) {
-                let (_, ops) = ops_from_wire_txn_v2(commit.txn.clone())
+            let snap_wb = decoded.engine.workbook().clone();
+            let snap_permutes: Vec<CommittedPermute> = decoded
+                .permutes
+                .iter()
+                .map(CommittedPermute::from)
+                .collect();
+            let mut snap_replay = snap_wb.clone();
+            let tail_commits: Vec<WireCommittedTxnV3> = self
+                .current_epoch_log
+                .iter()
+                .filter(|t| t.seq > stored.seq)
+                .cloned()
+                .collect();
+            for commit in &tail_commits {
+                let (_, ops) = ops_from_wire_txn_v3(commit.txn.clone())
                     .map_err(|e| format!("snapshot tail decode failed: {e:?}"))?;
                 for op in ops {
                     snap_replay
@@ -1745,9 +1893,31 @@ impl SimWorld {
                     "Invariant #9 violated: latest snapshot + tail diverges from server workbook",
                 ));
             }
+            let rebuilt = ServerDocMachine::from_snapshot_and_log(
+                SIM_DOC_ID,
+                SIM_BRANCH_ID,
+                String::from("/api/w"),
+                self.server.epoch(),
+                stored.seq,
+                snap_wb,
+                self.server.next_per_epoch_replica(),
+                stored.watermarks.clone(),
+                snap_permutes,
+                tail_commits,
+                self.active_server_limits(),
+            )
+            .map_err(|e| format!("Invariant #11 snapshot+tail machine rebuild failed: {e:?}"))?;
+            if rebuilt.committed_permutes() != self.server.committed_permutes()
+                || rebuilt.workbook().state_digest() != server_digest
+                || rebuilt.workbook().logical_digest() != server_logical
+            {
+                return Err(String::from(
+                    "Invariant #11 violated: latest snapshot + tail machine rebuild diverges from server",
+                ));
+            }
         }
 
-        let _ = SYNC_PROTOCOL_VERSION;
+        let _ = SYNC_PROTOCOL_VERSION_V2;
         Ok(())
     }
 }
@@ -1756,7 +1926,7 @@ fn compute_next_id_hint(
     epoch: u8,
     replica: Option<u32>,
     confirmed: &Workbook<BoundFormula>,
-    pending: &[WirePendingTxnV2],
+    pending: &[WirePendingTxnV3],
     prev_hint: u32,
 ) -> u32 {
     let Some(rep) = replica else {
@@ -1780,7 +1950,7 @@ fn compute_next_id_hint(
         }
     }
     for p in pending {
-        if let Ok((_, ops)) = ops_from_wire_txn_v2(p.txn.clone()) {
+        if let Ok((_, ops)) = ops_from_wire_txn_v3(p.txn.clone()) {
             for op in ops {
                 if let Op::InsertRows { ids, .. } | Op::InsertCols { ids, .. } = op
                     && ids.belongs_to(epoch, rep)

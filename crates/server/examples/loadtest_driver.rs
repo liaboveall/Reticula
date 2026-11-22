@@ -21,12 +21,12 @@ use reticula_core::sheet::Sheet;
 use reticula_core::state_digest::StateDigest;
 use reticula_core::value::Value as CellValue;
 use reticula_formula::binder::BoundFormula;
-use reticula_sync::{ClientAction, ClientSyncMachine, ReplicaWatermark};
+use reticula_sync::{ClientAction, ClientSyncMachine, CommittedPermute, ReplicaWatermark};
 use reticula_wire::snapshot::{
     decode_snapshot_any, decode_snapshot_for_collab, encode_snapshot_v1,
 };
-use reticula_wire::sync_frame::{decode_sync_frame, encode_sync_frame};
-use reticula_wire::v2::{WireCommittedTxnV2, WireSyncFrameV1};
+use reticula_wire::sync_frame::{decode_sync_frame_v2, encode_sync_frame_v2};
+use reticula_wire::v3::{WireCommittedTxnV3, WireSyncFrameV2};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::net::TcpStream;
@@ -794,9 +794,9 @@ async fn run_load_client(
                     .bytes()
                     .await
                     .map_err(|e| format!("client {idx} snap bytes: {e}"))?;
-                let (snap_wb, watermarks) =
+                let (snap_wb, watermarks, permutes) =
                     if snapshot_seq == 0 && raw.as_ref() == expected_snap_bytes.as_slice() {
-                        ((*base_wb).clone(), Vec::new())
+                        ((*base_wb).clone(), Vec::new(), Vec::new())
                     } else {
                         let decoded = decode_snapshot_any(&raw)
                             .map_err(|e| format!("client {idx} decode snap: {e:?}"))?;
@@ -810,10 +810,21 @@ async fn run_load_client(
                                 max_id_counter: wm.max_id_counter,
                             })
                             .collect();
-                        (decoded.engine.workbook().clone(), wms)
+                        let permutes = decoded
+                            .permutes
+                            .iter()
+                            .map(CommittedPermute::from)
+                            .collect();
+                        (decoded.engine.workbook().clone(), wms, permutes)
                     };
                 let tail = fetch_tail(&http, &base_url, doc, &cookie, snapshot_seq).await?;
-                queue.extend(machine.install_snapshot(snapshot_seq, snap_wb, &watermarks, tail));
+                queue.extend(machine.install_snapshot(
+                    snapshot_seq,
+                    snap_wb,
+                    &watermarks,
+                    permutes,
+                    tail,
+                ));
             }
             _ => {}
         }
@@ -884,16 +895,16 @@ async fn run_load_client(
             incoming = socket.next() => {
                 match incoming {
                     Some(Ok(Message::Binary(bytes))) => {
-                        let frame = decode_sync_frame(&bytes)
+                        let frame = decode_sync_frame_v2(&bytes)
                             .map_err(|e| format!("client {idx} decode: {e:?}"))?;
                         match frame {
-                            WireSyncFrameV1::Ack { replica, client_seq, .. } => {
+                            WireSyncFrameV2::Ack { replica, client_seq, .. } => {
                                 machine.on_ack(replica, client_seq);
                             }
-                            WireSyncFrameV1::Reject { client_seq, reason } => {
+                            WireSyncFrameV2::Reject { client_seq, reason } => {
                                 return Err(format!("client {idx} rejected client_seq={client_seq}: {reason:?}"));
                             }
-                            WireSyncFrameV1::Commit { seq, replica, client_seq, user_id, timestamp_ms, txn } => {
+                            WireSyncFrameV2::Commit { seq, replica, client_seq, user_id, timestamp_ms, txn } => {
                                 let now_ns = u64::try_from(shared.origin.elapsed().as_nanos()).unwrap_or(u64::MAX);
                                 if let Some(&author_idx) = snapshot_rep_map.get(&replica)
                                     && author_idx != idx
@@ -907,7 +918,7 @@ async fn run_load_client(
                                         latencies_ns.push(lat);
                                     }
                                 }
-                                let acts = machine.on_commit(WireCommittedTxnV2 {
+                                let acts = machine.on_commit(WireCommittedTxnV3 {
                                     seq, replica, client_seq, user_id, timestamp_ms, txn,
                                 });
                                 for act in acts {
@@ -926,7 +937,7 @@ async fn run_load_client(
                                     shared.settled_count.fetch_add(1, Ordering::Release);
                                 }
                             }
-                            WireSyncFrameV1::Digest { seq, state_digest } => {
+                            WireSyncFrameV2::Digest { seq, state_digest } => {
                                 for act in machine.on_digest(seq, state_digest) {
                                     if let ClientAction::DigestMismatch { .. } = act {
                                         shared.digest_mismatches.fetch_add(1, Ordering::AcqRel);
@@ -938,11 +949,11 @@ async fn run_load_client(
                                     *shared.server_digest.lock().unwrap() = Some(parsed);
                                 }
                             }
-                            WireSyncFrameV1::Ping(n) => {
-                                send_ws(&mut socket, &WireSyncFrameV1::Pong(n)).await?;
+                            WireSyncFrameV2::Ping(n) => {
+                                send_ws(&mut socket, &WireSyncFrameV2::Pong(n)).await?;
                             }
-                            WireSyncFrameV1::Presence(_) | WireSyncFrameV1::Pong(_) => {}
-                            WireSyncFrameV1::Welcome { .. } | WireSyncFrameV1::Hello { .. } | WireSyncFrameV1::Push { .. } => {}
+                            WireSyncFrameV2::Presence(_) | WireSyncFrameV2::Pong(_) => {}
+                            WireSyncFrameV2::Welcome { .. } | WireSyncFrameV2::Hello { .. } | WireSyncFrameV2::Push { .. } => {}
                         }
                     }
                     Some(Ok(Message::Ping(_) | Message::Pong(_) | Message::Text(_) | Message::Frame(_))) => {}
@@ -965,20 +976,21 @@ async fn run_load_client(
     })
 }
 
-async fn send_ws(socket: &mut Socket, frame: &WireSyncFrameV1) -> AppResult<()> {
-    let bytes = encode_sync_frame(frame).map_err(|e| format!("encode frame: {e:?}"))?;
+async fn send_ws(socket: &mut Socket, frame: &WireSyncFrameV2) -> AppResult<()> {
+    let bytes = encode_sync_frame_v2(frame).map_err(|e| format!("encode frame: {e:?}"))?;
     timeout(IO_TIMEOUT, socket.send(Message::Binary(bytes.into())))
         .await
         .map_err(|_| String::from("ws send timeout"))?
         .map_err(|e| format!("ws send: {e}"))
 }
 
-async fn recv_ws(socket: &mut Socket) -> AppResult<WireSyncFrameV1> {
+async fn recv_ws(socket: &mut Socket) -> AppResult<WireSyncFrameV2> {
     timeout(IO_TIMEOUT, async {
         while let Some(msg) = socket.next().await {
             match msg {
                 Ok(Message::Binary(bytes)) => {
-                    return decode_sync_frame(&bytes).map_err(|e| format!("decode frame: {e:?}"));
+                    return decode_sync_frame_v2(&bytes)
+                        .map_err(|e| format!("decode frame: {e:?}"));
                 }
                 Ok(Message::Close(f)) => return Err(format!("ws closed: {f:?}")),
                 Ok(_) => {}
@@ -997,7 +1009,7 @@ async fn fetch_tail(
     doc: Uuid,
     cookie: &str,
     after_seq: u64,
-) -> AppResult<Vec<WireCommittedTxnV2>> {
+) -> AppResult<Vec<WireCommittedTxnV3>> {
     let mut out = Vec::new();
     let mut cursor = after_seq;
     loop {
@@ -1013,7 +1025,7 @@ async fn fetch_tail(
             return Err(format!("GET {path}: {}", resp.status()));
         }
         let bytes = resp.bytes().await.map_err(|e| format!("txns bytes: {e}"))?;
-        let batch: Vec<WireCommittedTxnV2> =
+        let batch: Vec<WireCommittedTxnV3> =
             postcard::from_bytes(&bytes).map_err(|e| format!("decode txns: {e}"))?;
         if batch.is_empty() {
             break;

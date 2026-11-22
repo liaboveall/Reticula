@@ -1,6 +1,6 @@
 //! Revision history, transaction replay chunks, and named versions.
 
-use reticula_wire::v2::{WireCommittedTxnV2, WireTxnV2};
+use reticula_wire::v3::{WireCommittedTxnV3, WireTxnV3};
 use serde::Serialize;
 use utoipa::ToSchema;
 use uuid::Uuid;
@@ -139,13 +139,13 @@ impl Store {
             for row in rows {
                 let seq = integer(row.seq, "transaction seq")?;
                 let record = decode_log(&row.payload, seq)?;
-                commits.push(WireCommittedTxnV2 {
+                commits.push(WireCommittedTxnV3 {
                     seq,
                     replica: integer(row.replica, "replica")?,
                     client_seq: integer(row.client_seq, "client seq")?,
                     user_id: row.user_id.into_bytes(),
                     timestamp_ms: record.timestamp_ms,
-                    txn: WireTxnV2 {
+                    txn: WireTxnV3 {
                         label: record.label,
                         ops: record.ops,
                     },

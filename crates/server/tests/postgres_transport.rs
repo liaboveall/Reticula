@@ -12,10 +12,11 @@ use reticula_core::id::{ColId, RowId, SheetId};
 use reticula_core::ops::{CellEdit, CellInput, FormatPatch, Op, ScalarValue};
 use reticula_core::value::Value as CellValue;
 use reticula_server::store::{MAIN_BRANCH, SessionIdentity, Store};
-use reticula_wire::convert_v2::ops_to_wire_txn_v2;
+use reticula_wire::convert_v3::ops_to_wire_txn_v3;
 use reticula_wire::snapshot::decode_snapshot_any;
-use reticula_wire::sync_frame::{decode_sync_frame, encode_sync_frame};
-use reticula_wire::v2::{WirePendingTxnV2, WirePresenceV1, WireRejectReasonV1, WireSyncFrameV1};
+use reticula_wire::sync_frame::{decode_sync_frame_v2, encode_sync_frame_v2};
+use reticula_wire::v2::{WirePresenceV1, WireRejectReasonV1};
+use reticula_wire::v3::{SYNC_PROTOCOL_VERSION_V2, WirePendingTxnV3, WireSyncFrameV2};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
@@ -184,7 +185,7 @@ impl Server {
         cookie: &str,
         replica: Option<u32>,
         seq: u64,
-    ) -> (Socket, WireSyncFrameV1) {
+    ) -> (Socket, WireSyncFrameV2) {
         let mut socket = self.connect(doc, Some(cookie), ORIGIN).await.unwrap();
         send(&mut socket, &hello_frame(doc, replica, seq)).await;
         let response = recv(&mut socket).await;
@@ -196,9 +197,9 @@ fn database_url() -> String {
     std::env::var("RETICULA_TEST_DATABASE_URL").unwrap()
 }
 
-fn hello_frame(doc: Uuid, replica: Option<u32>, last_applied_seq: u64) -> WireSyncFrameV1 {
-    WireSyncFrameV1::Hello {
-        protocol_version: 1,
+fn hello_frame(doc: Uuid, replica: Option<u32>, last_applied_seq: u64) -> WireSyncFrameV2 {
+    WireSyncFrameV2::Hello {
+        protocol_version: SYNC_PROTOCOL_VERSION_V2,
         doc_id: doc.into_bytes(),
         branch_id: MAIN_BRANCH.into_bytes(),
         replica,
@@ -207,28 +208,28 @@ fn hello_frame(doc: Uuid, replica: Option<u32>, last_applied_seq: u64) -> WireSy
     }
 }
 
-fn replica(frame: WireSyncFrameV1) -> u32 {
+fn replica(frame: WireSyncFrameV2) -> u32 {
     match frame {
-        WireSyncFrameV1::Welcome { replica, .. } => replica,
+        WireSyncFrameV2::Welcome { replica, .. } => replica,
         other => panic!("expected Welcome, got {other:?}"),
     }
 }
 
-async fn send(socket: &mut Socket, frame: &WireSyncFrameV1) {
+async fn send(socket: &mut Socket, frame: &WireSyncFrameV2) {
     timeout(
         WAIT,
-        socket.send(Message::Binary(encode_sync_frame(frame).unwrap().into())),
+        socket.send(Message::Binary(encode_sync_frame_v2(frame).unwrap().into())),
     )
     .await
     .unwrap()
     .unwrap();
 }
 
-async fn recv(socket: &mut Socket) -> WireSyncFrameV1 {
+async fn recv(socket: &mut Socket) -> WireSyncFrameV2 {
     timeout(WAIT, async {
         while let Some(message) = socket.next().await {
             if let Message::Binary(bytes) = message.unwrap() {
-                return decode_sync_frame(&bytes).unwrap();
+                return decode_sync_frame_v2(&bytes).unwrap();
             }
         }
         panic!("sync connection closed before next frame");
@@ -237,13 +238,13 @@ async fn recv(socket: &mut Socket) -> WireSyncFrameV1 {
     .unwrap()
 }
 
-fn edit(replica: u32, client_seq: u64, base_server_seq: u64) -> WirePendingTxnV2 {
-    WirePendingTxnV2 {
+fn edit(replica: u32, client_seq: u64, base_server_seq: u64) -> WirePendingTxnV3 {
+    WirePendingTxnV3 {
         replica,
         client_seq,
         base_server_seq,
         timestamp_ms: 0,
-        txn: ops_to_wire_txn_v2(
+        txn: ops_to_wire_txn_v3(
             "Edit".into(),
             &[Op::SetCells {
                 sheet: SheetId(0),
@@ -419,7 +420,7 @@ async fn permission_matrix_and_binary_sync_over_http() {
     let (_, forbidden) = server.hello(doc, &editor, Some(owner_replica), 0).await;
     assert_eq!(
         forbidden,
-        WireSyncFrameV1::Reject {
+        WireSyncFrameV2::Reject {
             client_seq: 0,
             reason: WireRejectReasonV1::Forbidden
         }
@@ -428,14 +429,14 @@ async fn permission_matrix_and_binary_sync_over_http() {
     let editor_replica = replica(editor_welcome);
     send(
         &mut active_editor,
-        &WireSyncFrameV1::Push {
+        &WireSyncFrameV2::Push {
             txns: vec![edit(owner_replica, 1, 0)],
         },
     )
     .await;
     assert_eq!(
         recv(&mut active_editor).await,
-        WireSyncFrameV1::Reject {
+        WireSyncFrameV2::Reject {
             client_seq: 1,
             reason: WireRejectReasonV1::Forbidden
         }
@@ -443,7 +444,7 @@ async fn permission_matrix_and_binary_sync_over_http() {
 
     send(
         &mut active_editor,
-        &WireSyncFrameV1::Presence(WirePresenceV1 {
+        &WireSyncFrameV2::Presence(WirePresenceV1 {
             replica: editor_replica,
             user_id: [0; 16],
             display_name: "Impersonation".into(),
@@ -456,35 +457,35 @@ async fn permission_matrix_and_binary_sync_over_http() {
     )
     .await;
     assert!(
-        matches!(recv(&mut owner_ws).await, WireSyncFrameV1::Presence(value) if value.display_name == "Bob" && value.user_id != [0; 16] && value.color_slot < 8)
+        matches!(recv(&mut owner_ws).await, WireSyncFrameV2::Presence(value) if value.display_name == "Bob" && value.user_id != [0; 16] && value.color_slot < 8)
     );
-    send(&mut owner_ws, &WireSyncFrameV1::Ping(77)).await;
-    assert_eq!(recv(&mut owner_ws).await, WireSyncFrameV1::Pong(77));
+    send(&mut owner_ws, &WireSyncFrameV2::Ping(77)).await;
+    assert_eq!(recv(&mut owner_ws).await, WireSyncFrameV2::Pong(77));
     send(
         &mut active_editor,
-        &WireSyncFrameV1::Push {
+        &WireSyncFrameV2::Push {
             txns: vec![edit(editor_replica, 1, 0)],
         },
     )
     .await;
     assert!(matches!(
         recv(&mut active_editor).await,
-        WireSyncFrameV1::Ack { seq: 1, .. }
+        WireSyncFrameV2::Ack { seq: 1, .. }
     ));
     assert!(matches!(
         recv(&mut owner_ws).await,
-        WireSyncFrameV1::Commit { seq: 1, .. }
+        WireSyncFrameV2::Commit { seq: 1, .. }
     ));
     send(
         &mut owner_ws,
-        &WireSyncFrameV1::Push {
+        &WireSyncFrameV2::Push {
             txns: vec![edit(owner_replica, 1, 1)],
         },
     )
     .await;
     assert!(matches!(
         recv(&mut owner_ws).await,
-        WireSyncFrameV1::Ack { seq: 2, .. }
+        WireSyncFrameV2::Ack { seq: 2, .. }
     ));
     assert_eq!(
         server
@@ -545,7 +546,7 @@ async fn permission_matrix_and_binary_sync_over_http() {
 async fn ack_seqs(socket: &mut Socket, count: usize) -> Vec<u64> {
     let mut seen = Vec::new();
     while seen.len() < count {
-        if let WireSyncFrameV1::Ack { seq, .. } = recv(socket).await {
+        if let WireSyncFrameV2::Ack { seq, .. } = recv(socket).await {
             seen.push(seq);
         }
     }
@@ -558,7 +559,7 @@ async fn push_edits(
     sequences: std::ops::RangeInclusive<u64>,
     base: u64,
 ) {
-    let frame = WireSyncFrameV1::Push {
+    let frame = WireSyncFrameV2::Push {
         txns: sequences.map(|seq| edit(replica, seq, base)).collect(),
     };
     send(socket, &frame).await;
@@ -630,7 +631,7 @@ async fn forced_process_exit_preserves_every_observed_ack() {
     let (_, welcome) = recovered.hello(doc, &owner, Some(ra), 0).await;
     assert!(matches!(
         welcome,
-        WireSyncFrameV1::Welcome {
+        WireSyncFrameV2::Welcome {
             head_seq: 32,
             last_client_seq: 16,
             ..

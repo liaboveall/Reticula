@@ -9,3 +9,9 @@ b7b3b2768ca4eac2eb5e4461111ae4dec0f33af9e38df34b948d8306739efc1a  tests/compat/v
 22eb6b2424f5beb5da5734319827ddff66be099aa4286c38afdf42aed89a03bc  tests/compat/v2/expected_digest.txt
 d43810a982997d9c9b6ec98cd174d597e80137490c7f08a2ce41bd3029e1caee  tests/compat/v2/replay.rtclwal
 6ad5c408d68f04fd82594251fbd78fc922c0ff3b4e0f1ca30fae90ed877a05f0  tests/compat/v2/sync_frames.bin
+# Frozen SHA-256 manifest for wire v3 schema, sync protocol v2 frames and fixtures (D-020).
+aa469f0a2842e62c11eba5ac6c40c67305cd5d27f021bed1bc2b30b8a6ddd3bc  crates/wire/src/v3.rs
+9f088bf56567380847a64eabf35f120a496988db4fd3a708fb8a0b4a58616b18  tests/compat/v3/base.rtclsnap
+4b191cb85dfd1df989828e8451edc8066ba9dd627c144d485543f0f286282901  tests/compat/v3/expected_digest.txt
+8cfa8789b68f468a2c92576d46bb52f4a2ce8d09c7567c0a9665a004f0ea2604  tests/compat/v3/replay.rtclwal
+7272cc347e851dd85d549068f882b9683c97987178ceb96aacb8d523d8f2ff01  tests/compat/v3/sync_frames.bin

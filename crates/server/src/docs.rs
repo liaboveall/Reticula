@@ -9,9 +9,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use reticula_sync::{
     MemberRole, ServerDocMachine, ServerLimits, StagedTxn, TryApplyOutcome, VIEWER_REPLICA,
 };
-use reticula_wire::sync_frame::{SyncFrameError, encode_sync_frame};
+use reticula_wire::convert_v1::WireConvertError;
+use reticula_wire::sync_frame::{SyncFrameError, encode_sync_frame, encode_sync_frame_v2};
 use reticula_wire::v2::{
-    WireCatchupV1, WirePendingTxnV2, WirePresenceV1, WireRejectReasonV1, WireSyncFrameV1,
+    SYNC_PROTOCOL_VERSION, WirePresenceV1, WireRejectReasonV1, WireSyncFrameV1,
+};
+use reticula_wire::v3::{
+    SYNC_PROTOCOL_VERSION_V2, WireCatchupV2, WirePendingTxnV3, WireSyncFrameV2,
 };
 use thiserror::Error;
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
@@ -99,7 +103,7 @@ impl DocRooms {
         user: Uuid,
         role: MemberRole,
         display_name: String,
-        hello: WireSyncFrameV1,
+        hello: WireSyncFrameV2,
     ) -> Result<RoomConnection, RoomError> {
         self.join_session(doc, user, role, display_name, None, hello)
             .await
@@ -112,8 +116,14 @@ impl DocRooms {
         role: MemberRole,
         display_name: String,
         share_link_id: Option<Uuid>,
-        hello: WireSyncFrameV1,
+        hello: WireSyncFrameV2,
     ) -> Result<RoomConnection, RoomError> {
+        let protocol_version = match &hello {
+            WireSyncFrameV2::Hello {
+                protocol_version, ..
+            } => *protocol_version,
+            _ => 0,
+        };
         let lease = self.acquire_room_lease(doc).await?;
         let (reply, ready) = oneshot::channel();
         let (sender, receiver) = mpsc::channel(QUEUE_FRAMES);
@@ -129,6 +139,7 @@ impl DocRooms {
                 output: Output {
                     sender,
                     budget: Arc::clone(&budget),
+                    graceful_drop: false,
                 },
                 reply,
             })
@@ -141,6 +152,7 @@ impl DocRooms {
         std::mem::forget(lease);
         Ok(RoomConnection {
             id,
+            protocol_version,
             actor,
             receiver,
             budget,
@@ -417,6 +429,7 @@ impl Drop for RoomLease {
 
 pub struct RoomConnection {
     id: u64,
+    protocol_version: u8,
     actor: mpsc::Sender<Command>,
     receiver: mpsc::Receiver<QueuedItem>,
     budget: Arc<Semaphore>,
@@ -435,9 +448,14 @@ impl Drop for RoomConnection {
 }
 
 impl RoomConnection {
+    #[must_use]
+    pub const fn protocol_version(&self) -> u8 {
+        self.protocol_version
+    }
+
     pub async fn push(
         &self,
-        txns: Vec<WirePendingTxnV2>,
+        txns: Vec<WirePendingTxnV3>,
         wire_bytes: usize,
     ) -> Result<(), RoomError> {
         self.actor
@@ -484,6 +502,7 @@ struct QueuedItem {
 struct Output {
     sender: mpsc::Sender<QueuedItem>,
     budget: Arc<Semaphore>,
+    graceful_drop: bool,
 }
 
 impl Output {
@@ -511,7 +530,9 @@ impl Output {
 
 impl Drop for Output {
     fn drop(&mut self) {
-        self.budget.close();
+        if !self.graceful_drop {
+            self.budget.close();
+        }
     }
 }
 
@@ -521,13 +542,13 @@ enum Command {
         role: MemberRole,
         display_name: String,
         share_link_id: Option<Uuid>,
-        hello: WireSyncFrameV1,
+        hello: WireSyncFrameV2,
         output: Output,
         reply: oneshot::Sender<Result<u64, RoomError>>,
     },
     Push {
         id: u64,
-        txns: Vec<WirePendingTxnV2>,
+        txns: Vec<WirePendingTxnV3>,
         wire_bytes: usize,
     },
     Presence {
@@ -554,6 +575,7 @@ struct Member {
     user: Uuid,
     role: MemberRole,
     replica: u32,
+    protocol_version: u8,
     display_name: String,
     share_link_id: Option<Uuid>,
     last_presence: Option<Instant>,
@@ -698,10 +720,16 @@ impl DocActor {
         _role: MemberRole,
         display_name: String,
         share_link_id: Option<Uuid>,
-        hello: &WireSyncFrameV1,
+        hello: &WireSyncFrameV2,
         output: Output,
         reply: oneshot::Sender<Result<u64, RoomError>>,
     ) -> Result<(), StoreError> {
+        let protocol_version = match hello {
+            WireSyncFrameV2::Hello {
+                protocol_version, ..
+            } => *protocol_version,
+            _ => SYNC_PROTOCOL_VERSION_V2,
+        };
         let role = if let Some(link_id) = share_link_id {
             if !self
                 .store
@@ -727,7 +755,7 @@ impl DocActor {
                 return Ok(());
             }
         };
-        let WireSyncFrameV1::Welcome {
+        let WireSyncFrameV2::Welcome {
             replica,
             ref catchup,
             ..
@@ -758,9 +786,9 @@ impl DocActor {
             }
         }
 
-        let bytes = match encode_sync_frame(&welcome) {
-            Ok(bytes) if matches!(catchup, WireCatchupV1::Txns { .. }) => bytes.into(),
-            Ok(_) | Err(SyncFrameError::FrameTooLarge { .. }) => {
+        let bytes = match encode_for_version(protocol_version, &welcome) {
+            Ok(bytes) if matches!(catchup, WireCatchupV2::Txns { .. }) => bytes,
+            Ok(_) | Err(EncodeError::TooLarge) => {
                 if let Some(task) = self.snapshot.take() {
                     self.machine.mark_snapshot_written(task.await??);
                 }
@@ -775,18 +803,35 @@ impl DocActor {
                     self.metrics.inc_snapshots_pruned(pruned);
                 }
                 self.machine.mark_snapshot_written(snapshot.seq());
-                if let WireSyncFrameV1::Welcome {
+                if let WireSyncFrameV2::Welcome {
                     ref mut catchup, ..
                 } = welcome
                 {
-                    *catchup = WireCatchupV1::SnapshotRequired {
+                    *catchup = WireCatchupV2::SnapshotRequired {
                         snapshot_seq: snapshot.seq(),
                         url: format!("/api/workbooks/{}/snapshots/{}", self.doc, snapshot.seq()),
                     };
                 }
-                encode(&welcome)?
+                match encode_for_version(protocol_version, &welcome) {
+                    Ok(bytes) => bytes,
+                    Err(EncodeError::UnsupportedInV1) => {
+                        let _ = reply.send(Err(RoomError::Rejected(
+                            WireRejectReasonV1::UpgradeRequired,
+                        )));
+                        return Ok(());
+                    }
+                    Err(EncodeError::TooLarge | EncodeError::Failed) => {
+                        return Err(StoreError::Invalid("handshake encoding"));
+                    }
+                }
             }
-            Err(_) => return Err(StoreError::Invalid("handshake encoding")),
+            Err(EncodeError::UnsupportedInV1) => {
+                let _ = reply.send(Err(RoomError::Rejected(
+                    WireRejectReasonV1::UpgradeRequired,
+                )));
+                return Ok(());
+            }
+            Err(EncodeError::Failed) => return Err(StoreError::Invalid("handshake encoding")),
         };
 
         let ws_kind = if share_link_id.is_some() {
@@ -807,6 +852,7 @@ impl DocActor {
                     user,
                     role,
                     replica,
+                    protocol_version,
                     display_name,
                     share_link_id,
                     last_presence: None,
@@ -887,7 +933,7 @@ impl DocActor {
         if update.replica != member.replica {
             return self.send(
                 id,
-                &WireSyncFrameV1::Reject {
+                &WireSyncFrameV2::Reject {
                     client_seq: 0,
                     reason: WireRejectReasonV1::Forbidden,
                 },
@@ -904,16 +950,13 @@ impl DocActor {
         update.user_id = member.user.into_bytes();
         update.display_name.clone_from(&member.display_name);
         update.color_slot = (member.replica % 8) as u8;
-        let bytes = encode(&WireSyncFrameV1::Presence(update))?;
-        self.members
-            .retain(|key, member| *key == id || member.output.send(Arc::clone(&bytes)));
-        Ok(())
+        self.broadcast_filtered(Some(id), &WireSyncFrameV2::Presence(update))
     }
 
     async fn push(
         &mut self,
         id: u64,
-        txns: Vec<WirePendingTxnV2>,
+        txns: Vec<WirePendingTxnV3>,
         wire_bytes: usize,
     ) -> Result<(), StoreError> {
         let Some(member) = self.members.get(&id) else {
@@ -926,7 +969,7 @@ impl DocActor {
             self.flush().await?;
             return self.send(
                 id,
-                &WireSyncFrameV1::Reject {
+                &WireSyncFrameV2::Reject {
                     client_seq: txns.first().map_or(0, |txn| txn.client_seq),
                     reason: WireRejectReasonV1::Forbidden,
                 },
@@ -938,7 +981,7 @@ impl DocActor {
             self.flush().await?;
             return self.send(
                 id,
-                &WireSyncFrameV1::Reject {
+                &WireSyncFrameV2::Reject {
                     client_seq: txns.first().map_or(0, |txn| txn.client_seq),
                     reason: WireRejectReasonV1::QuotaExceeded,
                 },
@@ -950,7 +993,7 @@ impl DocActor {
             self.flush().await?;
             return self.send(
                 id,
-                &WireSyncFrameV1::Reject {
+                &WireSyncFrameV2::Reject {
                     client_seq: txns.first().map_or(0, |txn| txn.client_seq),
                     reason,
                 },
@@ -999,7 +1042,7 @@ impl DocActor {
                     };
                     self.send(
                         id,
-                        &WireSyncFrameV1::Ack {
+                        &WireSyncFrameV2::Ack {
                             replica,
                             client_seq,
                             seq,
@@ -1010,7 +1053,7 @@ impl DocActor {
                 Err(reason) => {
                     self.metrics.inc_rejected_txns(1);
                     self.flush().await?;
-                    self.send(id, &WireSyncFrameV1::Reject { client_seq, reason })?;
+                    self.send(id, &WireSyncFrameV2::Reject { client_seq, reason })?;
                     break;
                 }
             }
@@ -1067,14 +1110,14 @@ impl DocActor {
             );
             self.send(
                 entry.author,
-                &WireSyncFrameV1::Ack {
+                &WireSyncFrameV2::Ack {
                     replica,
                     client_seq,
                     seq,
                     timestamp_ms,
                 },
             )?;
-            self.broadcast(&WireSyncFrameV1::Commit {
+            self.broadcast(&WireSyncFrameV2::Commit {
                 seq,
                 replica,
                 client_seq,
@@ -1089,19 +1132,71 @@ impl DocActor {
         Ok(())
     }
 
-    fn send(&mut self, id: u64, frame: &WireSyncFrameV1) -> Result<(), StoreError> {
-        if let Some(member) = self.members.get(&id)
-            && !member.output.send(encode(frame)?)
-        {
-            self.members.remove(&id);
+    fn send(&mut self, id: u64, frame: &WireSyncFrameV2) -> Result<(), StoreError> {
+        let Some(proto) = self.members.get(&id).map(|m| m.protocol_version) else {
+            return Ok(());
+        };
+        match encode_for_version(proto, frame) {
+            Ok(bytes) => {
+                if let Some(member) = self.members.get(&id)
+                    && !member.output.send(bytes)
+                {
+                    self.members.remove(&id);
+                }
+                Ok(())
+            }
+            Err(EncodeError::UnsupportedInV1) => {
+                if let Some(mut member) = self.members.remove(&id) {
+                    notify_upgrade_required(&mut member);
+                }
+                Ok(())
+            }
+            Err(EncodeError::TooLarge | EncodeError::Failed) => {
+                Err(StoreError::Invalid("outbound frame encoding"))
+            }
         }
-        Ok(())
     }
 
-    fn broadcast(&mut self, frame: &WireSyncFrameV1) -> Result<(), StoreError> {
-        let bytes = encode(frame)?;
-        self.members
-            .retain(|_, member| member.output.send(Arc::clone(&bytes)));
+    fn broadcast(&mut self, frame: &WireSyncFrameV2) -> Result<(), StoreError> {
+        self.broadcast_filtered(None, frame)
+    }
+
+    fn broadcast_filtered(
+        &mut self,
+        skip_id: Option<u64>,
+        frame: &WireSyncFrameV2,
+    ) -> Result<(), StoreError> {
+        let mut encoded_v1: Option<Result<Arc<[u8]>, EncodeError>> = None;
+        let mut encoded_v2: Option<Result<Arc<[u8]>, EncodeError>> = None;
+        let mut encode_failed = false;
+
+        self.members.retain(|key, member| {
+            if skip_id == Some(*key) {
+                return true;
+            }
+            let slot = if member.protocol_version == SYNC_PROTOCOL_VERSION {
+                &mut encoded_v1
+            } else {
+                &mut encoded_v2
+            };
+            let result =
+                slot.get_or_insert_with(|| encode_for_version(member.protocol_version, frame));
+            match result {
+                Ok(bytes) => member.output.send(Arc::clone(bytes)),
+                Err(EncodeError::UnsupportedInV1) => {
+                    notify_upgrade_required(member);
+                    false
+                }
+                Err(EncodeError::TooLarge | EncodeError::Failed) => {
+                    encode_failed = true;
+                    true
+                }
+            }
+        });
+
+        if encode_failed {
+            return Err(StoreError::Invalid("outbound frame encoding"));
+        }
         Ok(())
     }
 
@@ -1140,10 +1235,42 @@ fn now_since_ms(epoch_start: Instant) -> u64 {
     u64::try_from(epoch_start.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
-fn encode(frame: &WireSyncFrameV1) -> Result<Arc<[u8]>, StoreError> {
-    encode_sync_frame(frame)
-        .map(Into::into)
-        .map_err(|_| StoreError::Invalid("outbound frame encoding"))
+enum EncodeError {
+    TooLarge,
+    UnsupportedInV1,
+    Failed,
+}
+
+fn encode_for_version(version: u8, frame: &WireSyncFrameV2) -> Result<Arc<[u8]>, EncodeError> {
+    let encoded = if version == SYNC_PROTOCOL_VERSION_V2 {
+        encode_sync_frame_v2(frame)
+    } else if version == SYNC_PROTOCOL_VERSION {
+        let v1 = WireSyncFrameV1::try_from(frame).map_err(|err| match err {
+            WireConvertError::UnsupportedInV2 => EncodeError::UnsupportedInV1,
+            _ => EncodeError::Failed,
+        })?;
+        encode_sync_frame(&v1)
+    } else {
+        return Err(EncodeError::UnsupportedInV1);
+    };
+    encoded.map(Into::into).map_err(|err| match err {
+        SyncFrameError::FrameTooLarge { .. } => EncodeError::TooLarge,
+        _ => EncodeError::Failed,
+    })
+}
+
+fn notify_upgrade_required(member: &mut Member) {
+    member.output.graceful_drop = true;
+    if let Ok(reject) = encode_for_version(
+        SYNC_PROTOCOL_VERSION,
+        &WireSyncFrameV2::Reject {
+            client_seq: 0,
+            reason: WireRejectReasonV1::UpgradeRequired,
+        },
+    ) {
+        let _ = member.output.send(reject);
+    }
+    member.output.send_close(1008, "Protocol upgrade required");
 }
 
 async fn deadline(at: Option<Instant>) {

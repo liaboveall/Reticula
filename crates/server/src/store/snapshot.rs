@@ -7,9 +7,10 @@ use std::path::Path;
 
 use reticula_core::ops::Workbook;
 use reticula_formula::binder::BoundFormula;
-use reticula_sync::ReplicaWatermark;
+use reticula_sync::{CommittedPermute, ReplicaWatermark};
 use reticula_wire::snapshot::{SnapshotEncoder, SnapshotStep, decode_snapshot_any};
 use reticula_wire::v1::WireReplicaWatermarkV1;
+use reticula_wire::v3::WireCommittedPermuteV3;
 use sha2::{Digest, Sha256};
 use sqlx::{PgConnection, PgPool};
 use tempfile::NamedTempFile;
@@ -56,10 +57,10 @@ impl SnapshotFile {
         Ok(file)
     }
 
-    pub(super) fn read_workbook(
+    pub(super) fn read_snapshot(
         &self,
         data_dir: &Path,
-    ) -> Result<Workbook<BoundFormula>, StoreError> {
+    ) -> Result<(Workbook<BoundFormula>, Vec<CommittedPermute>), StoreError> {
         let mut bytes = Vec::new();
         self.open(data_dir)?.read_to_end(&mut bytes)?;
         let decoded =
@@ -67,7 +68,12 @@ impl SnapshotFile {
         if i64::from(decoded.format_version) != i64::from(self.format_version) {
             return Err(StoreError::Invalid("snapshot version"));
         }
-        Ok(decoded.engine.workbook().clone())
+        let permutes = decoded
+            .permutes
+            .iter()
+            .map(CommittedPermute::from)
+            .collect();
+        Ok((decoded.engine.workbook().clone(), permutes))
     }
 
     pub(super) fn write(
@@ -76,6 +82,7 @@ impl SnapshotFile {
         seq: i64,
         workbook: &Workbook<BoundFormula>,
         watermarks: Vec<ReplicaWatermark>,
+        permutes: &[CommittedPermute],
     ) -> Result<Self, StoreError> {
         let storage_key = storage_key(doc, seq);
         let parent = data_dir.join("snapshots").join(doc.to_string());
@@ -89,7 +96,9 @@ impl SnapshotFile {
                 max_id_counter: wm.max_id_counter,
             })
             .collect();
-        let mut encoder = SnapshotEncoder::new(workbook, wire_watermarks);
+        let wire_permutes = permutes.iter().map(WireCommittedPermuteV3::from).collect();
+        let mut encoder =
+            SnapshotEncoder::new_with_permutes(workbook, wire_watermarks, wire_permutes);
         let length = loop {
             match encoder
                 .encode_step(workbook, 8)

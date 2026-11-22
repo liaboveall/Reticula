@@ -501,7 +501,7 @@ fn arb_bound_expr(u: &mut Unstructured<'_>, depth: usize) -> BoundExpr {
     }
 }
 
-/// Target 6: arbitrary sync frames (`WireSyncFrameV1`), `RTCLPWAL`/`RTCLWAL2`
+/// Target 6: arbitrary sync frames (`WireSyncFrameV2`/`v1`), `RTCLPWAL`/`RTCLWAL3`
 /// scanning, and arbitrary synchronized state-machine transitions across
 /// `ServerDocMachine` and two `ClientSyncMachine` instances.
 pub fn fuzz_one_sync(data: &[u8]) {
@@ -510,19 +510,20 @@ pub fn fuzz_one_sync(data: &[u8]) {
         ApplyResult, ClientSyncMachine, MemberRole, ServerDocMachine, ServerLimits,
         replay_pending_onto,
     };
-    use reticula_wire::convert_v2::ops_to_wire_txn_v2;
-    use reticula_wire::sync_frame::{decode_sync_frame, encode_sync_frame};
-    use reticula_wire::v2::{
-        SYNC_PROTOCOL_VERSION, WireCatchupV1, WireCommittedTxnV2, WirePendingTxnV2,
-        WireRejectReasonV1, WireStateDigestV1, WireSyncFrameV1,
+    use reticula_wire::convert_v3::ops_to_wire_txn_v3;
+    use reticula_wire::sync_frame::{decode_sync_frame_any, encode_sync_frame_v2};
+    use reticula_wire::v2::{WireRejectReasonV1, WireStateDigestV1};
+    use reticula_wire::v3::{
+        SYNC_PROTOCOL_VERSION_V2, WireCatchupV2, WireCommittedTxnV3, WirePendingTxnV3,
+        WireSyncFrameV2,
     };
-    use reticula_wire::wal::{scan_pending_wal, scan_wal_any};
+    use reticula_wire::wal::{scan_pending_wal_any, scan_wal_any_v3};
 
-    if let Ok(frame) = decode_sync_frame(data) {
-        let _ = encode_sync_frame(&frame);
+    if let Ok((_, frame)) = decode_sync_frame_any(data) {
+        let _ = encode_sync_frame_v2(&frame);
     }
-    let _ = scan_pending_wal(data);
-    let _ = scan_wal_any(data, 0, 8);
+    let _ = scan_pending_wal_any(data);
+    let _ = scan_wal_any_v3(data, 0, 8);
 
     const DOC: [u8; 16] = [0x11; 16];
     const BRANCH: [u8; 16] = [0x22; 16];
@@ -587,7 +588,7 @@ pub fn fuzz_one_sync(data: &[u8]) {
                     step as u64,
                 ) {
                     for act in actions {
-                        if let reticula_sync::ClientAction::SendFrame(WireSyncFrameV1::Push {
+                        if let reticula_sync::ClientAction::SendFrame(WireSyncFrameV2::Push {
                             txns,
                         }) = act
                             && let Some(rep) = clients[cidx].replica()
@@ -605,13 +606,13 @@ pub fn fuzz_one_sync(data: &[u8]) {
                 }
             }
             3 => {
-                if let Ok(frame) = decode_sync_frame(data) {
+                if let Ok((_, frame)) = decode_sync_frame_any(data) {
                     let _ = server.on_hello(user, role, &frame);
                     match &frame {
-                        WireSyncFrameV1::Welcome { .. } => {
+                        WireSyncFrameV2::Welcome { .. } => {
                             let _ = clients[cidx].on_welcome(frame);
                         }
-                        WireSyncFrameV1::Commit {
+                        WireSyncFrameV2::Commit {
                             seq,
                             replica,
                             client_seq,
@@ -619,7 +620,7 @@ pub fn fuzz_one_sync(data: &[u8]) {
                             timestamp_ms,
                             txn,
                         } => {
-                            let _ = clients[cidx].on_commit(WireCommittedTxnV2 {
+                            let _ = clients[cidx].on_commit(WireCommittedTxnV3 {
                                 seq: *seq,
                                 replica: *replica,
                                 client_seq: *client_seq,
@@ -628,15 +629,15 @@ pub fn fuzz_one_sync(data: &[u8]) {
                                 txn: txn.clone(),
                             });
                         }
-                        WireSyncFrameV1::Ack {
+                        WireSyncFrameV2::Ack {
                             replica,
                             client_seq,
                             ..
                         } => clients[cidx].on_ack(*replica, *client_seq),
-                        WireSyncFrameV1::Reject { client_seq, reason } => {
+                        WireSyncFrameV2::Reject { client_seq, reason } => {
                             let _ = clients[cidx].on_reject(*client_seq, *reason);
                         }
-                        WireSyncFrameV1::Digest { seq, state_digest } => {
+                        WireSyncFrameV2::Digest { seq, state_digest } => {
                             let _ = clients[cidx].on_digest(*seq, *state_digest);
                         }
                         _ => {}
@@ -646,8 +647,8 @@ pub fn fuzz_one_sync(data: &[u8]) {
             4 => {
                 let cs = u.int_in_range(0_u64..=8).unwrap_or(1);
                 let rep = u.int_in_range(0_u32..=8).unwrap_or(1);
-                if let Ok(txn) = ops_to_wire_txn_v2(String::from("arb"), &[]) {
-                    let pending = WirePendingTxnV2 {
+                if let Ok(txn) = ops_to_wire_txn_v3(String::from("arb"), &[]) {
+                    let pending = WirePendingTxnV3 {
                         replica: rep,
                         client_seq: cs,
                         base_server_seq: u.arbitrary().unwrap_or(0),
@@ -670,7 +671,7 @@ pub fn fuzz_one_sync(data: &[u8]) {
             }
             6 => {
                 let df = server.digest_frame();
-                if let WireSyncFrameV1::Digest { seq, state_digest } = df {
+                if let WireSyncFrameV2::Digest { seq, state_digest } = df {
                     let _ = clients[cidx].on_digest(seq, state_digest);
                 }
                 let bad = WireStateDigestV1 {
@@ -682,22 +683,23 @@ pub fn fuzz_one_sync(data: &[u8]) {
                 let _ = clients[cidx].on_digest(clients[cidx].confirmed_seq(), bad);
             }
             7 => {
-                let welcome = WireSyncFrameV1::Welcome {
+                let welcome = WireSyncFrameV2::Welcome {
                     epoch: 0,
                     head_seq: 0,
                     replica: 1,
                     last_client_seq: 0,
                     max_id_counter: 0,
-                    catchup: WireCatchupV1::SnapshotRequired {
+                    catchup: WireCatchupV2::SnapshotRequired {
                         snapshot_seq: 0,
                         url: String::from("/snap/0"),
                     },
                 };
                 let _ = clients[cidx].on_welcome(welcome);
-                let _ = clients[cidx].install_snapshot(0, Workbook::new(), &[], Vec::new());
+                let _ =
+                    clients[cidx].install_snapshot(0, Workbook::new(), &[], Vec::new(), Vec::new());
             }
             _ => {
-                let _ = SYNC_PROTOCOL_VERSION;
+                let _ = SYNC_PROTOCOL_VERSION_V2;
                 let _ = StateDigest::try_from(server.state_digest());
             }
         }
@@ -706,6 +708,7 @@ pub fn fuzz_one_sync(data: &[u8]) {
         let expected = replay_pending_onto(
             clients[cidx].confirmed(),
             &clients[cidx].pending_wire_txns(),
+            clients[cidx].confirmed_permutes(),
         );
         assert_eq!(
             clients[cidx].visible().state_digest(),

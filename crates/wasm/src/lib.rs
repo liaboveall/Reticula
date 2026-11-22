@@ -36,10 +36,10 @@ use reticula_formula::parser::ParseError;
 use reticula_wire::snapshot::{
     SnapshotEncoder, SnapshotStep, decode_snapshot_any, encode_seed_stub_v1, encode_snapshot_v1,
 };
-use reticula_wire::v1::{WireOpV1, WireWalRecordV1};
+use reticula_wire::v3::{WireOpV3, WireWalRecordV3};
 use reticula_wire::wal::{
-    WalCorruption, WalTailDisposition, encode_wal_init, encode_wal_record, replay_wal_records,
-    scan_wal,
+    WalCorruptionV3, WalTailDisposition, encode_wal_init_v3, encode_wal_record_v3,
+    replay_wal_records_v3, scan_wal_any_v3,
 };
 use serde::{Deserialize, Serialize};
 use tsify::{Ts, Tsify};
@@ -1171,11 +1171,12 @@ pub fn reserve_for_bytes(bytes: usize) -> bool {
     reticula_core::memory::try_reserve_heap(bytes)
 }
 
-/// Encodes the 16-byte `RTCLWAL1` header + initial `WireWalMetaV1` anchor frame.
+/// Encodes the 16-byte `RTCLWAL3` header + initial `WireWalMetaV1` anchor frame.
 #[wasm_bindgen(js_name = encodeWalInit)]
 pub fn wasm_encode_wal_init(base_snapshot_seq: f64) -> Result<Vec<u8>, JsError> {
     let base_seq = f64_to_u64(base_snapshot_seq)?;
-    encode_wal_init(base_seq).map_err(|e| JsError::new(&format!("WAL header encode failed: {e:?}")))
+    encode_wal_init_v3(base_seq)
+        .map_err(|e| JsError::new(&format!("WAL header encode failed: {e:?}")))
 }
 
 /// Inspects a raw `wal.log` buffer and classifies it as clean, recoverable tail,
@@ -1197,7 +1198,7 @@ fn inspect_wal_inner(
     expected_base_seq: u64,
     last_flushed_seq: u64,
 ) -> WireWalInspection {
-    match scan_wal(wal_bytes, expected_base_seq, last_flushed_seq) {
+    match scan_wal_any_v3(wal_bytes, expected_base_seq, last_flushed_seq) {
         Ok(scan) => {
             let truncate_to_bytes = match scan.tail {
                 WalTailDisposition::Clean => None,
@@ -1218,19 +1219,19 @@ fn inspect_wal_inner(
             }
         }
         Err(corr) => match corr {
-            WalCorruption::InvalidHeader => WireWalInspection::Corrupted {
+            WalCorruptionV3::InvalidHeader => WireWalInspection::Corrupted {
                 reason: String::from("WAL header magic or CRC-32 checksum is corrupted."),
                 salvageable_count: 0,
                 salvageable_tail_txns: Vec::new(),
             },
-            WalCorruption::BaseSeqMismatch { found, expected } => WireWalInspection::Corrupted {
+            WalCorruptionV3::BaseSeqMismatch { found, expected } => WireWalInspection::Corrupted {
                 reason: format!(
                     "WAL base snapshot sequence mismatch (found {found:?}, expected {expected})."
                 ),
                 salvageable_count: 0,
                 salvageable_tail_txns: Vec::new(),
             },
-            WalCorruption::NonContiguousSeq {
+            WalCorruptionV3::NonContiguousSeq {
                 offset,
                 expected_seq,
                 found_seq,
@@ -1241,7 +1242,7 @@ fn inspect_wal_inner(
                 salvageable_count: 0,
                 salvageable_tail_txns: Vec::new(),
             },
-            WalCorruption::MidFileCorruption {
+            WalCorruptionV3::MidFileCorruption {
                 offset,
                 last_valid_seq,
                 salvageable_records,
@@ -1260,7 +1261,7 @@ fn inspect_wal_inner(
     }
 }
 
-fn summarize_tail_records(records: &[WireWalRecordV1], max_tail: usize) -> Vec<WireWalTxnSummary> {
+fn summarize_tail_records(records: &[WireWalRecordV3], max_tail: usize) -> Vec<WireWalTxnSummary> {
     let skip = records.len().saturating_sub(max_tail);
     records
         .iter()
@@ -1584,7 +1585,7 @@ impl Engine {
         let mut final_seq = base_seq;
 
         if !wal_bytes.is_empty() {
-            let records = match scan_wal(wal_bytes, base_seq, flushed_seq) {
+            let records = match scan_wal_any_v3(wal_bytes, base_seq, flushed_seq) {
                 Ok(scan) => {
                     if let WalTailDisposition::ZeroPaddedTail { valid_bytes }
                     | WalTailDisposition::TornFinalRecord { valid_bytes } = scan.tail
@@ -1593,7 +1594,7 @@ impl Engine {
                     }
                     scan.records
                 }
-                Err(WalCorruption::MidFileCorruption {
+                Err(WalCorruptionV3::MidFileCorruption {
                     salvageable_records,
                     ..
                 }) if salvage_corrupt_mid => salvageable_records,
@@ -1608,7 +1609,7 @@ impl Engine {
             {
                 final_seq = last_rec.seq;
             }
-            replay_wal_records(
+            replay_wal_records_v3(
                 &mut new_engine,
                 &records,
                 skip_tail_txns as usize,
@@ -2239,16 +2240,16 @@ impl Engine {
         self.wal_seq = self.wal_seq.saturating_add(1);
         if let Ok(wire_ops) = ops
             .iter()
-            .map(WireOpV1::try_from)
+            .map(WireOpV3::try_from)
             .collect::<Result<Vec<_>, _>>()
         {
-            let rec = WireWalRecordV1 {
+            let rec = WireWalRecordV3 {
                 seq: self.wal_seq,
                 timestamp_ms: self.last_timestamp_ms,
                 label: String::from(label),
                 ops: wire_ops,
             };
-            if let Ok(frame) = encode_wal_record(&rec) {
+            if let Ok(frame) = encode_wal_record_v3(&rec) {
                 self.pending_wal_frames.push_back(frame);
             }
         }
@@ -3743,7 +3744,7 @@ mod tests {
         while eng.take_page().is_some() {}
 
         // Replay `stub + wal_frame_1 + wal_frame_2` into a fresh Engine and verify bit-identical digest!
-        let mut full_wal = encode_wal_init(0).unwrap();
+        let mut full_wal = encode_wal_init_v3(0).unwrap();
         full_wal.extend_from_slice(&wal_frame_1);
         full_wal.extend_from_slice(&wal_frame_2);
 
@@ -3751,8 +3752,8 @@ mod tests {
         let mut reloaded = Engine::new();
         let decoded = decode_snapshot_any(&stub).unwrap();
         reloaded.engine = decoded.engine;
-        let scan = scan_wal(&full_wal, 0, 2).unwrap();
-        replay_wal_records(&mut reloaded.engine, &scan.records, 0, true).unwrap();
+        let scan = scan_wal_any_v3(&full_wal, 0, 2).unwrap();
+        replay_wal_records_v3(&mut reloaded.engine, &scan.records, 0, true).unwrap();
         assert_eq!(reloaded.engine.workbook().logical_digest(), expected_digest);
 
         // Undo InsertRows -> rows returns to 500!

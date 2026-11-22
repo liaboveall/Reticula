@@ -11,11 +11,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use reticula_core::id::unpack_replica_id;
 use reticula_core::ops::Workbook;
 use reticula_formula::binder::BoundFormula;
-use reticula_sync::{ReplicaWatermark, ServerDocMachine, ServerLimits, StagedTxn};
+use reticula_sync::{
+    CommittedPermute, ReplicaWatermark, ServerDocMachine, ServerLimits, StagedTxn,
+};
 use reticula_wire::snapshot::decode_snapshot_for_collab;
-use reticula_wire::v2::{WireCommittedTxnV2, WireTxnV2, WireWalRecordV2};
+use reticula_wire::v3::{WireCommittedTxnV3, WireTxnV3, WireWalRecordV3};
 use reticula_wire::wal::{
-    MAX_WAL_FRAME_PAYLOAD, WAL_HEADER_LEN, encode_wal_complete_v2, scan_wal_any,
+    MAX_WAL_FRAME_PAYLOAD, WAL_HEADER_LEN, encode_wal_complete_v3, scan_wal_any_v3,
 };
 use sqlx::PgPool;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
@@ -105,6 +107,7 @@ pub(crate) struct SnapshotCapture {
     seq: u64,
     workbook: Workbook<BoundFormula>,
     watermarks: Vec<ReplicaWatermark>,
+    permutes: Vec<CommittedPermute>,
 }
 
 impl From<&ServerDocMachine> for SnapshotCapture {
@@ -114,6 +117,7 @@ impl From<&ServerDocMachine> for SnapshotCapture {
             seq: machine.head_seq(),
             workbook: machine.workbook().clone(),
             watermarks: machine.watermarks(),
+            permutes: machine.committed_permutes().to_vec(),
         }
     }
 }
@@ -295,7 +299,7 @@ impl Store {
                 })?;
             let workbook = decoded.engine.workbook();
             let est_bytes = workbook.estimated_bytes();
-            let file = SnapshotFile::write(&dir, id, 0, workbook, Vec::new())?;
+            let file = SnapshotFile::write(&dir, id, 0, workbook, Vec::new(), &[])?;
             Ok::<_, StoreError>((file, est_bytes))
         })
         .await??;
@@ -708,22 +712,22 @@ impl Store {
             ..ServerLimits::default()
         };
         tokio::task::spawn_blocking(move || {
-            let workbook = match snapshot {
-                Some(file) => file.read_workbook(&dir)?,
-                None => Workbook::new(),
+            let (workbook, snapshot_permutes) = match snapshot {
+                Some(file) => file.read_snapshot(&dir)?,
+                None => (Workbook::new(), Vec::new()),
             };
             let commits = tail
                 .into_iter()
                 .map(|row| {
                     let seq = integer(row.seq, "transaction seq")?;
                     let record = decode_log(&row.payload, seq)?;
-                    Ok(WireCommittedTxnV2 {
+                    Ok(WireCommittedTxnV3 {
                         seq,
                         replica: integer(row.replica, "replica")?,
                         client_seq: integer(row.client_seq, "client seq")?,
                         user_id: row.user_id.into_bytes(),
                         timestamp_ms: record.timestamp_ms,
-                        txn: WireTxnV2 {
+                        txn: WireTxnV3 {
                             label: record.label,
                             ops: record.ops,
                         },
@@ -739,6 +743,7 @@ impl Store {
                 workbook,
                 next,
                 watermarks,
+                snapshot_permutes,
                 commits,
                 server_limits,
             )
@@ -776,6 +781,7 @@ impl Store {
                 seq,
                 &capture.workbook,
                 capture.watermarks,
+                &capture.permutes,
             )
         })
         .await??;
@@ -844,19 +850,19 @@ impl Store {
     }
 }
 
-fn encode_log(commit: &WireCommittedTxnV2) -> Result<Vec<u8>, StoreError> {
-    let record = WireWalRecordV2 {
+fn encode_log(commit: &WireCommittedTxnV3) -> Result<Vec<u8>, StoreError> {
+    let record = WireWalRecordV3 {
         seq: commit.seq,
         timestamp_ms: commit.timestamp_ms,
         label: commit.txn.label.clone(),
         ops: commit.txn.ops.clone(),
     };
-    let bytes = encode_wal_complete_v2(commit.seq - 1, &[record])
+    let bytes = encode_wal_complete_v3(commit.seq - 1, &[record])
         .map_err(|_| StoreError::Invalid("transaction encoding"))?;
     Ok(lz4_flex::compress_prepend_size(&bytes))
 }
 
-fn decode_log(payload: &[u8], seq: u64) -> Result<WireWalRecordV2, StoreError> {
+fn decode_log(payload: &[u8], seq: u64) -> Result<WireWalRecordV3, StoreError> {
     let invalid = || StoreError::Invalid("transaction encoding");
     let (size, _) = lz4_flex::block::uncompressed_size(payload).map_err(|_| invalid())?;
     let base_seq = seq.checked_sub(1).ok_or_else(invalid)?;
@@ -864,7 +870,7 @@ fn decode_log(payload: &[u8], seq: u64) -> Result<WireWalRecordV2, StoreError> {
         return Err(invalid());
     }
     let bytes = lz4_flex::decompress_size_prepended(payload).map_err(|_| invalid())?;
-    let mut wal = scan_wal_any(&bytes, base_seq, seq).map_err(|_| invalid())?;
+    let mut wal = scan_wal_any_v3(&bytes, base_seq, seq).map_err(|_| invalid())?;
     if wal.records.len() != 1 || wal.valid_bytes != bytes.len() {
         return Err(invalid());
     }

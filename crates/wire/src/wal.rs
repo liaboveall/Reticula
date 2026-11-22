@@ -21,12 +21,16 @@ use crate::convert_v1::WireConvertError;
 use crate::crc32::{crc32, crc32_pair};
 use crate::v1::{WireWalMetaV1, WireWalRecordV1};
 use crate::v2::{WirePendingTxnV2, WireWalRecordV2};
+use crate::v3::{WirePendingTxnV3, WireWalRecordV3};
 
 /// 8-byte file magic at the start of every `wal.log` v1 write-ahead log.
 pub const WAL_MAGIC: &[u8; 8] = b"RTCLWAL1";
 
 /// 8-byte file magic at the start of every `wal.log` v2 write-ahead log.
 pub const WAL_MAGIC_V2: &[u8; 8] = b"RTCLWAL2";
+
+/// 8-byte file magic at the start of every `wal.log` v3 write-ahead log.
+pub const WAL_MAGIC_V3: &[u8; 8] = b"RTCLWAL3";
 
 /// 8-byte file magic at the start of every collaborative `pending.wal` log.
 pub const PENDING_WAL_MAGIC: &[u8; 8] = b"RTCLPWAL";
@@ -37,8 +41,14 @@ pub const WAL_VERSION_V1: u32 = 1;
 /// `RTCLWAL2` container format version introduced in M2a.
 pub const WAL_VERSION_V2: u32 = 2;
 
+/// `RTCLWAL3` container format version introduced in M3a.
+pub const WAL_VERSION_V3: u32 = 3;
+
 /// `RTCLPWAL` pending-queue container format version introduced in M2a.
 pub const PENDING_WAL_VERSION_V1: u32 = 1;
+
+/// `RTCLPWAL` pending-queue container format version introduced in M3a (`WirePendingTxnV3`).
+pub const PENDING_WAL_VERSION_V2: u32 = 2;
 
 /// Byte length of the fixed `RTCLWAL1` file header.
 pub const WAL_HEADER_LEN: usize = 16;
@@ -268,6 +278,192 @@ pub enum PendingWalCorruption {
     },
 }
 
+/// Result of scanning and validating `wal.log` v3 (or upgraded `v1`/`v2`) bytes.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WalScanV3 {
+    /// Base snapshot sequence anchored by frame `0`.
+    pub base_snapshot_seq: u64,
+    /// Validated contiguous transaction records (`base_snapshot_seq + 1 ..= last_seq`).
+    pub records: Vec<WireWalRecordV3>,
+    /// Byte length of the valid prefix (`<= input.len()`).
+    pub valid_bytes: usize,
+    /// Classification of any trailing bytes beyond `valid_bytes`.
+    pub tail: WalTailDisposition,
+}
+
+impl WalScanV3 {
+    /// Highest contiguous sequence number present (`base_snapshot_seq` if empty).
+    #[must_use]
+    pub fn last_seq(&self) -> u64 {
+        self.records
+            .last()
+            .map_or(self.base_snapshot_seq, |r| r.seq)
+    }
+}
+
+/// Unrecoverable corruption in a scanned `RTCLWAL3` (or upgraded `v1`/`v2`) WAL file.
+#[derive(Clone, Debug, PartialEq)]
+pub enum WalCorruptionV3 {
+    /// Magic mismatch, unsupported version, or corrupted 16-byte header CRC.
+    InvalidHeader,
+    /// Metadata frame missing, corrupted, or anchored to a different snapshot sequence.
+    BaseSeqMismatch {
+        /// Decoded `base_snapshot_seq` if readable.
+        found: Option<u64>,
+        /// Expected `base_snapshot_seq`.
+        expected: u64,
+    },
+    /// Record sequence jumped or repeated instead of incrementing by `+1`.
+    NonContiguousSeq {
+        /// Byte offset of the out-of-sequence frame.
+        offset: usize,
+        /// Expected `seq`.
+        expected_seq: u64,
+        /// Found `seq`.
+        found_seq: u64,
+    },
+    /// CRC mismatch or malformed payload followed by non-zero trailing bytes.
+    MidFileCorruption {
+        /// Byte offset of the corrupted frame.
+        offset: usize,
+        /// Highest valid sequence number before `offset`.
+        last_valid_seq: u64,
+        /// Already-validated records preceding `offset`.
+        salvageable_records: Vec<WireWalRecordV3>,
+    },
+}
+
+impl From<WalScan> for WalScanV3 {
+    fn from(s: WalScan) -> Self {
+        Self {
+            base_snapshot_seq: s.base_snapshot_seq,
+            records: s.records.into_iter().map(WireWalRecordV3::from).collect(),
+            valid_bytes: s.valid_bytes,
+            tail: s.tail,
+        }
+    }
+}
+
+impl From<WalScanV2> for WalScanV3 {
+    fn from(s: WalScanV2) -> Self {
+        Self {
+            base_snapshot_seq: s.base_snapshot_seq,
+            records: s.records.into_iter().map(WireWalRecordV3::from).collect(),
+            valid_bytes: s.valid_bytes,
+            tail: s.tail,
+        }
+    }
+}
+
+impl From<WalCorruption> for WalCorruptionV3 {
+    fn from(c: WalCorruption) -> Self {
+        Self::from(WalCorruptionV2::from(c))
+    }
+}
+
+impl From<WalCorruptionV2> for WalCorruptionV3 {
+    fn from(c: WalCorruptionV2) -> Self {
+        match c {
+            WalCorruptionV2::InvalidHeader => Self::InvalidHeader,
+            WalCorruptionV2::BaseSeqMismatch { found, expected } => {
+                Self::BaseSeqMismatch { found, expected }
+            }
+            WalCorruptionV2::NonContiguousSeq {
+                offset,
+                expected_seq,
+                found_seq,
+            } => Self::NonContiguousSeq {
+                offset,
+                expected_seq,
+                found_seq,
+            },
+            WalCorruptionV2::MidFileCorruption {
+                offset,
+                last_valid_seq,
+                salvageable_records,
+            } => Self::MidFileCorruption {
+                offset,
+                last_valid_seq,
+                salvageable_records: salvageable_records
+                    .into_iter()
+                    .map(WireWalRecordV3::from)
+                    .collect(),
+            },
+        }
+    }
+}
+
+/// Result of scanning collaborative offline `pending.wal` (`RTCLPWAL` v2 or upgraded v1).
+#[derive(Clone, Debug, PartialEq)]
+pub struct PendingWalScanV2 {
+    /// Validated strictly increasing pending transactions.
+    pub records: Vec<WirePendingTxnV3>,
+    /// Byte length of the valid prefix (`<= input.len()`).
+    pub valid_bytes: usize,
+    /// Tail classification beyond `valid_bytes`.
+    pub tail: WalTailDisposition,
+}
+
+/// Unrecoverable corruption in a scanned `pending.wal` (`RTCLPWAL` v2 or v1) file.
+#[derive(Clone, Debug, PartialEq)]
+pub enum PendingWalCorruptionV2 {
+    /// Magic mismatch, unsupported version, or corrupted 16-byte header CRC.
+    InvalidHeader,
+    /// Pending records did not strictly increase in `client_seq`.
+    NonMonotonicClientSeq {
+        /// Byte offset of the out-of-order frame.
+        offset: usize,
+        /// Previous valid `client_seq`.
+        prev_client_seq: u64,
+        /// Observed `client_seq` (`<= prev_client_seq`).
+        found_client_seq: u64,
+    },
+    /// CRC mismatch or malformed payload followed by non-zero trailing bytes.
+    MidFileCorruption {
+        /// Byte offset of the corrupted frame.
+        offset: usize,
+        /// Already-validated records preceding `offset`.
+        salvageable_records: Vec<WirePendingTxnV3>,
+    },
+}
+
+impl From<PendingWalScan> for PendingWalScanV2 {
+    fn from(s: PendingWalScan) -> Self {
+        Self {
+            records: s.records.into_iter().map(WirePendingTxnV3::from).collect(),
+            valid_bytes: s.valid_bytes,
+            tail: s.tail,
+        }
+    }
+}
+
+impl From<PendingWalCorruption> for PendingWalCorruptionV2 {
+    fn from(c: PendingWalCorruption) -> Self {
+        match c {
+            PendingWalCorruption::InvalidHeader => Self::InvalidHeader,
+            PendingWalCorruption::NonMonotonicClientSeq {
+                offset,
+                prev_client_seq,
+                found_client_seq,
+            } => Self::NonMonotonicClientSeq {
+                offset,
+                prev_client_seq,
+                found_client_seq,
+            },
+            PendingWalCorruption::MidFileCorruption {
+                offset,
+                salvageable_records,
+            } => Self::MidFileCorruption {
+                offset,
+                salvageable_records: salvageable_records
+                    .into_iter()
+                    .map(WirePendingTxnV3::from)
+                    .collect(),
+            },
+        }
+    }
+}
+
 /// Encodes the 16-byte `RTCLWAL1` header followed by the initial
 /// [`WireWalMetaV1`] anchor frame.
 pub fn encode_wal_init(base_snapshot_seq: u64) -> Result<Vec<u8>, WalError> {
@@ -278,6 +474,12 @@ pub fn encode_wal_init(base_snapshot_seq: u64) -> Result<Vec<u8>, WalError> {
 /// [`WireWalMetaV1`] anchor frame.
 pub fn encode_wal_init_v2(base_snapshot_seq: u64) -> Result<Vec<u8>, WalError> {
     encode_sequenced_wal_init(WAL_MAGIC_V2, WAL_VERSION_V2, base_snapshot_seq)
+}
+
+/// Encodes the 16-byte `RTCLWAL3` header followed by the initial
+/// [`WireWalMetaV1`] anchor frame.
+pub fn encode_wal_init_v3(base_snapshot_seq: u64) -> Result<Vec<u8>, WalError> {
+    encode_sequenced_wal_init(WAL_MAGIC_V3, WAL_VERSION_V3, base_snapshot_seq)
 }
 
 fn encode_sequenced_wal_init(
@@ -312,6 +514,11 @@ pub fn encode_wal_record_v2(record: &WireWalRecordV2) -> Result<Vec<u8>, WalErro
     encode_frame(record)
 }
 
+/// Encodes a single [`WireWalRecordV3`] transaction frame ready to append.
+pub fn encode_wal_record_v3(record: &WireWalRecordV3) -> Result<Vec<u8>, WalError> {
+    encode_frame(record)
+}
+
 /// Convenience helper encoding a complete standalone WAL v1 file (`header + meta + records`).
 pub fn encode_wal_complete(
     base_snapshot_seq: u64,
@@ -338,7 +545,20 @@ pub fn encode_wal_complete_v2(
     Ok(out)
 }
 
-/// Encodes the initial 16-byte `pending.wal` (`RTCLPWAL`) header.
+/// Convenience helper encoding a complete standalone WAL v3 file (`header + meta + records`).
+pub fn encode_wal_complete_v3(
+    base_snapshot_seq: u64,
+    records: &[WireWalRecordV3],
+) -> Result<Vec<u8>, WalError> {
+    let mut out = encode_wal_init_v3(base_snapshot_seq)?;
+    for rec in records {
+        let frame = encode_wal_record_v3(rec)?;
+        out.extend_from_slice(&frame);
+    }
+    Ok(out)
+}
+
+/// Encodes the initial 16-byte `pending.wal` (`RTCLPWAL`) header (v1).
 #[must_use]
 pub fn encode_pending_wal_init() -> Vec<u8> {
     let mut out = Vec::with_capacity(WAL_HEADER_LEN);
@@ -346,16 +566,39 @@ pub fn encode_pending_wal_init() -> Vec<u8> {
     out
 }
 
-/// Encodes one [`WirePendingTxnV2`] frame for appending to `pending.wal`.
+/// Encodes one [`WirePendingTxnV2`] frame for appending to `pending.wal` (v1).
 pub fn encode_pending_wal_record(record: &WirePendingTxnV2) -> Result<Vec<u8>, WalError> {
     encode_frame(record)
 }
 
-/// Encodes a complete standalone `pending.wal` (`header + records`).
+/// Encodes a complete standalone `pending.wal` v1 (`header + records`).
 pub fn encode_pending_wal_complete(records: &[WirePendingTxnV2]) -> Result<Vec<u8>, WalError> {
     let mut out = encode_pending_wal_init();
     for rec in records {
         let frame = encode_pending_wal_record(rec)?;
+        out.extend_from_slice(&frame);
+    }
+    Ok(out)
+}
+
+/// Encodes the initial 16-byte `pending.wal` (`RTCLPWAL` v2) header.
+#[must_use]
+pub fn encode_pending_wal_init_v2() -> Vec<u8> {
+    let mut out = Vec::with_capacity(WAL_HEADER_LEN);
+    append_log_header(&mut out, PENDING_WAL_MAGIC, PENDING_WAL_VERSION_V2);
+    out
+}
+
+/// Encodes one [`WirePendingTxnV3`] frame for appending to `pending.wal` v2.
+pub fn encode_pending_wal_record_v2(record: &WirePendingTxnV3) -> Result<Vec<u8>, WalError> {
+    encode_frame(record)
+}
+
+/// Encodes a complete standalone `pending.wal` v2 (`header + records`).
+pub fn encode_pending_wal_complete_v2(records: &[WirePendingTxnV3]) -> Result<Vec<u8>, WalError> {
+    let mut out = encode_pending_wal_init_v2();
+    for rec in records {
+        let frame = encode_pending_wal_record_v2(rec)?;
         out.extend_from_slice(&frame);
     }
     Ok(out)
@@ -435,6 +678,86 @@ pub fn scan_wal_any(
             .map(WalScanV2::from)
             .map_err(WalCorruptionV2::from)
     })
+}
+
+/// Scans `RTCLWAL3` bytes from byte `0`, distinguishing recoverable crash tails
+/// from mid-file corruption.
+pub fn scan_wal_v3(
+    bytes: &[u8],
+    expected_base_seq: u64,
+    last_flushed_seq: u64,
+) -> Result<WalScanV3, WalCorruptionV3> {
+    let raw = scan_sequenced_wal_generic(
+        bytes,
+        WAL_MAGIC_V3,
+        WAL_VERSION_V3,
+        expected_base_seq,
+        last_flushed_seq,
+        |r: &WireWalRecordV3| r.seq,
+    )
+    .map_err(map_raw_corruption_v3)?;
+    Ok(WalScanV3 {
+        base_snapshot_seq: raw.base_snapshot_seq,
+        records: raw.records,
+        valid_bytes: raw.valid_bytes,
+        tail: raw.tail,
+    })
+}
+
+/// Scans `RTCLWAL1`, `RTCLWAL2`, or `RTCLWAL3` bytes cleanly, transparently
+/// upgrading `v1`/`v2` records into [`WalScanV3`].
+pub fn scan_wal_any_v3(
+    bytes: &[u8],
+    expected_base_seq: u64,
+    last_flushed_seq: u64,
+) -> Result<WalScanV3, WalCorruptionV3> {
+    match bytes.get(0..8) {
+        Some(m) if m == WAL_MAGIC_V3 => scan_wal_v3(bytes, expected_base_seq, last_flushed_seq),
+        Some(m) if m == WAL_MAGIC_V2 => scan_wal_v2(bytes, expected_base_seq, last_flushed_seq)
+            .map(WalScanV3::from)
+            .map_err(WalCorruptionV3::from),
+        Some(m) if m == WAL_MAGIC => scan_wal(bytes, expected_base_seq, last_flushed_seq)
+            .map(WalScanV3::from)
+            .map_err(WalCorruptionV3::from),
+        _ => scan_wal_v3(bytes, expected_base_seq, last_flushed_seq)
+            .or_else(|_| {
+                scan_wal_v2(bytes, expected_base_seq, last_flushed_seq)
+                    .map(WalScanV3::from)
+                    .map_err(WalCorruptionV3::from)
+            })
+            .or_else(|_| {
+                scan_wal(bytes, expected_base_seq, last_flushed_seq)
+                    .map(WalScanV3::from)
+                    .map_err(WalCorruptionV3::from)
+            }),
+    }
+}
+
+fn map_raw_corruption_v3(c: WalCorruptionGeneric<WireWalRecordV3>) -> WalCorruptionV3 {
+    match c {
+        WalCorruptionGeneric::InvalidHeader => WalCorruptionV3::InvalidHeader,
+        WalCorruptionGeneric::BaseSeqMismatch { found, expected } => {
+            WalCorruptionV3::BaseSeqMismatch { found, expected }
+        }
+        WalCorruptionGeneric::NonContiguousSeq {
+            offset,
+            expected_seq,
+            found_seq,
+        } => WalCorruptionV3::NonContiguousSeq {
+            offset,
+            expected_seq,
+            found_seq,
+        },
+        WalCorruptionGeneric::MidFileCorruption {
+            offset,
+            last_valid_seq,
+            salvageable_records,
+        } => WalCorruptionV3::MidFileCorruption {
+            offset,
+            last_valid_seq,
+            salvageable_records,
+        },
+    }
 }
 
 fn map_raw_corruption_v2(c: WalCorruptionGeneric<WireWalRecordV2>) -> WalCorruptionV2 {
@@ -748,19 +1071,39 @@ fn scan_sequenced_wal_generic<R: DeserializeOwned>(
     })
 }
 
-/// Scans `RTCLPWAL` (`pending.wal`) bytes from offset `0`, distinguishing
-/// recoverable crash tails (`ZeroPaddedTail` / `TornFinalRecord`) from mid-file
-/// corruption or non-monotonic `client_seq`.
-pub fn scan_pending_wal(bytes: &[u8]) -> Result<PendingWalScan, PendingWalCorruption> {
+enum RawPendingCorruption<R> {
+    InvalidHeader,
+    NonMonotonicClientSeq {
+        offset: usize,
+        prev_client_seq: u64,
+        found_client_seq: u64,
+    },
+    MidFileCorruption {
+        offset: usize,
+        salvageable_records: Vec<R>,
+    },
+}
+
+struct RawPendingScan<R> {
+    records: Vec<R>,
+    valid_bytes: usize,
+    tail: WalTailDisposition,
+}
+
+fn scan_pending_wal_generic<R: DeserializeOwned>(
+    bytes: &[u8],
+    version: u32,
+    client_seq_of: fn(&R) -> u64,
+) -> Result<RawPendingScan<R>, RawPendingCorruption<R>> {
     if bytes.is_empty() {
-        return Ok(PendingWalScan {
+        return Ok(RawPendingScan {
             records: Vec::new(),
             valid_bytes: 0,
             tail: WalTailDisposition::Clean,
         });
     }
     if all_zero(bytes) {
-        return Ok(PendingWalScan {
+        return Ok(RawPendingScan {
             records: Vec::new(),
             valid_bytes: 0,
             tail: WalTailDisposition::ZeroPaddedTail { valid_bytes: 0 },
@@ -773,16 +1116,16 @@ pub fn scan_pending_wal(bytes: &[u8]) -> Result<PendingWalScan, PendingWalCorrup
             .zip(PENDING_WAL_MAGIC.get(..magic_check_len))
             .is_some_and(|(a, b)| a == b);
         if prefix_matches {
-            return Ok(PendingWalScan {
+            return Ok(RawPendingScan {
                 records: Vec::new(),
                 valid_bytes: 0,
                 tail: WalTailDisposition::TornFinalRecord { valid_bytes: 0 },
             });
         }
-        return Err(PendingWalCorruption::InvalidHeader);
+        return Err(RawPendingCorruption::InvalidHeader);
     }
-    if !header_valid(bytes, PENDING_WAL_MAGIC, PENDING_WAL_VERSION_V1) {
-        return Err(PendingWalCorruption::InvalidHeader);
+    if !header_valid(bytes, PENDING_WAL_MAGIC, version) {
+        return Err(RawPendingCorruption::InvalidHeader);
     }
 
     let mut records = Vec::new();
@@ -794,7 +1137,7 @@ pub fn scan_pending_wal(bytes: &[u8]) -> Result<PendingWalScan, PendingWalCorrup
             break;
         };
         if all_zero(rem) {
-            return Ok(PendingWalScan {
+            return Ok(RawPendingScan {
                 records,
                 valid_bytes: cursor,
                 tail: WalTailDisposition::ZeroPaddedTail {
@@ -802,23 +1145,24 @@ pub fn scan_pending_wal(bytes: &[u8]) -> Result<PendingWalScan, PendingWalCorrup
                 },
             });
         }
-        match decode_frame_at::<WirePendingTxnV2>(bytes, cursor) {
+        match decode_frame_at::<R>(bytes, cursor) {
             FrameOutcome::Valid(rec, next_pos) => {
+                let cseq = client_seq_of(&rec);
                 if let Some(prev) = prev_seq
-                    && rec.client_seq <= prev
+                    && cseq <= prev
                 {
-                    return Err(PendingWalCorruption::NonMonotonicClientSeq {
+                    return Err(RawPendingCorruption::NonMonotonicClientSeq {
                         offset: cursor,
                         prev_client_seq: prev,
-                        found_client_seq: rec.client_seq,
+                        found_client_seq: cseq,
                     });
                 }
-                prev_seq = Some(rec.client_seq);
+                prev_seq = Some(cseq);
                 records.push(rec);
                 cursor = next_pos;
             }
             FrameOutcome::TornTail => {
-                return Ok(PendingWalScan {
+                return Ok(RawPendingScan {
                     records,
                     valid_bytes: cursor,
                     tail: WalTailDisposition::TornFinalRecord {
@@ -827,7 +1171,7 @@ pub fn scan_pending_wal(bytes: &[u8]) -> Result<PendingWalScan, PendingWalCorrup
                 });
             }
             FrameOutcome::MidCorrupt => {
-                return Err(PendingWalCorruption::MidFileCorruption {
+                return Err(RawPendingCorruption::MidFileCorruption {
                     offset: cursor,
                     salvageable_records: records,
                 });
@@ -835,11 +1179,88 @@ pub fn scan_pending_wal(bytes: &[u8]) -> Result<PendingWalScan, PendingWalCorrup
         }
     }
 
-    Ok(PendingWalScan {
+    Ok(RawPendingScan {
         records,
         valid_bytes: cursor,
         tail: WalTailDisposition::Clean,
     })
+}
+
+/// Scans `RTCLPWAL` v1 (`pending.wal`) bytes from offset `0`, distinguishing
+/// recoverable crash tails (`ZeroPaddedTail` / `TornFinalRecord`) from mid-file
+/// corruption or non-monotonic `client_seq`.
+pub fn scan_pending_wal(bytes: &[u8]) -> Result<PendingWalScan, PendingWalCorruption> {
+    let raw = scan_pending_wal_generic(bytes, PENDING_WAL_VERSION_V1, |r: &WirePendingTxnV2| {
+        r.client_seq
+    })
+    .map_err(|c| match c {
+        RawPendingCorruption::InvalidHeader => PendingWalCorruption::InvalidHeader,
+        RawPendingCorruption::NonMonotonicClientSeq {
+            offset,
+            prev_client_seq,
+            found_client_seq,
+        } => PendingWalCorruption::NonMonotonicClientSeq {
+            offset,
+            prev_client_seq,
+            found_client_seq,
+        },
+        RawPendingCorruption::MidFileCorruption {
+            offset,
+            salvageable_records,
+        } => PendingWalCorruption::MidFileCorruption {
+            offset,
+            salvageable_records,
+        },
+    })?;
+    Ok(PendingWalScan {
+        records: raw.records,
+        valid_bytes: raw.valid_bytes,
+        tail: raw.tail,
+    })
+}
+
+/// Scans `RTCLPWAL` v2 (`pending.wal` for `WirePendingTxnV3`) bytes from offset `0`.
+pub fn scan_pending_wal_v2(bytes: &[u8]) -> Result<PendingWalScanV2, PendingWalCorruptionV2> {
+    let raw = scan_pending_wal_generic(bytes, PENDING_WAL_VERSION_V2, |r: &WirePendingTxnV3| {
+        r.client_seq
+    })
+    .map_err(|c| match c {
+        RawPendingCorruption::InvalidHeader => PendingWalCorruptionV2::InvalidHeader,
+        RawPendingCorruption::NonMonotonicClientSeq {
+            offset,
+            prev_client_seq,
+            found_client_seq,
+        } => PendingWalCorruptionV2::NonMonotonicClientSeq {
+            offset,
+            prev_client_seq,
+            found_client_seq,
+        },
+        RawPendingCorruption::MidFileCorruption {
+            offset,
+            salvageable_records,
+        } => PendingWalCorruptionV2::MidFileCorruption {
+            offset,
+            salvageable_records,
+        },
+    })?;
+    Ok(PendingWalScanV2 {
+        records: raw.records,
+        valid_bytes: raw.valid_bytes,
+        tail: raw.tail,
+    })
+}
+
+/// Scans `RTCLPWAL` v1 (upgraded to `WirePendingTxnV3`) or v2 bytes cleanly.
+pub fn scan_pending_wal_any(bytes: &[u8]) -> Result<PendingWalScanV2, PendingWalCorruptionV2> {
+    if bytes.len() >= WAL_HEADER_LEN
+        && bytes.get(0..8) == Some(PENDING_WAL_MAGIC.as_slice())
+        && read_u32_le(bytes, 8) == Some(PENDING_WAL_VERSION_V1)
+    {
+        return scan_pending_wal(bytes)
+            .map(PendingWalScanV2::from)
+            .map_err(PendingWalCorruptionV2::from);
+    }
+    scan_pending_wal_v2(bytes)
 }
 
 fn header_valid(bytes: &[u8], magic: &[u8; 8], expected_version: u32) -> bool {
@@ -861,6 +1282,54 @@ fn header_valid(bytes: &[u8], magic: &[u8; 8], expected_version: u32) -> bool {
     head_crc == crc32(head_prefix)
 }
 
+fn replay_wal_records_generic<R, W>(
+    engine: &mut FormulaEngine,
+    records: &[R],
+    skip_tail: usize,
+    recalculate: bool,
+    seq_of: fn(&R) -> u64,
+    ops_of: fn(&R) -> &[W],
+) -> Result<usize, WalError>
+where
+    W: Clone + TryInto<Op<BoundFormula>, Error = WireConvertError>,
+{
+    let keep = records.len().saturating_sub(skip_tail);
+    let slice = records.get(..keep).unwrap_or(&[]);
+    for rec in slice {
+        let seq = seq_of(rec);
+        for wire_op in ops_of(rec) {
+            let op = wire_op
+                .clone()
+                .try_into()
+                .map_err(WalError::InvalidWireOp)?;
+            engine
+                .apply_op(op)
+                .map_err(|_| WalError::ApplyFailed { seq })?;
+        }
+    }
+    if recalculate {
+        engine.recalc_all();
+    }
+    Ok(slice.len())
+}
+
+/// Applies `RTCLWAL3` (or upgraded) `records` onto `engine`, optionally recalculating.
+pub fn replay_wal_records_v3(
+    engine: &mut FormulaEngine,
+    records: &[WireWalRecordV3],
+    skip_tail: usize,
+    recalculate: bool,
+) -> Result<usize, WalError> {
+    replay_wal_records_generic(
+        engine,
+        records,
+        skip_tail,
+        recalculate,
+        |r| r.seq,
+        |r| &r.ops,
+    )
+}
+
 /// Applies `RTCLWAL2` `records` (optionally skipping the last `skip_tail`
 /// records) onto `engine`, optionally running recalculation at the end.
 pub fn replay_wal_records_v2(
@@ -869,21 +1338,14 @@ pub fn replay_wal_records_v2(
     skip_tail: usize,
     recalculate: bool,
 ) -> Result<usize, WalError> {
-    let keep = records.len().saturating_sub(skip_tail);
-    let slice = records.get(..keep).unwrap_or(&[]);
-    for rec in slice {
-        for wire_op in &rec.ops {
-            let op =
-                Op::<BoundFormula>::try_from(wire_op.clone()).map_err(WalError::InvalidWireOp)?;
-            engine
-                .apply_op(op)
-                .map_err(|_| WalError::ApplyFailed { seq: rec.seq })?;
-        }
-    }
-    if recalculate {
-        engine.recalc_all();
-    }
-    Ok(slice.len())
+    replay_wal_records_generic(
+        engine,
+        records,
+        skip_tail,
+        recalculate,
+        |r| r.seq,
+        |r| &r.ops,
+    )
 }
 
 /// Applies `records` (optionally skipping the last `skip_tail` records for Safe
@@ -894,21 +1356,14 @@ pub fn replay_wal_records(
     skip_tail: usize,
     recalculate: bool,
 ) -> Result<usize, WalError> {
-    let keep = records.len().saturating_sub(skip_tail);
-    let slice = records.get(..keep).unwrap_or(&[]);
-    for rec in slice {
-        for wire_op in &rec.ops {
-            let op =
-                Op::<BoundFormula>::try_from(wire_op.clone()).map_err(WalError::InvalidWireOp)?;
-            engine
-                .apply_op(op)
-                .map_err(|_| WalError::ApplyFailed { seq: rec.seq })?;
-        }
-    }
-    if recalculate {
-        engine.recalc_all();
-    }
-    Ok(slice.len())
+    replay_wal_records_generic(
+        engine,
+        records,
+        skip_tail,
+        recalculate,
+        |r| r.seq,
+        |r| &r.ops,
+    )
 }
 
 // ------------------------------------------------------------ internal helpers
@@ -1252,6 +1707,158 @@ mod tests {
         assert!(matches!(
             scan_pending_wal(&non_mono),
             Err(PendingWalCorruption::NonMonotonicClientSeq { .. })
+        ));
+    }
+
+    #[test]
+    fn wal_v3_and_pending_v2_round_trip_and_upgrade_older_formats() {
+        use super::{
+            PendingWalCorruptionV2, encode_pending_wal_complete, encode_pending_wal_complete_v2,
+            encode_wal_complete_v2, encode_wal_complete_v3, encode_wal_record_v3,
+            replay_wal_records_v3, scan_pending_wal_any, scan_pending_wal_v2, scan_wal_any_v3,
+            scan_wal_v3,
+        };
+        use crate::v1::WireOpV1;
+        use crate::v2::{WireOpV2, WirePendingTxnV2, WireTxnV2, WireWalRecordV2};
+        use crate::v3::{WireOpV3, WirePendingTxnV3, WireTxnV3, WireWalRecordV3};
+
+        // Upgrade RTCLWAL1 and RTCLWAL2 through scan_wal_any_v3.
+        let v1_bytes = encode_wal_complete(0, &[make_record(1, 0, 5.0)]).unwrap();
+        let up_v1 = scan_wal_any_v3(&v1_bytes, 0, 1).unwrap();
+        assert_eq!(up_v1.records.len(), 1);
+        assert_eq!(up_v1.last_seq(), 1);
+
+        let v2_op: Op<BoundFormula> = Op::SetCells {
+            sheet: SheetId(0),
+            edits: vec![CellEdit {
+                row: RowId(1),
+                col: ColId(0),
+                input: CellInput::Scalar(ScalarValue::Number(15.0)),
+                format: FormatPatch::Keep,
+            }],
+        };
+        let v2_rec = WireWalRecordV2 {
+            seq: 1,
+            timestamp_ms: 100,
+            label: String::from("v2"),
+            ops: vec![WireOpV2::try_from(&v2_op).unwrap()],
+        };
+        let v2_bytes = encode_wal_complete_v2(0, &[v2_rec]).unwrap();
+        let up_v2 = scan_wal_any_v3(&v2_bytes, 0, 1).unwrap();
+        assert_eq!(up_v2.records.len(), 1);
+
+        // Native RTCLWAL3 with PermuteContent & DefineNamedRange.
+        let ops_v3 = [
+            Op::PermuteContent {
+                sheet: SheetId(0),
+                rows: vec![RowId(0), RowId(1)],
+                cols: vec![ColId(0)],
+                row_perm: vec![1, 0],
+            },
+            Op::DefineNamedRange {
+                scope: None,
+                name: String::from("Tax"),
+                formula: BoundFormula {
+                    mode: reticula_core::ops::FormulaMode::Legacy,
+                    root: reticula_formula::binder::BoundExpr::Literal(
+                        reticula_formula::ast::Literal::Number(0.1),
+                    ),
+                },
+                comment: None,
+                hidden: false,
+            },
+        ];
+        let rec3 = WireWalRecordV3 {
+            seq: 2,
+            timestamp_ms: 200,
+            label: String::from("Sort & Name"),
+            ops: ops_v3
+                .iter()
+                .map(|o| WireOpV3::try_from(o).unwrap())
+                .collect(),
+        };
+        let wal3 = encode_wal_complete_v3(1, core::slice::from_ref(&rec3)).unwrap();
+        let scan3 = scan_wal_v3(&wal3, 1, 2).unwrap();
+        assert_eq!(scan3.records, vec![rec3.clone()]);
+        assert_eq!(scan_wal_any_v3(&wal3, 1, 2).unwrap(), scan3);
+
+        let mut eng = FormulaEngine::new();
+        eng.edit_cell_raw(SheetId(0), RowId(0), ColId(0), "10")
+            .unwrap();
+        eng.edit_cell_raw(SheetId(0), RowId(1), ColId(0), "20")
+            .unwrap();
+        replay_wal_records_v3(&mut eng, &scan3.records, 0, true).unwrap();
+        assert_eq!(
+            eng.workbook()
+                .sheet(SheetId(0))
+                .unwrap()
+                .value_by_id(RowId(0), ColId(0)),
+            reticula_core::value::Value::Number(20.0)
+        );
+        assert_eq!(eng.workbook().named_ranges().len(), 1);
+
+        // Torn tail on RTCLWAL3.
+        let extra = encode_wal_record_v3(&WireWalRecordV3 {
+            seq: 3,
+            timestamp_ms: 300,
+            label: String::from("Torn"),
+            ops: vec![WireOpV3::from(WireOpV1::DeleteSheet { sheet: 99 })],
+        })
+        .unwrap();
+        let mut torn_wal3 = wal3;
+        torn_wal3.extend_from_slice(&extra[..4]);
+        let torn_scan3 = scan_wal_any_v3(&torn_wal3, 1, 2).unwrap();
+        assert!(matches!(
+            torn_scan3.tail,
+            WalTailDisposition::TornFinalRecord { .. }
+        ));
+
+        // RTCLPWAL v2 round-trip + v1 upgrade.
+        let p_v1 = encode_pending_wal_complete(&[WirePendingTxnV2 {
+            replica: 1,
+            client_seq: 1,
+            base_server_seq: 0,
+            timestamp_ms: 50,
+            txn: WireTxnV2 {
+                label: String::from("p1"),
+                ops: vec![],
+            },
+        }])
+        .unwrap();
+        assert_eq!(scan_pending_wal_any(&p_v1).unwrap().records.len(), 1);
+
+        let pv2_1 = WirePendingTxnV3 {
+            replica: 1,
+            client_seq: 1,
+            base_server_seq: 0,
+            timestamp_ms: 100,
+            txn: WireTxnV3 {
+                label: String::from("sort"),
+                ops: rec3.ops,
+            },
+        };
+        let pv2_2 = WirePendingTxnV3 {
+            replica: 1,
+            client_seq: 2,
+            base_server_seq: 0,
+            timestamp_ms: 101,
+            txn: WireTxnV3 {
+                label: String::from("del"),
+                ops: vec![WireOpV3::DeleteNamedRange {
+                    scope: None,
+                    name: String::from("Tax"),
+                }],
+            },
+        };
+        let p_v2_bytes = encode_pending_wal_complete_v2(&[pv2_1.clone(), pv2_2.clone()]).unwrap();
+        let p_v2_scan = scan_pending_wal_v2(&p_v2_bytes).unwrap();
+        assert_eq!(p_v2_scan.records, vec![pv2_1.clone(), pv2_2.clone()]);
+        assert_eq!(scan_pending_wal_any(&p_v2_bytes).unwrap(), p_v2_scan);
+
+        let bad_v2 = encode_pending_wal_complete_v2(&[pv2_2, pv2_1]).unwrap();
+        assert!(matches!(
+            scan_pending_wal_any(&bad_v2),
+            Err(PendingWalCorruptionV2::NonMonotonicClientSeq { .. })
         ));
     }
 }

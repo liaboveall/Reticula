@@ -14,8 +14,9 @@ use reticula_core::axis::AxisRun;
 use reticula_core::format::NumberFormat;
 use reticula_core::id::{ColId, IdAllocator, RowId, SheetId};
 use reticula_core::ops::{
-    MAX_CELL_TEXT_UTF16, MAX_SHEETS, MAX_WORKBOOK_BYTES, OpError, SeedOrigin, Workbook,
-    WorkbookCellKey,
+    MAX_CELL_TEXT_UTF16, MAX_NAMED_RANGE_COMMENT_CHARS, MAX_NAMED_RANGES, MAX_SHEETS,
+    MAX_WORKBOOK_BYTES, NamedRangeDef, NamedRangeKey, OpError, ScalarValue, SeedOrigin, Workbook,
+    WorkbookCellKey, is_valid_named_range_name,
 };
 use reticula_core::sheet::{Sheet, SheetExtras};
 use reticula_core::snapshot::{
@@ -32,11 +33,15 @@ use reticula_formula::engine::FormulaEngine;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
+use crate::convert_v3::formula_uses_v3;
 use crate::v1::{
-    WireAxesMetricsSectionV1, WireAxisRunV1, WireBoundFormulaV1, WireCellStyleV1,
-    WireFormulaEntryV1, WireNumberFormatV1, WireReplicaWatermarkV1, WireSeedOriginV1,
-    WireSheetAxesMetricsV1, WireSheetStringsV1, WireSheetStylesV1, WireStringsSectionV1,
-    WireStylesSectionV1, WireWatermarksSectionV1,
+    WireAxesMetricsSectionV1, WireAxisRunV1, WireCellStyleV1, WireNumberFormatV1,
+    WireReplicaWatermarkV1, WireSeedOriginV1, WireSheetAxesMetricsV1, WireSheetStringsV1,
+    WireSheetStylesV1, WireStringsSectionV1, WireStylesSectionV1, WireWatermarksSectionV1,
+};
+use crate::v3::{
+    WireBoundFormulaV3, WireCommittedPermuteV3, WireFormulaEntryV3, WireNamedRangeEntryV1,
+    WireNamedRangesSectionV1, WirePermuteLogSectionV1,
 };
 
 /// `RTCLSNAP` container format version introduced in M1b.
@@ -50,6 +55,9 @@ const SECTION_FORMULAS_V1: u16 = 5;
 const SECTION_SEED_ORIGIN_V1: u16 = 6;
 const SECTION_WATERMARKS_V1: u16 = 7;
 const SECTION_SEED_STUB_V1: u16 = 8;
+const SECTION_FORMULAS_V3: u16 = 9;
+const SECTION_NAMED_RANGES_V1: u16 = 10;
+const SECTION_PERMUTE_LOG_V1: u16 = 11;
 
 const BLOCK_TAG_EMPTY: u8 = 0;
 const BLOCK_TAG_SPARSE: u8 = 1;
@@ -84,6 +92,8 @@ pub struct DecodedSnapshot {
     pub format_version: u32,
     /// Per-replica deduplication high-water marks (`D-026`).
     pub watermarks: Vec<WireReplicaWatermarkV1>,
+    /// Persisted E16 committed permutation mappings up to snapshot sequence.
+    pub permutes: Vec<WireCommittedPermuteV3>,
 }
 
 /// Output of one time-sliced call to [`SnapshotEncoder::encode_step`].
@@ -154,11 +164,14 @@ pub struct SnapshotEncoder {
     styles: WireStylesSectionV1,
     seed_origin: Option<WireSeedOriginV1>,
     watermarks: WireWatermarksSectionV1,
+    named_ranges: Vec<(Option<SheetId>, NamedRangeDef<BoundFormula>)>,
+    permutes: WirePermuteLogSectionV1,
+    has_v3_formulas: bool,
     /// MVCC before-image of any formula mutated on the live workbook after
     /// `SnapshotEncoder::new` was called (`None` value means formula did not
     /// exist at snapshot start).
     formula_before_image: BTreeMap<WorkbookCellKey, Option<BoundFormula>>,
-    formulas_collected: Option<Vec<WireFormulaEntryV1>>,
+    formulas_collected: Option<Vec<WireFormulaEntryV3>>,
     formula_cursor: Option<WorkbookCellKey>,
     formula_chunks: Vec<Vec<u8>>,
     total_formulas_encoded: u32,
@@ -171,6 +184,17 @@ impl SnapshotEncoder {
     /// Creates a point-in-time CoW encoder over `workbook`.
     #[must_use]
     pub fn new(workbook: &Workbook<BoundFormula>, watermarks: Vec<WireReplicaWatermarkV1>) -> Self {
+        Self::new_with_permutes(workbook, watermarks, Vec::new())
+    }
+
+    /// Creates a point-in-time CoW encoder over `workbook` including persisted
+    /// E16 committed permutation history.
+    #[must_use]
+    pub fn new_with_permutes(
+        workbook: &Workbook<BoundFormula>,
+        watermarks: Vec<WireReplicaWatermarkV1>,
+        permutes: Vec<WireCommittedPermuteV3>,
+    ) -> Self {
         let mut sheets = Vec::with_capacity(workbook.sheets().len());
         let mut axes_sheets = Vec::with_capacity(workbook.sheets().len());
         let mut style_sheets = Vec::with_capacity(workbook.sheets().len());
@@ -266,8 +290,17 @@ impl SnapshotEncoder {
             });
         }
 
+        let named_ranges: Vec<(Option<SheetId>, NamedRangeDef<BoundFormula>)> = workbook
+            .named_ranges()
+            .iter()
+            .map(|(k, v)| (k.scope, v.clone()))
+            .collect();
+        let has_v3_formulas = workbook.formulas().values().any(formula_uses_v3);
         let seed_origin = workbook.seed_origin().map(WireSeedOriginV1::from);
-        let section_count: usize = if seed_origin.is_some() { 7 } else { 6 };
+        let section_count: usize = 6_usize
+            .saturating_add(usize::from(seed_origin.is_some()))
+            .saturating_add(usize::from(!named_ranges.is_empty()))
+            .saturating_add(usize::from(!permutes.is_empty()));
         let header_len = compute_header_len(KERNEL_VERSION.len(), section_count);
 
         let initial_phase = if any_strings {
@@ -305,6 +338,9 @@ impl SnapshotEncoder {
             watermarks: WireWatermarksSectionV1 {
                 entries: watermarks,
             },
+            named_ranges,
+            permutes: WirePermuteLogSectionV1 { entries: permutes },
+            has_v3_formulas,
             formula_before_image: BTreeMap::new(),
             formulas_collected: None,
             formula_cursor: None,
@@ -583,7 +619,7 @@ impl SnapshotEncoder {
                     return Ok(SnapshotStep::Progress);
                 }
 
-                // All formula chunks compressed — emit `SECTION_FORMULAS_V1`.
+                // All formula chunks compressed — emit `SECTION_FORMULAS_V1` (or `V3`).
                 let sec_start = self.write_offset;
                 let chunk_count =
                     u32::try_from(self.formula_chunks.len()).map_err(|_| SnapshotError::Codec)?;
@@ -598,8 +634,12 @@ impl SnapshotEncoder {
                     out.extend_from_slice(&frame);
                 }
                 let len_u64 = u64::try_from(out.len()).map_err(|_| SnapshotError::Codec)?;
-                self.directory
-                    .push((SECTION_FORMULAS_V1, sec_start, len_u64));
+                let formula_sec_id = if self.has_v3_formulas {
+                    SECTION_FORMULAS_V3
+                } else {
+                    SECTION_FORMULAS_V1
+                };
+                self.directory.push((formula_sec_id, sec_start, len_u64));
                 self.write_offset = self
                     .write_offset
                     .checked_add(len_u64)
@@ -620,6 +660,26 @@ impl SnapshotEncoder {
                 }
                 let wm_bytes = encode_compressed_section(&self.watermarks)?;
                 self.push_dir_and_append(SECTION_WATERMARKS_V1, &wm_bytes, &mut out)?;
+                if !self.named_ranges.is_empty() {
+                    let mut entries = Vec::with_capacity(self.named_ranges.len());
+                    for (scope, def) in &self.named_ranges {
+                        entries.push(WireNamedRangeEntryV1 {
+                            scope: scope.map(|s| s.0),
+                            name: def.name.clone(),
+                            formula: WireBoundFormulaV3::try_from(&def.formula)
+                                .map_err(|_| SnapshotError::Codec)?,
+                            comment: def.comment.clone(),
+                            hidden: def.hidden,
+                        });
+                    }
+                    let nr_sec = WireNamedRangesSectionV1 { entries };
+                    let nr_bytes = encode_compressed_section(&nr_sec)?;
+                    self.push_dir_and_append(SECTION_NAMED_RANGES_V1, &nr_bytes, &mut out)?;
+                }
+                if !self.permutes.entries.is_empty() {
+                    let perm_bytes = encode_compressed_section(&self.permutes)?;
+                    self.push_dir_and_append(SECTION_PERMUTE_LOG_V1, &perm_bytes, &mut out)?;
+                }
 
                 self.phase = EncodePhase::Done;
                 Ok(SnapshotStep::Chunk {
@@ -662,7 +722,7 @@ impl SnapshotEncoder {
         &mut self,
         live_workbook: &Workbook<BoundFormula>,
         limit: usize,
-    ) -> Result<Vec<WireFormulaEntryV1>, SnapshotError> {
+    ) -> Result<Vec<WireFormulaEntryV3>, SnapshotError> {
         if self.formula_before_image.is_empty() {
             // Fast path (no formulas edited while snapshot in flight): stream
             // directly from `live_workbook.formulas()` with zero allocations!
@@ -676,11 +736,12 @@ impl SnapshotEncoder {
                     batch.reserve(limit.min(live_workbook.formulas().len()));
                 }
                 self.formula_cursor = Some(key);
-                batch.push(WireFormulaEntryV1 {
+                self.has_v3_formulas |= formula_uses_v3(f);
+                batch.push(WireFormulaEntryV3 {
                     sheet: key.0.0,
                     row: key.1.0,
                     col: key.2.0,
-                    formula: WireBoundFormulaV1::try_from(f).map_err(|_| SnapshotError::Codec)?,
+                    formula: WireBoundFormulaV3::try_from(f).map_err(|_| SnapshotError::Codec)?,
                 });
             }
             return Ok(batch);
@@ -688,11 +749,14 @@ impl SnapshotEncoder {
 
         // Merge live `formulas()` with `formula_before_image` in sorted key order.
         if self.formulas_collected.is_none() {
-            let mut merged: BTreeMap<WorkbookCellKey, WireBoundFormulaV1> = BTreeMap::new();
+            let mut merged: BTreeMap<WorkbookCellKey, (WireBoundFormulaV3, bool)> = BTreeMap::new();
             for (&k, f) in live_workbook.formulas() {
                 merged.insert(
                     k,
-                    WireBoundFormulaV1::try_from(f).map_err(|_| SnapshotError::Codec)?,
+                    (
+                        WireBoundFormulaV3::try_from(f).map_err(|_| SnapshotError::Codec)?,
+                        formula_uses_v3(f),
+                    ),
                 );
             }
             for (&k, prior) in &self.formula_before_image {
@@ -700,7 +764,11 @@ impl SnapshotEncoder {
                     Some(f) => {
                         merged.insert(
                             k,
-                            WireBoundFormulaV1::try_from(f).map_err(|_| SnapshotError::Codec)?,
+                            (
+                                WireBoundFormulaV3::try_from(f)
+                                    .map_err(|_| SnapshotError::Codec)?,
+                                formula_uses_v3(f),
+                            ),
                         );
                     }
                     None => {
@@ -708,10 +776,11 @@ impl SnapshotEncoder {
                     }
                 }
             }
+            self.has_v3_formulas = merged.values().any(|&(_, is_v3)| is_v3);
             self.formulas_collected = Some(
                 merged
                     .into_iter()
-                    .map(|((s, r, c), formula)| WireFormulaEntryV1 {
+                    .map(|((s, r, c), (formula, _))| WireFormulaEntryV3 {
                         sheet: s.0,
                         row: r.0,
                         col: c.0,
@@ -731,12 +800,22 @@ impl SnapshotEncoder {
     }
 }
 
-/// Encodes `workbook` into a complete in-memory `RTCLSNAP` v1 buffer.
+/// Encodes `workbook` into a complete in-memory `RTCLSNAP` buffer.
 pub fn encode_snapshot_v1(
     workbook: &Workbook<BoundFormula>,
     watermarks: &[WireReplicaWatermarkV1],
 ) -> Result<Vec<u8>, SnapshotError> {
-    let mut enc = SnapshotEncoder::new(workbook, watermarks.to_vec());
+    encode_snapshot_with_permutes(workbook, watermarks, &[])
+}
+
+/// Encodes `workbook` together with E16 committed permutation history into an `RTCLSNAP` buffer.
+pub fn encode_snapshot_with_permutes(
+    workbook: &Workbook<BoundFormula>,
+    watermarks: &[WireReplicaWatermarkV1],
+    permutes: &[WireCommittedPermuteV3],
+) -> Result<Vec<u8>, SnapshotError> {
+    let mut enc =
+        SnapshotEncoder::new_with_permutes(workbook, watermarks.to_vec(), permutes.to_vec());
     let mut out = vec![0_u8; enc.header_len];
     loop {
         match enc.encode_step(workbook, BLOCKS_PER_COLUMN_CHUNK)? {
@@ -842,6 +921,7 @@ fn decode_snapshot_any_with_limits(
             kernel_version,
             format_version: SNAPSHOT_VERSION_V0,
             watermarks: Vec::new(),
+            permutes: Vec::new(),
         });
     }
     if version != SNAPSHOT_VERSION_V1 {
@@ -922,6 +1002,7 @@ fn decode_snapshot_any_with_limits(
             kernel_version,
             format_version: SNAPSHOT_VERSION_V1,
             watermarks,
+            permutes: Vec::new(),
         });
     }
 
@@ -947,13 +1028,29 @@ fn decode_snapshot_any_with_limits(
         .get(&SECTION_COLUMNS_V1)
         .copied()
         .ok_or(SnapshotError::MissingSection)?;
-    let formulas_slice = dir
-        .get(&SECTION_FORMULAS_V1)
-        .copied()
-        .ok_or(SnapshotError::MissingSection)?;
+    let (formulas_slice, allow_v3_formulas) = match (
+        dir.get(&SECTION_FORMULAS_V1).copied(),
+        dir.get(&SECTION_FORMULAS_V3).copied(),
+    ) {
+        (Some(slice), None) => (slice, false),
+        (None, Some(slice)) => (slice, true),
+        (Some(_), Some(_)) => return Err(SnapshotError::InvalidDirectory),
+        (None, None) => return Err(SnapshotError::MissingSection),
+    };
     let seed_origin: Option<SeedOrigin> = match dir.get(&SECTION_SEED_ORIGIN_V1) {
         Some(raw) => Some(decode_compressed_section::<WireSeedOriginV1>(raw, section_cap)?.into()),
         None => None,
+    };
+    let named_ranges_wire: Option<WireNamedRangesSectionV1> =
+        match dir.get(&SECTION_NAMED_RANGES_V1) {
+            Some(raw) => Some(decode_compressed_section(raw, section_cap)?),
+            None => None,
+        };
+    let permutes: Vec<WireCommittedPermuteV3> = match dir.get(&SECTION_PERMUTE_LOG_V1) {
+        Some(raw) => {
+            decode_compressed_section::<WirePermuteLogSectionV1>(raw, section_cap)?.entries
+        }
+        None => Vec::new(),
     };
 
     // Pre-warm linear memory in one contiguous step so decoding large
@@ -1171,11 +1268,43 @@ fn decode_snapshot_any_with_limits(
         running_bytes,
         max_bytes,
         section_cap,
+        allow_v3_formulas,
     )?;
 
-    let workbook = Workbook::from_parts(
+    let mut named_ranges: BTreeMap<NamedRangeKey, NamedRangeDef<BoundFormula>> = BTreeMap::new();
+    if let Some(nr_sec) = named_ranges_wire {
+        if nr_sec.entries.len() > MAX_NAMED_RANGES {
+            return Err(SnapshotError::Validation);
+        }
+        for entry in nr_sec.entries {
+            if !is_valid_named_range_name(&entry.name) {
+                return Err(SnapshotError::Validation);
+            }
+            if let Some(ref comment) = entry.comment
+                && comment.chars().count() > MAX_NAMED_RANGE_COMMENT_CHARS
+            {
+                return Err(SnapshotError::Validation);
+            }
+            let formula =
+                BoundFormula::try_from(entry.formula).map_err(|_| SnapshotError::Validation)?;
+            let scope = entry.scope.map(SheetId);
+            let key = NamedRangeKey::new(scope, &entry.name);
+            let def = NamedRangeDef {
+                name: entry.name,
+                formula,
+                comment: entry.comment,
+                hidden: entry.hidden,
+            };
+            if named_ranges.insert(key, def).is_some() {
+                return Err(SnapshotError::Validation);
+            }
+        }
+    }
+
+    let workbook = Workbook::from_parts_with_names(
         sheets,
         formulas,
+        named_ranges,
         allocator,
         axes_sec.next_sheet_id,
         seed_origin,
@@ -1192,6 +1321,7 @@ fn decode_snapshot_any_with_limits(
         kernel_version,
         format_version: SNAPSHOT_VERSION_V1,
         watermarks,
+        permutes,
     })
 }
 
@@ -1492,6 +1622,7 @@ struct DirectFormulaEntry {
 fn validate_and_normalize_direct_expr(
     expr: &mut BoundExpr,
     depth: usize,
+    allow_v3: bool,
 ) -> Result<(), SnapshotError> {
     if depth > MAX_NESTING_DEPTH {
         return Err(SnapshotError::Validation);
@@ -1520,17 +1651,50 @@ fn validate_and_normalize_direct_expr(
         }
         BoundExpr::Reference(_) => Ok(()),
         BoundExpr::Name(n) => check_direct_text_len(n),
-        BoundExpr::ScopedName { .. }
-        | BoundExpr::SpillRef(_)
-        | BoundExpr::Opaque { .. }
-        | BoundExpr::PreservedCached { .. }
-        | BoundExpr::MissingArg => Err(SnapshotError::Codec),
+        BoundExpr::ScopedName {
+            missing_sheet,
+            name,
+            ..
+        } => {
+            if !allow_v3 {
+                return Err(SnapshotError::Codec);
+            }
+            if let Some(ms) = missing_sheet {
+                check_direct_text_len(ms)?;
+            }
+            check_direct_text_len(name)
+        }
+        BoundExpr::SpillRef(inner) => {
+            if !allow_v3 {
+                return Err(SnapshotError::Codec);
+            }
+            validate_and_normalize_direct_expr(inner, next, allow_v3)
+        }
+        BoundExpr::Opaque { raw } => {
+            if !allow_v3 {
+                return Err(SnapshotError::Codec);
+            }
+            check_direct_text_len(raw)
+        }
+        BoundExpr::PreservedCached { raw, cached } => {
+            if !allow_v3 {
+                return Err(SnapshotError::Codec);
+            }
+            check_direct_text_len(raw)?;
+            validate_direct_scalar(cached)
+        }
+        BoundExpr::MissingArg => {
+            if !allow_v3 {
+                return Err(SnapshotError::Codec);
+            }
+            Ok(())
+        }
         BoundExpr::Paren(inner) | BoundExpr::Unary { expr: inner, .. } => {
-            validate_and_normalize_direct_expr(inner, next)
+            validate_and_normalize_direct_expr(inner, next, allow_v3)
         }
         BoundExpr::Binary { left, right, .. } => {
-            validate_and_normalize_direct_expr(left, next)?;
-            validate_and_normalize_direct_expr(right, next)
+            validate_and_normalize_direct_expr(left, next, allow_v3)?;
+            validate_and_normalize_direct_expr(right, next, allow_v3)
         }
         BoundExpr::Call { name, args } => {
             if args.len() > MAX_FUNCTION_ARGS {
@@ -1541,10 +1705,26 @@ fn validate_and_normalize_direct_expr(
                 name.make_ascii_uppercase();
             }
             for arg in args.iter_mut() {
-                validate_and_normalize_direct_expr(arg, next)?;
+                validate_and_normalize_direct_expr(arg, next, allow_v3)?;
             }
             Ok(())
         }
+    }
+}
+
+fn validate_direct_scalar(scalar: &mut ScalarValue) -> Result<(), SnapshotError> {
+    match scalar {
+        ScalarValue::Number(n) => {
+            if !n.is_finite() {
+                return Err(SnapshotError::Validation);
+            }
+            if *n == 0.0 {
+                *n = 0.0;
+            }
+            Ok(())
+        }
+        ScalarValue::Text(s) => check_direct_text_len(s),
+        ScalarValue::Bool(_) | ScalarValue::Error(_) => Ok(()),
     }
 }
 
@@ -1577,6 +1757,7 @@ fn decode_formulas_section(
     mut running_bytes: usize,
     max_bytes: usize,
     section_cap: usize,
+    allow_v3: bool,
 ) -> Result<BTreeMap<WorkbookCellKey, BoundFormula>, SnapshotError> {
     let total_formulas =
         usize::try_from(read_u32_le(bytes, 0)?).map_err(|_| SnapshotError::Validation)?;
@@ -1616,7 +1797,7 @@ fn decode_formulas_section(
             return Err(SnapshotError::Validation);
         }
         for mut entry in entries {
-            validate_and_normalize_direct_expr(&mut entry.formula.root, 0)?;
+            validate_and_normalize_direct_expr(&mut entry.formula.root, 0, allow_v3)?;
             use reticula_core::ops::FormulaPayload as _;
             entry
                 .formula
@@ -2007,12 +2188,151 @@ mod tests {
         let mut decoded: Vec<DirectFormulaEntry> = postcard::from_bytes(&encoded).unwrap();
         assert_eq!(decoded.len(), samples.len());
         for (idx, (direct, expected)) in decoded.iter_mut().zip(samples.iter()).enumerate() {
-            validate_and_normalize_direct_expr(&mut direct.formula.root, 0).unwrap();
+            validate_and_normalize_direct_expr(&mut direct.formula.root, 0, false).unwrap();
             assert_eq!(direct.sheet, u32::try_from(idx).unwrap());
             assert_eq!(direct.row, (idx as u64) + 10);
             assert_eq!(direct.col, (idx as u64) + 20);
             assert_eq!(&direct.formula, expected);
         }
+
+        // Verify v3 WireFormulaEntryV3 shares exact binary layout on v1 formulas and
+        // round-trips all 5 new v3 BoundExpr variants through DirectFormulaEntry!
+        let v3_same_bytes = postcard::to_allocvec(
+            &samples
+                .iter()
+                .enumerate()
+                .map(|(i, f)| crate::v3::WireFormulaEntryV3 {
+                    sheet: u32::try_from(i).unwrap(),
+                    row: (i as u64) + 10,
+                    col: (i as u64) + 20,
+                    formula: crate::v3::WireBoundFormulaV3::try_from(f).unwrap(),
+                })
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        assert_eq!(encoded, v3_same_bytes);
+
+        let v3_sample = BoundFormula {
+            mode: FormulaMode::Dynamic,
+            root: BoundExpr::Call {
+                name: String::from("XLOOKUP"),
+                args: vec![
+                    BoundExpr::ScopedName {
+                        sheet: Some(SheetId(0)),
+                        missing_sheet: None,
+                        name: String::from("Rate"),
+                    },
+                    BoundExpr::SpillRef(Box::new(BoundExpr::Reference(BoundRef::Cell {
+                        sheet: None,
+                        missing_sheet: None,
+                        row: RowId(0),
+                        col: ColId(0),
+                        abs_col: false,
+                        abs_row: false,
+                    }))),
+                    BoundExpr::Opaque {
+                        raw: String::from("=_xlfn.FUTURE()"),
+                    },
+                    BoundExpr::PreservedCached {
+                        raw: String::from("=LEGACY(2)"),
+                        cached: reticula_core::ops::ScalarValue::Number(9.5),
+                    },
+                    BoundExpr::MissingArg,
+                ],
+            },
+        };
+        let v3_encoded = postcard::to_allocvec(&vec![crate::v3::WireFormulaEntryV3 {
+            sheet: 0,
+            row: 1,
+            col: 2,
+            formula: crate::v3::WireBoundFormulaV3::try_from(&v3_sample).unwrap(),
+        }])
+        .unwrap();
+        let mut v3_direct: Vec<DirectFormulaEntry> = postcard::from_bytes(&v3_encoded).unwrap();
+        assert_eq!(
+            validate_and_normalize_direct_expr(&mut v3_direct[0].formula.root.clone(), 0, false),
+            Err(crate::snapshot::SnapshotError::Codec)
+        );
+        validate_and_normalize_direct_expr(&mut v3_direct[0].formula.root, 0, true).unwrap();
+        assert_eq!(v3_direct[0].formula, v3_sample);
+    }
+
+    #[test]
+    fn m3a_sections_formulas_v3_named_ranges_and_permutes_round_trip() {
+        use alloc::boxed::Box;
+        use reticula_core::id::{ColId, RowId, SheetId};
+        use reticula_core::ops::{CellEdit, CellInput, FormatPatch, FormulaMode, Op};
+        use reticula_formula::ast::Literal;
+        use reticula_formula::binder::{BoundExpr, BoundFormula, BoundRef};
+
+        use super::encode_snapshot_with_permutes;
+        use crate::v3::WireCommittedPermuteV3;
+
+        let mut eng = FormulaEngine::new();
+        let s0 = SheetId(0);
+        eng.edit_cell_raw(s0, RowId(0), ColId(0), "=SEQUENCE(3)")
+            .unwrap();
+        let f_spill = BoundFormula {
+            mode: FormulaMode::Dynamic,
+            root: BoundExpr::Call {
+                name: String::from("SUM"),
+                args: vec![
+                    BoundExpr::SpillRef(Box::new(BoundExpr::Reference(BoundRef::Cell {
+                        sheet: None,
+                        missing_sheet: None,
+                        row: RowId(0),
+                        col: ColId(0),
+                        abs_col: false,
+                        abs_row: false,
+                    }))),
+                    BoundExpr::MissingArg,
+                ],
+            },
+        };
+        eng.apply_op(Op::SetCells {
+            sheet: s0,
+            edits: vec![CellEdit {
+                row: RowId(0),
+                col: ColId(1),
+                input: CellInput::Formula {
+                    formula: f_spill,
+                    cached: None,
+                },
+                format: FormatPatch::Keep,
+            }],
+        })
+        .unwrap();
+        eng.apply_op(Op::DefineNamedRange {
+            scope: Some(s0),
+            name: String::from("TaxRate"),
+            formula: BoundFormula {
+                mode: FormulaMode::Legacy,
+                root: BoundExpr::Literal(Literal::Number(0.075)),
+            },
+            comment: Some(String::from("Local rate")),
+            hidden: false,
+        })
+        .unwrap();
+
+        let permutes = vec![WireCommittedPermuteV3 {
+            seq: 5,
+            replica: 1,
+            client_seq: 3,
+            sheet: 0,
+            cols: vec![0, 1],
+            row_pairs: vec![(0, 2), (2, 0)],
+        }];
+        let bytes = encode_snapshot_with_permutes(eng.workbook(), &[], &permutes).unwrap();
+        let decoded = decode_snapshot_any(&bytes).unwrap();
+        assert_eq!(
+            decoded.engine.workbook().state_digest(),
+            eng.workbook().state_digest()
+        );
+        assert_eq!(
+            decoded.engine.workbook().logical_digest(),
+            eng.workbook().logical_digest()
+        );
+        assert_eq!(decoded.permutes, permutes);
     }
 
     #[test]

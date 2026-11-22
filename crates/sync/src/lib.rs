@@ -38,9 +38,10 @@ pub mod validate;
 pub use client::{ClientSyncMachine, replay_pending_onto};
 pub use server::{ApplyResult, ServerDocMachine};
 pub use types::{
-    ClientAction, ConnectionState, MemberRole, ReplicaWatermark, ServerLimits, StagedTxn,
-    TryApplyOutcome, VIEWER_REPLICA,
+    ClientAction, CommittedPermute, ConnectionState, MemberRole, ReplicaWatermark, ServerLimits,
+    StagedTxn, TryApplyOutcome, VIEWER_REPLICA,
 };
+pub use validate::transform_ops_through_permute;
 
 #[cfg(test)]
 #[allow(
@@ -62,15 +63,17 @@ mod tests {
     use reticula_core::ops::{CellEdit, CellInput, FormatPatch, FormulaMode, Op, ScalarValue};
     use reticula_core::value::Value;
     use reticula_formula::binder::BoundFormula;
-    use reticula_wire::convert_v2::ops_to_wire_txn_v2;
-    use reticula_wire::v2::{
-        SYNC_PROTOCOL_VERSION, WireCatchupV1, WireCommittedTxnV2, WirePendingTxnV2,
-        WireRejectReasonV1, WireStateDigestV1, WireSyncFrameV1,
+    use reticula_wire::convert_v3::ops_to_wire_txn_v3;
+    use reticula_wire::v2::{WireRejectReasonV1, WireStateDigestV1};
+    use reticula_wire::v3::{
+        SYNC_PROTOCOL_VERSION_V2, WireCatchupV2, WireCommittedTxnV3, WirePendingTxnV3,
+        WireSyncFrameV2,
     };
 
     use crate::{
         ClientAction, ClientSyncMachine, ConnectionState, MemberRole, ReplicaWatermark,
         ServerDocMachine, ServerLimits, VIEWER_REPLICA, replay_pending_onto,
+        transform_ops_through_permute,
     };
 
     const DOC_ID: [u8; 16] = [1; 16];
@@ -106,9 +109,9 @@ mod tests {
         user_id: [u8; 16],
         role: Option<MemberRole>,
         rep: u32,
-        txn: WirePendingTxnV2,
+        txn: WirePendingTxnV3,
         ts: u64,
-    ) -> WireCommittedTxnV2 {
+    ) -> WireCommittedTxnV3 {
         let crate::server::ApplyResult::Committed(c) = server
             .apply_and_commit(user_id, role, rep, txn, ts)
             .unwrap()
@@ -197,7 +200,7 @@ mod tests {
             .on_hello(USER_B, Some(MemberRole::Editor), hb)
             .unwrap();
         let b_actions = cb.on_welcome(wb_welcome);
-        let ClientAction::SendFrame(WireSyncFrameV1::Push { txns: b_txns }) =
+        let ClientAction::SendFrame(WireSyncFrameV2::Push { txns: b_txns }) =
             b_actions.last().unwrap()
         else {
             panic!("expected Push from B");
@@ -226,7 +229,7 @@ mod tests {
             .unwrap();
         let a_actions = ca.on_welcome(wa_welcome);
         assert!(a_actions.contains(&ClientAction::NotifyVisibleChanged));
-        let ClientAction::SendFrame(WireSyncFrameV1::Push { txns: a_txns }) =
+        let ClientAction::SendFrame(WireSyncFrameV2::Push { txns: a_txns }) =
             a_actions.last().unwrap()
         else {
             panic!("expected Push from A");
@@ -315,7 +318,7 @@ mod tests {
                 10,
             )
             .unwrap();
-        let ClientAction::SendFrame(WireSyncFrameV1::Push { txns: t1 }) = &a1[2] else {
+        let ClientAction::SendFrame(WireSyncFrameV2::Push { txns: t1 }) = &a1[2] else {
             panic!();
         };
         let c1 = commit_ok(
@@ -350,7 +353,7 @@ mod tests {
                 20,
             )
             .unwrap();
-        let ClientAction::SendFrame(WireSyncFrameV1::Push { txns: t2 }) = &a2[2] else {
+        let ClientAction::SendFrame(WireSyncFrameV2::Push { txns: t2 }) = &a2[2] else {
             panic!();
         };
         let _c2 = server
@@ -366,6 +369,7 @@ mod tests {
             1,
             1,
             client.confirmed().clone(),
+            vec![],
             vec![],
             2,
         );
@@ -403,7 +407,7 @@ mod tests {
         let welcome = server.on_hello(USER_A, Some(MemberRole::Owner), h).unwrap();
         let w_actions = crashed.on_welcome(welcome);
         assert_eq!(crashed.next_client_seq(), 4);
-        let ClientAction::SendFrame(WireSyncFrameV1::Push { txns: remapped }) =
+        let ClientAction::SendFrame(WireSyncFrameV2::Push { txns: remapped }) =
             w_actions.last().unwrap()
         else {
             panic!();
@@ -487,13 +491,13 @@ mod tests {
         // remaps pending formulas/inserted IDs, and replays!
         let old_rep = pack_replica_id(0, 1).unwrap();
         let mut cl_epoch = ClientSyncMachine::new(DOC_ID, BRANCH_ID);
-        let welcome_e0 = WireSyncFrameV1::Welcome {
+        let welcome_e0 = WireSyncFrameV2::Welcome {
             epoch: 0,
             head_seq: 0,
             replica: old_rep,
             last_client_seq: 0,
             max_id_counter: 0,
-            catchup: reticula_wire::v2::WireCatchupV1::Txns {
+            catchup: WireCatchupV2::Txns {
                 from_seq: 1,
                 txns: vec![],
             },
@@ -548,6 +552,7 @@ mod tests {
             1,
             vec![],
             vec![],
+            vec![],
             ServerLimits::default(),
         )
         .unwrap();
@@ -565,7 +570,7 @@ mod tests {
             new_epoch: 1
         }));
         assert_eq!(cl_epoch.epoch(), 1);
-        let ClientAction::SendFrame(WireSyncFrameV1::Push { txns: e1_push }) =
+        let ClientAction::SendFrame(WireSyncFrameV2::Push { txns: e1_push }) =
             actions_e1.last().unwrap()
         else {
             panic!();
@@ -584,7 +589,12 @@ mod tests {
             restored_server.workbook().state_digest()
         );
         assert_eq!(
-            replay_pending_onto(cl_epoch.confirmed(), &cl_epoch.pending_wire_txns()).state_digest(),
+            replay_pending_onto(
+                cl_epoch.confirmed(),
+                &cl_epoch.pending_wire_txns(),
+                cl_epoch.confirmed_permutes()
+            )
+            .state_digest(),
             cl_epoch.visible().state_digest()
         );
 
@@ -602,13 +612,13 @@ mod tests {
             ServerLimits::default(),
         );
         let r_dm = dm_server.allocate_replica(USER_A).unwrap();
-        let c_dm = WireCommittedTxnV2 {
+        let c_dm = WireCommittedTxnV3 {
             seq: 1,
             replica: r_dm,
             client_seq: 1,
             user_id: USER_A,
             timestamp_ms: 1,
-            txn: ops_to_wire_txn_v2(String::new(), &[]).unwrap(),
+            txn: ops_to_wire_txn_v3(String::new(), &[]).unwrap(),
         };
         let mut dm_client = ClientSyncMachine::new(DOC_ID, BRANCH_ID);
         dm_client.on_connected();
@@ -617,8 +627,8 @@ mod tests {
                 .on_hello(
                     USER_A,
                     Some(MemberRole::Owner),
-                    &WireSyncFrameV1::Hello {
-                        protocol_version: SYNC_PROTOCOL_VERSION,
+                    &WireSyncFrameV2::Hello {
+                        protocol_version: SYNC_PROTOCOL_VERSION_V2,
                         doc_id: DOC_ID,
                         branch_id: BRANCH_ID,
                         replica: Some(r_dm),
@@ -668,7 +678,7 @@ mod tests {
                     i,
                 )
                 .unwrap();
-            let ClientAction::SendFrame(WireSyncFrameV1::Push { txns }) = act.last().unwrap()
+            let ClientAction::SendFrame(WireSyncFrameV2::Push { txns }) = act.last().unwrap()
             else {
                 panic!();
             };
@@ -725,7 +735,7 @@ mod tests {
                 4,
             )
             .unwrap();
-        let ClientAction::SendFrame(WireSyncFrameV1::Push { txns: t4 }) = act4.last().unwrap()
+        let ClientAction::SendFrame(WireSyncFrameV2::Push { txns: t4 }) = act4.last().unwrap()
         else {
             panic!();
         };
@@ -742,7 +752,7 @@ mod tests {
 
         let wms: Vec<ReplicaWatermark> = server.watermarks();
         let tail = server.txns_since(2).unwrap();
-        bob.install_snapshot(2, snap_wb_at_2, &wms, tail);
+        bob.install_snapshot(2, snap_wb_at_2, &wms, Vec::new(), tail);
         assert_eq!(bob.connection_state(), ConnectionState::Online);
         assert_eq!(bob.confirmed_seq(), 4);
         assert_eq!(
@@ -785,7 +795,7 @@ mod tests {
                 1,
             )
             .unwrap();
-        let ClientAction::SendFrame(WireSyncFrameV1::Push { txns: t1 }) = act1.last().unwrap()
+        let ClientAction::SendFrame(WireSyncFrameV2::Push { txns: t1 }) = act1.last().unwrap()
         else {
             panic!();
         };
@@ -819,7 +829,7 @@ mod tests {
                 2,
             )
             .unwrap();
-        let ClientAction::SendFrame(WireSyncFrameV1::Push { txns: t2 }) = act2.last().unwrap()
+        let ClientAction::SendFrame(WireSyncFrameV2::Push { txns: t2 }) = act2.last().unwrap()
         else {
             panic!();
         };
@@ -863,7 +873,7 @@ mod tests {
                 3,
             )
             .unwrap();
-        let ClientAction::SendFrame(WireSyncFrameV1::Push { txns: t3 }) = act3.last().unwrap()
+        let ClientAction::SendFrame(WireSyncFrameV2::Push { txns: t3 }) = act3.last().unwrap()
         else {
             panic!();
         };
@@ -896,6 +906,7 @@ mod tests {
             server.workbook().clone(),
             server.next_per_epoch_replica(),
             server.watermarks(),
+            server.committed_permutes().to_vec(),
             Vec::new(),
             ServerLimits::default(),
         )
@@ -951,7 +962,7 @@ mod tests {
                 1,
             )
             .unwrap();
-        let ClientAction::SendFrame(WireSyncFrameV1::Push { txns }) = act1.last().unwrap() else {
+        let ClientAction::SendFrame(WireSyncFrameV2::Push { txns }) = act1.last().unwrap() else {
             panic!();
         };
         let c1 = commit_ok(
@@ -977,6 +988,7 @@ mod tests {
             1,
             wms1.clone(),
             Vec::new(),
+            Vec::new(),
             ServerLimits {
                 catchup_window: 1,
                 snapshot_txn_threshold: 1,
@@ -990,12 +1002,12 @@ mod tests {
                 USER_B,
                 Some(MemberRole::Editor),
                 bob_rep,
-                WirePendingTxnV2 {
+                WirePendingTxnV3 {
                     replica: bob_rep,
                     client_seq: 1,
                     base_server_seq: 1,
                     timestamp_ms: 2,
-                    txn: ops_to_wire_txn_v2(
+                    txn: ops_to_wire_txn_v3(
                         String::from("b1"),
                         &[Op::SetCells {
                             sheet: SheetId(0),
@@ -1017,12 +1029,12 @@ mod tests {
                 USER_B,
                 Some(MemberRole::Editor),
                 bob_rep,
-                WirePendingTxnV2 {
+                WirePendingTxnV3 {
                     replica: bob_rep,
                     client_seq: 2,
                     base_server_seq: 1,
                     timestamp_ms: 3,
-                    txn: ops_to_wire_txn_v2(
+                    txn: ops_to_wire_txn_v3(
                         String::from("b2"),
                         &[Op::SetCells {
                             sheet: SheetId(0),
@@ -1081,12 +1093,17 @@ mod tests {
         ));
         assert_eq!(
             alice.visible().state_digest(),
-            replay_pending_onto(alice.confirmed(), &alice.pending_wire_txns()).state_digest()
+            replay_pending_onto(
+                alice.confirmed(),
+                &alice.pending_wire_txns(),
+                alice.confirmed_permutes()
+            )
+            .state_digest()
         );
 
         let tail = backup_srv.txns_since(1).unwrap();
-        let snap_actions = alice.install_snapshot(1, snap1, &wms1, tail);
-        let ClientAction::SendFrame(WireSyncFrameV1::Push { txns: remapped }) =
+        let snap_actions = alice.install_snapshot(1, snap1, &wms1, Vec::new(), tail);
+        let ClientAction::SendFrame(WireSyncFrameV2::Push { txns: remapped }) =
             snap_actions.last().unwrap()
         else {
             panic!();
@@ -1108,7 +1125,7 @@ mod tests {
 
     #[test]
     fn awaiting_snapshot_after_epoch_change_keeps_pending_wal_monotonic() {
-        use reticula_wire::wal::{encode_pending_wal_complete, scan_pending_wal};
+        use reticula_wire::wal::{encode_pending_wal_complete_v2, scan_pending_wal_v2};
 
         let mut srv0 = ServerDocMachine::new(
             DOC_ID,
@@ -1138,7 +1155,7 @@ mod tests {
                     i,
                 )
                 .unwrap();
-            let ClientAction::SendFrame(WireSyncFrameV1::Push { txns }) = act.last().unwrap()
+            let ClientAction::SendFrame(WireSyncFrameV2::Push { txns }) = act.last().unwrap()
             else {
                 panic!();
             };
@@ -1167,6 +1184,7 @@ mod tests {
             snap1.clone(),
             1,
             wms.clone(),
+            Vec::new(),
             tail_after_1,
             ServerLimits {
                 catchup_window: 1,
@@ -1180,12 +1198,12 @@ mod tests {
             USER_B,
             Some(MemberRole::Editor),
             rep,
-            WirePendingTxnV2 {
+            WirePendingTxnV3 {
                 replica: rep,
                 client_seq: 1,
                 base_server_seq: 2,
                 timestamp_ms: 3,
-                txn: ops_to_wire_txn_v2(
+                txn: ops_to_wire_txn_v3(
                     String::from("b3"),
                     &[Op::SetCells {
                         sheet: SheetId(0),
@@ -1253,8 +1271,8 @@ mod tests {
         let seqs: Vec<u64> = pending.iter().map(|p| p.client_seq).collect();
         assert_eq!(seqs, [1, 2, 3]);
 
-        let wal_bytes = encode_pending_wal_complete(&pending).unwrap();
-        let scan = scan_pending_wal(&wal_bytes).unwrap();
+        let wal_bytes = encode_pending_wal_complete_v2(&pending).unwrap();
+        let scan = scan_pending_wal_v2(&wal_bytes).unwrap();
         assert_eq!(scan.records.len(), 3);
 
         // Reload from persisted OPFS state and complete install_snapshot -> full convergence!
@@ -1266,6 +1284,7 @@ mod tests {
             alice.confirmed_seq(),
             alice.last_acked_client_seq(),
             alice.confirmed().clone(),
+            alice.confirmed_permutes().to_vec(),
             scan.records,
             1,
         );
@@ -1276,9 +1295,9 @@ mod tests {
         let w2 = srv1.on_hello(USER_A, Some(MemberRole::Owner), hf2).unwrap();
         let _ = reloaded.on_welcome(w2);
         let tail = srv1.txns_since(1).unwrap();
-        let snap_acts = reloaded.install_snapshot(1, snap1, &wms, tail);
+        let snap_acts = reloaded.install_snapshot(1, snap1, &wms, Vec::new(), tail);
         for act in snap_acts {
-            if let ClientAction::SendFrame(WireSyncFrameV1::Push { txns }) = act {
+            if let ClientAction::SendFrame(WireSyncFrameV2::Push { txns }) = act {
                 for p in txns {
                     let c = commit_ok(
                         &mut srv1,
@@ -1321,7 +1340,7 @@ mod tests {
                 )
                 .unwrap();
             for act in acts {
-                if let ClientAction::SendFrame(WireSyncFrameV1::Push { txns }) = act {
+                if let ClientAction::SendFrame(WireSyncFrameV2::Push { txns }) = act {
                     for p in txns {
                         let c = commit_ok(
                             &mut server,
@@ -1346,7 +1365,7 @@ mod tests {
             .push_local(String::from("Tail"), vec![set_num(6, 0, 6.0)], 60)
             .unwrap();
         for act in acts6 {
-            if let ClientAction::SendFrame(WireSyncFrameV1::Push { txns }) = act {
+            if let ClientAction::SendFrame(WireSyncFrameV2::Push { txns }) = act {
                 for p in txns {
                     let c = commit_ok(
                         &mut server,
@@ -1372,11 +1391,11 @@ mod tests {
             .unwrap();
         assert!(matches!(
             welcome,
-            WireSyncFrameV1::Welcome {
+            WireSyncFrameV2::Welcome {
                 replica: VIEWER_REPLICA,
                 last_client_seq: 0,
                 max_id_counter: 0,
-                catchup: WireCatchupV1::SnapshotRequired { .. },
+                catchup: WireCatchupV2::SnapshotRequired { .. },
                 ..
             }
         ));
@@ -1387,11 +1406,11 @@ mod tests {
                 .any(|a| matches!(a, ClientAction::RequestSnapshot { .. }))
         );
         let tail = server.txns_since(snap_seq).unwrap();
-        let snap_acts = viewer.install_snapshot(snap_seq, snap_wb, &snap_wms, tail);
+        let snap_acts = viewer.install_snapshot(snap_seq, snap_wb, &snap_wms, Vec::new(), tail);
         assert!(
             !snap_acts
                 .iter()
-                .any(|a| matches!(a, ClientAction::SendFrame(WireSyncFrameV1::Push { .. })))
+                .any(|a| matches!(a, ClientAction::SendFrame(WireSyncFrameV2::Push { .. })))
         );
         assert!(viewer.is_read_only());
         assert_eq!(viewer.replica(), None);
@@ -1404,12 +1423,12 @@ mod tests {
             Err(reticula_core::ops::OpError::ReadOnly)
         );
         // Viewer Push rejected by server even with sentinel replica 0.
-        let forged = WirePendingTxnV2 {
+        let forged = WirePendingTxnV3 {
             replica: VIEWER_REPLICA,
             client_seq: 1,
             base_server_seq: snap_seq,
             timestamp_ms: 99,
-            txn: ops_to_wire_txn_v2(String::from("Rogue"), &[set_num(0, 0, 99.0)]).unwrap(),
+            txn: ops_to_wire_txn_v3(String::from("Rogue"), &[set_num(0, 0, 99.0)]).unwrap(),
         };
         assert!(matches!(
             server.validate_and_try_apply(
@@ -1488,12 +1507,13 @@ mod tests {
             1,
             Vec::new(),
             Vec::new(),
+            Vec::new(),
             ServerLimits::default(),
         )
         .unwrap();
 
-        let hello = WireSyncFrameV1::Hello {
-            protocol_version: 1,
+        let hello = WireSyncFrameV2::Hello {
+            protocol_version: SYNC_PROTOCOL_VERSION_V2,
             doc_id: DOC_ID,
             branch_id: BRANCH_ID,
             replica: None,
@@ -1505,9 +1525,9 @@ mod tests {
             .unwrap();
         assert!(matches!(
             welcome,
-            WireSyncFrameV1::Welcome {
+            WireSyncFrameV2::Welcome {
                 head_seq: 0,
-                catchup: WireCatchupV1::SnapshotRequired {
+                catchup: WireCatchupV2::SnapshotRequired {
                     snapshot_seq: 0,
                     ..
                 },
@@ -1524,7 +1544,7 @@ mod tests {
                 ..
             }
         )));
-        alice.install_snapshot(0, base, &[], Vec::new());
+        alice.install_snapshot(0, base, &[], Vec::new(), Vec::new());
         assert_eq!(
             alice.confirmed().state_digest(),
             server.workbook().state_digest()
@@ -1541,10 +1561,551 @@ mod tests {
             .unwrap();
         assert!(matches!(
             empty_welcome,
-            WireSyncFrameV1::Welcome {
-                catchup: WireCatchupV1::Txns { txns, .. },
+            WireSyncFrameV2::Welcome {
+                catchup: WireCatchupV2::Txns { txns, .. },
                 ..
             } if txns.is_empty()
         ));
+    }
+
+    #[test]
+    fn e16_concurrent_sort_transforms_all_content_ops_and_fill_formula() {
+        use alloc::boxed::Box;
+        use reticula_core::format::NumberFormat;
+        use reticula_core::id::IdRun;
+        use reticula_core::ops::{CellInput, ConditionalCellEdit, FormatTarget};
+        use reticula_core::style::StylePatch;
+        use reticula_formula::ast::BinaryOp;
+        use reticula_formula::binder::{
+            AxisTarget, BoundExpr, BoundRef, TemplateExpr, TemplateFormula, TemplateRef,
+        };
+
+        let mut server = ServerDocMachine::new(
+            DOC_ID,
+            BRANCH_ID,
+            String::from("/api/w"),
+            ServerLimits::default(),
+        );
+        let mut a = ClientSyncMachine::new(DOC_ID, BRANCH_ID);
+        let mut b = ClientSyncMachine::new(DOC_ID, BRANCH_ID);
+        connect_client(&mut server, &mut a, USER_A, Some(MemberRole::Owner));
+        connect_client(&mut server, &mut b, USER_B, Some(MemberRole::Editor));
+
+        // Seed rows 0..3, cols 0..=1.
+        let seed_ops = vec![Op::SetBlock {
+            sheet: SheetId(0),
+            rows: vec![IdRun::new(0, 4).unwrap()],
+            cols: vec![ColId(0), ColId(1)],
+            columns_data: vec![
+                vec![
+                    CellInput::Scalar(ScalarValue::Number(30.0)),
+                    CellInput::Scalar(ScalarValue::Number(10.0)),
+                    CellInput::Scalar(ScalarValue::Number(20.0)),
+                    CellInput::Scalar(ScalarValue::Number(99.0)),
+                ],
+                vec![
+                    CellInput::Scalar(ScalarValue::Text(String::from("row0_b"))),
+                    CellInput::Scalar(ScalarValue::Text(String::from("row1_b"))),
+                    CellInput::Scalar(ScalarValue::Text(String::from("row2_b"))),
+                    CellInput::Scalar(ScalarValue::Text(String::from("row3_b"))),
+                ],
+            ],
+        }];
+        let a0 = a.push_local(String::from("seed"), seed_ops, 1).unwrap();
+        let ClientAction::SendFrame(WireSyncFrameV2::Push { txns: seed_push }) = a0.last().unwrap()
+        else {
+            panic!();
+        };
+        let c_seed = commit_ok(
+            &mut server,
+            USER_A,
+            Some(MemberRole::Owner),
+            a.replica().unwrap(),
+            seed_push[0].clone(),
+            1,
+        );
+        a.on_commit(c_seed.clone());
+        b.on_commit(c_seed);
+        assert_eq!(a.confirmed_seq(), 1);
+        assert_eq!(b.confirmed_seq(), 1);
+
+        // Now A sorts col 0 only across rows [0, 1, 2] ascending -> row_perm = [1, 2, 0]
+        // Meaning: dst0(Row0) <- Row1(10), dst1(Row1) <- Row2(20), dst2(Row2) <- Row0(30).
+        // Therefore forward record map across col 0 is: Row1 -> Row0, Row2 -> Row1, Row0 -> Row2.
+        let sort_op = Op::PermuteContent {
+            sheet: SheetId(0),
+            rows: vec![RowId(0), RowId(1), RowId(2)],
+            cols: vec![ColId(0)],
+            row_perm: vec![1, 2, 0],
+        };
+        let a_sort = a
+            .push_local(String::from("sort"), vec![sort_op], 2)
+            .unwrap();
+        let ClientAction::SendFrame(WireSyncFrameV2::Push { txns: sort_push }) =
+            a_sort.last().unwrap()
+        else {
+            panic!();
+        };
+
+        // Concurrently BEFORE B receives sort (B still at confirmed_seq = 1):
+        // B edits Row0/Col0 (30 -> 35), Row0/Col1 ("row0_b" -> "still_row0_b"),
+        // conditionally updates Row1/Col0 (10 -> 15), SetFormat on Row2/Col0,
+        // and FillFormula across rows 0..=3, cols 0..=1!
+        let b_txns_ops = [
+            Op::SetCells {
+                sheet: SheetId(0),
+                edits: vec![
+                    CellEdit {
+                        row: RowId(0),
+                        col: ColId(0),
+                        input: CellInput::Scalar(ScalarValue::Number(35.0)),
+                        format: FormatPatch::Keep,
+                    },
+                    CellEdit {
+                        row: RowId(0),
+                        col: ColId(1),
+                        input: CellInput::Scalar(ScalarValue::Text(String::from("still_row0_b"))),
+                        format: FormatPatch::Keep,
+                    },
+                ],
+            },
+            Op::SetCellsIf {
+                sheet: SheetId(0),
+                edits: vec![ConditionalCellEdit {
+                    row: RowId(1),
+                    col: ColId(0),
+                    expected_input: CellInput::Scalar(ScalarValue::Number(10.0)),
+                    expected_format: None,
+                    new_input: CellInput::Scalar(ScalarValue::Number(15.0)),
+                    new_format: FormatPatch::Keep,
+                }],
+            },
+            Op::SetFormat {
+                sheet: SheetId(0),
+                target: FormatTarget::Cells {
+                    rows: vec![IdRun::new(2, 1).unwrap()],
+                    cols: vec![IdRun::new(0, 1).unwrap()],
+                },
+                number_format: FormatPatch::Set(NumberFormat::Fixed2),
+                style: StylePatch::default(),
+            },
+            Op::FillFormula {
+                sheet: SheetId(0),
+                rows: vec![IdRun::new(0, 4).unwrap()],
+                cols: vec![IdRun::new(0, 2).unwrap()],
+                template: TemplateFormula {
+                    mode: FormulaMode::Dynamic,
+                    root: TemplateExpr::Binary {
+                        op: BinaryOp::Add,
+                        left: Box::new(TemplateExpr::Reference(TemplateRef::Cell {
+                            sheet: None,
+                            missing_sheet: None,
+                            row: AxisTarget::IdDelta(0),
+                            col: AxisTarget::Fixed(2),
+                            abs_col: true,
+                            abs_row: false,
+                        })),
+                        right: Box::new(TemplateExpr::Literal(
+                            reticula_formula::ast::Literal::Number(1.0),
+                        )),
+                    },
+                },
+            },
+        ];
+        let b1 = b
+            .push_local(String::from("b_edits"), b_txns_ops[..3].to_vec(), 3)
+            .unwrap();
+        let ClientAction::SendFrame(WireSyncFrameV2::Push { txns: b1_push }) = b1.last().unwrap()
+        else {
+            panic!();
+        };
+
+        let c_sort = commit_ok(
+            &mut server,
+            USER_A,
+            Some(MemberRole::Owner),
+            a.replica().unwrap(),
+            sort_push[0].clone(),
+            2,
+        );
+        let c_b1 = commit_ok(
+            &mut server,
+            USER_B,
+            Some(MemberRole::Editor),
+            b.replica().unwrap(),
+            b1_push[0].clone(),
+            3,
+        );
+        a.on_commit(c_sort.clone());
+        b.on_commit(c_sort);
+        assert_eq!(
+            b.visible().state_digest(),
+            replay_pending_onto(
+                b.confirmed(),
+                &b.pending_wire_txns(),
+                b.confirmed_permutes()
+            )
+            .state_digest()
+        );
+        assert_eq!(
+            b.visible().sheet(SheetId(0)).unwrap().value(2, 0),
+            Value::Number(35.0)
+        );
+        assert_eq!(
+            b.visible().sheet(SheetId(0)).unwrap().value(0, 0),
+            Value::Number(15.0)
+        );
+
+        a.on_commit(c_b1.clone());
+        b.on_commit(c_b1);
+        assert_eq!(b.pending_len(), 0);
+        assert_eq!(
+            a.confirmed().state_digest(),
+            server.workbook().state_digest()
+        );
+        assert_eq!(
+            b.confirmed().state_digest(),
+            server.workbook().state_digest()
+        );
+        assert_eq!(
+            server.workbook().sheet(SheetId(0)).unwrap().value(0, 0),
+            Value::Number(15.0)
+        );
+        assert_eq!(
+            server.workbook().sheet(SheetId(0)).unwrap().value(2, 0),
+            Value::Number(35.0)
+        );
+        assert_eq!(
+            server
+                .workbook()
+                .sheet(SheetId(0))
+                .unwrap()
+                .cell_format_by_id(RowId(1), ColId(0)),
+            Some(NumberFormat::Fixed2)
+        );
+
+        // Now test FillFormula & ClearRange at pre-sort base_server_seq = 1:
+        let fill_ops = core::slice::from_ref(&b_txns_ops[3]);
+        let transformed_fill = transform_ops_through_permute(
+            fill_ops,
+            server.committed_permutes(),
+            1,
+            b.replica().unwrap(),
+            b.next_client_seq(),
+        );
+        assert_eq!(transformed_fill.len(), 3);
+        let fill_pending = WirePendingTxnV3 {
+            replica: b.replica().unwrap(),
+            client_seq: b.next_client_seq(),
+            base_server_seq: 1,
+            timestamp_ms: 4,
+            txn: ops_to_wire_txn_v3(String::from("late_fill"), fill_ops).unwrap(),
+        };
+        let _c_fill = commit_ok(
+            &mut server,
+            USER_B,
+            Some(MemberRole::Editor),
+            b.replica().unwrap(),
+            fill_pending,
+            4,
+        );
+        let f_at_dst2 = server
+            .workbook()
+            .formulas()
+            .get(&(SheetId(0), RowId(2), ColId(0)))
+            .unwrap();
+        let BoundExpr::Binary { left, .. } = &f_at_dst2.root else {
+            panic!("expected binary formula");
+        };
+        assert_eq!(
+            **left,
+            BoundExpr::Reference(BoundRef::Cell {
+                sheet: None,
+                missing_sheet: None,
+                row: RowId(0),
+                col: ColId(2),
+                abs_col: true,
+                abs_row: false,
+            })
+        );
+    }
+
+    #[test]
+    fn e16_own_offline_sort_followed_by_own_edit_is_not_double_permuted() {
+        let mut server = ServerDocMachine::new(
+            DOC_ID,
+            BRANCH_ID,
+            String::from("/api/w"),
+            ServerLimits::default(),
+        );
+        let mut a = ClientSyncMachine::new(DOC_ID, BRANCH_ID);
+        let mut b = ClientSyncMachine::new(DOC_ID, BRANCH_ID);
+        connect_client(&mut server, &mut a, USER_A, Some(MemberRole::Owner));
+        connect_client(&mut server, &mut b, USER_B, Some(MemberRole::Editor));
+
+        let s_acts = a
+            .push_local(
+                String::from("seed"),
+                vec![set_num(0, 0, 1.0), set_num(1, 0, 2.0)],
+                1,
+            )
+            .unwrap();
+        let ClientAction::SendFrame(WireSyncFrameV2::Push { txns: s_push }) =
+            s_acts.last().unwrap()
+        else {
+            panic!();
+        };
+        let c1 = commit_ok(
+            &mut server,
+            USER_A,
+            Some(MemberRole::Owner),
+            a.replica().unwrap(),
+            s_push[0].clone(),
+            1,
+        );
+        a.on_commit(c1.clone());
+        b.on_commit(c1);
+
+        a.on_disconnected();
+        b.on_disconnected();
+
+        a.push_local(
+            String::from("a_sort"),
+            vec![Op::PermuteContent {
+                sheet: SheetId(0),
+                rows: vec![RowId(0), RowId(1)],
+                cols: vec![ColId(0)],
+                row_perm: vec![1, 0],
+            }],
+            2,
+        )
+        .unwrap();
+        a.push_local(
+            String::from("a_edit_post_sort"),
+            vec![set_num(0, 0, 200.0)],
+            3,
+        )
+        .unwrap();
+
+        b.push_local(
+            String::from("b_edit_pre_sort"),
+            vec![set_num(0, 0, 100.0)],
+            4,
+        )
+        .unwrap();
+
+        let ah = a.on_connected();
+        let ClientAction::SendFrame(ref hf_a) = ah[0] else {
+            panic!();
+        };
+        let aw = server
+            .on_hello(USER_A, Some(MemberRole::Owner), hf_a)
+            .unwrap();
+        let a_w_acts = a.on_welcome(aw);
+        let ClientAction::SendFrame(WireSyncFrameV2::Push { txns: a_pushes }) =
+            a_w_acts.last().unwrap()
+        else {
+            panic!();
+        };
+        assert_eq!(a_pushes.len(), 2);
+        let ca2 = commit_ok(
+            &mut server,
+            USER_A,
+            Some(MemberRole::Owner),
+            a.replica().unwrap(),
+            a_pushes[0].clone(),
+            5,
+        );
+        let ca3 = commit_ok(
+            &mut server,
+            USER_A,
+            Some(MemberRole::Owner),
+            a.replica().unwrap(),
+            a_pushes[1].clone(),
+            6,
+        );
+        a.on_commit(ca2);
+        a.on_commit(ca3);
+
+        let bh = b.on_connected();
+        let ClientAction::SendFrame(ref hf_b) = bh[0] else {
+            panic!();
+        };
+        let bw = server
+            .on_hello(USER_B, Some(MemberRole::Editor), hf_b)
+            .unwrap();
+        let b_w_acts = b.on_welcome(bw);
+        let ClientAction::SendFrame(WireSyncFrameV2::Push { txns: b_pushes }) =
+            b_w_acts.last().unwrap()
+        else {
+            panic!();
+        };
+        let cb4 = commit_ok(
+            &mut server,
+            USER_B,
+            Some(MemberRole::Editor),
+            b.replica().unwrap(),
+            b_pushes[0].clone(),
+            7,
+        );
+        b.on_commit(cb4.clone());
+        a.on_commit(cb4);
+
+        assert_eq!(
+            a.confirmed().state_digest(),
+            server.workbook().state_digest()
+        );
+        assert_eq!(
+            b.confirmed().state_digest(),
+            server.workbook().state_digest()
+        );
+        assert_eq!(
+            server.workbook().sheet(SheetId(0)).unwrap().value(0, 0),
+            Value::Number(200.0)
+        );
+        assert_eq!(
+            server.workbook().sheet(SheetId(0)).unwrap().value(1, 0),
+            Value::Number(100.0)
+        );
+    }
+
+    #[test]
+    fn e16_server_cold_restart_with_persisted_permutes_and_v1_upgrade_required() {
+        let mut server = ServerDocMachine::new(
+            DOC_ID,
+            BRANCH_ID,
+            String::from("/api/w"),
+            ServerLimits {
+                catchup_window: 1,
+                snapshot_txn_threshold: 1,
+                ..ServerLimits::default()
+            },
+        );
+        let mut a = ClientSyncMachine::new(DOC_ID, BRANCH_ID);
+        let mut b = ClientSyncMachine::new(DOC_ID, BRANCH_ID);
+        connect_client(&mut server, &mut a, USER_A, Some(MemberRole::Owner));
+        connect_client(&mut server, &mut b, USER_B, Some(MemberRole::Editor));
+        b.on_disconnected();
+
+        let a1 = a
+            .push_local(
+                String::from("sort"),
+                vec![Op::PermuteContent {
+                    sheet: SheetId(0),
+                    rows: vec![RowId(0), RowId(1)],
+                    cols: vec![ColId(0)],
+                    row_perm: vec![1, 0],
+                }],
+                1,
+            )
+            .unwrap();
+        let ClientAction::SendFrame(WireSyncFrameV2::Push { txns: ap1 }) = a1.last().unwrap()
+        else {
+            panic!();
+        };
+        commit_ok(
+            &mut server,
+            USER_A,
+            Some(MemberRole::Owner),
+            a.replica().unwrap(),
+            ap1[0].clone(),
+            1,
+        );
+        let a2 = a
+            .push_local(String::from("extra"), vec![set_num(5, 0, 5.0)], 2)
+            .unwrap();
+        let ClientAction::SendFrame(WireSyncFrameV2::Push { txns: ap2 }) = a2.last().unwrap()
+        else {
+            panic!();
+        };
+        commit_ok(
+            &mut server,
+            USER_A,
+            Some(MemberRole::Owner),
+            a.replica().unwrap(),
+            ap2[0].clone(),
+            2,
+        );
+
+        let v1_hello = WireSyncFrameV2::Hello {
+            protocol_version: 1,
+            doc_id: DOC_ID,
+            branch_id: BRANCH_ID,
+            replica: None,
+            last_applied_seq: 0,
+            known_epoch: 0,
+        };
+        let permutes_snap = server.committed_permutes().to_vec();
+        let snap_wb = server.workbook().clone();
+        let wms = server.watermarks();
+
+        let mut cold_srv = ServerDocMachine::from_snapshot_and_log(
+            DOC_ID,
+            BRANCH_ID,
+            String::from("/api/w"),
+            server.epoch(),
+            server.head_seq(),
+            snap_wb.clone(),
+            server.next_per_epoch_replica(),
+            wms.clone(),
+            permutes_snap.clone(),
+            Vec::new(),
+            ServerLimits::default(),
+        )
+        .unwrap();
+
+        let mut srv_v1_test = ServerDocMachine::new(
+            DOC_ID,
+            BRANCH_ID,
+            String::from("/api/w"),
+            ServerLimits::default(),
+        );
+        let rep_v1 = srv_v1_test.allocate_replica(USER_A).unwrap();
+        srv_v1_test
+            .apply_and_commit(USER_A, Some(MemberRole::Owner), rep_v1, ap1[0].clone(), 1)
+            .unwrap();
+        assert_eq!(
+            srv_v1_test.on_hello(USER_B, Some(MemberRole::Editor), &v1_hello),
+            Err(WireRejectReasonV1::UpgradeRequired)
+        );
+
+        b.push_local(String::from("b_offline"), vec![set_num(0, 0, 777.0)], 3)
+            .unwrap();
+        let bh = b.on_connected();
+        let ClientAction::SendFrame(ref hfb) = bh[0] else {
+            panic!();
+        };
+        let bw = cold_srv
+            .on_hello(USER_B, Some(MemberRole::Editor), hfb)
+            .unwrap();
+        let _ = b.on_welcome(bw);
+        let b_snap_acts =
+            b.install_snapshot(server.head_seq(), snap_wb, &wms, permutes_snap, Vec::new());
+        assert_eq!(
+            b.visible().sheet(SheetId(0)).unwrap().value(1, 0),
+            Value::Number(777.0)
+        );
+        let ClientAction::SendFrame(WireSyncFrameV2::Push { txns: bp }) =
+            b_snap_acts.last().unwrap()
+        else {
+            panic!();
+        };
+        let cb = commit_ok(
+            &mut cold_srv,
+            USER_B,
+            Some(MemberRole::Editor),
+            b.replica().unwrap(),
+            bp[0].clone(),
+            4,
+        );
+        b.on_commit(cb);
+        assert_eq!(
+            b.confirmed().state_digest(),
+            cold_srv.workbook().state_digest()
+        );
+        assert_eq!(
+            cold_srv.workbook().sheet(SheetId(0)).unwrap().value(1, 0),
+            Value::Number(777.0)
+        );
     }
 }

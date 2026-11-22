@@ -1,12 +1,16 @@
 //! Shared protocol constants, configuration, roles, watermarks, and
 //! client/server state-machine input/output descriptors.
 
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
 use alloc::vec::Vec;
 
+use reticula_core::id::{ColId, RowId, SheetId};
 use reticula_core::ops::{InverseOp, Op};
 use reticula_formula::binder::BoundFormula;
-use reticula_wire::v2::{WireCommittedTxnV2, WirePendingTxnV2, WireSyncFrameV1};
+use reticula_wire::v3::{
+    WireCommittedPermuteV3, WireCommittedTxnV3, WirePendingTxnV3, WireSyncFrameV2,
+};
 
 /// Default server quota: maximum populated cells per collaborative document (`2,000,000`).
 pub const DEFAULT_MAX_POPULATED_CELLS: u64 = 2_000_000;
@@ -98,11 +102,102 @@ impl Default for ServerLimits {
     }
 }
 
+/// Immutable E15/E16 committed row-content permutation descriptor.
+///
+/// Maps each affected source record's prior `RowId` to its post-permutation
+/// destination `RowId` across `cols` on `sheet`, allowing late concurrent
+/// content operations authored prior to `seq` to follow the moved record.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommittedPermute {
+    /// Server sequence number at which this permutation committed (`0` when local).
+    pub seq: u64,
+    /// Originating replica ID (`0` when local/synthetic).
+    pub replica: u32,
+    /// Author's `client_seq` (`0` when local/synthetic).
+    pub client_seq: u64,
+    /// Target worksheet identity.
+    pub sheet: SheetId,
+    /// Columns included in the permuted block.
+    pub cols: BTreeSet<ColId>,
+    /// Bijective non-identity map `old_row_id -> new_row_id` for moved records.
+    pub row_map: BTreeMap<RowId, RowId>,
+}
+
+impl CommittedPermute {
+    /// Extracts a non-identity [`CommittedPermute`] from `op` at `(seq, replica, client_seq)`,
+    /// returning `None` for non-`PermuteContent` ops, empty permutations, or identity permutations.
+    #[must_use]
+    pub fn from_op(seq: u64, replica: u32, client_seq: u64, op: &Op<BoundFormula>) -> Option<Self> {
+        let Op::PermuteContent {
+            sheet,
+            rows,
+            cols,
+            row_perm,
+        } = op
+        else {
+            return None;
+        };
+        if rows.is_empty() || cols.is_empty() || rows.len() != row_perm.len() {
+            return None;
+        }
+        let mut row_map = BTreeMap::new();
+        for (dst_idx, &src_idx_u32) in row_perm.iter().enumerate() {
+            let src_idx = usize::try_from(src_idx_u32).ok()?;
+            let &src_row = rows.get(src_idx)?;
+            let &dst_row = rows.get(dst_idx)?;
+            if src_row != dst_row {
+                row_map.insert(src_row, dst_row);
+            }
+        }
+        if row_map.is_empty() {
+            return None;
+        }
+        Some(Self {
+            seq,
+            replica,
+            client_seq,
+            sheet: *sheet,
+            cols: cols.iter().copied().collect(),
+            row_map,
+        })
+    }
+}
+
+impl From<&CommittedPermute> for WireCommittedPermuteV3 {
+    fn from(p: &CommittedPermute) -> Self {
+        Self {
+            seq: p.seq,
+            replica: p.replica,
+            client_seq: p.client_seq,
+            sheet: p.sheet.0,
+            cols: p.cols.iter().map(|c| c.0).collect(),
+            row_pairs: p.row_map.iter().map(|(&k, &v)| (k.0, v.0)).collect(),
+        }
+    }
+}
+
+impl From<&WireCommittedPermuteV3> for CommittedPermute {
+    fn from(w: &WireCommittedPermuteV3) -> Self {
+        Self {
+            seq: w.seq,
+            replica: w.replica,
+            client_seq: w.client_seq,
+            sheet: SheetId(w.sheet),
+            cols: w.cols.iter().copied().map(ColId).collect(),
+            row_map: w
+                .row_pairs
+                .iter()
+                .map(|&(k, v)| (RowId(k), RowId(v)))
+                .collect(),
+        }
+    }
+}
+
 /// Result of calling [`crate::ServerDocMachine::validate_and_try_apply`].
 #[derive(Clone, Debug)]
 pub struct StagedTxn {
     /// Authoritative committed transaction ready for database insertion and broadcast.
-    pub committed: WireCommittedTxnV2,
+    pub committed: WireCommittedTxnV3,
     /// Inverses enabling atomic rollback if the batch transaction is aborted before persistence.
     pub(crate) inverses: Vec<InverseOp<BoundFormula>>,
     /// Encoded payload byte length counted against snapshot threshold and DB `log_bytes`.
@@ -111,6 +206,8 @@ pub struct StagedTxn {
     pub(crate) prior_watermark: ReplicaWatermark,
     /// New `max_id_counter` after this transaction.
     pub max_id_counter: u32,
+    /// Number of [`CommittedPermute`] entries appended while staging this transaction.
+    pub(crate) staged_permute_count: usize,
 }
 
 /// Outcome of submitting one pending transaction to [`crate::ServerDocMachine`].
@@ -154,13 +251,13 @@ pub enum ConnectionState {
 /// invariant (`06-sync.md`).
 #[derive(Clone, Debug, PartialEq)]
 pub enum ClientAction {
-    /// Append one [`WirePendingTxnV2`] to local `pending.wal` and `fsync` before network send.
-    PersistPending(WirePendingTxnV2),
+    /// Append one [`WirePendingTxnV3`] to local `pending.wal` and `fsync` before network send.
+    PersistPending(WirePendingTxnV3),
     /// Atomically rewrite/truncate local `pending.wal` to the exact slice given
     /// (after committing catchup pops, epoch remap, or rejection tail removal).
-    PersistTruncatedPending(Vec<WirePendingTxnV2>),
+    PersistTruncatedPending(Vec<WirePendingTxnV3>),
     /// Transmit one sync frame over the active WebSocket connection.
-    SendFrame(WireSyncFrameV1),
+    SendFrame(WireSyncFrameV2),
     /// Fetch and install the authoritative `RTCLSNAP` snapshot at `snapshot_seq`.
     RequestSnapshot {
         /// Sequence covered by the snapshot.
@@ -174,7 +271,7 @@ pub enum ClientAction {
         /// Highest rejected client sequence (`pending` tail starting here was removed).
         from_client_seq: u64,
         /// Ordered transactions that failed server acceptance.
-        txns: Vec<WirePendingTxnV2>,
+        txns: Vec<WirePendingTxnV3>,
     },
     /// Drop local undo entries authored at `client_seq >= from_client_seq` (`06-sync.md`).
     PruneUndoFrom(u64),

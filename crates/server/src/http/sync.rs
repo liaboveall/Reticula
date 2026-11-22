@@ -12,9 +12,11 @@ use axum::response::Response;
 use axum_extra::extract::cookie::CookieJar;
 use reticula_sync::MemberRole;
 use reticula_wire::sync_frame::{
-    MAX_SYNC_FRAME_BYTES, SyncFrameError, decode_sync_frame, encode_sync_frame,
+    MAX_SYNC_FRAME_BYTES, SyncFrameError, decode_sync_frame_any, encode_sync_frame,
+    encode_sync_frame_v2,
 };
-use reticula_wire::v2::{WireRejectReasonV1, WireSyncFrameV1};
+use reticula_wire::v2::{SYNC_PROTOCOL_VERSION, WireRejectReasonV1, WireSyncFrameV1};
+use reticula_wire::v3::{SYNC_PROTOCOL_VERSION_V2, WireSyncFrameV2};
 use serde::Deserialize;
 use tokio::sync::broadcast;
 use tokio::time::{Instant, MissedTickBehavior, interval_at, sleep_until, timeout};
@@ -133,6 +135,12 @@ pub(super) async fn upgrade(
                     ),
                 };
 
+            let reject_proto = match &hello {
+                WireSyncFrameV2::Hello {
+                    protocol_version, ..
+                } if *protocol_version == SYNC_PROTOCOL_VERSION => SYNC_PROTOCOL_VERSION,
+                _ => SYNC_PROTOCOL_VERSION_V2,
+            };
             match state
                 .rooms
                 .join_session(id, user_id, role, display_name, share_link_id, hello)
@@ -142,7 +150,7 @@ pub(super) async fn upgrade(
                     run_connection(&mut socket, &mut room, &state, session_hash, revocations).await;
                 }
                 Err(RoomError::Rejected(reason)) => {
-                    reject_handshake(&mut socket, reason).await;
+                    reject_handshake(&mut socket, reject_proto, reason).await;
                 }
                 Err(RoomError::Busy) => {
                     close_ws(&mut socket, CLOSE_SERVER_BUSY, "ServerBusy").await;
@@ -155,28 +163,54 @@ pub(super) async fn upgrade(
         }))
 }
 
-async fn handshake(socket: &mut WebSocket) -> Option<WireSyncFrameV1> {
+async fn handshake(socket: &mut WebSocket) -> Option<WireSyncFrameV2> {
     let frame = match timeout(SEND_TIMEOUT, socket.recv()).await {
-        Ok(Some(Ok(Message::Binary(data)))) => decode_sync_frame(&data),
+        Ok(Some(Ok(Message::Binary(data)))) => decode_sync_frame_any(&data),
         _ => return None,
     };
     match frame {
-        Ok(hello @ WireSyncFrameV1::Hello { .. }) => Some(hello),
+        Ok((
+            frame_ver,
+            hello @ WireSyncFrameV2::Hello {
+                protocol_version, ..
+            },
+        )) => {
+            if frame_ver != protocol_version {
+                reject_handshake(socket, frame_ver, WireRejectReasonV1::InvalidOp).await;
+                return None;
+            }
+            Some(hello)
+        }
         Err(SyncFrameError::UnsupportedVersion(_)) => {
-            reject_handshake(socket, WireRejectReasonV1::UpgradeRequired).await;
+            reject_handshake(
+                socket,
+                SYNC_PROTOCOL_VERSION,
+                WireRejectReasonV1::UpgradeRequired,
+            )
+            .await;
             None
         }
         _ => {
-            reject_handshake(socket, WireRejectReasonV1::InvalidOp).await;
+            reject_handshake(
+                socket,
+                SYNC_PROTOCOL_VERSION_V2,
+                WireRejectReasonV1::InvalidOp,
+            )
+            .await;
             None
         }
     }
 }
 
-async fn reject_handshake(socket: &mut WebSocket, reason: WireRejectReasonV1) {
+async fn reject_handshake(
+    socket: &mut WebSocket,
+    protocol_version: u8,
+    reason: WireRejectReasonV1,
+) {
     send_frame(
         socket,
-        &WireSyncFrameV1::Reject {
+        protocol_version,
+        &WireSyncFrameV2::Reject {
             client_seq: 0,
             reason,
         },
@@ -195,8 +229,15 @@ async fn close_ws(socket: &mut WebSocket, code: u16, reason: &'static str) {
     .await;
 }
 
-async fn send_frame(socket: &mut WebSocket, frame: &WireSyncFrameV1) -> bool {
-    let Ok(bytes) = encode_sync_frame(frame) else {
+async fn send_frame(socket: &mut WebSocket, protocol_version: u8, frame: &WireSyncFrameV2) -> bool {
+    let encoded = if protocol_version == SYNC_PROTOCOL_VERSION_V2 {
+        encode_sync_frame_v2(frame)
+    } else if let Ok(v1) = WireSyncFrameV1::try_from(frame) {
+        encode_sync_frame(&v1)
+    } else {
+        return false;
+    };
+    let Ok(bytes) = encoded else {
         return false;
     };
     send_bytes(socket, bytes.into()).await
@@ -241,7 +282,9 @@ async fn run_connection(
                     break;
                 }
                 ping = ping.wrapping_add(1);
-                if !send_frame(socket, &WireSyncFrameV1::Ping(ping)).await { break }
+                if !send_frame(socket, room.protocol_version(), &WireSyncFrameV2::Ping(ping)).await {
+                    break;
+                }
             }
             outbound = room.recv_event() => {
                 let Some(event) = outbound else { break };
@@ -275,17 +318,25 @@ async fn handle_message(socket: &mut WebSocket, room: &RoomConnection, message: 
         Message::Ping(_) | Message::Pong(_) => return true,
         Message::Close(_) | Message::Text(_) => return false,
     };
-    match decode_sync_frame(&bytes) {
-        Ok(WireSyncFrameV1::Push { txns }) => matches!(
+    match decode_sync_frame_any(&bytes) {
+        Ok((frame_ver, _)) if frame_ver != room.protocol_version() => false,
+        Ok((_, WireSyncFrameV2::Push { txns })) => matches!(
             timeout(SEND_TIMEOUT, room.push(txns, bytes.len())).await,
             Ok(Ok(()))
         ),
-        Ok(WireSyncFrameV1::Presence(value)) => matches!(
+        Ok((_, WireSyncFrameV2::Presence(value))) => matches!(
             timeout(SEND_TIMEOUT, room.presence(value)).await,
             Ok(Ok(()))
         ),
-        Ok(WireSyncFrameV1::Ping(nonce)) => send_frame(socket, &WireSyncFrameV1::Pong(nonce)).await,
-        Ok(WireSyncFrameV1::Pong(_)) => true,
+        Ok((_, WireSyncFrameV2::Ping(nonce))) => {
+            send_frame(
+                socket,
+                room.protocol_version(),
+                &WireSyncFrameV2::Pong(nonce),
+            )
+            .await
+        }
+        Ok((_, WireSyncFrameV2::Pong(_))) => true,
         _ => false,
     }
 }

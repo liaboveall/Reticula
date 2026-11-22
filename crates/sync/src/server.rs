@@ -8,17 +8,21 @@ use alloc::vec::Vec;
 use reticula_core::id::pack_replica_id;
 use reticula_core::ops::Workbook;
 use reticula_formula::binder::BoundFormula;
-use reticula_wire::convert_v2::{ops_from_wire_txn_v2, ops_to_wire_txn_v2};
+use reticula_wire::convert_v3::{ops_from_wire_txn_v3, ops_to_wire_txn_v3};
 use reticula_wire::v2::{
-    SYNC_PROTOCOL_VERSION, WireCatchupV1, WireCommittedTxnV2, WirePendingTxnV2, WireRejectReasonV1,
-    WireStateDigestV1, WireSyncFrameV1,
+    SYNC_PROTOCOL_VERSION, WireRejectReasonV1, WireStateDigestV1, WireSyncFrameV1,
+};
+use reticula_wire::v3::{
+    SYNC_PROTOCOL_VERSION_V2, WireCatchupV2, WireCommittedTxnV3, WirePendingTxnV3, WireSyncFrameV2,
 };
 
 use crate::types::{
-    MemberRole, ReplicaWatermark, ServerLimits, StagedTxn, TryApplyOutcome, VIEWER_REPLICA,
-    apply_ops_atomic, rewind_inverses,
+    CommittedPermute, MemberRole, ReplicaWatermark, ServerLimits, StagedTxn, TryApplyOutcome,
+    VIEWER_REPLICA, apply_ops_atomic, rewind_inverses,
 };
-use crate::validate::{max_id_counter_in_ops, validate_txn_ownership};
+use crate::validate::{
+    max_id_counter_in_ops, transform_ops_through_permute, validate_txn_ownership,
+};
 
 /// Authoritative in-memory server state machine for one document branch
 /// (`15-m2a.md` 5.3 & `06-sync.md`).
@@ -32,7 +36,8 @@ pub struct ServerDocMachine {
     next_per_epoch_replica: u16,
     workbook: Workbook<BoundFormula>,
     replicas: BTreeMap<u32, ReplicaWatermark>,
-    recent_txns: VecDeque<WireCommittedTxnV2>,
+    recent_txns: VecDeque<WireCommittedTxnV3>,
+    committed_permutes: Vec<CommittedPermute>,
     /// Lookup `(replica, client_seq) -> (seq, timestamp_ms)` for exact idempotent resend Acks.
     receipts: BTreeMap<(u32, u64), (u64, u64)>,
     last_snapshot_seq: u64,
@@ -61,6 +66,7 @@ impl ServerDocMachine {
             workbook: Workbook::new(),
             replicas: BTreeMap::new(),
             recent_txns: VecDeque::new(),
+            committed_permutes: Vec::new(),
             receipts: BTreeMap::new(),
             last_snapshot_seq: 0,
             non_empty_base: false,
@@ -71,11 +77,11 @@ impl ServerDocMachine {
     }
 
     /// Reconstructs server state after restart or backup restore from a loaded
-    /// snapshot (`workbook` at `snapshot_seq`), persisted `replicas`, `tail_commits`
-    /// (`seq > snapshot_seq`), and `epoch`.
+    /// snapshot (`workbook` at `snapshot_seq`), persisted `replicas`, E16
+    /// `snapshot_permutes`, `tail_commits` (`seq > snapshot_seq`), and `epoch`.
     #[expect(
         clippy::too_many_arguments,
-        reason = "cold reload binds persisted DB snapshot, watermarks, epoch and tail log cleanly"
+        reason = "cold reload binds persisted DB snapshot, permute log, watermarks, epoch and tail log cleanly"
     )]
     pub fn from_snapshot_and_log(
         doc_id: [u8; 16],
@@ -86,7 +92,8 @@ impl ServerDocMachine {
         mut workbook: Workbook<BoundFormula>,
         next_per_epoch_replica: u16,
         watermarks: Vec<ReplicaWatermark>,
-        tail_commits: Vec<WireCommittedTxnV2>,
+        snapshot_permutes: Vec<CommittedPermute>,
+        tail_commits: Vec<WireCommittedTxnV3>,
         limits: ServerLimits,
     ) -> Result<Self, WireRejectReasonV1> {
         let non_empty_base = snapshot_seq == 0
@@ -94,6 +101,7 @@ impl ServerDocMachine {
         let mut replicas = BTreeMap::new();
         let mut receipts = BTreeMap::new();
         let mut max_seq_for_epoch: u16 = 0;
+        let mut committed_permutes = snapshot_permutes;
 
         for wm in watermarks {
             let (wm_epoch, wm_seq) = reticula_core::id::unpack_replica_id(wm.replica);
@@ -115,10 +123,17 @@ impl ServerDocMachine {
             if commit.seq != head_seq.saturating_add(1) {
                 return Err(WireRejectReasonV1::InvalidOp);
             }
-            let (_, ops) = ops_from_wire_txn_v2(commit.txn.clone())
+            let (_, ops) = ops_from_wire_txn_v3(commit.txn.clone())
                 .map_err(|_| WireRejectReasonV1::InvalidOp)?;
             let _ =
                 apply_ops_atomic(&mut workbook, &ops).map_err(|_| WireRejectReasonV1::InvalidOp)?;
+            for op in &ops {
+                if let Some(cp) =
+                    CommittedPermute::from_op(commit.seq, commit.replica, commit.client_seq, op)
+                {
+                    committed_permutes.push(cp);
+                }
+            }
 
             let used_max = max_id_counter_in_ops(epoch, commit.replica, &ops);
             let wm = replicas.entry(commit.replica).or_insert(ReplicaWatermark {
@@ -160,6 +175,7 @@ impl ServerDocMachine {
             workbook,
             replicas,
             recent_txns,
+            committed_permutes,
             receipts,
             last_snapshot_seq: snapshot_seq,
             non_empty_base,
@@ -213,16 +229,22 @@ impl ServerDocMachine {
         &self.workbook
     }
 
+    /// E16 committed permutation history accumulated across the document lifetime.
+    #[must_use]
+    pub fn committed_permutes(&self) -> &[CommittedPermute] {
+        &self.committed_permutes
+    }
+
     /// Current collaborative 192-bit `StateDigest`.
     #[must_use]
     pub fn state_digest(&self) -> WireStateDigestV1 {
         WireStateDigestV1::from(self.workbook.state_digest())
     }
 
-    /// Ready-to-send periodic [`WireSyncFrameV1::Digest`] frame at current `head_seq`.
+    /// Ready-to-send periodic [`WireSyncFrameV2::Digest`] frame at current `head_seq`.
     #[must_use]
-    pub fn digest_frame(&self) -> WireSyncFrameV1 {
-        WireSyncFrameV1::Digest {
+    pub fn digest_frame(&self) -> WireSyncFrameV2 {
+        WireSyncFrameV2::Digest {
             seq: self.head_seq,
             state_digest: self.state_digest(),
         }
@@ -283,15 +305,15 @@ impl ServerDocMachine {
     }
 
     /// Processes an incoming `Hello` handshake frame cleanly, checking permissions,
-    /// protocol version, epoch/replica ownership, and catch-up eligibility.
+    /// protocol version (`1` or `2`), epoch/replica ownership, and catch-up eligibility.
     pub fn on_hello(
         &mut self,
         user_id: [u8; 16],
         role: Option<MemberRole>,
-        frame: &WireSyncFrameV1,
-    ) -> Result<WireSyncFrameV1, WireRejectReasonV1> {
+        frame: &WireSyncFrameV2,
+    ) -> Result<WireSyncFrameV2, WireRejectReasonV1> {
         let member_role = role.ok_or(WireRejectReasonV1::Forbidden)?;
-        let WireSyncFrameV1::Hello {
+        let WireSyncFrameV2::Hello {
             protocol_version,
             doc_id,
             branch_id,
@@ -302,7 +324,9 @@ impl ServerDocMachine {
         else {
             return Err(WireRejectReasonV1::InvalidOp);
         };
-        if *protocol_version != SYNC_PROTOCOL_VERSION {
+        if *protocol_version != SYNC_PROTOCOL_VERSION_V2
+            && *protocol_version != SYNC_PROTOCOL_VERSION
+        {
             return Err(WireRejectReasonV1::UpgradeRequired);
         }
         if *doc_id != self.doc_id || *branch_id != self.branch_id {
@@ -348,19 +372,25 @@ impl ServerDocMachine {
             };
 
         let catchup = self.build_catchup(effective_last_seq);
-        Ok(WireSyncFrameV1::Welcome {
+        let welcome = WireSyncFrameV2::Welcome {
             epoch: self.epoch,
             head_seq: self.head_seq,
             replica: assigned_replica,
             last_client_seq,
             max_id_counter,
             catchup,
-        })
+        };
+        if *protocol_version == SYNC_PROTOCOL_VERSION
+            && WireSyncFrameV1::try_from(&welcome).is_err()
+        {
+            return Err(WireRejectReasonV1::UpgradeRequired);
+        }
+        Ok(welcome)
     }
 
-    fn build_catchup(&self, effective_last_seq: u64) -> WireCatchupV1 {
+    fn build_catchup(&self, effective_last_seq: u64) -> WireCatchupV2 {
         if effective_last_seq == 0 && self.non_empty_base {
-            return WireCatchupV1::SnapshotRequired {
+            return WireCatchupV2::SnapshotRequired {
                 snapshot_seq: self.last_snapshot_seq,
                 url: format!(
                     "{}/snapshots/{}",
@@ -370,7 +400,7 @@ impl ServerDocMachine {
         }
         let from_seq = effective_last_seq.saturating_add(1);
         if effective_last_seq == self.head_seq {
-            return WireCatchupV1::Txns {
+            return WireCatchupV2::Txns {
                 from_seq,
                 txns: Vec::new(),
             };
@@ -380,15 +410,15 @@ impl ServerDocMachine {
         let can_inline = gap <= (self.limits.catchup_window as u64)
             && earliest_in_mem.is_some_and(|e| e <= from_seq);
         if can_inline {
-            let txns: Vec<WireCommittedTxnV2> = self
+            let txns: Vec<WireCommittedTxnV3> = self
                 .recent_txns
                 .iter()
                 .filter(|t| t.seq >= from_seq)
                 .cloned()
                 .collect();
-            return WireCatchupV1::Txns { from_seq, txns };
+            return WireCatchupV2::Txns { from_seq, txns };
         }
-        WireCatchupV1::SnapshotRequired {
+        WireCatchupV2::SnapshotRequired {
             snapshot_seq: self.last_snapshot_seq,
             url: format!(
                 "{}/snapshots/{}",
@@ -400,7 +430,7 @@ impl ServerDocMachine {
     /// Validates `Push` frame batch count and serialized byte cap.
     pub fn validate_push_batch(
         &self,
-        txns: &[WirePendingTxnV2],
+        txns: &[WirePendingTxnV3],
         raw_frame_bytes: usize,
     ) -> Result<(), WireRejectReasonV1> {
         if txns.len() > self.limits.max_push_batch || raw_frame_bytes > self.limits.max_push_bytes {
@@ -409,15 +439,15 @@ impl ServerDocMachine {
         Ok(())
     }
 
-    /// Validates permissions, contiguous `client_seq`, ID ownership, and workbook
-    /// limits, atomically staging the transaction in memory (`commit_staged` must
-    /// follow once database persistence commits).
+    /// Validates permissions, contiguous `client_seq`, ID ownership, E16 permute
+    /// transforms, and workbook limits, atomically staging the transaction in memory
+    /// (`commit_staged` must follow once database persistence commits).
     pub fn validate_and_try_apply(
         &mut self,
         user_id: [u8; 16],
         role: Option<MemberRole>,
         session_replica: u32,
-        pending: WirePendingTxnV2,
+        pending: WirePendingTxnV3,
         server_timestamp_ms: u64,
     ) -> Result<TryApplyOutcome, WireRejectReasonV1> {
         let member_role = role.ok_or(WireRejectReasonV1::Forbidden)?;
@@ -475,6 +505,9 @@ impl ServerDocMachine {
         if pending.client_seq != expected {
             return Err(WireRejectReasonV1::NonContiguousClientSeq { expected });
         }
+        if pending.base_server_seq > self.head_seq {
+            return Err(WireRejectReasonV1::InvalidOp);
+        }
 
         let payload_vec =
             postcard::to_allocvec(&pending.txn).map_err(|_| WireRejectReasonV1::InvalidOp)?;
@@ -482,10 +515,17 @@ impl ServerDocMachine {
             return Err(WireRejectReasonV1::PayloadTooLarge);
         }
 
-        let (label, ops) =
-            ops_from_wire_txn_v2(pending.txn).map_err(|_| WireRejectReasonV1::InvalidOp)?;
+        let (label, raw_ops) =
+            ops_from_wire_txn_v3(pending.txn).map_err(|_| WireRejectReasonV1::InvalidOp)?;
         let new_max_id =
-            validate_txn_ownership(self.epoch, session_replica, wm.max_id_counter, &ops)?;
+            validate_txn_ownership(self.epoch, session_replica, wm.max_id_counter, &raw_ops)?;
+        let ops = transform_ops_through_permute(
+            &raw_ops,
+            &self.committed_permutes,
+            pending.base_server_seq,
+            session_replica,
+            pending.client_seq,
+        );
 
         let inverses = apply_ops_atomic(&mut self.workbook, &ops)
             .map_err(|_| WireRejectReasonV1::InvalidOp)?;
@@ -497,7 +537,7 @@ impl ServerDocMachine {
             return Err(WireRejectReasonV1::QuotaExceeded);
         }
 
-        let Ok(wire_txn) = ops_to_wire_txn_v2(label, &ops) else {
+        let Ok(wire_txn) = ops_to_wire_txn_v3(label, &ops) else {
             rewind_inverses(&mut self.workbook, inverses);
             return Err(WireRejectReasonV1::InvalidOp);
         };
@@ -508,9 +548,18 @@ impl ServerDocMachine {
             entry.last_client_seq = pending.client_seq;
             entry.max_id_counter = new_max_id;
         }
+        let mut staged_permute_count = 0_usize;
+        for op in &ops {
+            if let Some(cp) =
+                CommittedPermute::from_op(next_seq, session_replica, pending.client_seq, op)
+            {
+                self.committed_permutes.push(cp);
+                staged_permute_count = staged_permute_count.saturating_add(1);
+            }
+        }
 
         Ok(TryApplyOutcome::Staged(StagedTxn {
-            committed: WireCommittedTxnV2 {
+            committed: WireCommittedTxnV3 {
                 seq: next_seq,
                 replica: session_replica,
                 client_seq: pending.client_seq,
@@ -522,12 +571,13 @@ impl ServerDocMachine {
             payload_bytes: payload_vec.len(),
             prior_watermark: wm,
             max_id_counter: new_max_id,
+            staged_permute_count,
         }))
     }
 
     /// Finalizes a previously staged transaction after durable Postgres `COMMIT`,
     /// recording it in `recent_txns`, `receipts`, and snapshot byte/count counters.
-    pub fn commit_staged(&mut self, staged: StagedTxn) -> WireCommittedTxnV2 {
+    pub fn commit_staged(&mut self, staged: StagedTxn) -> WireCommittedTxnV3 {
         let commit = staged.committed;
         self.receipts.insert(
             (commit.replica, commit.client_seq),
@@ -545,6 +595,11 @@ impl ServerDocMachine {
     /// Rolls back a staged transaction in memory (LIFO order if multiple were
     /// staged in one aborted batch).
     pub fn rollback_staged(&mut self, staged: StagedTxn) {
+        let keep_permutes = self
+            .committed_permutes
+            .len()
+            .saturating_sub(staged.staged_permute_count);
+        self.committed_permutes.truncate(keep_permutes);
         rewind_inverses(&mut self.workbook, staged.inverses);
         self.head_seq = self.head_seq.saturating_sub(1);
         self.replicas
@@ -558,7 +613,7 @@ impl ServerDocMachine {
         user_id: [u8; 16],
         role: Option<MemberRole>,
         session_replica: u32,
-        pending: WirePendingTxnV2,
+        pending: WirePendingTxnV3,
         server_timestamp_ms: u64,
     ) -> Result<ApplyResult, WireRejectReasonV1> {
         match self.validate_and_try_apply(
@@ -588,7 +643,7 @@ impl ServerDocMachine {
     /// Returns recent committed transactions strictly after `after_seq`, if
     /// all of them remain buffered in memory.
     #[must_use]
-    pub fn txns_since(&self, after_seq: u64) -> Option<Vec<WireCommittedTxnV2>> {
+    pub fn txns_since(&self, after_seq: u64) -> Option<Vec<WireCommittedTxnV3>> {
         if after_seq >= self.head_seq {
             return Some(Vec::new());
         }
@@ -624,7 +679,7 @@ impl ServerDocMachine {
 #[derive(Clone, Debug, PartialEq)]
 pub enum ApplyResult {
     /// Transaction was newly committed at `commit.seq`.
-    Committed(WireCommittedTxnV2),
+    Committed(WireCommittedTxnV3),
     /// Duplicate `client_seq` was ignored and matched an earlier commit.
     Duplicate {
         /// Originating replica ID.

@@ -13,14 +13,16 @@ use reticula_sim::{
     FaultCounts, SeedSummary, SimEvent, SimReplicaState, SimWorld, generate_script,
 };
 use reticula_sync::{
-    ClientAction, ClientSyncMachine, ConnectionState, MemberRole, ReplicaWatermark,
-    ServerDocMachine, ServerLimits,
+    ClientAction, ClientSyncMachine, CommittedPermute, ConnectionState, MemberRole,
+    ReplicaWatermark, ServerDocMachine, ServerLimits,
 };
-use reticula_wire::snapshot::{decode_snapshot_any, encode_snapshot_v1};
-use reticula_wire::sync_frame::{decode_sync_frame, encode_sync_frame};
+use reticula_wire::snapshot::{decode_snapshot_any, encode_snapshot_with_permutes};
+use reticula_wire::sync_frame::{decode_sync_frame_v2, encode_sync_frame_v2};
 use reticula_wire::v1::WireReplicaWatermarkV1;
-use reticula_wire::v2::{WireCatchupV1, WireCommittedTxnV2, WirePendingTxnV2, WireSyncFrameV1};
-use reticula_wire::wal::{encode_pending_wal_complete, scan_pending_wal};
+use reticula_wire::v3::{
+    WireCatchupV2, WireCommittedPermuteV3, WireCommittedTxnV3, WirePendingTxnV3, WireSyncFrameV2,
+};
+use reticula_wire::wal::{encode_pending_wal_complete_v2, scan_pending_wal_any};
 use serde::{Deserialize, Serialize};
 use tsify::{Ts, Tsify};
 use wasm_bindgen::prelude::*;
@@ -74,7 +76,8 @@ struct ReplicaCheckpoint {
     confirmed_seq: u64,
     last_acked_client_seq: u64,
     confirmed: Workbook<BoundFormula>,
-    pending: Vec<WirePendingTxnV2>,
+    confirmed_permutes: Vec<CommittedPermute>,
+    pending: Vec<WirePendingTxnV3>,
     next_id_counter_hint: u32,
 }
 
@@ -86,6 +89,7 @@ impl ReplicaCheckpoint {
             confirmed_seq: 0,
             last_acked_client_seq: 0,
             confirmed: Workbook::new(),
+            confirmed_permutes: Vec::new(),
             pending: Vec::new(),
             next_id_counter_hint: 1,
         }
@@ -154,6 +158,7 @@ impl LabReplica {
         self.checkpoint.epoch = self.machine.epoch();
         self.checkpoint.replica = self.machine.replica();
         self.checkpoint.confirmed = self.machine.confirmed().clone();
+        self.checkpoint.confirmed_permutes = self.machine.confirmed_permutes().to_vec();
         self.checkpoint.confirmed_seq = self.machine.confirmed_seq();
         self.checkpoint.last_acked_client_seq = self.machine.last_acked_client_seq();
         self.checkpoint.pending = self.machine.pending_wire_txns();
@@ -218,7 +223,7 @@ pub struct SimLabState {
 pub struct InteractiveSimLab {
     server: ServerDocMachine,
     replicas: Vec<LabReplica>,
-    epoch_log: Vec<WireCommittedTxnV2>,
+    epoch_log: Vec<WireCommittedTxnV3>,
     snapshots_by_seq: BTreeMap<u64, (Vec<u8>, Vec<ReplicaWatermark>)>,
     next_conn_id: u64,
     timestamp_ms: u64,
@@ -599,15 +604,25 @@ impl InteractiveSimLab {
                 }]
             })
             .unwrap_or_default();
-        let snap_bytes = encode_snapshot_v1(&cp.confirmed, &wire_wms)
+        let wire_permutes: Vec<WireCommittedPermuteV3> = cp
+            .confirmed_permutes
+            .iter()
+            .map(WireCommittedPermuteV3::from)
+            .collect();
+        let snap_bytes = encode_snapshot_with_permutes(&cp.confirmed, &wire_wms, &wire_permutes)
             .map_err(|err| format!("OPFS snapshot encode failed: {err:?}"))?;
-        let wal_bytes = encode_pending_wal_complete(&cp.pending)
+        let wal_bytes = encode_pending_wal_complete_v2(&cp.pending)
             .map_err(|err| format!("OPFS pending WAL encode failed: {err:?}"))?;
 
         let decoded = decode_snapshot_any(&snap_bytes)
             .map_err(|err| format!("OPFS snapshot decode failed: {err:?}"))?;
-        let wal_scan = scan_pending_wal(&wal_bytes)
+        let wal_scan = scan_pending_wal_any(&wal_bytes)
             .map_err(|err| format!("OPFS pending WAL scan failed: {err:?}"))?;
+        let confirmed_permutes = decoded
+            .permutes
+            .iter()
+            .map(CommittedPermute::from)
+            .collect();
 
         let restored = ClientSyncMachine::from_persisted(
             LAB_DOC_ID,
@@ -617,6 +632,7 @@ impl InteractiveSimLab {
             cp.confirmed_seq,
             cp.last_acked_client_seq,
             decoded.engine.workbook().clone(),
+            confirmed_permutes,
             wal_scan.records,
             cp.next_id_counter_hint,
         );
@@ -850,7 +866,7 @@ impl InteractiveSimLab {
                 }
                 ClientAction::SendFrame(frame) => {
                     if let Some(conn_id) = self.replicas[replica].active_conn
-                        && let Ok(bytes) = encode_sync_frame(&frame)
+                        && let Ok(bytes) = encode_sync_frame_v2(&frame)
                     {
                         self.replicas[replica].c2s_queue.push_back(QueuedFrame {
                             conn_id,
@@ -904,11 +920,11 @@ impl InteractiveSimLab {
         }
     }
 
-    fn enqueue_s2c(&mut self, replica: usize, conn_id: u64, frame: &WireSyncFrameV1) {
+    fn enqueue_s2c(&mut self, replica: usize, conn_id: u64, frame: &WireSyncFrameV2) {
         if self.replicas[replica].active_conn != Some(conn_id) {
             return;
         }
-        if let Ok(bytes) = encode_sync_frame(frame) {
+        if let Ok(bytes) = encode_sync_frame_v2(frame) {
             self.replicas[replica].s2c_queue.push_back(QueuedFrame {
                 conn_id,
                 summary: summarize_frame(frame),
@@ -924,15 +940,15 @@ impl InteractiveSimLab {
         if self.replicas[replica].active_conn != Some(queued.conn_id) {
             return Ok(());
         }
-        let frame = decode_sync_frame(&queued.bytes)
+        let frame = decode_sync_frame_v2(&queued.bytes)
             .map_err(|err| format!("failed to decode client frame: {err:?}"))?;
         match frame {
-            WireSyncFrameV1::Hello { .. } => {
+            WireSyncFrameV2::Hello { .. } => {
                 let user_id = self.replicas[replica].user_id;
                 let role = Some(self.replicas[replica].role);
                 match self.server.on_hello(user_id, role, &frame) {
                     Ok(welcome) => {
-                        if let WireSyncFrameV1::Welcome { head_seq, .. } = &welcome {
+                        if let WireSyncFrameV2::Welcome { head_seq, .. } = &welcome {
                             self.replicas[replica].welcome_head_seq = Some(*head_seq);
                         }
                         self.enqueue_s2c(replica, queued.conn_id, &welcome);
@@ -941,7 +957,7 @@ impl InteractiveSimLab {
                         self.enqueue_s2c(
                             replica,
                             queued.conn_id,
-                            &WireSyncFrameV1::Reject {
+                            &WireSyncFrameV2::Reject {
                                 client_seq: 0,
                                 reason,
                             },
@@ -949,13 +965,13 @@ impl InteractiveSimLab {
                     }
                 }
             }
-            WireSyncFrameV1::Push { txns } => {
+            WireSyncFrameV2::Push { txns } => {
                 if let Err(reason) = self.server.validate_push_batch(&txns, queued.bytes.len()) {
                     if let Some(first) = txns.first() {
                         self.enqueue_s2c(
                             replica,
                             queued.conn_id,
-                            &WireSyncFrameV1::Reject {
+                            &WireSyncFrameV2::Reject {
                                 client_seq: first.client_seq,
                                 reason,
                             },
@@ -981,7 +997,7 @@ impl InteractiveSimLab {
                     ) {
                         Ok(reticula_sync::ApplyResult::Committed(commit)) => {
                             self.epoch_log.push(commit.clone());
-                            let ack = WireSyncFrameV1::Ack {
+                            let ack = WireSyncFrameV2::Ack {
                                 replica: commit.replica,
                                 client_seq: commit.client_seq,
                                 seq: commit.seq,
@@ -989,7 +1005,7 @@ impl InteractiveSimLab {
                             };
                             self.enqueue_s2c(replica, queued.conn_id, &ack);
 
-                            let bcast = WireSyncFrameV1::Commit {
+                            let bcast = WireSyncFrameV2::Commit {
                                 seq: commit.seq,
                                 replica: commit.replica,
                                 client_seq: commit.client_seq,
@@ -1013,7 +1029,7 @@ impl InteractiveSimLab {
                             self.enqueue_s2c(
                                 replica,
                                 queued.conn_id,
-                                &WireSyncFrameV1::Ack {
+                                &WireSyncFrameV2::Ack {
                                     replica: ack_rep,
                                     client_seq,
                                     seq,
@@ -1025,7 +1041,7 @@ impl InteractiveSimLab {
                             self.enqueue_s2c(
                                 replica,
                                 queued.conn_id,
-                                &WireSyncFrameV1::Reject {
+                                &WireSyncFrameV2::Reject {
                                     client_seq: cseq,
                                     reason,
                                 },
@@ -1046,11 +1062,11 @@ impl InteractiveSimLab {
         if self.replicas[replica].active_conn != Some(queued.conn_id) {
             return Ok(());
         }
-        let frame = decode_sync_frame(&queued.bytes)
+        let frame = decode_sync_frame_v2(&queued.bytes)
             .map_err(|err| format!("failed to decode server frame: {err:?}"))?;
         let actions = match frame {
-            WireSyncFrameV1::Welcome { .. } => self.replicas[replica].machine.on_welcome(frame),
-            WireSyncFrameV1::Commit {
+            WireSyncFrameV2::Welcome { .. } => self.replicas[replica].machine.on_welcome(frame),
+            WireSyncFrameV2::Commit {
                 seq,
                 replica: commit_rep,
                 client_seq,
@@ -1059,7 +1075,7 @@ impl InteractiveSimLab {
                 txn,
             } => self.replicas[replica]
                 .machine
-                .on_commit(WireCommittedTxnV2 {
+                .on_commit(WireCommittedTxnV3 {
                     seq,
                     replica: commit_rep,
                     client_seq,
@@ -1067,7 +1083,7 @@ impl InteractiveSimLab {
                     timestamp_ms,
                     txn,
                 }),
-            WireSyncFrameV1::Ack {
+            WireSyncFrameV2::Ack {
                 replica: ack_rep,
                 client_seq,
                 ..
@@ -1076,10 +1092,10 @@ impl InteractiveSimLab {
                 self.replicas[replica].sync_checkpoint();
                 Vec::new()
             }
-            WireSyncFrameV1::Reject { client_seq, reason } => {
+            WireSyncFrameV2::Reject { client_seq, reason } => {
                 self.replicas[replica].machine.on_reject(client_seq, reason)
             }
-            WireSyncFrameV1::Digest { seq, state_digest } => {
+            WireSyncFrameV2::Digest { seq, state_digest } => {
                 self.replicas[replica].machine.on_digest(seq, state_digest)
             }
             _ => Vec::new(),
@@ -1096,8 +1112,8 @@ impl InteractiveSimLab {
         if self.replicas[replica].active_conn != Some(conn_id) {
             return Ok(());
         }
-        let (snap_wb, snap_wms) = if snap_seq == 0 {
-            (Workbook::new(), Vec::new())
+        let (snap_wb, snap_wms, snap_permutes) = if snap_seq == 0 {
+            (Workbook::new(), Vec::new(), Vec::new())
         } else {
             let (bytes, wms) = self
                 .snapshots_by_seq
@@ -1105,20 +1121,29 @@ impl InteractiveSimLab {
                 .ok_or_else(|| format!("missing snapshot #{snap_seq}"))?;
             let decoded = decode_snapshot_any(bytes)
                 .map_err(|err| format!("failed to decode snapshot #{snap_seq}: {err:?}"))?;
-            (decoded.engine.workbook().clone(), wms.clone())
+            let permutes = decoded
+                .permutes
+                .iter()
+                .map(CommittedPermute::from)
+                .collect();
+            (decoded.engine.workbook().clone(), wms.clone(), permutes)
         };
         let welcome_head = self.replicas[replica]
             .welcome_head_seq
             .unwrap_or_else(|| self.server.head_seq());
-        let tail: Vec<WireCommittedTxnV2> = self
+        let tail: Vec<WireCommittedTxnV3> = self
             .epoch_log
             .iter()
             .filter(|txn| txn.seq > snap_seq && txn.seq <= welcome_head)
             .cloned()
             .collect();
-        let actions = self.replicas[replica]
-            .machine
-            .install_snapshot(snap_seq, snap_wb, &snap_wms, tail);
+        let actions = self.replicas[replica].machine.install_snapshot(
+            snap_seq,
+            snap_wb,
+            &snap_wms,
+            snap_permutes,
+            tail,
+        );
         self.apply_client_actions(replica, actions);
         Ok(())
     }
@@ -1135,8 +1160,15 @@ impl InteractiveSimLab {
                     max_id_counter: w.max_id_counter,
                 })
                 .collect();
-            let bytes = encode_snapshot_v1(self.server.workbook(), &wire_wms)
-                .map_err(|err| format!("server snapshot encode failed: {err:?}"))?;
+            let wire_permutes: Vec<WireCommittedPermuteV3> = self
+                .server
+                .committed_permutes()
+                .iter()
+                .map(WireCommittedPermuteV3::from)
+                .collect();
+            let bytes =
+                encode_snapshot_with_permutes(self.server.workbook(), &wire_wms, &wire_permutes)
+                    .map_err(|err| format!("server snapshot encode failed: {err:?}"))?;
             self.snapshots_by_seq.insert(head, (bytes, wms));
             self.server.mark_snapshot_written(head);
         }
@@ -1152,6 +1184,10 @@ pub struct AutoSimFaultCounts {
     pub set_cells_if_ops: u64,
     pub formula_ops: u64,
     pub move_row_col_ops: u64,
+    pub permute_content_ops: u64,
+    pub move_cells_ops: u64,
+    pub named_range_ops: u64,
+    pub e16_transformed_edits: u64,
     pub structural_sheet_ops: u64,
     pub reordered_deliveries: u64,
     pub slow_receiver_disconnects: u64,
@@ -1174,6 +1210,10 @@ impl From<&FaultCounts> for AutoSimFaultCounts {
             set_cells_if_ops: f.set_cells_if_ops,
             formula_ops: f.formula_ops,
             move_row_col_ops: f.move_row_col_ops,
+            permute_content_ops: f.permute_content_ops,
+            move_cells_ops: f.move_cells_ops,
+            named_range_ops: f.named_range_ops,
+            e16_transformed_edits: f.e16_transformed_edits,
             structural_sheet_ops: f.structural_sheet_ops,
             reordered_deliveries: f.reordered_deliveries,
             slow_receiver_disconnects: f.slow_receiver_disconnects,
@@ -1390,43 +1430,43 @@ fn connection_label(state: ConnectionState) -> &'static str {
     }
 }
 
-fn summarize_frame(frame: &WireSyncFrameV1) -> String {
+fn summarize_frame(frame: &WireSyncFrameV2) -> String {
     match frame {
-        WireSyncFrameV1::Hello {
+        WireSyncFrameV2::Hello {
             last_applied_seq, ..
         } => format!("Hello (seq #{last_applied_seq})"),
-        WireSyncFrameV1::Welcome {
+        WireSyncFrameV2::Welcome {
             replica,
             head_seq,
             catchup,
             ..
         } => match catchup {
-            WireCatchupV1::SnapshotRequired { snapshot_seq, .. } => {
+            WireCatchupV2::SnapshotRequired { snapshot_seq, .. } => {
                 format!("Welcome (r{replica}, head #{head_seq}, snap #{snapshot_seq})")
             }
-            WireCatchupV1::Txns { txns, .. } if !txns.is_empty() => {
+            WireCatchupV2::Txns { txns, .. } if !txns.is_empty() => {
                 format!("Welcome (r{replica}, head #{head_seq}, {} txn)", txns.len())
             }
-            WireCatchupV1::Txns { .. } => format!("Welcome (r{replica}, head #{head_seq})"),
+            WireCatchupV2::Txns { .. } => format!("Welcome (r{replica}, head #{head_seq})"),
         },
-        WireSyncFrameV1::Push { txns } => match txns.first() {
+        WireSyncFrameV2::Push { txns } => match txns.first() {
             Some(first) => format!("Push {} txn(s) from #{}", txns.len(), first.client_seq),
             None => String::from("Push (empty)"),
         },
-        WireSyncFrameV1::Commit { seq, replica, .. } => format!("Commit #{seq} (r{replica})"),
-        WireSyncFrameV1::Ack {
+        WireSyncFrameV2::Commit { seq, replica, .. } => format!("Commit #{seq} (r{replica})"),
+        WireSyncFrameV2::Ack {
             replica,
             client_seq,
             seq,
             ..
         } => format!("Ack r{replica} c#{client_seq} -> #{seq}"),
-        WireSyncFrameV1::Reject { client_seq, reason } => {
+        WireSyncFrameV2::Reject { client_seq, reason } => {
             format!("Reject c#{client_seq}: {reason:?}")
         }
-        WireSyncFrameV1::Digest { seq, .. } => format!("Digest #{seq}"),
-        WireSyncFrameV1::Presence(_) => String::from("Presence"),
-        WireSyncFrameV1::Ping(n) => format!("Ping #{n}"),
-        WireSyncFrameV1::Pong(n) => format!("Pong #{n}"),
+        WireSyncFrameV2::Digest { seq, .. } => format!("Digest #{seq}"),
+        WireSyncFrameV2::Presence(_) => String::from("Presence"),
+        WireSyncFrameV2::Ping(n) => format!("Ping #{n}"),
+        WireSyncFrameV2::Pong(n) => format!("Pong #{n}"),
     }
 }
 

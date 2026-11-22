@@ -7,17 +7,22 @@ use reticula_core::ops::{InverseOp, Op, Workbook};
 use reticula_formula::binder::BoundFormula;
 use reticula_formula::engine::FormulaEngine;
 use reticula_sync::types::DEFAULT_MAX_PUSH_BYTES;
-use reticula_sync::{ClientAction, ClientSyncMachine, ConnectionState, ReplicaWatermark};
-use reticula_wire::convert_v2::{ops_from_wire_txn_v2, ops_to_wire_txn_v2};
-use reticula_wire::snapshot::{decode_snapshot_any, encode_snapshot_v1};
-use reticula_wire::sync_frame::{decode_sync_frame, encode_sync_frame};
+use reticula_sync::{
+    ClientAction, ClientSyncMachine, CommittedPermute, ConnectionState, ReplicaWatermark,
+};
+use reticula_wire::convert_v3::{ops_from_wire_txn_v3, ops_to_wire_txn_v3};
+use reticula_wire::snapshot::{
+    decode_snapshot_any, encode_snapshot_v1, encode_snapshot_with_permutes,
+};
+use reticula_wire::sync_frame::{decode_sync_frame_any, encode_sync_frame_v2};
 use reticula_wire::v1::WireReplicaWatermarkV1;
-use reticula_wire::v2::{
-    WireCommittedTxnV2, WirePendingTxnV2, WirePresenceRangeV1, WirePresenceV1, WireSyncFrameV1,
+use reticula_wire::v2::{WirePresenceRangeV1, WirePresenceV1};
+use reticula_wire::v3::{
+    WireCommittedPermuteV3, WireCommittedTxnV3, WirePendingTxnV3, WireSyncFrameV2,
 };
 use reticula_wire::wal::{
-    encode_pending_wal_complete, encode_pending_wal_init, encode_pending_wal_record,
-    scan_pending_wal,
+    encode_pending_wal_complete_v2, encode_pending_wal_init_v2, encode_pending_wal_record_v2,
+    scan_pending_wal_any,
 };
 use serde::{Deserialize, Serialize};
 use tsify::{Ts, Tsify};
@@ -269,25 +274,28 @@ impl CollabSession {
         {
             return Err("Invalid collaborative replica metadata.".into());
         }
-        let confirmed = if snapshot.is_empty() && info.confirmed_seq == 0 {
-            Workbook::new()
+        let (confirmed, confirmed_permutes) = if snapshot.is_empty() && info.confirmed_seq == 0 {
+            (Workbook::new(), Vec::new())
         } else {
-            decode_snapshot_any(snapshot)
-                .map_err(|error| format!("Could not decode collaborative checkpoint: {error:?}"))?
-                .engine
-                .workbook()
-                .clone()
+            let decoded = decode_snapshot_any(snapshot)
+                .map_err(|error| format!("Could not decode collaborative checkpoint: {error:?}"))?;
+            let permutes = decoded
+                .permutes
+                .iter()
+                .map(CommittedPermute::from)
+                .collect();
+            (decoded.engine.workbook().clone(), permutes)
         };
         let (mut pending_records, mut repair_pending) = if pending.is_empty() {
             (Vec::new(), false)
         } else {
-            let scan = scan_pending_wal(pending)
+            let scan = scan_pending_wal_any(pending)
                 .map_err(|error| format!("Could not recover pending transactions: {error:?}"))?;
             (scan.records, scan.valid_bytes < pending.len())
         };
         if pending_records.iter().any(|record| {
             Some(record.replica) != info.replica
-                || ops_from_wire_txn_v2(record.txn.clone()).is_err()
+                || ops_from_wire_txn_v3(record.txn.clone()).is_err()
         }) {
             return Err("Pending transactions do not belong to this collaborative replica.".into());
         }
@@ -305,6 +313,7 @@ impl CollabSession {
             info.confirmed_seq,
             info.confirmed_client_seq,
             confirmed,
+            confirmed_permutes,
             pending_records,
             info.next_id_counter,
         );
@@ -348,15 +357,15 @@ impl CollabSession {
         else {
             return Err("Collaborative edits require a verified replica.".into());
         };
-        let pending = WirePendingTxnV2 {
+        let pending = WirePendingTxnV3 {
             replica,
             client_seq: self.machine.next_client_seq(),
             base_server_seq: self.machine.confirmed_seq(),
             timestamp_ms,
-            txn: ops_to_wire_txn_v2(label.into(), ops)
-                .map_err(|_| String::from("This transaction cannot be encoded in wire v2."))?,
+            txn: ops_to_wire_txn_v3(label.into(), ops)
+                .map_err(|_| String::from("This transaction cannot be encoded for sync."))?,
         };
-        if !encode_sync_frame(&WireSyncFrameV1::Push {
+        if !encode_sync_frame_v2(&WireSyncFrameV2::Push {
             txns: vec![pending],
         })
         .is_ok_and(|bytes| bytes.len() <= DEFAULT_MAX_PUSH_BYTES)
@@ -424,6 +433,14 @@ impl CollabSession {
         if !self.engine_inverses_valid
             || self.engine_pending.is_empty()
             || self.engine_pending.len() != self.machine.pending_len()
+            || remote_ops
+                .iter()
+                .any(|op| matches!(op, Op::PermuteContent { .. }))
+            || self.engine_pending.iter().any(|e| {
+                e.ops
+                    .iter()
+                    .any(|op| matches!(op, Op::PermuteContent { .. }))
+            })
         {
             return false;
         }
@@ -477,16 +494,16 @@ impl CollabSession {
             return;
         }
         let event = match action {
-            ClientAction::PersistPending(txn) => encode_pending_wal_record(&txn)
+            ClientAction::PersistPending(txn) => encode_pending_wal_record_v2(&txn)
                 .map(|bytes| CollabEvent::AppendPending { bytes })
                 .ok(),
-            ClientAction::PersistTruncatedPending(txns) => encode_pending_wal_complete(&txns)
+            ClientAction::PersistTruncatedPending(txns) => encode_pending_wal_complete_v2(&txns)
                 .map(|bytes| CollabEvent::ReplacePending {
                     info: self.info(),
                     bytes,
                 })
                 .ok(),
-            ClientAction::SendFrame(frame) => encode_sync_frame(&frame)
+            ClientAction::SendFrame(frame) => encode_sync_frame_v2(&frame)
                 .map(|bytes| CollabEvent::Send { bytes })
                 .ok(),
             ClientAction::RequestSnapshot { snapshot_seq, url } => {
@@ -543,8 +560,18 @@ impl CollabSession {
             last_client_seq: info.confirmed_client_seq,
             max_id_counter: info.next_id_counter.saturating_sub(1),
         });
-        let snapshot = encode_snapshot_v1(self.machine.confirmed(), watermarks.as_slice())
-            .map_err(|error| format!("Could not encode collaborative checkpoint: {error:?}"))?;
+        let permutes: Vec<WireCommittedPermuteV3> = self
+            .machine
+            .confirmed_permutes()
+            .iter()
+            .map(WireCommittedPermuteV3::from)
+            .collect();
+        let snapshot = encode_snapshot_with_permutes(
+            self.machine.confirmed(),
+            watermarks.as_slice(),
+            &permutes,
+        )
+        .map_err(|error| format!("Could not encode collaborative checkpoint: {error:?}"))?;
         self.events.push_back(CollabEvent::Checkpoint {
             checkpoint: SyncCheckpoint { info, snapshot },
         });
@@ -600,7 +627,7 @@ impl CollabSession {
             return;
         };
         self.last_presence_sent = Some(now);
-        self.emit(ClientAction::SendFrame(WireSyncFrameV1::Presence(
+        self.emit(ClientAction::SendFrame(WireSyncFrameV2::Presence(
             WirePresenceV1 {
                 replica,
                 user_id: [0; 16],
@@ -718,11 +745,11 @@ fn parse_uuid(value: &str) -> Result<[u8; 16], String> {
         .map_err(|_| "Invalid collaborative document or branch identifier.".into())
 }
 
-/// Encodes the 16-byte `RTCLPWAL` header for collaborative `pending.wal` logs.
+/// Encodes the 16-byte `RTCLPWAL` header (v2) for collaborative `pending.wal` logs.
 #[wasm_bindgen(js_name = encodePendingWalInit)]
 #[must_use]
 pub fn wasm_encode_pending_wal_init() -> Vec<u8> {
-    encode_pending_wal_init()
+    encode_pending_wal_init_v2()
 }
 
 #[wasm_bindgen]
@@ -804,29 +831,32 @@ impl Engine {
                 session.presence(self.subscribed_sheet);
                 Vec::new()
             }
-            SyncCommand::Receive { frame } => match decode_sync_frame(&frame) {
-                Ok(WireSyncFrameV1::Ping(nonce)) => {
-                    vec![ClientAction::SendFrame(WireSyncFrameV1::Pong(nonce))]
+            SyncCommand::Receive { frame } => match decode_sync_frame_any(&frame) {
+                Ok((_, WireSyncFrameV2::Ping(nonce))) => {
+                    vec![ClientAction::SendFrame(WireSyncFrameV2::Pong(nonce))]
                 }
-                Ok(welcome @ WireSyncFrameV1::Welcome { .. })
+                Ok((_, welcome @ WireSyncFrameV2::Welcome { .. }))
                     if session.machine.connection_state() == ConnectionState::Handshaking =>
                 {
                     session.machine.on_welcome(welcome)
                 }
-                Ok(WireSyncFrameV1::Commit {
-                    seq,
-                    replica,
-                    client_seq,
-                    user_id,
-                    timestamp_ms,
-                    txn,
-                }) => {
+                Ok((
+                    _,
+                    WireSyncFrameV2::Commit {
+                        seq,
+                        replica,
+                        client_seq,
+                        user_id,
+                        timestamp_ms,
+                        txn,
+                    },
+                )) => {
                     if session.machine.connection_state() == ConnectionState::Online {
                         was_pending = Some(session.machine.pending_len());
                         incremental_ops =
-                            ops_from_wire_txn_v2(txn.clone()).ok().map(|(_, ops)| ops);
+                            ops_from_wire_txn_v3(txn.clone()).ok().map(|(_, ops)| ops);
                     }
-                    session.machine.on_commit(WireCommittedTxnV2 {
+                    session.machine.on_commit(WireCommittedTxnV3 {
                         seq,
                         replica,
                         client_seq,
@@ -835,31 +865,37 @@ impl Engine {
                         txn,
                     })
                 }
-                Ok(WireSyncFrameV1::Ack {
-                    replica,
-                    client_seq,
-                    ..
-                }) => {
+                Ok((
+                    _,
+                    WireSyncFrameV2::Ack {
+                        replica,
+                        client_seq,
+                        ..
+                    },
+                )) => {
                     session.machine.on_ack(replica, client_seq);
                     Vec::new()
                 }
-                Ok(WireSyncFrameV1::Reject {
-                    reason: reticula_wire::v2::WireRejectReasonV1::UpgradeRequired,
-                    ..
-                }) => {
+                Ok((
+                    _,
+                    WireSyncFrameV2::Reject {
+                        reason: reticula_wire::v2::WireRejectReasonV1::UpgradeRequired,
+                        ..
+                    },
+                )) => {
                     session.events.push_back(CollabEvent::UpgradeRequired);
                     Vec::new()
                 }
-                Ok(WireSyncFrameV1::Reject { client_seq: 0, .. }) => {
+                Ok((_, WireSyncFrameV2::Reject { client_seq: 0, .. })) => {
                     vec![ClientAction::RequestReconnect]
                 }
-                Ok(WireSyncFrameV1::Reject { client_seq, reason }) => {
+                Ok((_, WireSyncFrameV2::Reject { client_seq, reason })) => {
                     session.machine.on_reject(client_seq, reason)
                 }
-                Ok(WireSyncFrameV1::Digest { seq, state_digest }) => {
+                Ok((_, WireSyncFrameV2::Digest { seq, state_digest })) => {
                     session.machine.on_digest(seq, state_digest)
                 }
-                Ok(WireSyncFrameV1::Presence(value)) => {
+                Ok((_, WireSyncFrameV2::Presence(value))) => {
                     if session.machine.replica() != Some(value.replica) {
                         session.presences.insert(
                             value.replica,
@@ -872,7 +908,7 @@ impl Engine {
                     }
                     Vec::new()
                 }
-                Ok(WireSyncFrameV1::Pong(_)) => Vec::new(),
+                Ok((_, WireSyncFrameV2::Pong(_))) => Vec::new(),
                 _ => vec![ClientAction::RequestReconnect],
             },
             SyncCommand::InstallSnapshot { seq, snapshot } => {
@@ -891,10 +927,16 @@ impl Engine {
                                     max_id_counter: wm.max_id_counter,
                                 })
                                 .collect::<Vec<_>>();
+                            let permutes = decoded
+                                .permutes
+                                .iter()
+                                .map(CommittedPermute::from)
+                                .collect::<Vec<_>>();
                             session.machine.install_snapshot(
                                 seq,
                                 decoded.engine.workbook().clone(),
                                 &watermarks,
+                                permutes,
                                 Vec::new(),
                             )
                         }
@@ -935,7 +977,7 @@ impl Engine {
                     txns,
                 } => match (
                     encode_snapshot_v1(self.engine.workbook(), &[]),
-                    encode_pending_wal_complete(&txns),
+                    encode_pending_wal_complete_v2(&txns),
                 ) {
                     (Ok(snapshot), Ok(pending_wal)) => {
                         session.events.push_back(CollabEvent::SaveUnsynced {

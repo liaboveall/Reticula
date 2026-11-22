@@ -17,7 +17,9 @@ use reticula_core::style::StylePatch;
 use reticula_core::value::CalcError;
 use reticula_formula::binder::{BoundFormula, templatize_formula};
 use reticula_sync::ClientSyncMachine;
-use reticula_wire::v2::{SYNC_PROTOCOL_VERSION, WirePendingTxnV2, WireSyncFrameV1, WireTxnV2};
+use reticula_wire::v3::{
+    SYNC_PROTOCOL_VERSION_V2, WireOpV3, WirePendingTxnV3, WireSyncFrameV2, WireTxnV3,
+};
 
 /// Fixed simulated collaborator count:
 /// - `0`: Alice Tab 1 (`USER_A`, Owner)
@@ -39,7 +41,7 @@ pub const USER_C: [u8; 16] = [0xC3; 16];
 pub const USER_D: [u8; 16] = [0xD4; 16];
 pub const ROGUE_OUTSIDER: [u8; 16] = [0xEE; 16];
 
-/// Every M2a operation family exercised in deterministic simulation.
+/// Every M3a operation family exercised in deterministic simulation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OpChoice {
     SetCellsScalar,
@@ -55,6 +57,10 @@ pub enum OpChoice {
     UndeleteCols,
     MoveRows,
     MoveCols,
+    PermuteContent,
+    MoveCells,
+    DefineNamedRange,
+    DeleteNamedRange,
     ResizeRows,
     ResizeCols,
     SetFreeze,
@@ -150,6 +156,9 @@ pub(crate) struct GeneratedLocalTxn {
     pub(crate) used_set_cells_if: bool,
     pub(crate) used_formula: bool,
     pub(crate) used_move: bool,
+    pub(crate) used_permute: bool,
+    pub(crate) used_move_cells: bool,
+    pub(crate) used_named_range: bool,
     pub(crate) used_sheet_op: bool,
 }
 
@@ -255,31 +264,36 @@ pub fn generate_script(seed: u64) -> Vec<SimEvent> {
 }
 
 fn pick_op_choice(rng: &mut Rng) -> OpChoice {
-    match rng.next_below(100) {
-        0..=21 => OpChoice::SetCellsScalar,
-        22..=32 => OpChoice::SetCellsFormula,
-        33..=40 => OpChoice::SetCellsIfMatching,
-        41..=43 => OpChoice::SetCellsIfStale,
-        44..=46 => OpChoice::ClearRange,
-        47..=52 => OpChoice::InsertRows,
-        53..=56 => OpChoice::InsertCols,
-        57..=60 => OpChoice::DeleteRows,
-        61..=63 => OpChoice::DeleteCols,
-        64..=66 => OpChoice::UndeleteRows,
-        67..=69 => OpChoice::UndeleteCols,
-        70..=75 => OpChoice::MoveRows,
-        76..=79 => OpChoice::MoveCols,
-        80..=81 => OpChoice::ResizeRows,
-        82..=83 => OpChoice::ResizeCols,
-        84..=85 => OpChoice::SetFreeze,
-        86..=88 => OpChoice::SetFormat,
-        89..=91 => OpChoice::SetBlock,
-        92..=94 => OpChoice::FillFormula,
-        95 => OpChoice::AddSheet,
-        96 => OpChoice::RenameSheet,
-        97 => OpChoice::DeleteSheet,
-        98 => OpChoice::UndeleteSheet,
-        _ => OpChoice::MoveSheet,
+    match rng.next_below(105) {
+        0..=17 => OpChoice::SetCellsScalar,
+        18..=26 => OpChoice::SetCellsFormula,
+        27..=32 => OpChoice::SetCellsIfMatching,
+        33..=35 => OpChoice::SetCellsIfStale,
+        36..=38 => OpChoice::ClearRange,
+        39..=43 => OpChoice::InsertRows,
+        44..=46 => OpChoice::InsertCols,
+        47..=49 => OpChoice::DeleteRows,
+        50..=51 => OpChoice::DeleteCols,
+        52..=53 => OpChoice::UndeleteRows,
+        54..=55 => OpChoice::UndeleteCols,
+        56..=59 => OpChoice::MoveRows,
+        60..=62 => OpChoice::MoveCols,
+        63..=71 => OpChoice::PermuteContent,
+        72..=77 => OpChoice::MoveCells,
+        78..=81 => OpChoice::DefineNamedRange,
+        82..=83 => OpChoice::DeleteNamedRange,
+        84..=85 => OpChoice::ResizeRows,
+        86..=87 => OpChoice::ResizeCols,
+        88..=89 => OpChoice::SetFreeze,
+        90..=92 => OpChoice::SetFormat,
+        93..=95 => OpChoice::SetBlock,
+        96..=98 => OpChoice::FillFormula,
+        99 => OpChoice::AddSheet,
+        100 => OpChoice::RenameSheet,
+        101 => OpChoice::DeleteSheet,
+        102 => OpChoice::UndeleteSheet,
+        103 => OpChoice::MoveSheet,
+        _ => OpChoice::PermuteContent,
     }
 }
 
@@ -424,6 +438,9 @@ pub(crate) fn build_op_for_client(
     let mut used_set_cells_if = false;
     let mut used_formula = false;
     let mut used_move = false;
+    let mut used_permute = false;
+    let mut used_move_cells = false;
+    let mut used_named_range = false;
     let mut used_sheet_op = false;
 
     let op = match choice {
@@ -795,6 +812,112 @@ pub(crate) fn build_op_for_client(
                 Op::MoveSheet { sheet: s, after }
             }
         }
+        OpChoice::PermuteContent => {
+            if live_rows.len() < 2 || live_cols.is_empty() {
+                return None;
+            }
+            used_permute = true;
+            let n_rows = 2 + (rng.next_below((live_rows.len() - 2).min(4) as u64 + 1) as usize);
+            let n_cols = 1 + (rng.next_below(live_cols.len().min(3) as u64) as usize);
+            let rows: Vec<RowId> = live_rows[..n_rows].iter().copied().map(RowId).collect();
+            let cols: Vec<ColId> = live_cols[..n_cols].iter().copied().map(ColId).collect();
+            let mut row_perm: Vec<u32> = (0..n_rows as u32).collect();
+            for i in (1..n_rows).rev() {
+                let j = rng.next_below((i + 1) as u64) as usize;
+                row_perm.swap(i, j);
+            }
+            if row_perm.iter().enumerate().all(|(i, &p)| p as usize == i) {
+                row_perm.swap(0, 1);
+            }
+            Op::PermuteContent {
+                sheet: sheet_id,
+                rows,
+                cols,
+                row_perm,
+            }
+        }
+        OpChoice::MoveCells => {
+            if sheet.rows() < 2 || sheet.cols() < 2 {
+                return None;
+            }
+            used_move_cells = true;
+            let dst_sheet_id = if live_sheets.len() >= 2 && rng.next_below(3) == 0 {
+                live_sheets[rng.next_below(live_sheets.len() as u64) as usize]
+            } else {
+                sheet_id
+            };
+            let dst_sheet = wb.sheet(dst_sheet_id)?;
+            let max_h = sheet.rows().min(dst_sheet.rows()).min(3);
+            let max_w = sheet.cols().min(dst_sheet.cols()).min(3);
+            if max_h == 0 || max_w == 0 {
+                return None;
+            }
+            let h = 1 + (rng.next_below(u64::from(max_h)) as u32);
+            let w = 1 + (rng.next_below(u64::from(max_w)) as u32);
+            let src_r0 = rng.next_below(u64::from((sheet.rows() - h).min(8) + 1)) as u32;
+            let src_c0 = rng.next_below(u64::from((sheet.cols() - w).min(6) + 1)) as u32;
+            let dst_r0 = rng.next_below(u64::from((dst_sheet.rows() - h).min(8) + 1)) as u32;
+            let dst_c0 = rng.next_below(u64::from((dst_sheet.cols() - w).min(6) + 1)) as u32;
+            let src_rows: Vec<RowId> = (src_r0..src_r0 + h)
+                .filter_map(|p| sheet.row_axis().pos_to_id(p).map(RowId))
+                .collect();
+            let src_cols: Vec<ColId> = (src_c0..src_c0 + w)
+                .filter_map(|p| sheet.col_axis().pos_to_id(p).map(ColId))
+                .collect();
+            let dst_rows: Vec<RowId> = (dst_r0..dst_r0 + h)
+                .filter_map(|p| dst_sheet.row_axis().pos_to_id(p).map(RowId))
+                .collect();
+            let dst_cols: Vec<ColId> = (dst_c0..dst_c0 + w)
+                .filter_map(|p| dst_sheet.col_axis().pos_to_id(p).map(ColId))
+                .collect();
+            if src_rows.len() != h as usize
+                || dst_rows.len() != h as usize
+                || src_cols.len() != w as usize
+                || dst_cols.len() != w as usize
+            {
+                return None;
+            }
+            Op::MoveCells {
+                src_sheet: sheet_id,
+                src_rows,
+                src_cols,
+                dst_sheet: dst_sheet_id,
+                dst_rows,
+                dst_cols,
+            }
+        }
+        OpChoice::DefineNamedRange => {
+            used_named_range = true;
+            let scope = (rng.next_below(2) == 0).then_some(sheet_id);
+            let names = ["TaxRate", "Sales_Q1", "Total_A", "Ref_B"];
+            let name = String::from(names[rng.next_below(names.len() as u64) as usize]);
+            let formula = build_formula_for_sheet(&mut rng, &wb, sheet_id)?;
+            Op::DefineNamedRange {
+                scope,
+                name,
+                formula,
+                comment: (rng.next_below(2) == 0).then(|| String::from("sim note")),
+                hidden: rng.next_below(4) == 0,
+            }
+        }
+        OpChoice::DeleteNamedRange => {
+            used_named_range = true;
+            if let Some((key, def)) = wb.named_ranges().iter().next() {
+                Op::DeleteNamedRange {
+                    scope: key.scope,
+                    name: def.name.clone(),
+                }
+            } else {
+                let formula = build_formula_for_sheet(&mut rng, &wb, sheet_id)?;
+                Op::DefineNamedRange {
+                    scope: None,
+                    name: String::from("TaxRate"),
+                    formula,
+                    comment: None,
+                    hidden: false,
+                }
+            }
+        }
     };
 
     Some(GeneratedLocalTxn {
@@ -803,6 +926,9 @@ pub(crate) fn build_op_for_client(
         used_set_cells_if,
         used_formula,
         used_move,
+        used_permute,
+        used_move_cells,
+        used_named_range,
         used_sheet_op,
     })
 }
@@ -840,13 +966,13 @@ pub(crate) fn build_rogue_pending(
     expected_next_cs: u64,
     current_max_id: u32,
     sub_seed: u64,
-) -> Option<WirePendingTxnV2> {
+) -> Option<WirePendingTxnV3> {
     let mut rng = Rng::from_seed(sub_seed);
     let (replica, client_seq, op) = match kind {
         RogueKind::ClientSeqZero => (
             target_replica,
             0,
-            reticula_wire::v2::WireOpV2::SetFreeze {
+            WireOpV3::SetFreeze {
                 sheet: 0,
                 frozen_rows: 1,
                 frozen_cols: 0,
@@ -855,7 +981,7 @@ pub(crate) fn build_rogue_pending(
         RogueKind::ClientSeqGap => (
             target_replica,
             expected_next_cs.saturating_add(5),
-            reticula_wire::v2::WireOpV2::SetFreeze {
+            WireOpV3::SetFreeze {
                 sheet: 0,
                 frozen_rows: 1,
                 frozen_cols: 0,
@@ -868,7 +994,7 @@ pub(crate) fn build_rogue_pending(
             (
                 target_replica,
                 expected_next_cs,
-                reticula_wire::v2::WireOpV2::InsertRows {
+                WireOpV3::InsertRows {
                     sheet: 0,
                     after: None,
                     ids: IdRun::new(forged_first, 1)?.into(),
@@ -881,7 +1007,7 @@ pub(crate) fn build_rogue_pending(
             (
                 target_replica,
                 expected_next_cs,
-                reticula_wire::v2::WireOpV2::AddSheet {
+                WireOpV3::AddSheet {
                     sheet: forged_sheet.0,
                     name: String::from("Forged"),
                     after: Some(0),
@@ -893,7 +1019,7 @@ pub(crate) fn build_rogue_pending(
             (
                 target_replica,
                 expected_next_cs,
-                reticula_wire::v2::WireOpV2::InsertRows {
+                WireOpV3::InsertRows {
                     sheet: 0,
                     after: None,
                     ids: IdRun::new(stale_first, 1)?.into(),
@@ -903,7 +1029,7 @@ pub(crate) fn build_rogue_pending(
         RogueKind::CrossUserReplicaHijack => (
             target_replica.saturating_add(1),
             expected_next_cs,
-            reticula_wire::v2::WireOpV2::SetFreeze {
+            WireOpV3::SetFreeze {
                 sheet: 0,
                 frozen_rows: 2,
                 frozen_cols: 0,
@@ -912,7 +1038,7 @@ pub(crate) fn build_rogue_pending(
         RogueKind::DuplicateMoveRows => (
             target_replica,
             expected_next_cs,
-            reticula_wire::v2::WireOpV2::MoveRows {
+            WireOpV3::MoveRows {
                 sheet: 0,
                 ids: vec![IdRun::new(0, 1)?.into(), IdRun::new(0, 1)?.into()],
                 after: Some(1),
@@ -928,12 +1054,12 @@ pub(crate) fn build_rogue_pending(
         }
     };
 
-    Some(WirePendingTxnV2 {
+    Some(WirePendingTxnV3 {
         replica,
         client_seq,
         base_server_seq: 0,
         timestamp_ms: 999,
-        txn: WireTxnV2 {
+        txn: WireTxnV3 {
             label: format!("rogue_{}", rng.next_below(100)),
             ops: vec![op],
         },
@@ -971,26 +1097,26 @@ pub(crate) fn record_unique_ids(
 
 /// Builds a malformed handshake frame for non-Push rogue variants.
 #[must_use]
-pub fn build_rogue_hello_frame(kind: RogueKind) -> Option<WireSyncFrameV1> {
+pub fn build_rogue_hello_frame(kind: RogueKind) -> Option<WireSyncFrameV2> {
     match kind {
-        RogueKind::NonMemberHello => Some(WireSyncFrameV1::Hello {
-            protocol_version: SYNC_PROTOCOL_VERSION,
+        RogueKind::NonMemberHello => Some(WireSyncFrameV2::Hello {
+            protocol_version: SYNC_PROTOCOL_VERSION_V2,
             doc_id: SIM_DOC_ID,
             branch_id: SIM_BRANCH_ID,
             replica: None,
             last_applied_seq: 0,
             known_epoch: 0,
         }),
-        RogueKind::BadProtocolVersion => Some(WireSyncFrameV1::Hello {
-            protocol_version: SYNC_PROTOCOL_VERSION.wrapping_add(7),
+        RogueKind::BadProtocolVersion => Some(WireSyncFrameV2::Hello {
+            protocol_version: SYNC_PROTOCOL_VERSION_V2.wrapping_add(7),
             doc_id: SIM_DOC_ID,
             branch_id: SIM_BRANCH_ID,
             replica: None,
             last_applied_seq: 0,
             known_epoch: 0,
         }),
-        RogueKind::WrongDocOrBranch => Some(WireSyncFrameV1::Hello {
-            protocol_version: SYNC_PROTOCOL_VERSION,
+        RogueKind::WrongDocOrBranch => Some(WireSyncFrameV2::Hello {
+            protocol_version: SYNC_PROTOCOL_VERSION_V2,
             doc_id: [0x99; 16],
             branch_id: SIM_BRANCH_ID,
             replica: None,

@@ -1,15 +1,17 @@
 //! Identity ownership checks and collaborative ID remapping for offline/epoch
 //! recovery (`06-sync.md` & `15-m2a.md` 5.1, 5.3).
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 
 use reticula_core::id::{
     ColId, IdAllocator, IdRun, RowId, SheetId, id_counter, pack_sheet_id, sheet_id_belongs_to,
 };
-use reticula_core::ops::{FormatTarget, Op, Workbook};
+use reticula_core::ops::{CellInput, FormatTarget, FormulaPayload, Op, Workbook};
 use reticula_formula::binder::BoundFormula;
 use reticula_wire::v2::WireRejectReasonV1;
+
+use crate::types::CommittedPermute;
 
 /// Verifies that every freshly introduced row/column [`IdRun`] and worksheet
 /// [`SheetId`] in `ops` belongs exclusively to `(epoch, replica)` and advances
@@ -395,4 +397,311 @@ fn push_id_coalesced(out: &mut Vec<IdRun>, raw_id: u64) {
     if let Some(single) = IdRun::new(raw_id, 1) {
         out.push(single);
     }
+}
+
+/// Applies E16 row-content permutation transforms to `ops` for every committed
+/// permutation in `permutes` that occurred strictly after `base_server_seq`,
+/// skipping permutations previously authored locally by the same replica
+/// (`author_replica != 0 && p.replica == author_replica && p.client_seq < author_client_seq`).
+///
+/// Structural operations, `PermuteContent`, `MoveCells`, and named-range ops
+/// are left untouched per `06-sync.md` & `17-m3a.md` 6.1.
+#[must_use]
+pub fn transform_ops_through_permute(
+    ops: &[Op<BoundFormula>],
+    permutes: &[CommittedPermute],
+    base_server_seq: u64,
+    author_replica: u32,
+    author_client_seq: u64,
+) -> Vec<Op<BoundFormula>> {
+    let mut current: Vec<Op<BoundFormula>> = ops.to_vec();
+    for p in permutes {
+        if p.seq <= base_server_seq || p.row_map.is_empty() || p.cols.is_empty() {
+            continue;
+        }
+        if author_replica != 0 && p.replica == author_replica && p.client_seq < author_client_seq {
+            continue;
+        }
+        let mut next = Vec::with_capacity(current.len());
+        for op in current {
+            transform_op_through_one_permute(op, p, &mut next);
+        }
+        current = next;
+    }
+    current
+}
+
+fn transform_op_through_one_permute(
+    op: Op<BoundFormula>,
+    p: &CommittedPermute,
+    out: &mut Vec<Op<BoundFormula>>,
+) {
+    match op {
+        Op::SetCells { sheet, mut edits } => {
+            if sheet == p.sheet {
+                for edit in &mut edits {
+                    if p.cols.contains(&edit.col)
+                        && let Some(&mapped_row) = p.row_map.get(&edit.row)
+                    {
+                        edit.row = mapped_row;
+                    }
+                }
+            }
+            out.push(Op::SetCells { sheet, edits });
+        }
+        Op::SetCellsIf { sheet, mut edits } => {
+            if sheet == p.sheet {
+                for edit in &mut edits {
+                    if p.cols.contains(&edit.col)
+                        && let Some(&mapped_row) = p.row_map.get(&edit.row)
+                    {
+                        edit.row = mapped_row;
+                    }
+                }
+            }
+            out.push(Op::SetCellsIf { sheet, edits });
+        }
+        Op::ClearRange { sheet, rows, cols } => {
+            if sheet != p.sheet {
+                out.push(Op::ClearRange { sheet, rows, cols });
+                return;
+            }
+            let (inside_cols, outside_cols) = partition_col_runs(&cols, &p.cols);
+            if inside_cols.is_empty() || !any_row_in_map(&rows, &p.row_map) {
+                out.push(Op::ClearRange { sheet, rows, cols });
+                return;
+            }
+            if !outside_cols.is_empty() {
+                out.push(Op::ClearRange {
+                    sheet,
+                    rows: rows.clone(),
+                    cols: outside_cols,
+                });
+            }
+            let mapped_rows = map_rows_canonical(&rows, &p.row_map);
+            out.push(Op::ClearRange {
+                sheet,
+                rows: mapped_rows,
+                cols: inside_cols,
+            });
+        }
+        Op::SetFormat {
+            sheet,
+            target: FormatTarget::Cells { rows, cols },
+            number_format,
+            style,
+        } => {
+            if sheet != p.sheet {
+                out.push(Op::SetFormat {
+                    sheet,
+                    target: FormatTarget::Cells { rows, cols },
+                    number_format,
+                    style,
+                });
+                return;
+            }
+            let (inside_cols, outside_cols) = partition_col_runs(&cols, &p.cols);
+            if inside_cols.is_empty() || !any_row_in_map(&rows, &p.row_map) {
+                out.push(Op::SetFormat {
+                    sheet,
+                    target: FormatTarget::Cells { rows, cols },
+                    number_format,
+                    style,
+                });
+                return;
+            }
+            if !outside_cols.is_empty() {
+                out.push(Op::SetFormat {
+                    sheet,
+                    target: FormatTarget::Cells {
+                        rows: rows.clone(),
+                        cols: outside_cols,
+                    },
+                    number_format,
+                    style,
+                });
+            }
+            let mapped_rows = map_rows_canonical(&rows, &p.row_map);
+            out.push(Op::SetFormat {
+                sheet,
+                target: FormatTarget::Cells {
+                    rows: mapped_rows,
+                    cols: inside_cols,
+                },
+                number_format,
+                style,
+            });
+        }
+        Op::SetBlock {
+            sheet,
+            rows,
+            cols,
+            columns_data,
+        } => {
+            if sheet != p.sheet
+                || cols.len() != columns_data.len()
+                || !cols.iter().any(|c| p.cols.contains(c))
+                || !any_row_in_map(&rows, &p.row_map)
+            {
+                out.push(Op::SetBlock {
+                    sheet,
+                    rows,
+                    cols,
+                    columns_data,
+                });
+                return;
+            }
+            let mut outside_cols = Vec::new();
+            let mut outside_data = Vec::new();
+            let mut inside_cols = Vec::new();
+            let mut inside_data = Vec::new();
+            for (c, col_vec) in cols.into_iter().zip(columns_data) {
+                if p.cols.contains(&c) {
+                    inside_cols.push(c);
+                    inside_data.push(col_vec);
+                } else {
+                    outside_cols.push(c);
+                    outside_data.push(col_vec);
+                }
+            }
+            if !outside_cols.is_empty() {
+                out.push(Op::SetBlock {
+                    sheet,
+                    rows: rows.clone(),
+                    cols: outside_cols,
+                    columns_data: outside_data,
+                });
+            }
+            let mut mapped_rows = Vec::new();
+            for run in &rows {
+                for raw_r in run.iter() {
+                    let mapped = p.row_map.get(&RowId(raw_r)).map_or(raw_r, |m| m.0);
+                    push_id_coalesced(&mut mapped_rows, mapped);
+                }
+            }
+            out.push(Op::SetBlock {
+                sheet,
+                rows: mapped_rows,
+                cols: inside_cols,
+                columns_data: inside_data,
+            });
+        }
+        Op::FillFormula {
+            sheet,
+            rows,
+            cols,
+            template,
+        } => {
+            if sheet != p.sheet {
+                out.push(Op::FillFormula {
+                    sheet,
+                    rows,
+                    cols,
+                    template,
+                });
+                return;
+            }
+            let (inside_cols, outside_cols) = partition_col_runs(&cols, &p.cols);
+            if inside_cols.is_empty() || !any_row_in_map(&rows, &p.row_map) {
+                out.push(Op::FillFormula {
+                    sheet,
+                    rows,
+                    cols,
+                    template,
+                });
+                return;
+            }
+            if !outside_cols.is_empty() {
+                out.push(Op::FillFormula {
+                    sheet,
+                    rows: rows.clone(),
+                    cols: outside_cols,
+                    template: template.clone(),
+                });
+            }
+            let mut unaffected_rows = Vec::new();
+            let mut affected_pairs: Vec<(RowId, RowId)> = Vec::new();
+            for run in &rows {
+                for raw_r in run.iter() {
+                    let orig = RowId(raw_r);
+                    if let Some(&mapped) = p.row_map.get(&orig) {
+                        affected_pairs.push((orig, mapped));
+                    } else {
+                        push_id_coalesced(&mut unaffected_rows, raw_r);
+                    }
+                }
+            }
+            if !unaffected_rows.is_empty() {
+                out.push(Op::FillFormula {
+                    sheet,
+                    rows: unaffected_rows,
+                    cols: inside_cols.clone(),
+                    template: template.clone(),
+                });
+            }
+            if !affected_pairs.is_empty() {
+                let mut mapped_rows = Vec::new();
+                for &(_, mapped) in &affected_pairs {
+                    push_id_coalesced(&mut mapped_rows, mapped.0);
+                }
+                let cols_vec: Vec<ColId> = inside_cols
+                    .iter()
+                    .flat_map(|r| r.iter().map(ColId))
+                    .collect();
+                let mut columns_data = Vec::with_capacity(cols_vec.len());
+                for &col in &cols_vec {
+                    let mut col_vec = Vec::with_capacity(affected_pairs.len());
+                    for &(orig_row, _) in &affected_pairs {
+                        col_vec.push(CellInput::Formula {
+                            formula: BoundFormula::expand_template(&template, orig_row, col),
+                            cached: None,
+                        });
+                    }
+                    columns_data.push(col_vec);
+                }
+                out.push(Op::SetBlock {
+                    sheet,
+                    rows: mapped_rows,
+                    cols: cols_vec,
+                    columns_data,
+                });
+            }
+        }
+        other => out.push(other),
+    }
+}
+
+fn any_row_in_map(rows: &[IdRun], row_map: &BTreeMap<RowId, RowId>) -> bool {
+    rows.iter()
+        .any(|run| run.iter().any(|r| row_map.contains_key(&RowId(r))))
+}
+
+fn partition_col_runs(runs: &[IdRun], p_cols: &BTreeSet<ColId>) -> (Vec<IdRun>, Vec<IdRun>) {
+    let mut inside = Vec::new();
+    let mut outside = Vec::new();
+    for run in runs {
+        for raw_c in run.iter() {
+            if p_cols.contains(&ColId(raw_c)) {
+                push_id_coalesced(&mut inside, raw_c);
+            } else {
+                push_id_coalesced(&mut outside, raw_c);
+            }
+        }
+    }
+    (inside, outside)
+}
+
+fn map_rows_canonical(rows: &[IdRun], row_map: &BTreeMap<RowId, RowId>) -> Vec<IdRun> {
+    let mut set = BTreeSet::new();
+    for run in rows {
+        for raw_r in run.iter() {
+            let mapped = row_map.get(&RowId(raw_r)).map_or(raw_r, |m| m.0);
+            set.insert(mapped);
+        }
+    }
+    let mut out = Vec::new();
+    for raw_r in set {
+        push_id_coalesced(&mut out, raw_r);
+    }
+    out
 }

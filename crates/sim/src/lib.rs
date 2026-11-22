@@ -244,6 +244,13 @@ mod tests {
         assert!(f.set_cells_if_ops > 0, "expected SetCellsIf ops");
         assert!(f.formula_ops > 0, "expected bound formula ops");
         assert!(f.move_row_col_ops > 0, "expected MoveRows/MoveCols ops");
+        assert!(f.permute_content_ops > 0, "expected PermuteContent ops");
+        assert!(f.move_cells_ops > 0, "expected MoveCells ops");
+        assert!(f.named_range_ops > 0, "expected NamedRange ops");
+        assert!(
+            f.e16_transformed_edits > 0,
+            "expected E16 permute-transformed concurrent edits"
+        );
         assert!(f.structural_sheet_ops > 0, "expected sheet structural ops");
         assert!(f.reordered_deliveries > 0, "expected async deliveries");
         assert!(

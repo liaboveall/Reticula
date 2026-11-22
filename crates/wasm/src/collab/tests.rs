@@ -2,9 +2,11 @@ use reticula_core::id::{ColId, IdRun, RowId, pack_id};
 use reticula_core::ops::{CellEdit, CellInput, FormatPatch, ScalarValue};
 use reticula_core::value::Value;
 use reticula_sync::{ApplyResult, MemberRole, ServerDocMachine, ServerLimits};
+use reticula_wire::sync_frame::decode_sync_frame_v2;
 use reticula_wire::v2::WireRejectReasonV1;
 use reticula_wire::v2::WireStateDigestV1;
-use reticula_wire::wal::encode_pending_wal_init;
+use reticula_wire::v3::{WireCommittedTxnV3, WirePendingTxnV3, WireSyncFrameV2};
+use reticula_wire::wal::encode_pending_wal_init_v2;
 
 use super::*;
 use crate::{EngineCommand, WireIdRun};
@@ -47,9 +49,9 @@ fn connect() -> (Engine, ServerDocMachine) {
     (engine, server)
 }
 
-fn receive(engine: &mut Engine, frame: &WireSyncFrameV1) {
+fn receive(engine: &mut Engine, frame: &WireSyncFrameV2) {
     let _ = engine.handle_sync_command(SyncCommand::Receive {
-        frame: encode_sync_frame(frame).unwrap(),
+        frame: encode_sync_frame_v2(frame).unwrap(),
     });
 }
 
@@ -57,18 +59,18 @@ fn events(engine: &mut Engine) -> Vec<CollabEvent> {
     std::iter::from_fn(|| engine.pop_collab_event()).collect()
 }
 
-fn sent(events: Vec<CollabEvent>) -> WireSyncFrameV1 {
+fn sent(events: Vec<CollabEvent>) -> WireSyncFrameV2 {
     events
         .into_iter()
         .find_map(|event| match event {
-            CollabEvent::Send { bytes } => Some(decode_sync_frame(&bytes).unwrap()),
+            CollabEvent::Send { bytes } => Some(decode_sync_frame_v2(&bytes).unwrap()),
             _ => None,
         })
         .expect("expected an outbound frame")
 }
 
-fn pending(frame: WireSyncFrameV1) -> WirePendingTxnV2 {
-    let WireSyncFrameV1::Push { mut txns } = frame else {
+fn pending(frame: WireSyncFrameV2) -> WirePendingTxnV3 {
+    let WireSyncFrameV2::Push { mut txns } = frame else {
         panic!("expected Push")
     };
     assert_eq!(txns.len(), 1);
@@ -78,8 +80,8 @@ fn pending(frame: WireSyncFrameV1) -> WirePendingTxnV2 {
 fn commit(
     server: &mut ServerDocMachine,
     user: [u8; 16],
-    txn: WirePendingTxnV2,
-) -> WireCommittedTxnV2 {
+    txn: WirePendingTxnV3,
+) -> WireCommittedTxnV3 {
     let accepted = server
         .apply_and_commit(user, Some(MemberRole::Editor), txn.replica, txn, 12)
         .unwrap();
@@ -89,10 +91,10 @@ fn commit(
     commit
 }
 
-fn deliver(engine: &mut Engine, commit: WireCommittedTxnV2) {
+fn deliver(engine: &mut Engine, commit: WireCommittedTxnV3) {
     receive(
         engine,
-        &WireSyncFrameV1::Commit {
+        &WireSyncFrameV2::Commit {
             seq: commit.seq,
             replica: commit.replica,
             client_seq: commit.client_seq,
@@ -162,13 +164,13 @@ fn pending_wal_precedes_send_and_checkpoint_tracks_commit_instead_of_ack() {
     let CollabEvent::AppendPending { bytes } = &output[0] else {
         panic!("pending WAL must be first")
     };
-    let mut original_pending = encode_pending_wal_init();
+    let mut original_pending = encode_pending_wal_init_v2();
     original_pending.extend_from_slice(bytes);
     let txn = pending(sent(output));
     let commit = commit(&mut server, ALICE, txn);
     receive(
         &mut engine,
-        &WireSyncFrameV1::Ack {
+        &WireSyncFrameV2::Ack {
             replica: commit.replica,
             client_seq: commit.client_seq,
             seq: commit.seq,
@@ -216,12 +218,12 @@ fn collaborative_undo_and_redo_preserve_remote_cells_and_reject_saves_before_tru
     let overwrite = commit(
         &mut server,
         BOB,
-        WirePendingTxnV2 {
+        WirePendingTxnV3 {
             replica: bob,
             client_seq: 1,
             base_server_seq: 1,
             timestamp_ms: 11,
-            txn: ops_to_wire_txn_v2("Bob edited A1".into(), &[edit_op(0, 77.0)]).unwrap(),
+            txn: ops_to_wire_txn_v3("Bob edited A1".into(), &[edit_op(0, 77.0)]).unwrap(),
         },
     );
     deliver(&mut engine, overwrite);
@@ -231,7 +233,7 @@ fn collaborative_undo_and_redo_preserve_remote_cells_and_reject_saves_before_tru
     assert_eq!(value(&engine, 0), Value::Number(77.0));
     assert_eq!(value(&engine, 1), Value::Empty);
     let undo = pending(sent(events(&mut engine)));
-    let (_, ops) = ops_from_wire_txn_v2(undo.txn.clone()).unwrap();
+    let (_, ops) = ops_from_wire_txn_v3(undo.txn.clone()).unwrap();
     assert!(ops.iter().all(|op| matches!(op, Op::SetCellsIf { .. })));
     deliver(&mut engine, commit(&mut server, ALICE, undo));
     events(&mut engine);
@@ -246,7 +248,7 @@ fn collaborative_undo_and_redo_preserve_remote_cells_and_reject_saves_before_tru
     let denied_seq = pending(sent(events(&mut engine))).client_seq;
     receive(
         &mut engine,
-        &WireSyncFrameV1::Reject {
+        &WireSyncFrameV2::Reject {
             client_seq: denied_seq,
             reason: WireRejectReasonV1::QuotaExceeded,
         },
@@ -274,7 +276,7 @@ fn collaborative_undo_and_redo_preserve_remote_cells_and_reject_saves_before_tru
         Value::Number(99.0)
     );
     assert_eq!(
-        scan_pending_wal(pending_wal).unwrap().records[0].client_seq,
+        scan_pending_wal_any(pending_wal).unwrap().records[0].client_seq,
         denied_seq
     );
     assert_eq!(value(&engine, 0), Value::Number(77.0));
@@ -288,7 +290,7 @@ fn remote_presence_is_resolved_again_after_a_structural_commit() {
     let bob = server.allocate_replica(BOB).unwrap();
     receive(
         &mut engine,
-        &WireSyncFrameV1::Presence(WirePresenceV1 {
+        &WireSyncFrameV2::Presence(WirePresenceV1 {
             replica: bob,
             user_id: BOB,
             display_name: "Bob".into(),
@@ -309,12 +311,12 @@ fn remote_presence_is_resolved_again_after_a_structural_commit() {
     let inserted = commit(
         &mut server,
         BOB,
-        WirePendingTxnV2 {
+        WirePendingTxnV3 {
             replica: bob,
             client_seq: 1,
             base_server_seq: 0,
             timestamp_ms: 0,
-            txn: ops_to_wire_txn_v2("Insert".into(), &[insert]).unwrap(),
+            txn: ops_to_wire_txn_v3("Insert".into(), &[insert]).unwrap(),
         },
     );
     deliver(&mut engine, inserted);
@@ -352,12 +354,12 @@ fn local_cursor_follows_rows_inserted_by_someone_else() {
     let inserted = commit(
         &mut server,
         BOB,
-        WirePendingTxnV2 {
+        WirePendingTxnV3 {
             replica: bob,
             client_seq: 1,
             base_server_seq: 0,
             timestamp_ms: 0,
-            txn: ops_to_wire_txn_v2("Insert".into(), &[insert]).unwrap(),
+            txn: ops_to_wire_txn_v3("Insert".into(), &[insert]).unwrap(),
         },
     );
     deliver(&mut engine, inserted);
@@ -389,12 +391,12 @@ fn local_cursor_follows_rows_inserted_by_someone_else() {
     let edit = commit(
         &mut server,
         BOB,
-        WirePendingTxnV2 {
+        WirePendingTxnV3 {
             replica: bob,
             client_seq: 2,
             base_server_seq: 1,
             timestamp_ms: 0,
-            txn: ops_to_wire_txn_v2("Edit".into(), &[edit_op(5, 1.0)]).unwrap(),
+            txn: ops_to_wire_txn_v3("Edit".into(), &[edit_op(5, 1.0)]).unwrap(),
         },
     );
     deliver(&mut engine, edit);
@@ -420,7 +422,7 @@ fn digest_mismatch_requests_a_full_catchup_without_dropping_pending_edits() {
     wrong.content_lo ^= 1;
     receive(
         &mut engine,
-        &WireSyncFrameV1::Digest {
+        &WireSyncFrameV2::Digest {
             seq: 1,
             state_digest: wrong,
         },
@@ -437,7 +439,7 @@ fn digest_mismatch_requests_a_full_catchup_without_dropping_pending_edits() {
     let hello = sent(events(&mut engine));
     assert!(matches!(
         hello,
-        WireSyncFrameV1::Hello {
+        WireSyncFrameV2::Hello {
             last_applied_seq: 0,
             ..
         }
@@ -483,7 +485,7 @@ fn incremental_reconciliation_with_pending_edits_recalculates_only_affected_form
     let mut pending_txns = Vec::new();
     for event in events(&mut engine) {
         if let CollabEvent::Send { bytes } = event
-            && let Ok(WireSyncFrameV1::Push { txns }) = decode_sync_frame(&bytes)
+            && let Ok(WireSyncFrameV2::Push { txns }) = decode_sync_frame_v2(&bytes)
         {
             pending_txns.extend(txns);
         }
@@ -507,12 +509,12 @@ fn incremental_reconciliation_with_pending_edits_recalculates_only_affected_form
     let remote = commit(
         &mut server,
         BOB,
-        WirePendingTxnV2 {
+        WirePendingTxnV3 {
             replica: bob,
             client_seq: 1,
             base_server_seq: 4,
             timestamp_ms: 20,
-            txn: ops_to_wire_txn_v2("Bob A2".into(), &[edit_op(1, 7.0)]).unwrap(),
+            txn: ops_to_wire_txn_v3("Bob A2".into(), &[edit_op(1, 7.0)]).unwrap(),
         },
     );
     deliver(&mut engine, remote);
@@ -566,7 +568,7 @@ fn reopened_pending_wal_falls_back_cleanly_then_re_enables_incremental_reconcile
     let CollabEvent::AppendPending { bytes } = &out[0] else {
         panic!("expected AppendPending")
     };
-    let mut wal = encode_pending_wal_init();
+    let mut wal = encode_pending_wal_init_v2();
     wal.extend_from_slice(bytes);
 
     let mut reopened = open(Some(cp.info), cp.snapshot, wal);
@@ -585,12 +587,12 @@ fn reopened_pending_wal_falls_back_cleanly_then_re_enables_incremental_reconcile
     let bob_commit = commit(
         &mut server,
         BOB,
-        WirePendingTxnV2 {
+        WirePendingTxnV3 {
             replica: bob,
             client_seq: 1,
             base_server_seq: 1,
             timestamp_ms: 30,
-            txn: ops_to_wire_txn_v2("Bob A2".into(), &[edit_op(1, 9.0)]).unwrap(),
+            txn: ops_to_wire_txn_v3("Bob A2".into(), &[edit_op(1, 9.0)]).unwrap(),
         },
     );
     deliver(&mut reopened, bob_commit);
@@ -619,12 +621,12 @@ fn viewer_receives_commits_reports_read_only_rejects_edits_and_skips_presence() 
     let c1 = commit(
         &mut server,
         ALICE,
-        WirePendingTxnV2 {
+        WirePendingTxnV3 {
             replica: alice,
             client_seq: 1,
             base_server_seq: 0,
             timestamp_ms: 10,
-            txn: ops_to_wire_txn_v2("Init".into(), &[edit_op(0, 12.0)]).unwrap(),
+            txn: ops_to_wire_txn_v3("Init".into(), &[edit_op(0, 12.0)]).unwrap(),
         },
     );
 
@@ -665,4 +667,80 @@ fn viewer_receives_commits_reports_read_only_rejects_edits_and_skips_presence() 
             .any(|e| matches!(e, CollabEvent::Send { .. }))
     );
     let _ = c1;
+}
+
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), test)]
+fn e16_collab_sort_sync_rebuilds_engine_and_checkpoints_permutes() {
+    let (mut engine, mut server) = connect();
+    engine
+        .execute_user_txn(
+            "Seed rows".into(),
+            &[edit_op(0, 10.0), edit_op(1, 20.0), edit_op(2, 30.0)],
+        )
+        .unwrap();
+    let init = commit(&mut server, ALICE, pending(sent(events(&mut engine))));
+    deliver(&mut engine, init);
+    events(&mut engine);
+
+    // Local pending edit targeting row 0 (value 10), before Bob's sort commits.
+    raw(&mut engine, 0, "99");
+    let pushed = pending(sent(events(&mut engine)));
+    assert_eq!(value(&engine, 0), Value::Number(99.0));
+
+    let bob = server.allocate_replica(BOB).unwrap();
+    let bob_sort = commit(
+        &mut server,
+        BOB,
+        WirePendingTxnV3 {
+            replica: bob,
+            client_seq: 1,
+            base_server_seq: 1,
+            timestamp_ms: 40,
+            txn: ops_to_wire_txn_v3(
+                "Sort".into(),
+                &[Op::PermuteContent {
+                    sheet: SheetId(0),
+                    rows: vec![RowId(0), RowId(1), RowId(2)],
+                    cols: vec![ColId(0)],
+                    row_perm: vec![2, 0, 1],
+                }],
+            )
+            .unwrap(),
+        },
+    );
+    deliver(&mut engine, bob_sort);
+    events(&mut engine);
+
+    // Old row 0 moved to row 1 via E16 while still pending -> Engine must match Session.
+    assert_eq!(value(&engine, 0), Value::Number(30.0));
+    assert_eq!(value(&engine, 1), Value::Number(99.0));
+    assert_eq!(value(&engine, 2), Value::Number(20.0));
+    assert_eq!(
+        engine.engine.workbook().state_digest(),
+        engine
+            .collab
+            .as_ref()
+            .unwrap()
+            .machine
+            .visible()
+            .state_digest()
+    );
+
+    // Commit Alice's pending edit -> server E16 maps to row 1, checkpoint preserves permutes.
+    deliver(&mut engine, commit(&mut server, ALICE, pushed));
+    events(&mut engine);
+    let cp = checkpoint(&mut engine);
+    let reopened = open(Some(cp.info), cp.snapshot, encode_pending_wal_init_v2());
+    assert_eq!(
+        reopened
+            .collab
+            .as_ref()
+            .unwrap()
+            .machine
+            .confirmed_permutes()
+            .len(),
+        1
+    );
+    assert_eq!(value(&reopened, 1), Value::Number(99.0));
 }
