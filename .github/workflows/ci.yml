@@ -40,6 +40,7 @@ jobs:
           tool: cargo-nextest@0.9.152
       - run: cargo xtask check --rust
       - run: cargo xtask test --rust
+      - run: cargo xtask spike s6 --mock
 
   # The server's PostgreSQL tests: storage, the permission matrix over HTTP
   # and WebSocket, and a server killed mid-write that must keep every

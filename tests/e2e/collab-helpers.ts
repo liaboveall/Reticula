@@ -104,6 +104,7 @@ export async function startCollabServer(): Promise<CollabServerHandle> {
       RETICULA_DATABASE_URL: databaseUrl,
       RETICULA_PUBLIC_ORIGIN: baseUrl,
       RETICULA_AUTH_MODE: "dev-mock",
+      RETICULA_LLM_MODE: "mock",
     },
     stdio: ["ignore", "pipe", "pipe"],
   });

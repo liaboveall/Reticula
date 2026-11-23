@@ -168,6 +168,44 @@ test("compose stack: sync, server SIGKILL, database restart and recreated contai
       .poll(() => alice.evaluate(() => window.__reticula?.textAt(0, 2)), { timeout: 10_000 })
       .toBe("after-db-restart");
 
+    // 2.5 Start a `[slow]` AI analyst run on the collaborative workbook, SIGKILL
+    //     the server container mid-run, restart it, and verify durable step recovery.
+    const docId = new URL(collabUrl).searchParams.get("collab");
+    expect(docId).toBeTruthy();
+    const startRunRes = await alice.request.post(`${baseUrl}/api/workbooks/${docId}/agent/runs`, {
+      headers: { origin: baseUrl },
+      data: { prompt: "[slow] Stack restart recovery run" },
+    });
+    expect(startRunRes.status()).toBe(201);
+    const startedRun = (await startRunRes.json()) as { id: string };
+    await expect
+      .poll(
+        async () => {
+          const r = await alice.request.get(
+            `${baseUrl}/api/workbooks/${docId}/agent/runs/${startedRun.id}`,
+          );
+          const body = (await r.json()) as { run: { status: string }; steps: unknown[] };
+          return body.run.status === "running" && body.steps.length >= 2;
+        },
+        { timeout: 15_000, intervals: [150] },
+      )
+      .toBe(true);
+    compose("kill", "--signal", "SIGKILL", "server");
+    compose("start", "server");
+    await waitReady();
+    await expect
+      .poll(
+        async () => {
+          const r = await alice.request.get(
+            `${baseUrl}/api/workbooks/${docId}/agent/runs/${startedRun.id}`,
+          );
+          const body = (await r.json()) as { run: { status: string; resumeCount: number } };
+          return `${body.run.status}:${body.run.resumeCount}`;
+        },
+        { timeout: 25_000, intervals: [200] },
+      )
+      .toBe("waiting_review:1");
+
     const memory = memoryUse();
     for (const entry of memory) {
       const line = `${entry.name}: ${entry.usage}`;
