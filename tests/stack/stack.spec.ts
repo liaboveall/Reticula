@@ -184,10 +184,17 @@ test("compose stack: sync, server SIGKILL, database restart and recreated contai
           const r = await alice.request.get(
             `${baseUrl}/api/workbooks/${docId}/agent/runs/${startedRun.id}`,
           );
-          const body = (await r.json()) as { run: { status: string }; steps: unknown[] };
-          return body.run.status === "running" && body.steps.length >= 2;
+          const body = (await r.json()) as {
+            run: { status: string };
+            steps: Array<{ kind?: string }>;
+          };
+          return (
+            body.run.status === "running" &&
+            body.steps.length >= 4 &&
+            body.steps[body.steps.length - 1]?.kind === "tool_result"
+          );
         },
-        { timeout: 15_000, intervals: [150] },
+        { timeout: 15_000, intervals: [75] },
       )
       .toBe(true);
     compose("kill", "--signal", "SIGKILL", "server");

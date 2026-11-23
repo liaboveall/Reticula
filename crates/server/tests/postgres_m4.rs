@@ -1269,8 +1269,11 @@ async fn sigkill_real_child_process_recovery_resume_and_clean_fail() {
         .unwrap();
     let run_id = Uuid::parse_str(run["id"].as_str().unwrap()).unwrap();
 
-    // Poll until at least 2 steps (user_prompt + overview tool_result) are persisted while still running!
-    for _ in 0..60 {
+    // Poll until a resumable `tool_result` checkpoint (user_prompt + assistant_thought +
+    // tool_call + tool_result) is persisted while the run is still `running`.
+    let mut ready_to_kill = false;
+    let mut last_poll = Value::Null;
+    for _ in 0..160 {
         let detail: Value = client
             .get(format!("{base}/api/workbooks/{doc}/agent/runs/{run_id}"))
             .header(header::COOKIE, &cookie)
@@ -1280,12 +1283,22 @@ async fn sigkill_real_child_process_recovery_resume_and_clean_fail() {
             .json()
             .await
             .unwrap();
-        let steps_len = detail["steps"].as_array().map_or(0, Vec::len);
-        if detail["run"]["status"] == "running" && steps_len >= 2 {
+        let is_resumable = detail["run"]["status"] == "running"
+            && detail["steps"].as_array().is_some_and(|s| {
+                s.len() >= 4
+                    && s.last().and_then(|step| step["kind"].as_str()) == Some("tool_result")
+            });
+        last_poll = detail;
+        if is_resumable {
+            ready_to_kill = true;
             break;
         }
-        sleep(Duration::from_millis(100)).await;
+        sleep(Duration::from_millis(50)).await;
     }
+    assert!(
+        ready_to_kill,
+        "run never reached resumable tool_result checkpoint before SIGKILL: {last_poll}"
+    );
 
     // Force-kill child1 immediately (SIGKILL / TerminateProcess)!
     child1.kill().await.unwrap();
@@ -1306,15 +1319,18 @@ async fn sigkill_real_child_process_recovery_resume_and_clean_fail() {
             .json()
             .await
             .unwrap();
-        if detail["run"]["status"] == "waiting_review" {
-            resumed_detail = detail;
+        resumed_detail = detail;
+        if matches!(
+            resumed_detail["run"]["status"].as_str(),
+            Some("waiting_review" | "failed" | "cancelled")
+        ) {
             break;
         }
         sleep(Duration::from_millis(150)).await;
     }
     assert_eq!(
         resumed_detail["run"]["status"], "waiting_review",
-        "interrupted run should have resumed cleanly after SIGKILL"
+        "interrupted run should have resumed cleanly after SIGKILL: {resumed_detail}"
     );
     assert_eq!(resumed_detail["run"]["resumeCount"], 1);
 
