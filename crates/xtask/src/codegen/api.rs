@@ -8,7 +8,10 @@ use super::BANNER;
 use crate::util::Result;
 
 const HTTP_CLIENT: &str = r#"export class ApiError extends Error {
-  constructor(readonly status: number) {
+  constructor(
+    readonly status: number,
+    readonly body?: unknown,
+  ) {
     super(`Reticula API returned ${status}`);
   }
 }
@@ -34,7 +37,18 @@ async function request(
     options.headers = headers;
   }
   const response = await fetch(path, options);
-  if (!response.ok) throw new ApiError(response.status);
+  if (!response.ok) {
+    let body: unknown;
+    const ct = response.headers.get("content-type") ?? "";
+    if (ct.includes("application/json")) {
+      try {
+        body = await response.json();
+      } catch {
+        body = undefined;
+      }
+    }
+    throw new ApiError(response.status, body);
+  }
   return response;
 }
 "#;
@@ -87,7 +101,27 @@ fn type_of(schema: &Value) -> Result<String> {
             .collect::<Result<Vec<_>>>()?
             .join(" | "));
     }
+    if let Some(variants) = schema["anyOf"].as_array() {
+        return Ok(variants
+            .iter()
+            .map(type_of)
+            .collect::<Result<Vec<_>>>()?
+            .join(" | "));
+    }
+    if let Some(parts) = schema["allOf"].as_array() {
+        let mut mapped = parts.iter().map(type_of).collect::<Result<Vec<_>>>()?;
+        let base = if mapped.len() == 1 {
+            mapped.pop().unwrap_or_else(|| "unknown".to_owned())
+        } else {
+            mapped.join(" & ")
+        };
+        if schema["nullable"].as_bool() == Some(true) && !base.contains("null") {
+            return Ok(format!("{base} | null"));
+        }
+        return Ok(base);
+    }
     match &schema["type"] {
+        Value::Null => Ok("unknown".to_owned()),
         Value::Array(types) => Ok(types
             .iter()
             .map(ts_primitive)
@@ -101,10 +135,28 @@ fn type_of(schema: &Value) -> Result<String> {
                 Ok(format!("{item}[]"))
             }
         }
-        kind if kind == "object" && schema.get("additionalProperties").is_some() => Ok(format!(
-            "Record<string, {}>",
-            type_of(&schema["additionalProperties"])?
-        )),
+        kind if kind == "object" && schema.get("properties").is_some() => {
+            let mut fields = Vec::new();
+            for (key, prop) in map(&schema["properties"])? {
+                let mark = if matches!(&schema["required"], Value::Array(keys) if keys.iter().any(|item| item == key.as_str()))
+                {
+                    ""
+                } else {
+                    "?"
+                };
+                fields.push(format!("{key}{mark}: {}", type_of(prop)?));
+            }
+            Ok(format!("{{ {} }}", fields.join("; ")))
+        }
+        kind if kind == "object" && schema.get("additionalProperties").is_some() => {
+            let add = &schema["additionalProperties"];
+            if add.is_boolean() {
+                Ok("Record<string, unknown>".to_owned())
+            } else {
+                Ok(format!("Record<string, {}>", type_of(add)?))
+            }
+        }
+        kind if kind == "object" => Ok("Record<string, unknown>".to_owned()),
         kind => ts_primitive(kind),
     }
 }
@@ -158,7 +210,11 @@ fn operation_ts(out: &mut String, method: &str, path: &str, op: &Value) -> Resul
         }
     }
     let responses = &op["responses"];
-    let url_only = responses.get("101").is_some() || responses.get("303").is_some();
+    let url_only = responses.get("101").is_some()
+        || responses.get("303").is_some()
+        || responses
+            .pointer("/200/content/text~1event-stream")
+            .is_some();
     let mut signature = Vec::new();
     let mut query = Vec::new();
     let mut opt_query = Vec::new();

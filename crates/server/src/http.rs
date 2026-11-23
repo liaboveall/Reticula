@@ -1,5 +1,6 @@
 //! Same-origin collaboration API and its OpenAPI contract.
 
+mod agent;
 mod auth;
 mod sync;
 
@@ -24,6 +25,7 @@ use tokio_util::io::ReaderStream;
 use utoipa::{Modify, OpenApi, ToSchema};
 use uuid::Uuid;
 
+use crate::agent::{AgentManager, AgentRuntimeConfig};
 use crate::docs::{DocRooms, RoomError};
 use crate::ops::{AnonRateLimitLayer, GovernanceConfig, Metrics, RateLimiter};
 use crate::store::{
@@ -38,6 +40,7 @@ pub struct ApiState {
     store: Store,
     auth: Arc<AuthConfig>,
     rooms: DocRooms,
+    agent: AgentManager,
     metrics: Arc<Metrics>,
     limiter: Arc<RateLimiter>,
     revocations: broadcast::Sender<[u8; 32]>,
@@ -55,14 +58,30 @@ impl ApiState {
     }
 
     pub fn with_governance(store: Store, auth: AuthConfig, gov: GovernanceConfig) -> Self {
+        Self::with_agent(store, auth, gov, AgentRuntimeConfig::from_env())
+    }
+
+    pub fn with_agent(
+        store: Store,
+        auth: AuthConfig,
+        gov: GovernanceConfig,
+        agent_cfg: AgentRuntimeConfig,
+    ) -> Self {
         let metrics = Arc::new(Metrics::default());
         let limiter = Arc::new(RateLimiter::new(gov, Arc::clone(&metrics)));
         let rooms =
             DocRooms::with_governance(store.clone(), gov.max_loaded_bytes, Arc::clone(&metrics));
+        let agent = AgentManager::new(
+            store.clone(),
+            rooms.clone(),
+            Arc::clone(&metrics),
+            agent_cfg,
+        );
         Self {
             store,
             auth: Arc::new(auth),
             rooms,
+            agent,
             metrics,
             limiter,
             revocations: broadcast::channel(128).0,
@@ -75,6 +94,14 @@ impl ApiState {
 
     pub fn store(&self) -> &Store {
         &self.store
+    }
+
+    pub fn agent(&self) -> &AgentManager {
+        &self.agent
+    }
+
+    pub fn rooms(&self) -> &DocRooms {
+        &self.rooms
     }
 
     pub fn metrics(&self) -> &Arc<Metrics> {
@@ -127,6 +154,38 @@ pub fn router(state: ApiState) -> Router {
         )
         .route("/join/{token}", post(join))
         .route("/workbooks/{id}/snapshots/{seq}", get(snapshot))
+        .route(
+            "/workbooks/{id}/branches",
+            get(agent::list_branches).post(agent::create_branch),
+        )
+        .route(
+            "/workbooks/{id}/branches/{bid}",
+            delete(agent::abandon_branch),
+        )
+        .route(
+            "/workbooks/{id}/branches/{bid}/snapshots/{seq}",
+            get(agent::branch_snapshot),
+        )
+        .route(
+            "/workbooks/{id}/branches/{bid}/diff",
+            get(agent::branch_diff),
+        )
+        .route(
+            "/workbooks/{id}/agent/runs",
+            get(agent::list_agent_runs).post(agent::start_agent_run),
+        )
+        .route(
+            "/workbooks/{id}/agent/runs/{rid}",
+            get(agent::get_agent_run),
+        )
+        .route(
+            "/workbooks/{id}/agent/runs/{rid}/cancel",
+            post(agent::cancel_agent_run),
+        )
+        .route(
+            "/workbooks/{id}/agent/runs/{rid}/events",
+            get(agent::agent_run_events),
+        )
         .route("/account", get(account).delete(delete_account))
         .route("/sync/{id}", get(sync::upgrade))
         .route("/client-errors", post(report))
@@ -136,11 +195,23 @@ pub fn router(state: ApiState) -> Router {
     }
     let standard = standard.layer(DefaultBodyLimit::max(16 * 1024));
 
+    let merge_routes = Router::new()
+        .route(
+            "/workbooks/{id}/branches/{bid}/merge/preview",
+            post(agent::preview_branch_merge),
+        )
+        .route(
+            "/workbooks/{id}/branches/{bid}/merge",
+            post(agent::merge_branch),
+        )
+        .layer(DefaultBodyLimit::max(512 * 1024));
+
     let import_routes = Router::new()
         .route("/workbooks/import", post(import_workbook))
         .layer(DefaultBodyLimit::max(import_limit));
 
     standard
+        .merge(merge_routes)
         .merge(import_routes)
         .fallback(|| async { ApiError::NotFound })
         .layer(middleware::from_fn_with_state(
@@ -248,10 +319,12 @@ enum ApiError {
     Invalid(String),
     Unprocessable(String),
     Conflict(String),
+    ConflictJson(serde_json::Value),
     Quota(String),
     DiskFull(String),
     RateLimited(u64),
     Busy,
+    Unavailable(String),
     Provider,
     Internal,
 }
@@ -290,6 +363,9 @@ struct ErrorBody {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        if let Self::ConflictJson(payload) = self {
+            return (StatusCode::CONFLICT, Json(payload)).into_response();
+        }
         let retry_after = match self {
             Self::RateLimited(secs) => Some(secs),
             _ => None,
@@ -301,6 +377,7 @@ impl IntoResponse for ApiError {
             Self::Invalid(reason) => (StatusCode::BAD_REQUEST, reason),
             Self::Unprocessable(reason) => (StatusCode::UNPROCESSABLE_ENTITY, reason),
             Self::Conflict(reason) => (StatusCode::CONFLICT, reason),
+            Self::ConflictJson(_) => unreachable!(),
             Self::Quota(reason) => (StatusCode::FORBIDDEN, reason),
             Self::DiskFull(reason) => (StatusCode::INSUFFICIENT_STORAGE, reason),
             Self::RateLimited(_) => (StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded".into()),
@@ -308,6 +385,7 @@ impl IntoResponse for ApiError {
                 StatusCode::SERVICE_UNAVAILABLE,
                 "server document budget busy".into(),
             ),
+            Self::Unavailable(reason) => (StatusCode::SERVICE_UNAVAILABLE, reason),
             Self::Provider => (
                 StatusCode::BAD_GATEWAY,
                 "GitHub authentication failed".into(),
@@ -613,6 +691,7 @@ async fn delete_workbook(
         return Err(ApiError::Forbidden);
     }
     check_write_rate(&state, user.id)?;
+    state.agent.cancel_all_for_workbook(id).await;
     state.rooms.shutdown_room(id).await;
     state.store.delete_workbook(id).await?;
     Ok(StatusCode::NO_CONTENT)
@@ -993,7 +1072,11 @@ async fn account(
     jar: CookieJar,
 ) -> Result<Json<AccountSummary>, ApiError> {
     let user = auth::authenticate(&state, &jar).await?;
-    Ok(Json(state.store.account_summary(user.id).await?))
+    let mut summary = state.store.account_summary(user.id).await?;
+    summary.ai_token_limit_daily = state.agent.config().daily_token_limit;
+    summary.ai_run_limit_daily = state.agent.config().daily_run_limit;
+    summary.ai_enabled = state.agent.is_enabled();
+    Ok(Json(summary))
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -1015,6 +1098,7 @@ async fn delete_account(
             "account deletion requires confirm = \"DELETE\"".into(),
         ));
     }
+    state.agent.cancel_all_for_user(user.id).await;
     let lists = state.store.list_workbooks(user.id).await?;
     for wb in &lists.owned {
         state.rooms.shutdown_room(wb.id).await;
@@ -1121,6 +1205,18 @@ fn percent_decode_utf8(input: &str) -> Option<String> {
         revoke_share_link,
         join,
         snapshot,
+        agent::list_branches,
+        agent::create_branch,
+        agent::abandon_branch,
+        agent::branch_snapshot,
+        agent::branch_diff,
+        agent::preview_branch_merge,
+        agent::merge_branch,
+        agent::list_agent_runs,
+        agent::start_agent_run,
+        agent::get_agent_run,
+        agent::cancel_agent_run,
+        agent::agent_run_events,
         history,
         txns,
         list_versions,

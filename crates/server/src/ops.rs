@@ -54,6 +54,7 @@ pub enum WsConnKind {
 #[derive(Default)]
 pub struct Metrics {
     active_rooms: AtomicU64,
+    draft_rooms: AtomicU64,
     loaded_bytes: AtomicU64,
     ws_authed: AtomicU64,
     ws_viewer: AtomicU64,
@@ -65,12 +66,64 @@ pub struct Metrics {
     snapshots_pruned_total: AtomicU64,
     rate_limited_total: AtomicU64,
     rejected_txns_total: AtomicU64,
+    agent_runs_active: AtomicU64,
+    agent_runs_waiting_review: AtomicU64,
+    agent_runs_merged: AtomicU64,
+    agent_runs_rejected: AtomicU64,
+    agent_runs_failed: AtomicU64,
+    agent_runs_cancelled: AtomicU64,
+    agent_tokens_prompt: AtomicU64,
+    agent_tokens_cached: AtomicU64,
+    agent_tokens_completion: AtomicU64,
 }
 
 impl Metrics {
     pub fn set_rooms(&self, active_rooms: u64, loaded_bytes: u64) {
+        self.set_rooms_with_drafts(active_rooms, 0, loaded_bytes);
+    }
+
+    pub fn set_rooms_with_drafts(&self, active_rooms: u64, draft_rooms: u64, loaded_bytes: u64) {
         self.active_rooms.store(active_rooms, Ordering::Relaxed);
+        self.draft_rooms.store(draft_rooms, Ordering::Relaxed);
         self.loaded_bytes.store(loaded_bytes, Ordering::Relaxed);
+    }
+
+    pub fn inc_agent_runs_active(&self) {
+        self.agent_runs_active.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn dec_agent_runs_active(&self) {
+        let _ = self
+            .agent_runs_active
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_sub(1))
+            });
+    }
+
+    pub fn record_agent_run_status(&self, status: &str) {
+        let counter = match status {
+            "waiting_review" => &self.agent_runs_waiting_review,
+            "merged" => &self.agent_runs_merged,
+            "rejected" => &self.agent_runs_rejected,
+            "cancelled" => &self.agent_runs_cancelled,
+            _ => &self.agent_runs_failed,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn add_agent_tokens(&self, prompt: u64, cached: u64, completion: u64) {
+        if prompt > 0 {
+            self.agent_tokens_prompt
+                .fetch_add(prompt, Ordering::Relaxed);
+        }
+        if cached > 0 {
+            self.agent_tokens_cached
+                .fetch_add(cached, Ordering::Relaxed);
+        }
+        if completion > 0 {
+            self.agent_tokens_completion
+                .fetch_add(completion, Ordering::Relaxed);
+        }
     }
 
     pub fn track_ws(self: &Arc<Self>, kind: WsConnKind) -> WsConnGuard {
@@ -139,9 +192,21 @@ impl Metrics {
         let rate_limited = self.rate_limited_total.load(Ordering::Relaxed);
         let rejected = self.rejected_txns_total.load(Ordering::Relaxed);
         let over_soft = u8::from(disk_over_soft_limit);
+        let draft_rooms = self.draft_rooms.load(Ordering::Relaxed);
+        let agent_active = self.agent_runs_active.load(Ordering::Relaxed);
+        let runs_waiting = self.agent_runs_waiting_review.load(Ordering::Relaxed);
+        let runs_merged = self.agent_runs_merged.load(Ordering::Relaxed);
+        let runs_rejected = self.agent_runs_rejected.load(Ordering::Relaxed);
+        let runs_failed = self.agent_runs_failed.load(Ordering::Relaxed);
+        let runs_cancelled = self.agent_runs_cancelled.load(Ordering::Relaxed);
+        let tok_prompt = self.agent_tokens_prompt.load(Ordering::Relaxed);
+        let tok_cached = self.agent_tokens_cached.load(Ordering::Relaxed);
+        let tok_completion = self.agent_tokens_completion.load(Ordering::Relaxed);
 
         let _ = writeln!(out, "# TYPE reticula_active_rooms gauge");
         let _ = writeln!(out, "reticula_active_rooms {active_rooms}");
+        let _ = writeln!(out, "# TYPE reticula_draft_rooms_active gauge");
+        let _ = writeln!(out, "reticula_draft_rooms_active {draft_rooms}");
         let _ = writeln!(out, "# TYPE reticula_loaded_bytes gauge");
         let _ = writeln!(out, "reticula_loaded_bytes {loaded_bytes}");
         let _ = writeln!(out, "# TYPE reticula_active_ws_connections gauge");
@@ -180,6 +245,42 @@ impl Metrics {
         let _ = writeln!(out, "reticula_rate_limited_total {rate_limited}");
         let _ = writeln!(out, "# TYPE reticula_rejected_txns_total counter");
         let _ = writeln!(out, "reticula_rejected_txns_total {rejected}");
+        let _ = writeln!(out, "# TYPE reticula_agent_runs_active gauge");
+        let _ = writeln!(out, "reticula_agent_runs_active {agent_active}");
+        let _ = writeln!(out, "# TYPE reticula_agent_runs_total counter");
+        let _ = writeln!(
+            out,
+            "reticula_agent_runs_total{{status=\"waiting_review\"}} {runs_waiting}"
+        );
+        let _ = writeln!(
+            out,
+            "reticula_agent_runs_total{{status=\"merged\"}} {runs_merged}"
+        );
+        let _ = writeln!(
+            out,
+            "reticula_agent_runs_total{{status=\"rejected\"}} {runs_rejected}"
+        );
+        let _ = writeln!(
+            out,
+            "reticula_agent_runs_total{{status=\"failed\"}} {runs_failed}"
+        );
+        let _ = writeln!(
+            out,
+            "reticula_agent_runs_total{{status=\"cancelled\"}} {runs_cancelled}"
+        );
+        let _ = writeln!(out, "# TYPE reticula_agent_tokens_total counter");
+        let _ = writeln!(
+            out,
+            "reticula_agent_tokens_total{{kind=\"prompt\"}} {tok_prompt}"
+        );
+        let _ = writeln!(
+            out,
+            "reticula_agent_tokens_total{{kind=\"cached\"}} {tok_cached}"
+        );
+        let _ = writeln!(
+            out,
+            "reticula_agent_tokens_total{{kind=\"completion\"}} {tok_completion}"
+        );
         out
     }
 }

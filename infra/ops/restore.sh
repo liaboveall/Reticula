@@ -79,6 +79,9 @@ if [[ -f "${BACKUP_DIR}/row-counts.txt" ]]; then
       SELECT 'txns=' || count(*) FROM txns;
       SELECT 'snapshots=' || count(*) FROM snapshots;
       SELECT 'versions=' || count(*) FROM versions;
+      SELECT 'agent_runs=' || count(*) FROM agent_runs;
+      SELECT 'agent_steps=' || count(*) FROM agent_steps;
+      SELECT 'quotas=' || count(*) FROM quotas;
     ")"
   diff -u "${BACKUP_DIR}/row-counts.txt" <(printf '%s\n' "$actual_counts")
 fi

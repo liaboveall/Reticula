@@ -67,6 +67,9 @@ compose exec -T postgres psql \
     SELECT 'txns=' || count(*) FROM txns;
     SELECT 'snapshots=' || count(*) FROM snapshots;
     SELECT 'versions=' || count(*) FROM versions;
+    SELECT 'agent_runs=' || count(*) FROM agent_runs;
+    SELECT 'agent_steps=' || count(*) FROM agent_steps;
+    SELECT 'quotas=' || count(*) FROM quotas;
   " > "${STAGE_DIR}/row-counts.txt"
 
 echo "[backup] archiving workbooks volume (${WORKBOOKS_VOLUME})..."

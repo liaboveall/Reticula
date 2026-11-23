@@ -27,6 +27,7 @@ use crate::docs::{
     CLOSE_ACCESS_REVOKED, CLOSE_SERVER_BUSY, RoomConnection, RoomError, RoomOutbound,
 };
 use crate::ops::{AnonWsPermit, client_ip_parts};
+use crate::store::MAIN_BRANCH;
 
 const HEARTBEAT: Duration = Duration::from_secs(30);
 const IDLE: Duration = Duration::from_secs(60);
@@ -35,6 +36,7 @@ const SEND_TIMEOUT: Duration = Duration::from_secs(10);
 #[derive(Deserialize)]
 pub(super) struct SyncQuery {
     share: Option<String>,
+    branch: Option<Uuid>,
 }
 
 enum WsPrincipal {
@@ -51,9 +53,13 @@ enum WsPrincipal {
 }
 
 #[utoipa::path(get, path = "/api/sync/{id}", operation_id = "sync",
-    params(("id" = Uuid, Path), ("share" = Option<String>, Query)),
+    params(
+        ("id" = Uuid, Path),
+        ("share" = Option<String>, Query),
+        ("branch" = Option<Uuid>, Query),
+    ),
     security(("session" = [])),
-    responses((status = 101, description = "Binary sync protocol v1"), (status = 400), (status = 401), (status = 403), (status = 429), (status = 503)))]
+    responses((status = 101, description = "Binary sync protocol v1/v2"), (status = 400), (status = 401), (status = 403), (status = 404), (status = 429), (status = 503)))]
 pub(super) async fn upgrade(
     State(state): State<ApiState>,
     Path(id): Path<Uuid>,
@@ -64,6 +70,7 @@ pub(super) async fn upgrade(
     upgrade: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
 ) -> Result<Response, ApiError> {
     state.auth.check_origin(&headers)?;
+    let branch_id = query.branch.unwrap_or(MAIN_BRANCH);
     let revocations = state.revocations.subscribe();
     let authed = auth::authenticate_optional(&state, &jar).await?;
 
@@ -77,6 +84,9 @@ pub(super) async fn upgrade(
             session_hash: hash,
         }
     } else if let Some(token) = query.share.as_deref().filter(|t| !t.is_empty()) {
+        if branch_id != MAIN_BRANCH {
+            return Err(ApiError::Forbidden);
+        }
         let ip = client_ip_parts(peer.map(|Extension(info)| info.0), &headers);
         if authed.is_none() && crate::ops::has_session_cookie(&headers) {
             state
@@ -104,8 +114,12 @@ pub(super) async fn upgrade(
         return Err(ApiError::Unauthorized);
     };
 
+    if branch_id != MAIN_BRANCH && state.store.get_branch(id, branch_id).await?.is_none() {
+        return Err(ApiError::NotFound);
+    }
+
     let upgrade = upgrade.map_err(|_| ApiError::Invalid("expected a WebSocket upgrade".into()))?;
-    if state.rooms.would_be_busy(id).await {
+    if state.rooms.would_be_busy_branch(id, branch_id).await {
         return Err(ApiError::Busy);
     }
 
@@ -143,7 +157,15 @@ pub(super) async fn upgrade(
             };
             match state
                 .rooms
-                .join_session(id, user_id, role, display_name, share_link_id, hello)
+                .join_session_branch(
+                    id,
+                    branch_id,
+                    user_id,
+                    role,
+                    display_name,
+                    share_link_id,
+                    hello,
+                )
                 .await
             {
                 Ok(mut room) => {

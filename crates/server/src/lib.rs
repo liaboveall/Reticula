@@ -1,5 +1,6 @@
-//! Document actors and durable storage for the Reticula collaboration server.
+//! Document actors, AI analyst runtime, and durable storage for the Reticula collaboration server.
 
+pub mod agent;
 pub mod docs;
 pub mod http;
 pub mod ops;

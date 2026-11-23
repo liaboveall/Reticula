@@ -201,7 +201,13 @@ async fn main() {
             let limits = storage_limits_from_env();
             let gov = governance_from_env();
             match Store::connect_with_limits(&database_url, PathBuf::from(data_dir), limits).await {
-                Ok(store) => Some(ApiState::with_governance(store, auth, gov)),
+                Ok(store) => {
+                    let api_state = ApiState::with_governance(store, auth, gov);
+                    if let Err(error) = api_state.agent().recover_interrupted_runs().await {
+                        tracing::error!(error = %error, "failed to recover interrupted AI agent runs");
+                    }
+                    Some(api_state)
+                }
                 Err(error) => {
                     tracing::error!(error = %error, "could not initialize collaboration storage");
                     std::process::exit(1);

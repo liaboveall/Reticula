@@ -1,5 +1,6 @@
 //! PostgreSQL transaction log, snapshots, quotas, and replica high-water marks.
 
+mod agent;
 mod collaboration;
 mod history;
 mod snapshot;
@@ -24,6 +25,9 @@ use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use thiserror::Error;
 use uuid::Uuid;
 
+pub use agent::{
+    AgentRunDetail, AgentRunRecord, BranchRecord, DailyQuotaUsage, InterruptedAgentRun,
+};
 pub use collaboration::{
     AccountSummary, AnonymousShareAccess, DeleteAccountOutcome, MemberEntry, SessionIdentity,
     ShareLinkRecord, User, WorkbookAccess, WorkbookListItem, WorkbookLists, WorkbookVisibility,
@@ -104,6 +108,7 @@ pub struct Store {
 
 pub(crate) struct SnapshotCapture {
     doc: Uuid,
+    branch_id: Uuid,
     seq: u64,
     workbook: Workbook<BoundFormula>,
     watermarks: Vec<ReplicaWatermark>,
@@ -114,6 +119,7 @@ impl From<&ServerDocMachine> for SnapshotCapture {
     fn from(machine: &ServerDocMachine) -> Self {
         Self {
             doc: Uuid::from_bytes(machine.doc_id()),
+            branch_id: Uuid::from_bytes(machine.branch_id()),
             seq: machine.head_seq(),
             workbook: machine.workbook().clone(),
             watermarks: machine.watermarks(),
@@ -514,10 +520,27 @@ impl Store {
         Ok(())
     }
 
-    /// Makes the whole staged batch durable, including all replica watermarks.
+    /// Makes the whole staged batch durable on `MAIN_BRANCH`, including all replica watermarks.
     pub async fn commit_batch(
         &self,
         doc: Uuid,
+        epoch: u8,
+        entries: &[BatchEntry<'_>],
+        est_bytes: usize,
+    ) -> Result<(), StoreError> {
+        self.commit_batch_branch(doc, MAIN_BRANCH, epoch, entries, est_bytes)
+            .await
+    }
+
+    /// Makes the whole staged batch durable on `(doc, branch_id)`.
+    ///
+    /// Preserves `workbooks.est_bytes` isolation: non-main branches update
+    /// `branches.est_bytes` while continuing to account log bytes against
+    /// `workbooks.log_bytes` and `users.storage_bytes`.
+    pub async fn commit_batch_branch(
+        &self,
+        doc: Uuid,
+        branch_id: Uuid,
         epoch: u8,
         entries: &[BatchEntry<'_>],
         est_bytes: usize,
@@ -561,38 +584,46 @@ impl Store {
         let previous = integer::<_, i64>(previous, "previous seq")?;
         let est_bytes = integer::<_, i64>(est_bytes, "estimated size")?;
         let mut db = self.pool.begin().await?;
-        let locked = sqlx::query!(
+        let owner_id: Option<Uuid> = sqlx::query_scalar(
             "SELECT owner_id FROM workbooks WHERE id = $1 AND log_epoch = $2 FOR UPDATE",
-            doc,
-            i16::from(epoch)
         )
+        .bind(doc)
+        .bind(i16::from(epoch))
         .fetch_optional(&mut *db)
         .await?;
-        let head = sqlx::query_scalar!(
-            "SELECT COALESCE(MAX(seq), 0) AS \"head!\" FROM txns WHERE workbook_id = $1 AND branch_id = $2",
-            doc,
-            MAIN_BRANCH,
+        let head: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(MAX(seq), 0) FROM txns WHERE workbook_id = $1 AND branch_id = $2",
         )
+        .bind(doc)
+        .bind(branch_id)
         .fetch_one(&mut *db)
         .await?;
-        let Some(wb) = locked else {
+        let Some(owner_id) = owner_id else {
             return Err(StoreError::StaleActor);
         };
         if head != previous {
             return Err(StoreError::StaleActor);
         }
-        sqlx::query!(
+        sqlx::query(
             "INSERT INTO txns (workbook_id, branch_id, seq, replica, client_seq, base_seq, user_id, created_at, payload)
              SELECT $1, $2, b.seq, b.replica, b.client_seq, b.base_seq, b.user_id,
                     to_timestamp(b.timestamp_ms::float8 / 1000), b.payload
              FROM UNNEST($3::bigint[], $4::integer[], $5::bigint[], $6::bigint[],
                          $7::uuid[], $8::bigint[], $9::bytea[])
                   AS b(seq, replica, client_seq, base_seq, user_id, timestamp_ms, payload)",
-            doc, MAIN_BRANCH, &seqs, &replicas, &client_seqs, &bases, &users, &timestamps, &payloads,
         )
+        .bind(doc)
+        .bind(branch_id)
+        .bind(&seqs)
+        .bind(&replicas)
+        .bind(&client_seqs)
+        .bind(&bases)
+        .bind(&users)
+        .bind(&timestamps)
+        .bind(&payloads)
         .execute(&mut *db)
         .await?;
-        let updated = sqlx::query!(
+        let updated = sqlx::query(
             "UPDATE replicas AS r
              SET last_client_seq = b.last_client_seq, max_id_counter = b.max_id_counter
              FROM (
@@ -606,12 +637,12 @@ impl Store {
              WHERE r.workbook_id = $1 AND r.replica = b.replica AND r.user_id = b.user_id
                    AND r.last_client_seq = b.first_client_seq - 1
                    AND r.max_id_counter <= b.max_id_counter",
-            doc,
-            &replicas,
-            &users,
-            &client_seqs,
-            &counters,
         )
+        .bind(doc)
+        .bind(&replicas)
+        .bind(&users)
+        .bind(&client_seqs)
+        .bind(&counters)
         .execute(&mut *db)
         .await?;
         let distinct = replicas
@@ -621,21 +652,37 @@ impl Store {
         if updated.rows_affected() != distinct as u64 {
             return Err(StoreError::StaleActor);
         }
-        sqlx::query!(
-            "UPDATE workbooks SET log_bytes = log_bytes + $2, est_bytes = $3, updated_at = now() WHERE id = $1",
-            doc,
-            log_bytes,
-            est_bytes
-        )
-        .execute(&mut *db)
-        .await?;
-        sqlx::query!(
-            "UPDATE users SET storage_bytes = storage_bytes + $2 WHERE id = $1",
-            wb.owner_id,
-            log_bytes,
-        )
-        .execute(&mut *db)
-        .await?;
+        if branch_id == MAIN_BRANCH {
+            sqlx::query(
+                "UPDATE workbooks SET log_bytes = log_bytes + $2, est_bytes = $3, updated_at = now() WHERE id = $1",
+            )
+            .bind(doc)
+            .bind(log_bytes)
+            .bind(est_bytes)
+            .execute(&mut *db)
+            .await?;
+        } else {
+            sqlx::query(
+                "UPDATE workbooks SET log_bytes = log_bytes + $2, updated_at = now() WHERE id = $1",
+            )
+            .bind(doc)
+            .bind(log_bytes)
+            .execute(&mut *db)
+            .await?;
+            sqlx::query(
+                "UPDATE branches SET est_bytes = $3, updated_at = now() WHERE workbook_id = $1 AND id = $2",
+            )
+            .bind(doc)
+            .bind(branch_id)
+            .bind(est_bytes)
+            .execute(&mut *db)
+            .await?;
+        }
+        sqlx::query("UPDATE users SET storage_bytes = storage_bytes + $2 WHERE id = $1")
+            .bind(owner_id)
+            .bind(log_bytes)
+            .execute(&mut *db)
+            .await?;
         db.commit().await?;
         self.disk_used_bytes.fetch_add(
             u64::try_from(log_bytes.max(0)).unwrap_or(0),
@@ -644,20 +691,42 @@ impl Store {
         Ok(())
     }
 
-    /// Loads one consistent database revision, then replays its durable tail.
+    /// Loads `MAIN_BRANCH` at one consistent database revision, then replays its durable tail.
     pub async fn load_machine(&self, doc: Uuid) -> Result<ServerDocMachine, StoreError> {
+        self.load_machine_branch(doc, MAIN_BRANCH).await
+    }
+
+    /// Loads `(doc, branch_id)` at one consistent database revision, injecting the
+    /// appropriate branch snapshot URL prefix (`MAIN_BRANCH` vs `/branches/{bid}`).
+    pub async fn load_machine_branch(
+        &self,
+        doc: Uuid,
+        branch_id: Uuid,
+    ) -> Result<ServerDocMachine, StoreError> {
         let mut db = self.pool.begin().await?;
-        sqlx::query!("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
             .execute(&mut *db)
             .await?;
-        let book = sqlx::query!(
-            "SELECT log_epoch, next_per_epoch_replica FROM workbooks WHERE id = $1",
-            doc
-        )
-        .fetch_optional(&mut *db)
-        .await?
-        .ok_or(StoreError::NotFound)?;
-        let snapshots = snapshot::list_desc(&mut db, doc).await?;
+        let book: (i16, i32) =
+            sqlx::query_as("SELECT log_epoch, next_per_epoch_replica FROM workbooks WHERE id = $1")
+                .bind(doc)
+                .fetch_optional(&mut *db)
+                .await?
+                .ok_or(StoreError::NotFound)?;
+
+        if branch_id != MAIN_BRANCH {
+            let exists: Option<Uuid> =
+                sqlx::query_scalar("SELECT id FROM branches WHERE workbook_id = $1 AND id = $2")
+                    .bind(doc)
+                    .bind(branch_id)
+                    .fetch_optional(&mut *db)
+                    .await?;
+            if exists.is_none() {
+                return Err(StoreError::NotFound);
+            }
+        }
+
+        let snapshots = snapshot::list_desc_branch(&mut db, doc, branch_id).await?;
         let mut snapshot = None;
         for candidate in snapshots {
             if tokio::fs::try_exists(self.data_dir.join(candidate.storage_key())).await? {
@@ -672,44 +741,53 @@ impl Store {
             }
             tracing::warn!(
                 workbook_id = %doc,
+                branch_id = %branch_id,
                 seq = candidate.seq,
                 storage_key = candidate.storage_key(),
                 "snapshot file missing on disk; falling back to earlier snapshot and replaying txns"
             );
         }
         let snapshot_seq = snapshot.as_ref().map_or(0, |file| file.seq);
-        let tail = sqlx::query!(
+        let tail: Vec<(i64, i32, i64, Uuid, Vec<u8>)> = sqlx::query_as(
             "SELECT seq, replica, client_seq, user_id, payload FROM txns
              WHERE workbook_id = $1 AND branch_id = $2 AND seq > $3 ORDER BY seq",
-            doc,
-            MAIN_BRANCH,
-            snapshot_seq,
         )
+        .bind(doc)
+        .bind(branch_id)
+        .bind(snapshot_seq)
         .fetch_all(&mut *db)
         .await?;
-        let replicas = sqlx::query!("SELECT replica, user_id, last_client_seq, max_id_counter FROM replicas WHERE workbook_id = $1", doc)
-            .fetch_all(&mut *db)
-            .await?;
+        let replicas: Vec<(i32, Uuid, i64, i64)> = sqlx::query_as(
+            "SELECT replica, user_id, last_client_seq, max_id_counter FROM replicas WHERE workbook_id = $1",
+        )
+        .bind(doc)
+        .fetch_all(&mut *db)
+        .await?;
         db.commit().await?;
 
         let watermarks = replicas
             .into_iter()
-            .map(|row| {
+            .map(|(replica, user_id, last_client_seq, max_id_counter)| {
                 Ok(ReplicaWatermark {
-                    replica: integer(row.replica, "replica")?,
-                    user_id: row.user_id.into_bytes(),
-                    last_client_seq: integer(row.last_client_seq, "client seq")?,
-                    max_id_counter: integer(row.max_id_counter, "max id counter")?,
+                    replica: integer(replica, "replica")?,
+                    user_id: user_id.into_bytes(),
+                    last_client_seq: integer(last_client_seq, "client seq")?,
+                    max_id_counter: integer(max_id_counter, "max id counter")?,
                 })
             })
             .collect::<Result<Vec<_>, StoreError>>()?;
-        let epoch = integer(book.log_epoch, "epoch")?;
-        let next = integer(book.next_per_epoch_replica, "next replica")?;
+        let epoch = integer(book.0, "epoch")?;
+        let next = integer(book.1, "next replica")?;
         let dir = self.data_dir.clone();
         let server_limits = ServerLimits {
             max_populated_cells: self.limits.max_doc_cells as u64,
             max_doc_bytes: self.limits.max_doc_bytes,
             ..ServerLimits::default()
+        };
+        let snapshot_prefix = if branch_id == MAIN_BRANCH {
+            format!("/api/workbooks/{doc}")
+        } else {
+            format!("/api/workbooks/{doc}/branches/{branch_id}")
         };
         tokio::task::spawn_blocking(move || {
             let (workbook, snapshot_permutes) = match snapshot {
@@ -718,14 +796,14 @@ impl Store {
             };
             let commits = tail
                 .into_iter()
-                .map(|row| {
-                    let seq = integer(row.seq, "transaction seq")?;
-                    let record = decode_log(&row.payload, seq)?;
+                .map(|(seq_i64, rep_i32, cseq_i64, uid, payload)| {
+                    let seq = integer(seq_i64, "transaction seq")?;
+                    let record = decode_log(&payload, seq)?;
                     Ok(WireCommittedTxnV3 {
                         seq,
-                        replica: integer(row.replica, "replica")?,
-                        client_seq: integer(row.client_seq, "client seq")?,
-                        user_id: row.user_id.into_bytes(),
+                        replica: integer(rep_i32, "replica")?,
+                        client_seq: integer(cseq_i64, "client seq")?,
+                        user_id: uid.into_bytes(),
                         timestamp_ms: record.timestamp_ms,
                         txn: WireTxnV3 {
                             label: record.label,
@@ -736,8 +814,8 @@ impl Store {
                 .collect::<Result<Vec<_>, StoreError>>()?;
             ServerDocMachine::from_snapshot_and_log(
                 doc.into_bytes(),
-                MAIN_BRANCH.into_bytes(),
-                format!("/api/workbooks/{doc}"),
+                branch_id.into_bytes(),
+                snapshot_prefix,
                 epoch,
                 integer(snapshot_seq, "snapshot seq")?,
                 workbook,
@@ -764,7 +842,10 @@ impl Store {
         &self,
         capture: SnapshotCapture,
     ) -> Result<SnapshotFile, StoreError> {
-        if let Some(file) = self.snapshot(capture.doc, capture.seq).await? {
+        if let Some(file) = self
+            .snapshot_branch(capture.doc, capture.branch_id, capture.seq)
+            .await?
+        {
             let dir = self.data_dir.clone();
             return tokio::task::spawn_blocking(move || {
                 file.open(&dir)?;
@@ -775,9 +856,10 @@ impl Store {
         let dir = self.data_dir.clone();
         let seq = integer(capture.seq, "snapshot seq")?;
         let file = tokio::task::spawn_blocking(move || {
-            SnapshotFile::write(
+            SnapshotFile::write_branch(
                 &dir,
                 capture.doc,
+                capture.branch_id,
                 seq,
                 &capture.workbook,
                 capture.watermarks,
@@ -793,17 +875,28 @@ impl Store {
     }
 
     pub async fn prune_snapshots(&self, doc: Uuid, keep_recent: usize) -> Result<u64, StoreError> {
+        self.prune_snapshots_branch(doc, MAIN_BRANCH, keep_recent)
+            .await
+    }
+
+    pub async fn prune_snapshots_branch(
+        &self,
+        doc: Uuid,
+        branch_id: Uuid,
+        keep_recent: usize,
+    ) -> Result<u64, StoreError> {
         let mut db = self.pool.begin().await?;
-        let Some(owner_id) = sqlx::query_scalar!(
+        let Some(owner_id) = sqlx::query_scalar::<_, Uuid>(
             "SELECT owner_id FROM workbooks WHERE id = $1 FOR UPDATE",
-            doc,
         )
+        .bind(doc)
         .fetch_optional(&mut *db)
         .await?
         else {
             return Ok(0);
         };
-        let (pruned_keys, reclaimed) = snapshot::prune(&mut db, doc, owner_id, keep_recent).await?;
+        let (pruned_keys, reclaimed) =
+            snapshot::prune_branch(&mut db, doc, branch_id, owner_id, keep_recent).await?;
         db.commit().await?;
         if pruned_keys.is_empty() {
             return Ok(0);
@@ -818,31 +911,61 @@ impl Store {
     }
 
     pub async fn workbook_est_bytes(&self, doc: Uuid) -> Result<u64, StoreError> {
-        let est = sqlx::query_scalar!("SELECT est_bytes FROM workbooks WHERE id = $1", doc)
-            .fetch_optional(&self.pool)
-            .await?
-            .ok_or(StoreError::NotFound)?;
+        self.branch_est_bytes(doc, MAIN_BRANCH).await
+    }
+
+    pub async fn branch_est_bytes(&self, doc: Uuid, branch_id: Uuid) -> Result<u64, StoreError> {
+        let est: i64 = if branch_id == MAIN_BRANCH {
+            sqlx::query_scalar("SELECT est_bytes FROM workbooks WHERE id = $1")
+                .bind(doc)
+                .fetch_optional(&self.pool)
+                .await?
+                .ok_or(StoreError::NotFound)?
+        } else {
+            sqlx::query_scalar("SELECT est_bytes FROM branches WHERE workbook_id = $1 AND id = $2")
+                .bind(doc)
+                .bind(branch_id)
+                .fetch_optional(&self.pool)
+                .await?
+                .ok_or(StoreError::NotFound)?
+        };
         Ok(u64::try_from(est.max(0)).unwrap_or(0))
     }
 
-    pub(crate) async fn receipt(
+    pub(crate) async fn receipt_branch(
         &self,
         doc: Uuid,
+        branch_id: Uuid,
         replica: u32,
         client_seq: u64,
     ) -> Result<(u64, u64), StoreError> {
         let replica = integer::<_, i32>(replica, "replica")?;
         let client_seq = integer::<_, i64>(client_seq, "client seq")?;
-        let row = sqlx::query!(
+        let row: Option<(i64, Vec<u8>)> = sqlx::query_as(
             "SELECT seq, payload FROM txns WHERE workbook_id = $1 AND branch_id = $2 AND replica = $3 AND client_seq = $4",
-            doc, MAIN_BRANCH, replica, client_seq,
-        ).fetch_optional(&self.pool).await?.ok_or(StoreError::Invalid("missing durable receipt"))?;
-        let seq = integer(row.seq, "receipt seq")?;
-        Ok((seq, decode_log(&row.payload, seq)?.timestamp_ms))
+        )
+        .bind(doc)
+        .bind(branch_id)
+        .bind(replica)
+        .bind(client_seq)
+        .fetch_optional(&self.pool)
+        .await?;
+        let (seq_i64, payload) = row.ok_or(StoreError::Invalid("missing durable receipt"))?;
+        let seq = integer(seq_i64, "receipt seq")?;
+        Ok((seq, decode_log(&payload, seq)?.timestamp_ms))
     }
 
     pub async fn snapshot(&self, doc: Uuid, seq: u64) -> Result<Option<SnapshotFile>, StoreError> {
-        snapshot::at(&self.pool, doc, integer(seq, "snapshot seq")?).await
+        self.snapshot_branch(doc, MAIN_BRANCH, seq).await
+    }
+
+    pub async fn snapshot_branch(
+        &self,
+        doc: Uuid,
+        branch_id: Uuid,
+        seq: u64,
+    ) -> Result<Option<SnapshotFile>, StoreError> {
+        snapshot::at_branch(&self.pool, doc, branch_id, integer(seq, "snapshot seq")?).await
     }
 
     pub fn data_dir(&self) -> &Path {

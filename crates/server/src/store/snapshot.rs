@@ -1,4 +1,8 @@
 //! Writes immutable RTCLSNAP files before publishing their PostgreSQL metadata.
+//!
+//! `MAIN_BRANCH` snapshots remain at `snapshots/{doc}/{seq}.rtclsnap` for full
+//! backward compatibility; non-main branches store isolated snapshots under
+//! `snapshots/{doc}/branches/{branch}/{seq}.rtclsnap`.
 
 use std::collections::BTreeSet;
 use std::fs::{self, File};
@@ -23,6 +27,7 @@ const FORMAT_VERSION: i32 = 1;
 #[derive(Clone, Debug, PartialEq, Eq, sqlx::FromRow)]
 pub struct SnapshotFile {
     pub(super) workbook_id: Uuid,
+    pub(super) branch_id: Uuid,
     pub(super) seq: i64,
     format_version: i32,
     storage_key: String,
@@ -39,13 +44,17 @@ impl SnapshotFile {
         self.size_bytes.unsigned_abs()
     }
 
+    pub fn branch_id(&self) -> Uuid {
+        self.branch_id
+    }
+
     pub(super) fn storage_key(&self) -> &str {
         &self.storage_key
     }
 
     /// Opens a verified snapshot and rewinds it for streaming or decoding.
     pub fn open(&self, data_dir: &Path) -> Result<File, StoreError> {
-        if self.storage_key != storage_key(self.workbook_id, self.seq) {
+        if self.storage_key != storage_key_branch(self.workbook_id, self.branch_id, self.seq) {
             return Err(StoreError::Invalid("snapshot path"));
         }
         let mut file = File::open(data_dir.join(&self.storage_key))?;
@@ -84,8 +93,36 @@ impl SnapshotFile {
         watermarks: Vec<ReplicaWatermark>,
         permutes: &[CommittedPermute],
     ) -> Result<Self, StoreError> {
-        let storage_key = storage_key(doc, seq);
-        let parent = data_dir.join("snapshots").join(doc.to_string());
+        Self::write_branch(
+            data_dir,
+            doc,
+            MAIN_BRANCH,
+            seq,
+            workbook,
+            watermarks,
+            permutes,
+        )
+    }
+
+    pub(super) fn write_branch(
+        data_dir: &Path,
+        doc: Uuid,
+        branch_id: Uuid,
+        seq: i64,
+        workbook: &Workbook<BoundFormula>,
+        watermarks: Vec<ReplicaWatermark>,
+        permutes: &[CommittedPermute],
+    ) -> Result<Self, StoreError> {
+        let storage_key = storage_key_branch(doc, branch_id, seq);
+        let parent = if branch_id == MAIN_BRANCH {
+            data_dir.join("snapshots").join(doc.to_string())
+        } else {
+            data_dir
+                .join("snapshots")
+                .join(doc.to_string())
+                .join("branches")
+                .join(branch_id.to_string())
+        };
         fs::create_dir_all(&parent)?;
         let mut temp = NamedTempFile::new_in(&parent)?;
         let wire_watermarks = watermarks
@@ -124,6 +161,7 @@ impl SnapshotFile {
         temp.rewind()?;
         let record = Self {
             workbook_id: doc,
+            branch_id,
             seq,
             format_version: FORMAT_VERSION,
             storage_key,
@@ -146,130 +184,135 @@ impl SnapshotFile {
         let mut db = pool.begin().await?;
         let inserted = self.publish_in_tx(&mut db).await?;
         if inserted {
-            sqlx::query!(
+            sqlx::query(
                 "UPDATE users u SET storage_bytes = u.storage_bytes + $2
                  FROM workbooks w WHERE w.id = $1 AND u.id = w.owner_id",
-                self.workbook_id,
-                self.size_bytes,
             )
+            .bind(self.workbook_id)
+            .bind(self.size_bytes)
             .execute(&mut *db)
             .await?;
         }
         db.commit().await?;
-        if at(pool, self.workbook_id, self.seq).await?.as_ref() != Some(self) {
+        if at_branch(pool, self.workbook_id, self.branch_id, self.seq)
+            .await?
+            .as_ref()
+            != Some(self)
+        {
             return Err(StoreError::Invalid("snapshot metadata mismatch"));
         }
         Ok(inserted)
     }
 
     pub(super) async fn publish_in_tx(&self, db: &mut PgConnection) -> Result<bool, StoreError> {
-        let inserted = sqlx::query_scalar!(
+        let inserted: Option<i64> = sqlx::query_scalar(
             "INSERT INTO snapshots (workbook_id, branch_id, seq, format_version, storage_key, size_bytes, sha256)
              VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT DO NOTHING RETURNING size_bytes",
-            self.workbook_id, MAIN_BRANCH, self.seq, self.format_version,
-            self.storage_key, self.size_bytes, &self.sha256,
-        ).fetch_optional(&mut *db).await?;
+        )
+        .bind(self.workbook_id)
+        .bind(self.branch_id)
+        .bind(self.seq)
+        .bind(self.format_version)
+        .bind(&self.storage_key)
+        .bind(self.size_bytes)
+        .bind(&self.sha256)
+        .fetch_optional(&mut *db)
+        .await?;
         Ok(inserted.is_some())
     }
 }
 
-pub(super) async fn prune(
+pub(super) async fn prune_branch(
     db: &mut PgConnection,
     doc: Uuid,
+    branch_id: Uuid,
     owner_id: Uuid,
     keep_recent: usize,
 ) -> Result<(Vec<String>, i64), StoreError> {
-    let rows = sqlx::query!(
+    let rows: Vec<(i64, String, i64)> = sqlx::query_as(
         "SELECT seq, storage_key, size_bytes FROM snapshots
          WHERE workbook_id = $1 AND branch_id = $2 ORDER BY seq ASC",
-        doc,
-        MAIN_BRANCH,
     )
+    .bind(doc)
+    .bind(branch_id)
     .fetch_all(&mut *db)
     .await?;
     if rows.len() <= keep_recent {
         return Ok((Vec::new(), 0));
     }
 
-    let version_seqs = sqlx::query_scalar!(
+    let version_seqs: Vec<i64> = sqlx::query_scalar(
         "SELECT DISTINCT seq FROM versions WHERE workbook_id = $1 AND branch_id = $2 ORDER BY seq ASC",
-        doc,
-        MAIN_BRANCH,
     )
+    .bind(doc)
+    .bind(branch_id)
     .fetch_all(&mut *db)
     .await?;
 
     let mut keep = BTreeSet::new();
-    if rows.first().is_some_and(|r| r.seq == 0) {
+    if rows.first().is_some_and(|r| r.0 == 0) {
         keep.insert(0);
     }
     for v_seq in version_seqs {
-        if let Some(base) = rows.iter().rfind(|r| r.seq <= v_seq) {
-            keep.insert(base.seq);
+        if let Some(base) = rows.iter().rfind(|r| r.0 <= v_seq) {
+            keep.insert(base.0);
         }
     }
     let mut seen_buckets = BTreeSet::new();
     for row in &rows {
-        if row.seq > 0 && seen_buckets.insert(row.seq / 5_000) {
-            keep.insert(row.seq);
+        if row.0 > 0 && seen_buckets.insert(row.0 / 5_000) {
+            keep.insert(row.0);
         }
     }
     for row in rows.iter().rev().take(keep_recent) {
-        keep.insert(row.seq);
+        keep.insert(row.0);
     }
 
     let mut prune_seqs = Vec::new();
     let mut prune_keys = Vec::new();
     let mut reclaimed = 0_i64;
-    for row in rows {
-        if !keep.contains(&row.seq) {
-            prune_seqs.push(row.seq);
-            prune_keys.push(row.storage_key);
-            reclaimed = reclaimed.saturating_add(row.size_bytes);
+    for (seq, key, size_bytes) in rows {
+        if !keep.contains(&seq) {
+            prune_seqs.push(seq);
+            prune_keys.push(key);
+            reclaimed = reclaimed.saturating_add(size_bytes);
         }
     }
     if prune_seqs.is_empty() {
         return Ok((Vec::new(), 0));
     }
 
-    sqlx::query!(
+    sqlx::query(
         "DELETE FROM snapshots WHERE workbook_id = $1 AND branch_id = $2 AND seq = ANY($3)",
-        doc,
-        MAIN_BRANCH,
-        &prune_seqs,
     )
+    .bind(doc)
+    .bind(branch_id)
+    .bind(&prune_seqs)
     .execute(&mut *db)
     .await?;
-    sqlx::query!(
-        "UPDATE users SET storage_bytes = GREATEST(0, storage_bytes - $2) WHERE id = $1",
-        owner_id,
-        reclaimed,
-    )
-    .execute(&mut *db)
-    .await?;
+    sqlx::query("UPDATE users SET storage_bytes = GREATEST(0, storage_bytes - $2) WHERE id = $1")
+        .bind(owner_id)
+        .bind(reclaimed)
+        .execute(&mut *db)
+        .await?;
     Ok((prune_keys, reclaimed))
 }
 
+/// Recursively sweeps stale `.tmp` files across `data_dir`, `snapshots/{doc}/`,
+/// and `snapshots/{doc}/branches/{branch}/`.
 pub(super) fn sweep_stale_tmp_files(data_dir: &Path) -> io::Result<usize> {
     let mut removed = 0_usize;
-    let mut dirs = vec![data_dir.to_path_buf()];
-    let snapshots_dir = data_dir.join("snapshots");
-    if snapshots_dir.is_dir() {
-        dirs.push(snapshots_dir.clone());
-        for entry in fs::read_dir(&snapshots_dir)? {
-            let entry = entry?;
-            if entry.file_type()?.is_dir() {
-                dirs.push(entry.path());
-            }
-        }
-    }
-    for dir in dirs {
+    let mut stack = vec![data_dir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
         if !dir.is_dir() {
             continue;
         }
-        for entry in fs::read_dir(dir)? {
+        for entry in fs::read_dir(&dir)? {
             let entry = entry?;
-            if entry.file_type()?.is_file()
+            let ft = entry.file_type()?;
+            if ft.is_dir() {
+                stack.push(entry.path());
+            } else if ft.is_file()
                 && entry
                     .file_name()
                     .to_str()
@@ -283,39 +326,46 @@ pub(super) fn sweep_stale_tmp_files(data_dir: &Path) -> io::Result<usize> {
     Ok(removed)
 }
 
-pub(super) async fn at(
+pub(super) async fn at_branch(
     pool: &PgPool,
     doc: Uuid,
+    branch_id: Uuid,
     seq: i64,
 ) -> Result<Option<SnapshotFile>, StoreError> {
-    Ok(sqlx::query_as!(
-        SnapshotFile,
-        "SELECT workbook_id, seq, format_version, storage_key, size_bytes, sha256 FROM snapshots
+    Ok(sqlx::query_as::<_, SnapshotFile>(
+        "SELECT workbook_id, branch_id, seq, format_version, storage_key, size_bytes, sha256
+         FROM snapshots
          WHERE workbook_id = $1 AND branch_id = $2 AND seq = $3",
-        doc,
-        MAIN_BRANCH,
-        seq,
     )
+    .bind(doc)
+    .bind(branch_id)
+    .bind(seq)
     .fetch_optional(pool)
     .await?)
 }
 
-pub(super) async fn list_desc(
+pub(super) async fn list_desc_branch(
     db: &mut PgConnection,
     doc: Uuid,
+    branch_id: Uuid,
 ) -> Result<Vec<SnapshotFile>, StoreError> {
     Ok(sqlx::query_as::<_, SnapshotFile>(
-        "SELECT workbook_id, seq, format_version, storage_key, size_bytes, sha256 FROM snapshots
+        "SELECT workbook_id, branch_id, seq, format_version, storage_key, size_bytes, sha256
+         FROM snapshots
          WHERE workbook_id = $1 AND branch_id = $2 ORDER BY seq DESC",
     )
     .bind(doc)
-    .bind(MAIN_BRANCH)
+    .bind(branch_id)
     .fetch_all(db)
     .await?)
 }
 
-fn storage_key(doc: Uuid, seq: i64) -> String {
-    format!("snapshots/{doc}/{seq}.rtclsnap")
+fn storage_key_branch(doc: Uuid, branch_id: Uuid, seq: i64) -> String {
+    if branch_id == MAIN_BRANCH {
+        format!("snapshots/{doc}/{seq}.rtclsnap")
+    } else {
+        format!("snapshots/{doc}/branches/{branch_id}/{seq}.rtclsnap")
+    }
 }
 
 fn hash_file(file: &mut File) -> io::Result<[u8; 32]> {
@@ -334,8 +384,7 @@ fn hash_file(file: &mut File) -> io::Result<[u8; 32]> {
 fn sync_directory(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
-        // Include the new workbook and snapshots directory entries on a fresh volume.
-        for ancestor in path.ancestors().take(3) {
+        for ancestor in path.ancestors().take(4) {
             File::open(ancestor)?.sync_all()?;
         }
     }

@@ -111,6 +111,11 @@ pub struct AccountSummary {
     pub quota_bytes: u64,
     pub disk_over_soft_limit: bool,
     pub disk_over_hard_limit: bool,
+    pub ai_tokens_used_today: u64,
+    pub ai_token_limit_daily: u64,
+    pub ai_runs_today: u32,
+    pub ai_run_limit_daily: u32,
+    pub ai_enabled: bool,
 }
 
 pub struct DeleteAccountOutcome {
@@ -635,6 +640,7 @@ impl Store {
         .await?
         .ok_or(StoreError::NotFound)?;
 
+        let quota = self.get_daily_quota(user_id).await.unwrap_or_default();
         Ok(AccountSummary {
             user: User {
                 id: row.id,
@@ -647,6 +653,11 @@ impl Store {
             quota_bytes: self.limits.user_quota_bytes,
             disk_over_soft_limit: self.disk_over_soft_limit(),
             disk_over_hard_limit: self.disk_over_hard_limit(),
+            ai_tokens_used_today: quota.llm_tokens,
+            ai_token_limit_daily: 500_000,
+            ai_runs_today: quota.agent_runs,
+            ai_run_limit_daily: 20,
+            ai_enabled: false,
         })
     }
 
@@ -730,6 +741,15 @@ impl Store {
         )
         .execute(&mut *db)
         .await?;
+        sqlx::query("UPDATE agent_runs SET user_id = $2 WHERE user_id = $1")
+            .bind(user_id)
+            .bind(DELETED_USER_ID)
+            .execute(&mut *db)
+            .await?;
+        sqlx::query("DELETE FROM quotas WHERE user_id = $1")
+            .bind(user_id)
+            .execute(&mut *db)
+            .await?;
 
         sqlx::query!("DELETE FROM users WHERE id = $1", user_id)
             .execute(&mut *db)
