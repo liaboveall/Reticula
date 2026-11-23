@@ -1,0 +1,691 @@
+import type { DiffHighlightMap, RemotePresenceOverlay } from "@reticula/grid";
+import {
+  type AgentRunRecord,
+  ApiError,
+  abandonBranch,
+  agentRunEventsUrl,
+  type BranchDiff,
+  branchDiff,
+  cancelAgentRun,
+  getAgentRun,
+  listAgentRuns,
+  type MergeConflictBody,
+  type MergeSelection,
+  mergeBranch,
+  type PersistedStep,
+  previewBranchMerge,
+  startAgentRun,
+} from "@reticula/protocol/collab-api";
+import { useCallback, useEffect, useRef, useState } from "react";
+import "./ai.css";
+import { DiffReviewDrawer } from "./DiffReviewDrawer.tsx";
+import {
+  buildLocalReplayMergeTxns,
+  decodeBase64,
+  fetchReplayBundle,
+  fetchReplayIndex,
+  previewLocalReplayMerge,
+  type ReplayBundle,
+  type ReplayIndexEntry,
+  type ReplayPresenceHint,
+} from "./replay-player.ts";
+
+export interface AiPanelProps {
+  readonly collabDocId: string | null;
+  readonly canWriteCloud: boolean;
+  readonly onClose: () => void;
+  readonly onOpenCloudDraft: (docId: string, branchId: string) => void;
+  readonly onOpenReplayDraft: (baseSnapshot: ArrayBuffer) => void;
+  readonly onApplyReplayTxn: (txn: ArrayBuffer) => void;
+  readonly onCommitLocalMerge: (baseSnapshot: ArrayBuffer, txns: ArrayBuffer[]) => void;
+  readonly onExitDraft: () => void;
+  readonly onSetAiPresence: (presence: RemotePresenceOverlay | null) => void;
+  readonly onSetDiffHighlights: (map: DiffHighlightMap | null) => void;
+  readonly onJumpToCell: (sheetId: number, row: number, col: number) => void;
+}
+
+function presenceFromHint(h: ReplayPresenceHint): RemotePresenceOverlay {
+  return {
+    replica: 0x00ff_ffff,
+    displayName: "AI Analyst",
+    colorSlot: 0x80 | 5,
+    cursorRow: h.row,
+    cursorCol: h.col,
+    selection:
+      h.endRow > h.row || h.endCol > h.col
+        ? {
+            firstRow: h.row,
+            firstCol: h.col,
+            endRow: h.endRow + 1,
+            endCol: h.endCol + 1,
+          }
+        : null,
+  };
+}
+
+export default function AiPanel({
+  collabDocId,
+  canWriteCloud,
+  onClose,
+  onOpenCloudDraft,
+  onOpenReplayDraft,
+  onApplyReplayTxn,
+  onCommitLocalMerge,
+  onExitDraft,
+  onSetAiPresence,
+  onSetDiffHighlights,
+  onJumpToCell,
+}: AiPanelProps) {
+  const cloudAvailable = collabDocId !== null && canWriteCloud;
+  const [tab, setTab] = useState<"cloud" | "demos">(cloudAvailable ? "cloud" : "demos");
+  const [followCursor, setFollowCursor] = useState(true);
+
+  // Cloud mode state
+  const [prompt, setPrompt] = useState("");
+  const [runs, setRuns] = useState<AgentRunRecord[]>([]);
+  const [activeRun, setActiveRun] = useState<AgentRunRecord | null>(null);
+  const [steps, setSteps] = useState<PersistedStep[]>([]);
+  const [streamText, setStreamText] = useState("");
+  const [cloudDiff, setCloudDiff] = useState<BranchDiff | null>(null);
+  const [cloudError, setCloudError] = useState<string | null>(null);
+  const [cloudBusy, setCloudBusy] = useState(false);
+  const sseRef = useRef<EventSource | null>(null);
+
+  // Local replay mode state
+  const [demos, setDemos] = useState<readonly ReplayIndexEntry[]>([]);
+  const [bundle, setBundle] = useState<ReplayBundle | null>(null);
+  const [replayIdx, setReplayIdx] = useState(-1);
+  const [playing, setPlaying] = useState(false);
+  const [replayReview, setReplayReview] = useState(false);
+  const [replayMsg, setReplayMsg] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!collabDocId) return;
+    listAgentRuns(collabDocId)
+      .then((list) => setRuns(list))
+      .catch(() => {});
+  }, [collabDocId]);
+
+  useEffect(() => {
+    if (tab !== "demos" || demos.length > 0) return;
+    fetchReplayIndex()
+      .then((idx) => setDemos(idx.items))
+      .catch((err) => setReplayMsg(err instanceof Error ? err.message : String(err)));
+  }, [tab, demos.length]);
+
+  const closeSse = useCallback(() => {
+    sseRef.current?.close();
+    sseRef.current = null;
+  }, []);
+
+  useEffect(() => () => closeSse(), [closeSse]);
+
+  const loadCloudReview = useCallback(async (docId: string, branchId: string) => {
+    try {
+      const d = await branchDiff(docId, branchId);
+      setCloudDiff(d);
+    } catch (err) {
+      setCloudError(err instanceof Error ? err.message : String(err));
+    }
+  }, []);
+
+  const attachSse = useCallback(
+    (docId: string, run: AgentRunRecord) => {
+      closeSse();
+      setActiveRun(run);
+      setSteps([]);
+      setStreamText("");
+      setCloudDiff(null);
+      setCloudError(null);
+      onOpenCloudDraft(docId, run.branchId);
+
+      const es = new EventSource(agentRunEventsUrl(docId, run.id), { withCredentials: true });
+      sseRef.current = es;
+      es.addEventListener("step", (ev) => {
+        try {
+          const step = JSON.parse((ev as MessageEvent).data) as PersistedStep;
+          setSteps((prev) => (prev.some((s) => s.idx === step.idx) ? prev : [...prev, step]));
+        } catch {
+          // ignore malformed event
+        }
+      });
+      es.addEventListener("text_delta", (ev) => {
+        try {
+          const d = JSON.parse((ev as MessageEvent).data) as { text?: string };
+          if (d.text) setStreamText((prev) => prev + d.text);
+        } catch {
+          // ignore
+        }
+      });
+      es.addEventListener("presence", (ev) => {
+        try {
+          const h = JSON.parse((ev as MessageEvent).data) as ReplayPresenceHint;
+          onSetAiPresence(presenceFromHint(h));
+          if (followCursor) onJumpToCell(h.sheet, h.row, h.col);
+        } catch {
+          // ignore
+        }
+      });
+      es.addEventListener("status", (ev) => {
+        try {
+          const d = JSON.parse((ev as MessageEvent).data) as {
+            status: string;
+            summary?: string;
+            error?: string;
+          };
+          setActiveRun((prev) =>
+            prev
+              ? {
+                  ...prev,
+                  status: d.status,
+                  summary: d.summary ?? prev.summary,
+                  errorMessage: d.error ?? prev.errorMessage ?? null,
+                }
+              : prev,
+          );
+          if (d.status === "waiting_review") {
+            void loadCloudReview(docId, run.branchId);
+          } else if (d.error) {
+            setCloudError(d.error);
+          }
+          es.close();
+          if (sseRef.current === es) sseRef.current = null;
+          onSetAiPresence(null);
+          void listAgentRuns(docId)
+            .then(setRuns)
+            .catch(() => {});
+        } catch {
+          // ignore
+        }
+      });
+    },
+    [closeSse, followCursor, loadCloudReview, onJumpToCell, onOpenCloudDraft, onSetAiPresence],
+  );
+
+  const handleStartRun = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!collabDocId || !prompt.trim()) return;
+    setCloudBusy(true);
+    setCloudError(null);
+    try {
+      const run = await startAgentRun(collabDocId, { prompt: prompt.trim() });
+      setPrompt("");
+      attachSse(collabDocId, run);
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 503) {
+        setCloudError(
+          "Cloud AI is not configured on this server yet. Try the 10 built-in interactive demos below.",
+        );
+      } else if (err instanceof ApiError && err.body && typeof err.body === "object") {
+        setCloudError(String((err.body as { error?: string }).error ?? err.message));
+      } else {
+        setCloudError(err instanceof Error ? err.message : String(err));
+      }
+    } finally {
+      setCloudBusy(false);
+    }
+  };
+
+  const handleStopRun = async () => {
+    if (!collabDocId || !activeRun) return;
+    await cancelAgentRun(collabDocId, activeRun.id).catch(() => {});
+    closeSse();
+    onSetAiPresence(null);
+  };
+
+  const handleOpenExistingRun = async (r: AgentRunRecord) => {
+    if (!collabDocId) return;
+    setCloudError(null);
+    const detail = await getAgentRun(collabDocId, r.id);
+    setActiveRun(detail.run);
+    setSteps(detail.steps);
+    if (detail.run.status === "running" || detail.run.status === "queued") {
+      attachSse(collabDocId, detail.run);
+    } else if (detail.run.status === "waiting_review") {
+      onOpenCloudDraft(collabDocId, detail.run.branchId);
+      await loadCloudReview(collabDocId, detail.run.branchId);
+    }
+  };
+
+  const handleCloudPreview = useCallback(
+    async (sel: MergeSelection) => {
+      if (!collabDocId || !activeRun) {
+        return {
+          canMerge: false,
+          mainHeadSeq: "0",
+          closureIssues: [],
+          unresolvedConflicts: [],
+          estimatedOps: 0,
+        };
+      }
+      return previewBranchMerge(collabDocId, activeRun.branchId, sel);
+    },
+    [collabDocId, activeRun],
+  );
+
+  const handleCloudApply = async (sel: MergeSelection) => {
+    if (!collabDocId || !activeRun) return;
+    setCloudBusy(true);
+    setCloudError(null);
+    try {
+      await mergeBranch(collabDocId, activeRun.branchId, sel);
+      setCloudDiff(null);
+      setActiveRun((prev) => (prev ? { ...prev, status: "merged" } : prev));
+      onSetDiffHighlights(null);
+      onSetAiPresence(null);
+      onExitDraft();
+      void listAgentRuns(collabDocId)
+        .then(setRuns)
+        .catch(() => {});
+    } catch (err) {
+      if (
+        err instanceof ApiError &&
+        err.status === 409 &&
+        err.body &&
+        typeof err.body === "object"
+      ) {
+        const conflict = err.body as Partial<MergeConflictBody>;
+        if (conflict.diff) setCloudDiff(conflict.diff);
+        setCloudError(conflict.error ?? "Merge conflict detected; review updated diff.");
+      } else {
+        setCloudError(err instanceof Error ? err.message : String(err));
+      }
+    } finally {
+      setCloudBusy(false);
+    }
+  };
+
+  const handleCloudDiscard = async () => {
+    if (!collabDocId || !activeRun) return;
+    setCloudBusy(true);
+    try {
+      await abandonBranch(collabDocId, activeRun.branchId);
+      setCloudDiff(null);
+      setActiveRun((prev) => (prev ? { ...prev, status: "rejected" } : prev));
+      onSetDiffHighlights(null);
+      onSetAiPresence(null);
+      onExitDraft();
+      void listAgentRuns(collabDocId)
+        .then(setRuns)
+        .catch(() => {});
+    } finally {
+      setCloudBusy(false);
+    }
+  };
+
+  // Replay stepping logic
+  const selectDemo = async (id: string) => {
+    setPlaying(false);
+    setReplayReview(false);
+    setReplayMsg(null);
+    onSetDiffHighlights(null);
+    onSetAiPresence(null);
+    try {
+      const loaded = await fetchReplayBundle(id);
+      setBundle(loaded);
+      setReplayIdx(-1);
+      onOpenReplayDraft(decodeBase64(loaded.baseSnapshotB64));
+    } catch (err) {
+      setReplayMsg(err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  const stepReplayOnce = useCallback(() => {
+    if (!bundle) return false;
+    const nextIdx = replayIdx + 1;
+    if (nextIdx >= bundle.steps.length) {
+      setPlaying(false);
+      setReplayReview(true);
+      onSetAiPresence(null);
+      return false;
+    }
+    const step = bundle.steps[nextIdx];
+    if (!step) return false;
+    setReplayIdx(nextIdx);
+    if (step.txnB64) {
+      onApplyReplayTxn(decodeBase64(step.txnB64));
+    }
+    if (step.presence) {
+      onSetAiPresence(presenceFromHint(step.presence));
+      if (followCursor) onJumpToCell(step.presence.sheet, step.presence.row, step.presence.col);
+    }
+    if (nextIdx === bundle.steps.length - 1) {
+      setPlaying(false);
+      setReplayReview(true);
+      onSetAiPresence(null);
+    }
+    return true;
+  }, [bundle, followCursor, onApplyReplayTxn, onJumpToCell, onSetAiPresence, replayIdx]);
+
+  useEffect(() => {
+    if (!playing || !bundle) return;
+    const timer = window.setTimeout(() => {
+      stepReplayOnce();
+    }, 260);
+    return () => window.clearTimeout(timer);
+  }, [playing, bundle, stepReplayOnce]);
+
+  const handleReplayPreview = useCallback(
+    async (sel: MergeSelection) => {
+      if (!bundle) {
+        return {
+          canMerge: false,
+          mainHeadSeq: "0",
+          closureIssues: [],
+          unresolvedConflicts: [],
+          estimatedOps: 0,
+        };
+      }
+      return previewLocalReplayMerge(
+        bundle,
+        new Set(sel.acceptedHunks),
+        sel.conflictChoices ?? {},
+        Boolean(sel.allowRefErrors),
+      );
+    },
+    [bundle],
+  );
+
+  const handleReplayApply = async (sel: MergeSelection) => {
+    if (!bundle) return;
+    const txns = buildLocalReplayMergeTxns(
+      bundle,
+      new Set(sel.acceptedHunks),
+      sel.conflictChoices ?? {},
+      Boolean(sel.allowRefErrors),
+    );
+    onSetDiffHighlights(null);
+    onSetAiPresence(null);
+    onCommitLocalMerge(decodeBase64(bundle.baseSnapshotB64), txns);
+    setReplayReview(false);
+    setReplayMsg(`Merged selected changes from "${bundle.title}" into your sheet.`);
+  };
+
+  const handleReplayDiscard = async () => {
+    setPlaying(false);
+    setReplayReview(false);
+    setBundle(null);
+    setReplayIdx(-1);
+    onSetDiffHighlights(null);
+    onSetAiPresence(null);
+    onExitDraft();
+  };
+
+  return (
+    <aside className="ai-panel" data-testid="ai-panel" aria-label="AI Analyst">
+      <div className="ai-panel-head">
+        <div className="ai-panel-title">
+          <span className="ai-badge">AI</span>
+          <span>Analyst</span>
+        </div>
+        <div className="ai-row">
+          <label style={{ display: "flex", gap: 4, alignItems: "center", fontSize: 11 }}>
+            <input
+              type="checkbox"
+              checked={followCursor}
+              onChange={(e) => setFollowCursor(e.target.checked)}
+            />
+            Follow cursor
+          </label>
+          <button type="button" className="ai-btn" data-testid="ai-close-btn" onClick={onClose}>
+            ✕
+          </button>
+        </div>
+      </div>
+
+      <div className="ai-tabs">
+        {cloudAvailable && (
+          <button
+            type="button"
+            className={`ai-tab ${tab === "cloud" ? "active" : ""}`}
+            data-testid="ai-tab-cloud"
+            onClick={() => setTab("cloud")}
+          >
+            Cloud Draft
+          </button>
+        )}
+        <button
+          type="button"
+          className={`ai-tab ${tab === "demos" ? "active" : ""}`}
+          data-testid="ai-tab-demos"
+          onClick={() => setTab("demos")}
+        >
+          10 Recorded Demos
+        </button>
+      </div>
+
+      <div className="ai-panel-body">
+        {tab === "cloud" && cloudAvailable ? (
+          <>
+            <form className="ai-form" onSubmit={handleStartRun}>
+              <textarea
+                className="ai-textarea"
+                data-testid="ai-prompt-input"
+                placeholder="Ask AI Analyst to inspect, build formulas, audit errors, or sort on an isolated draft branch..."
+                value={prompt}
+                onChange={(e) => setPrompt(e.target.value)}
+                maxLength={4000}
+              />
+              <div className="ai-row">
+                <button
+                  type="submit"
+                  className="ai-btn primary"
+                  data-testid="ai-run-btn"
+                  disabled={cloudBusy || !prompt.trim() || activeRun?.status === "running"}
+                >
+                  Run on Draft Branch
+                </button>
+                {activeRun?.status === "running" && (
+                  <button
+                    type="button"
+                    className="ai-btn danger"
+                    data-testid="ai-stop-btn"
+                    onClick={() => void handleStopRun()}
+                  >
+                    Stop
+                  </button>
+                )}
+              </div>
+            </form>
+
+            {cloudError && !cloudDiff && (
+              <div className="ai-card alert" role="alert">
+                {cloudError}
+              </div>
+            )}
+
+            {activeRun && (
+              <div className="ai-card" data-testid="ai-run-status">
+                <div className="ai-row">
+                  <strong>Status: {activeRun.status}</strong>
+                  <span className="ai-muted">{activeRun.model}</span>
+                </div>
+                {streamText && (
+                  <div className="ai-muted" style={{ marginTop: 4 }}>
+                    {streamText.slice(-240)}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {steps.length > 0 && !cloudDiff && (
+              <div className="ai-step-list" data-testid="ai-step-list">
+                {steps.map((s) => (
+                  <div key={s.idx} className="ai-step">
+                    <div className="ai-step-kind">{s.kind}</div>
+                    <div>
+                      {typeof s.payload === "object" && s.payload !== null
+                        ? String(
+                            (s.payload as Record<string, unknown>).name ??
+                              (s.payload as Record<string, unknown>).summary ??
+                              (s.payload as Record<string, unknown>).text ??
+                              (s.payload as Record<string, unknown>).prompt ??
+                              JSON.stringify(s.payload).slice(0, 140),
+                          )
+                        : String(s.payload)}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {cloudDiff && activeRun && (
+              <DiffReviewDrawer
+                diff={cloudDiff}
+                summaryText={activeRun.summary}
+                busy={cloudBusy}
+                errorText={cloudError}
+                onPreview={handleCloudPreview}
+                onApply={handleCloudApply}
+                onDiscard={handleCloudDiscard}
+                onJumpToCell={onJumpToCell}
+                onSetHighlights={onSetDiffHighlights}
+              />
+            )}
+
+            {runs.length > 0 && !cloudDiff && (
+              <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                <strong style={{ fontSize: 12 }}>Recent Runs</strong>
+                {runs.slice(0, 5).map((r) => (
+                  <button
+                    key={r.id}
+                    type="button"
+                    className="ai-replay-item"
+                    onClick={() => void handleOpenExistingRun(r)}
+                  >
+                    <div className="ai-row">
+                      <strong>{r.status}</strong>
+                      <span className="ai-muted">{r.stepCount} steps</span>
+                    </div>
+                    <span className="ai-muted">{r.prompt.slice(0, 80)}</span>
+                  </button>
+                ))}
+              </div>
+            )}
+          </>
+        ) : (
+          <>
+            <div className="ai-muted">
+              Pure-client interactive replays running the real WASM FormulaEngine. No sign-in or API
+              key required.
+            </div>
+            {replayMsg && <div className="ai-card">{replayMsg}</div>}
+
+            {!bundle ? (
+              <div
+                style={{ display: "flex", flexDirection: "column", gap: 6 }}
+                data-testid="ai-demo-list"
+              >
+                {demos.map((d) => (
+                  <button
+                    key={d.id}
+                    type="button"
+                    className="ai-replay-item"
+                    data-testid={`ai-demo-${d.id}`}
+                    onClick={() => void selectDemo(d.id)}
+                  >
+                    <strong>{d.title}</strong>
+                    <span className="ai-muted">{d.description}</span>
+                    <div className="ai-tags">
+                      {d.hasConflictDemo && <span className="ai-tag warn">3-Way Conflict</span>}
+                      {d.hasClosureDemo && <span className="ai-tag warn">Closure Guard</span>}
+                      {d.tags.map((t) => (
+                        <span key={t} className="ai-tag">
+                          {t}
+                        </span>
+                      ))}
+                    </div>
+                  </button>
+                ))}
+              </div>
+            ) : (
+              <>
+                <div className="ai-card">
+                  <div className="ai-row">
+                    <strong>{bundle.title}</strong>
+                    <button
+                      type="button"
+                      className="ai-btn"
+                      onClick={() => void handleReplayDiscard()}
+                    >
+                      All Demos
+                    </button>
+                  </div>
+                  <div className="ai-muted" style={{ marginTop: 4 }}>
+                    Prompt: “{bundle.prompt}”
+                  </div>
+                  <div className="ai-row" style={{ marginTop: 8 }}>
+                    <button
+                      type="button"
+                      className="ai-btn primary"
+                      data-testid="ai-replay-play"
+                      onClick={() => {
+                        if (replayIdx >= bundle.steps.length - 1) {
+                          setReplayReview(true);
+                        } else {
+                          setPlaying((p) => !p);
+                        }
+                      }}
+                    >
+                      {playing ? "Pause" : replayIdx < 0 ? "Play Replay" : "Resume"}
+                    </button>
+                    <button
+                      type="button"
+                      className="ai-btn"
+                      data-testid="ai-replay-step"
+                      disabled={playing}
+                      onClick={() => void stepReplayOnce()}
+                    >
+                      Step ({Math.max(0, replayIdx + 1)}/{bundle.steps.length})
+                    </button>
+                    <button
+                      type="button"
+                      className="ai-btn"
+                      data-testid="ai-replay-review-btn"
+                      onClick={() => {
+                        setPlaying(false);
+                        // Fast-forward remaining txns into draft engine before opening diff review.
+                        for (let i = replayIdx + 1; i < bundle.steps.length; i += 1) {
+                          const st = bundle.steps[i];
+                          if (st?.txnB64) onApplyReplayTxn(decodeBase64(st.txnB64));
+                        }
+                        setReplayIdx(bundle.steps.length - 1);
+                        onSetAiPresence(null);
+                        setReplayReview(true);
+                      }}
+                    >
+                      Review Changes
+                    </button>
+                  </div>
+                </div>
+
+                {!replayReview && replayIdx >= 0 && (
+                  <div className="ai-step-list" data-testid="ai-replay-steps">
+                    {bundle.steps.slice(0, replayIdx + 1).map((s) => (
+                      <div key={s.idx} className="ai-step">
+                        <div className="ai-step-kind">{s.title}</div>
+                        <div>{s.detail}</div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {replayReview && (
+                  <DiffReviewDrawer
+                    diff={bundle.diff}
+                    summaryText={bundle.summary}
+                    onPreview={handleReplayPreview}
+                    onApply={handleReplayApply}
+                    onDiscard={handleReplayDiscard}
+                    onJumpToCell={onJumpToCell}
+                    onSetHighlights={onSetDiffHighlights}
+                  />
+                )}
+              </>
+            )}
+          </>
+        )}
+      </div>
+    </aside>
+  );
+}

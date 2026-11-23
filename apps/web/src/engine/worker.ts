@@ -20,6 +20,7 @@ import type {
   WorkerOutput,
 } from "./client.ts";
 import type { CollabReplicaSession } from "./collab-storage.ts";
+import type { DraftPreviewSession } from "./draft-preview.ts";
 import {
   detectStorageBackend,
   isQuotaExceededError,
@@ -96,6 +97,7 @@ let lastSubscription: Extract<EngineCommand, { kind: "subscribe" }> | null = nul
 let activeSheetId = 0;
 let historyPlayer: HistoryPlayer | null = null;
 let historyPreviewActive = false;
+let draftPreview: DraftPreviewSession | null = null;
 
 // Web Locks held by this worker (`lockName -> release callback`).
 const heldLocks = new Map<string, () => void>();
@@ -312,6 +314,8 @@ async function closeActiveDoc(persistFinalState: boolean): Promise<void> {
   historyPreviewActive = false;
   historyPlayer?.free();
   historyPlayer = null;
+  draftPreview?.close();
+  draftPreview = null;
   const collab = activeCollab;
   if (collab) {
     if (persistFinalState && engine) {
@@ -758,6 +762,10 @@ async function runEngineCommand(command: EngineCommand): Promise<void> {
   if (command.kind === "subscribe") {
     lastSubscription = command;
     activeSheetId = command.sheet ?? activeSheetId;
+  }
+  if (draftPreview) {
+    draftPreview.handleCommand(command);
+    return;
   }
   if (historyPreviewActive && historyPlayer) {
     if (command.kind === "subscribe") {
@@ -1783,6 +1791,68 @@ async function handleHostCommand(cmd: HostCommand): Promise<void> {
       flushDuePagesAndAux(engine);
       break;
     }
+    case "draftOpenCloud":
+    case "draftOpenReplay": {
+      draftPreview?.close();
+      const { DraftPreviewSession } = await import("./draft-preview.ts");
+      draftPreview = new DraftPreviewSession({
+        post: (msg, transfer) =>
+          transfer?.length ? scope.postMessage(msg, transfer) : scope.postMessage(msg),
+        getLastSubscription: () => lastSubscription,
+        setActiveSheet: (s) => {
+          activeSheetId = s;
+        },
+        getActiveSheet: () => activeSheetId,
+      });
+      if (cmd.kind === "draftOpenCloud") {
+        draftPreview.openCloud(cmd.docId, cmd.branchId);
+      } else {
+        draftPreview.openReplay(cmd.baseSnapshot);
+      }
+      break;
+    }
+    case "draftApplyTxn": {
+      draftPreview?.applyReplayTxn(cmd.txn);
+      break;
+    }
+    case "draftCommitLocalMerge": {
+      draftPreview?.close();
+      draftPreview = null;
+      if (!collaborative) {
+        const loaded = engine.loadSnapshotAndWal(
+          new Uint8Array(cmd.baseSnapshot),
+          encodeWalInit(0),
+          0,
+          0,
+          0,
+          true,
+          false,
+          false,
+        );
+        let sheet: SheetInfo = loaded.sheet;
+        for (const txn of cmd.txns) {
+          sheet = engine.applyWireTxnV3(new Uint8Array(txn));
+        }
+        activeSheetId = sheet.sheet;
+        scope.postMessage({ kind: "draftExited", sheet });
+        flushDuePagesAndAux(engine);
+      }
+      break;
+    }
+    case "draftExit": {
+      draftPreview?.close();
+      draftPreview = null;
+      let ev = engine.handle({ kind: "switchSheet", sheet: activeSheetId });
+      if (ev?.kind === "rejected") {
+        ev = engine.handle({ kind: "switchSheet", sheet: 0 });
+      }
+      if (ev?.kind === "sheetChanged") {
+        activeSheetId = ev.sheet.sheet;
+        scope.postMessage({ kind: "draftExited", sheet: ev.sheet });
+      }
+      flushDuePagesAndAux(engine);
+      break;
+    }
     case "debugSpinWorker": {
       const end = performance.now() + cmd.ms;
       while (performance.now() < end) {
@@ -1831,6 +1901,10 @@ const COLLAB_ALLOWED_HOST_COMMANDS = new Set<HostCommand["kind"]>([
   "flushAndCloseForUpdate",
   "historySeek",
   "historyExit",
+  "draftOpenCloud",
+  "draftOpenReplay",
+  "draftApplyTxn",
+  "draftExit",
 ]);
 
 function dispatchEnvelope(item: WorkerEnvelope | EngineCommand): void {

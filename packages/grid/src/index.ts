@@ -47,6 +47,8 @@ export {
   SparseAxis,
 } from "./layout.ts";
 export type {
+  DiffHighlightKind,
+  DiffHighlightMap,
   FormulaReferenceOverlay,
   GridCellStyle,
   RemotePresenceOverlay,

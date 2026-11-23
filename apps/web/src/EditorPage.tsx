@@ -50,6 +50,7 @@ import { createSwClient, type SwClientHandle } from "./sw-client.ts";
 const LazyLocalModals = lazy(() => import("./LocalModals.tsx"));
 const LazyCollabShell = lazy(() => import("./collab/CollabShell.tsx"));
 const LazyM3aToolsModal = lazy(() => import("./M3aToolsModal.tsx"));
+const LazyAiPanel = lazy(() => import("./ai/AiPanel.tsx"));
 
 type EngineState =
   | { status: "starting" }
@@ -456,7 +457,10 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
   const [historyOpen, setHistoryOpen] = useState(false);
   const [historyPreviewSeq, setHistoryPreviewSeq] = useState<string | null>(null);
   const [historySeekMs, setHistorySeekMs] = useState<number | null>(null);
-  const effectiveReadOnly = collabTarget?.role === "viewer" || historyPreviewSeq !== null;
+  const [aiOpen, setAiOpen] = useState(false);
+  const [draftPreview, setDraftPreview] = useState(false);
+  const effectiveReadOnly =
+    collabTarget?.role === "viewer" || historyPreviewSeq !== null || draftPreview;
   const effectiveReadOnlyRef = useRef(effectiveReadOnly);
   effectiveReadOnlyRef.current = effectiveReadOnly;
   const [unsyncedRescue, setUnsyncedRescue] = useState<{
@@ -1360,7 +1364,9 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
               requestInspect(grid.selectionDetails(), true);
               break;
             }
-            case "historyExited": {
+            case "historyExited":
+            case "draftReady":
+            case "draftExited": {
               activeSheetRef.current = message.sheet.sheet;
               walSeqRef.current = message.sheet.walSeq;
               lastInspectKey = "";
@@ -1370,8 +1376,16 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
               setEngine((prev) =>
                 prev.status === "ready" ? { ...prev, sheet: message.sheet } : prev,
               );
-              setHistoryPreviewSeq(null);
-              setHistorySeekMs(null);
+              if (message.kind === "historyExited") {
+                setHistoryPreviewSeq(null);
+                setHistorySeekMs(null);
+              } else {
+                setDraftPreview(message.kind === "draftReady");
+                if (message.kind === "draftExited") {
+                  grid.setDiffHighlights(null);
+                  grid.setRemotePresences([]);
+                }
+              }
               requestInspect(grid.selectionDetails(), true);
               break;
             }
@@ -2419,6 +2433,15 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
         >
           Cloud
         </button>
+        <button
+          type="button"
+          className="toolbar-btn"
+          data-testid="ai-panel-btn"
+          onClick={() => setAiOpen((open) => !open)}
+          title="Open AI Analyst draft assistant and recorded demos"
+        >
+          AI
+        </button>
         {collabTarget && (
           <button
             type="button"
@@ -3099,6 +3122,60 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
         }}
         onAcceptCompletion={handleAcceptCompletion}
       />
+
+      {draftPreview && (
+        <div className="history-preview-banner" data-testid="ai-draft-banner" role="status">
+          <span>Viewing AI Draft · Main untouched</span>
+          <button
+            type="button"
+            className="toolbar-btn primary-btn"
+            data-testid="ai-banner-exit-btn"
+            onClick={() => clientRef.current?.sendHost({ kind: "draftExit" })}
+          >
+            Back to Main
+          </button>
+        </div>
+      )}
+
+      {aiOpen && (
+        <Suspense fallback={null}>
+          <LazyAiPanel
+            collabDocId={collabTarget?.docId ?? null}
+            canWriteCloud={collabTarget !== null && collabTarget.role !== "viewer"}
+            onClose={() => {
+              setAiOpen(false);
+              if (draftPreview) clientRef.current?.sendHost({ kind: "draftExit" });
+              gridRef.current?.setDiffHighlights(null);
+            }}
+            onOpenCloudDraft={(docId, branchId) =>
+              clientRef.current?.sendHost({ kind: "draftOpenCloud", docId, branchId })
+            }
+            onOpenReplayDraft={(baseSnapshot) =>
+              clientRef.current?.sendHost({ kind: "draftOpenReplay", baseSnapshot }, [baseSnapshot])
+            }
+            onApplyReplayTxn={(txn) =>
+              clientRef.current?.sendHost({ kind: "draftApplyTxn", txn }, [txn])
+            }
+            onCommitLocalMerge={(baseSnapshot, txns) =>
+              clientRef.current?.sendHost({ kind: "draftCommitLocalMerge", baseSnapshot, txns }, [
+                baseSnapshot,
+                ...txns,
+              ])
+            }
+            onExitDraft={() => clientRef.current?.sendHost({ kind: "draftExit" })}
+            onSetAiPresence={(p) => gridRef.current?.setRemotePresences(p ? [p] : [])}
+            onSetDiffHighlights={(m) => gridRef.current?.setDiffHighlights(m)}
+            onJumpToCell={(sheet, row, col) => {
+              if (activeSheetRef.current === sheet) {
+                gridRef.current?.jumpTo(row, col, false);
+              } else {
+                pendingJumpRef.current = { sheet, row, col };
+                clientRef.current?.send({ kind: "switchSheet", sheet });
+              }
+            }}
+          />
+        </Suspense>
+      )}
 
       {historyPreviewSeq !== null && (
         <div className="history-preview-banner" data-testid="history-preview-banner" role="status">

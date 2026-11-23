@@ -76,6 +76,8 @@ export type HostEvent =
       readonly elapsedMs: number;
     }
   | { readonly kind: "historyExited"; readonly sheet: SheetInfo }
+  | { readonly kind: "draftReady"; readonly sheet: SheetInfo }
+  | { readonly kind: "draftExited"; readonly sheet: SheetInfo }
   | { readonly kind: "failed"; readonly message: string; readonly panicked?: boolean };
 
 export type EngineMessage = EngineEvent | HostEvent;
@@ -139,6 +141,15 @@ export type HostCommand =
       readonly shareToken?: string | null | undefined;
     }
   | { readonly kind: "historyExit" }
+  | { readonly kind: "draftOpenCloud"; readonly docId: string; readonly branchId: string }
+  | { readonly kind: "draftOpenReplay"; readonly baseSnapshot: ArrayBuffer }
+  | { readonly kind: "draftApplyTxn"; readonly txn: ArrayBuffer }
+  | {
+      readonly kind: "draftCommitLocalMerge";
+      readonly baseSnapshot: ArrayBuffer;
+      readonly txns: readonly ArrayBuffer[];
+    }
+  | { readonly kind: "draftExit" }
   | { readonly kind: "debugSpinWorker"; readonly ms: number };
 
 export type WorkerEnvelope =

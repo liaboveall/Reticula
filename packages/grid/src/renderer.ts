@@ -34,6 +34,10 @@ export interface FormulaReferenceOverlay {
   readonly lastCol: number;
 }
 
+/** Three-state diff overlay cell highlight rendered during AI branch review. */
+export type DiffHighlightKind = "added" | "conflict" | "deleted";
+export type DiffHighlightMap = ReadonlyMap<string, DiffHighlightKind>;
+
 /** A collaborator's cursor and selection in displayed positions on the active sheet. */
 export type RemotePresenceOverlay = Readonly<Omit<RemotePresence, "selection">> & {
   readonly selection?: RemotePresence["selection"] | null;
@@ -72,6 +76,8 @@ export interface Frame {
   readonly formulaReferences?: readonly FormulaReferenceOverlay[];
   /** Remote collaborators on the active sheet. */
   readonly remotePresences?: readonly RemotePresenceOverlay[];
+  /** Optional three-state diff highlights keyed by `"row:col"`. */
+  readonly diffHighlights?: DiffHighlightMap | null;
   /** Dashed preview span while dragging the fill handle. */
   readonly fillPreview?: Span | null;
   /** Copied/cut source span (drawn with dashed border when active). */
@@ -308,6 +314,9 @@ export class Renderer {
       this.#spillBorderOutline(frame, layout, q, originX, originY);
       this.#clipboardOutline(frame, layout, q, originX, originY);
       this.#selectionOutlines(frame, layout, q, originX, originY);
+      if (frame.diffHighlights?.size) {
+        this.#diffHighlights(frame.diffHighlights, layout, q, originX, originY);
+      }
       if (frame.remotePresences?.length) {
         this.#remotePresence(frame.remotePresences, theme, layout, q, originX, originY);
       }
@@ -322,6 +331,57 @@ export class Renderer {
     this.#freezeDividers(frame, fz, right, bottom);
     this.#reorderGuide(frame, layout, sheet, fz, right, bottom);
     return counts;
+  }
+
+  #diffHighlights(
+    highlights: DiffHighlightMap,
+    layout: SheetLayout,
+    quadrant: Quadrant,
+    originX: number,
+    originY: number,
+  ): void {
+    const { clip, span } = quadrant;
+    const { rowAxis, colAxis } = layout;
+    const context = this.#context;
+    context.save();
+    context.beginPath();
+    context.rect(clip.left, clip.top, clip.width, clip.height);
+    context.clip();
+    for (const [key, kind] of highlights) {
+      const sep = key.indexOf(":");
+      if (sep <= 0) continue;
+      const row = Number(key.slice(0, sep));
+      const col = Number(key.slice(sep + 1));
+      if (row < span.firstRow || row >= span.endRow || col < span.firstCol || col >= span.endCol) {
+        continue;
+      }
+      const x = originX + colAxis.offsetOf(col);
+      const y = originY + rowAxis.offsetOf(row);
+      const w = colAxis.sizeOf(col);
+      const h = rowAxis.sizeOf(row);
+      if (kind === "conflict") {
+        context.fillStyle = "rgba(245,158,11,0.22)";
+        context.strokeStyle = "#d97706";
+        context.lineWidth = 2;
+      } else if (kind === "deleted") {
+        context.fillStyle = "rgba(239,68,68,0.12)";
+        context.strokeStyle = "#dc2626";
+        context.lineWidth = 1.5;
+      } else {
+        context.fillStyle = "rgba(34,197,94,0.10)";
+        context.strokeStyle = "#16a34a";
+        context.lineWidth = 1.5;
+      }
+      context.fillRect(x, y, w, h);
+      context.strokeRect(x + 1, y + 1, Math.max(0, w - 2), Math.max(0, h - 2));
+      if (kind === "deleted") {
+        context.beginPath();
+        context.moveTo(x + 3, y + h / 2);
+        context.lineTo(x + w - 3, y + h / 2);
+        context.stroke();
+      }
+    }
+    context.restore();
   }
 
   #remotePresence(
@@ -341,9 +401,11 @@ export class Renderer {
     context.clip();
 
     for (const overlay of overlays) {
+      const isAi = (overlay.colorSlot & 0x80) !== 0;
       const slot = overlay.colorSlot & 7;
-      const color = theme.refStrokes[slot] ?? theme.selection;
+      const color = isAi ? "#7c3aed" : (theme.refStrokes[slot] ?? theme.selection);
       const range = overlay.selection;
+      context.setLineDash(isAi ? [4, 3] : []);
       if (
         range &&
         !isEmpty(range) &&
@@ -356,7 +418,9 @@ export class Renderer {
         const y = originY + rowAxis.offsetOf(range.firstRow);
         const width = originX + colAxis.offsetOf(range.endCol) - x;
         const height = originY + rowAxis.offsetOf(range.endRow) - y;
-        context.fillStyle = theme.refFills[slot] ?? theme.selectionFill;
+        context.fillStyle = isAi
+          ? "rgba(124,58,237,0.12)"
+          : (theme.refFills[slot] ?? theme.selectionFill);
         context.fillRect(x, y, width, height);
         context.strokeStyle = color;
         context.lineWidth = 1;
@@ -373,7 +437,8 @@ export class Renderer {
       context.strokeStyle = color;
       context.lineWidth = 2;
       context.strokeRect(x + 1, y + 1, Math.max(0, width - 2), Math.max(0, height - 2));
-      this.#drawPresenceName(theme, clip, x, y, height, overlay.displayName);
+      context.setLineDash([]);
+      this.#drawPresenceName(theme, clip, x, y, height, isAi ? "AI" : overlay.displayName, isAi);
     }
     context.restore();
   }
@@ -385,6 +450,7 @@ export class Renderer {
     cursorY: number,
     cursorHeight: number,
     displayName: string,
+    isAi = false,
   ): void {
     const height = 18;
     const pad = 6;
@@ -407,11 +473,11 @@ export class Renderer {
     const top = Math.max(clip.top + 1, Math.min(preferredY, clip.top + clip.height - height - 1));
     context.beginPath();
     context.roundRect(left, top, width, height, 5);
-    context.fillStyle = theme.background;
+    context.fillStyle = isAi ? "#7c3aed" : theme.background;
     context.fill();
     context.lineWidth = 1;
     context.stroke();
-    context.fillStyle = theme.text;
+    context.fillStyle = isAi ? "#ffffff" : theme.text;
     context.fillText(name, left + pad, top + height / 2, width - 2 * pad);
   }
 

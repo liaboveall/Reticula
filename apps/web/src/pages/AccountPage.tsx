@@ -218,6 +218,17 @@ export default function AccountPage({ onNavigate }: AccountPageProps) {
                 )}
               </div>
 
+              <div className="collab-section" data-testid="account-ai-quota">
+                <p className="collab-section-title">Daily AI Analyst Quota</p>
+                <span className="page-muted">
+                  Status:{" "}
+                  {summary.aiEnabled ? "Enabled" : "Demo replays only (cloud LLM not configured)"} ·{" "}
+                  Runs today: {summary.aiRunsToday} / {summary.aiRunLimitDaily} · Tokens today:{" "}
+                  {summary.aiTokensUsedToday.toLocaleString()} /{" "}
+                  {summary.aiTokenLimitDaily.toLocaleString()}
+                </span>
+              </div>
+
               <div className="page-card page-danger">
                 <h2>Delete Account</h2>
                 <p className="page-muted">

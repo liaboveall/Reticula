@@ -10,6 +10,9 @@ pub fn run(name: &str, options: &[String]) -> Result {
     if matches!(name, "s1" | "s2") {
         return grid(name, options);
     }
+    if name == "s6" {
+        return s6_agent_loop(&Flags::parse(options, &["mock"], &["out"])?);
+    }
     if name == "s9" {
         return first_visit(options);
     }
@@ -25,9 +28,89 @@ pub fn run(name: &str, options: &[String]) -> Result {
     match name {
         "determinism" => determinism(),
         other => Err(format!(
-            "unknown spike `{other}`; available: determinism, s1, s2, s9, s9-builds, s10"
+            "unknown spike `{other}`; available: determinism, s1, s2, s6, s9, s9-builds, s10"
         )),
     }
+}
+
+/// Runs the S6 multi-step AI tool-loop probe (live endpoint from `.env.local` / env,
+/// or `--mock` deterministic dry-run) and prints latency, token, cache, and cost metrics.
+fn s6_agent_loop(flags: &Flags) -> Result {
+    use reticula_agent::LlmConfig;
+    use reticula_agent::eval::{estimate_eval_cost_usd, run_s6_probe, s6_mock_provider};
+    use reticula_agent::llm::{LlmProvider, OpenAiCompatProvider};
+
+    let provider: Box<dyn LlmProvider> = if flags.has("mock") {
+        Box::new(s6_mock_provider())
+    } else {
+        let dotenv = util::root().join(".env.local");
+        let cfg = LlmConfig::from_env_and_dotenv(Some(&dotenv))
+            .map_err(|e| format!("S6 LLM config error: {e}"))?
+            .ok_or_else(|| {
+                "S6 live probe requires RETICULA_LLM_ENABLED=true and RETICULA_LLM_API_KEY in .env.local or process env (or run `cargo xtask spike s6 --mock` for a local harness dry-run)".to_owned()
+            })?;
+        Box::new(
+            OpenAiCompatProvider::new(cfg)
+                .map_err(|e| format!("failed to build OpenAI-compatible client: {e}"))?,
+        )
+    };
+
+    util::step(&format!(
+        "s6 multi-step tool loop probe ({} / {})",
+        provider.provider_name(),
+        provider.model_name()
+    ));
+    let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+    let report = rt.block_on(run_s6_probe(provider.as_ref()));
+    println!(
+        "completion: {:.1}% | avg_steps: {:.2} | avg_in/step: {:.0} | avg_out/step: {:.0} | cache_hit: {:.1}%",
+        report.completion_rate * 100.0,
+        report.avg_steps,
+        report.avg_prompt_tokens_per_step,
+        report.avg_completion_tokens_per_step,
+        report.cache_hit_rate * 100.0,
+    );
+    println!(
+        "TTFT p50/p95: {}ms / {}ms | step latency p50/p95/max: {}ms / {}ms / {}ms | 429s: {} | schema_violations: {}",
+        report.ttft_p50_ms,
+        report.ttft_p95_ms,
+        report.step_latency_p50_ms,
+        report.step_latency_p95_ms,
+        report.step_latency_max_ms,
+        report.total_rate_limited_hits,
+        report.total_schema_violations,
+    );
+    // Illustrative cost projection using reference $1/$0.25/$4 per 1M tokens for 400 x 3 + 400 runs.
+    let est_1600 = estimate_eval_cost_usd(
+        1_600,
+        report.avg_steps,
+        report.avg_prompt_tokens_per_step,
+        report.cache_hit_rate,
+        report.avg_completion_tokens_per_step,
+        1.0,
+        0.25,
+        4.0,
+    );
+    println!("estimated 1,600-case eval cost (at ref $1/$0.25/$4 per 1M tok): ${est_1600:.2}");
+    for sc in &report.scenarios {
+        println!(
+            "  - {:<32} ok={} steps={} commits={} errors={} in={} cached={} out={}",
+            sc.id,
+            sc.completed,
+            sc.steps,
+            sc.commits,
+            sc.remaining_errors,
+            sc.prompt_tokens,
+            sc.cached_prompt_tokens,
+            sc.completion_tokens,
+        );
+    }
+    if let Some(out) = flags.get("out") {
+        let json = serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?;
+        std::fs::write(out, json).map_err(|e| format!("cannot write {out}: {e}"))?;
+        println!("wrote S6 report JSON to {out}");
+    }
+    Ok(())
 }
 
 /// Measures the grid in a browser: viewport pages (`s1`) or drawing text

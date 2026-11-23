@@ -1,0 +1,146 @@
+{
+  "version": 1,
+  "generatedWith": "reticula-agent-kernel-deterministic",
+  "items": [
+    {
+      "id": "regional-sales-summary",
+      "title": "Regional Sales Summary & Ranking",
+      "description": "Aggregate revenue by region with SUMIFS, sort descending, and format currency.",
+      "prompt": "Summarize total sales by region in E1:F5 using SUMIFS, sort the summary descending by revenue, and format amounts as currency.",
+      "tags": [
+        "SUMIFS",
+        "sort_range",
+        "format_range"
+      ],
+      "hasConflictDemo": false,
+      "hasClosureDemo": false,
+      "stepCount": 29
+    },
+    {
+      "id": "gross-margin-audit",
+      "title": "Gross Margin Error Audit & Repair",
+      "description": "Locate #DIV/0! errors via list_errors precedent chains and wrap with IFERROR.",
+      "prompt": "Audit all formula errors in the gross margin table and guard zero-revenue rows so margins evaluate cleanly.",
+      "tags": [
+        "list_errors",
+        "IFERROR",
+        "audit"
+      ],
+      "hasConflictDemo": false,
+      "hasClosureDemo": false,
+      "stepCount": 25
+    },
+    {
+      "id": "dynamic-top5-spill",
+      "title": "Dynamic Array Top-5 Customers",
+      "description": "Build a dynamic SORT/TAKE spill dashboard and sum with the # spill operator.",
+      "prompt": "Create a dynamic Top-3 customer leaderboard in D2 using SORT and TAKE, and compute the combined total in E6 using the spill operator D2#.",
+      "tags": [
+        "SORT",
+        "TAKE",
+        "Spill #"
+      ],
+      "hasConflictDemo": false,
+      "hasClosureDemo": false,
+      "stepCount": 18
+    },
+    {
+      "id": "monthly-budget-variance",
+      "title": "Budget Variance & Q1 Subtotal Row",
+      "description": "Insert a Q1 subtotal row with identity-anchored references and compute variance %.",
+      "prompt": "Insert a Q1 Subtotal row after March (row 4), calculate Budget/Actual subtotals, and add Variance % in column D.",
+      "tags": [
+        "edit_structure",
+        "insert_rows",
+        "variance"
+      ],
+      "hasConflictDemo": false,
+      "hasClosureDemo": false,
+      "stepCount": 24
+    },
+    {
+      "id": "xlookup-price-join",
+      "title": "Cross-Sheet XLOOKUP Price Join",
+      "description": "Join unit prices from a Catalog sheet into Orders via XLOOKUP and fill line totals.",
+      "prompt": "Add a Catalog price lookup in Orders!C2:C4 using XLOOKUP and compute Line Total in D2:D4.",
+      "tags": [
+        "XLOOKUP",
+        "cross-sheet",
+        "fill_formula"
+      ],
+      "hasConflictDemo": false,
+      "hasClosureDemo": false,
+      "stepCount": 23
+    },
+    {
+      "id": "cohort-kpi-named-range",
+      "title": "Named Range NPV & IRR Cashflow Model",
+      "description": "Define DiscountRate named range and compute project NPV and IRR.",
+      "prompt": "Define a workbook named range DiscountRate pointing to B1 (8%), then calculate NPV in B7 and IRR in B8.",
+      "tags": [
+        "NamedRange",
+        "NPV",
+        "IRR"
+      ],
+      "hasConflictDemo": false,
+      "hasClosureDemo": false,
+      "stepCount": 19
+    },
+    {
+      "id": "messy-text-cleanup",
+      "title": "Messy Customer Name Cleanup",
+      "description": "Normalize whitespace and casing with TRIM/PROPER and extract domains with TEXTSPLIT.",
+      "prompt": "Clean customer names into C2:C4 with PROPER(TRIM(...)) and build formatted contact tags in D2:D4 with TEXTJOIN.",
+      "tags": [
+        "TRIM",
+        "PROPER",
+        "TEXTJOIN"
+      ],
+      "hasConflictDemo": false,
+      "hasClosureDemo": false,
+      "stepCount": 19
+    },
+    {
+      "id": "date-sla-tracking",
+      "title": "Workday SLA Due Date & Status",
+      "description": "Compute business-day SLA due dates with WORKDAY and classify overdue tickets via IFS.",
+      "prompt": "Compute 5-business-day SLA due dates in D2:D4 using WORKDAY and classify status vs Closed Date in E2:E4 using IFS.",
+      "tags": [
+        "WORKDAY",
+        "NETWORKDAYS",
+        "IFS"
+      ],
+      "hasConflictDemo": false,
+      "hasClosureDemo": false,
+      "stepCount": 20
+    },
+    {
+      "id": "quarterly-sort-ranking",
+      "title": "Quarterly Multi-Key Sort & Percentile Rank",
+      "description": "Sort reps by Region then Score descending, then add RANK.EQ and PERCENTILE.INC.",
+      "prompt": "Sort A1:C6 by Region ascending then Score descending, add RANK.EQ in D2:D6, and show the 80th percentile threshold in C8.",
+      "tags": [
+        "sort_range",
+        "RANK.EQ",
+        "PERCENTILE.INC"
+      ],
+      "hasConflictDemo": false,
+      "hasClosureDemo": false,
+      "stepCount": 20
+    },
+    {
+      "id": "conflict-and-closure-demo",
+      "title": "Interactive Conflict & Reference Closure Lab",
+      "description": "Hands-on walkthrough with a concurrent main-branch cell conflict and an inserted-row reference closure check.",
+      "prompt": "Insert a Tax Adjustment row at row 2, update Q1 Forecast (B3) to 520, and reference the new Tax row from Net Total (C1).",
+      "tags": [
+        "3-Way Conflict",
+        "Reference Closure",
+        "No Sign-In"
+      ],
+      "hasConflictDemo": true,
+      "hasClosureDemo": true,
+      "stepCount": 19
+    }
+  ]
+}

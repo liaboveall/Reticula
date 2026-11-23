@@ -6,6 +6,7 @@
 
 mod codegen;
 mod compat;
+mod eval;
 mod qa;
 mod rust;
 mod setup;
@@ -80,11 +81,15 @@ Commands:
   ci                      Everything CI runs on a push. Run it before pushing.
   spike <name> [options]  Run one of the experiments under spikes/ and print its report.
                           `s1` and `s2` measure the grid in a browser and pass their
-                          options on: see spikes/grid/measure.mjs. `s9` measures a first
-                          visit of the production build: see spikes/startup/measure.mjs;
+                          options on: see spikes/grid/measure.mjs. `s6 [--mock] [--out <file>]`
+                          probes multi-step LLM tool-calling reliability and cost. `s9` measures
+                          a first visit of the production build: see spikes/startup/measure.mjs;
                           `s9-builds [--affinity <mask>]` compares the engine at several
                           optimisation levels. `s10` serves the page for checking input
                           methods: see spikes/grid/ime.mjs.
+  eval <replays|download|run|grade|report> [options]
+                          Generate the 10 built-in AI demo replays (`replays`) or run/grade/report
+                          SpreadsheetBench Verified evaluations.
 ";
 
 fn main() -> ExitCode {
@@ -171,6 +176,7 @@ fn run(args: &[String]) -> Result {
             Flags::parse(rest, &[], &[])?;
             ci()
         }
+        "eval" => eval::run(rest),
         "spike" => match rest.split_first() {
             Some((name, options)) => spike::run(name, options),
             None => Err("usage: cargo xtask spike <name> [options]".to_owned()),

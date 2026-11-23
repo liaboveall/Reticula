@@ -33,10 +33,11 @@ use reticula_formula::lang_service::{
     SignatureHelp, SyntaxTokenKind, SyntaxTokenSpan,
 };
 use reticula_formula::parser::ParseError;
+use reticula_wire::convert_v3::ops_from_wire_txn_v3;
 use reticula_wire::snapshot::{
     SnapshotEncoder, SnapshotStep, decode_snapshot_any, encode_seed_stub_v1, encode_snapshot_v1,
 };
-use reticula_wire::v3::{WireOpV3, WireWalRecordV3};
+use reticula_wire::v3::{WireOpV3, WireTxnV3, WireWalRecordV3};
 use reticula_wire::wal::{
     WalCorruptionV3, WalTailDisposition, encode_wal_init_v3, encode_wal_record_v3,
     replay_wal_records_v3, scan_wal_any_v3,
@@ -1980,6 +1981,49 @@ impl Engine {
             recalc_frozen: self.recalc_frozen,
         };
         Ok(Ts::from_rust(&outcome)?)
+    }
+
+    /// Applies a single postcard-encoded `WireTxnV3` directly to this engine,
+    /// recalculates all affected formulas, enqueues subscribed viewport pages,
+    /// and returns the updated `SheetInfo` (used by pure-client AI replay
+    /// playback and local selective merge).
+    #[wasm_bindgen(js_name = applyWireTxnV3)]
+    pub fn apply_wire_txn_v3(&mut self, bytes: &[u8]) -> Result<Ts<SheetInfo>, JsError> {
+        check_not_panicked()?;
+        let txn: WireTxnV3 = postcard::from_bytes(bytes)
+            .map_err(|e| JsError::new(&format!("invalid WireTxnV3: {e}")))?;
+        let (_, ops) = ops_from_wire_txn_v3(txn)
+            .map_err(|e| JsError::new(&format!("invalid WireTxnV3 ops: {e:?}")))?;
+        for op in ops {
+            self.engine
+                .apply_op(op)
+                .map_err(|e| JsError::new(&format!("apply op failed: {e:?}")))?;
+        }
+        self.engine.recalc_all();
+        let _ = self.engine.take_dirty_changes();
+        let active = if self
+            .engine
+            .workbook()
+            .sheet(self.subscribed_sheet)
+            .is_some()
+        {
+            self.subscribed_sheet
+        } else {
+            self.engine
+                .workbook()
+                .live_sheets()
+                .next()
+                .map_or(SheetId(0), Sheet::id)
+        };
+        if active != self.subscribed_sheet {
+            self.reset_subscription(active);
+        } else {
+            let pages = self.subscribed_pages.clone();
+            for page in pages {
+                self.enqueue_page(page);
+            }
+        }
+        Ok(Ts::from_rust(&self.sheet_info(active))?)
     }
 
     /// Validates `raw_bytes` (`<= 256 MiB`, valid UTF-8) and begins row-batched

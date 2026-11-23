@@ -673,6 +673,24 @@ export default function BenchmarksPage({ onNavigate }: BenchmarksPageProps) {
             </div>
           </section>
         )}
+
+        <section className="page-card" data-testid="bench-ai-eval-section">
+          <h2>AI Analyst — SpreadsheetBench Verified Evaluation</h2>
+          <p className="page-muted">
+            Methodology: 400 verified real-world spreadsheet tasks (CC BY-SA 4.0) executed
+            headlessly via <code>cargo xtask eval</code> using dual-path XLSX fidelity (
+            <code>patch_xlsx</code> default, <code>export_xlsx</code> fallback on structural edits),
+            graded inside the pinned <code>reticula-libreoffice:26.8.2</code> container, reported
+            with 95% Wilson score confidence intervals and mutually exclusive root-cause attribution
+            (<code>kernel_gap</code>, <code>agent_strategy</code>, <code>model_capability</code>).
+          </p>
+          <p className="page-muted">
+            <strong>Live Model Status:</strong> Awaiting live S6 tool-loop probe (
+            <code>cargo xtask spike s6</code>) and D-025 model/budget sign-off once a live{" "}
+            <code>RETICULA_LLM_API_KEY</code> is configured. No unmeasured numbers are shown; try
+            all 10 deterministic interactive AI replays directly in the <a href="/app">Editor</a>.
+          </p>
+        </section>
       </main>
     </div>
   );

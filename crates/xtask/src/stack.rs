@@ -192,7 +192,8 @@ pub(crate) fn write_compose_env(
          POSTGRES_PASSWORD={}\n\
          RETICULA_PUBLIC_ORIGIN={origin}\n\
          RETICULA_GITHUB_CLIENT_ID=stack-run-through\n\
-         RETICULA_GITHUB_CLIENT_SECRET={}\n",
+         RETICULA_GITHUB_CLIENT_SECRET={}\n\
+         RETICULA_LLM_MODE=mock\n",
         throwaway_secret(),
         throwaway_secret(),
     );

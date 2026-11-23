@@ -30,6 +30,7 @@ import {
 } from "./layout.ts";
 import { decodePage } from "./page.ts";
 import {
+  type DiffHighlightMap,
   FILL_HANDLE_SIZE,
   type FormulaReferenceOverlay,
   type GridCellStyle,
@@ -219,6 +220,7 @@ export class Grid {
   #styles: readonly GridCellStyle[] = [];
   #formulaRefs: readonly FormulaReferenceOverlay[] = [];
   #remotePresences: readonly RemotePresenceOverlay[] = [];
+  #diffHighlights: DiffHighlightMap | null = null;
   #clipboardRange: { readonly span: Span; readonly cut: boolean } | null = null;
   #fillPreview: Span | null = null;
   #reorderGuide: ReorderGuide | null = null;
@@ -386,6 +388,12 @@ export class Grid {
   /** Replaces the visible remote collaborators on the active sheet. */
   setRemotePresences(presences: readonly RemotePresenceOverlay[]): void {
     this.#remotePresences = presences;
+    this.#invalidate();
+  }
+
+  /** Sets or clears three-state diff highlights keyed by `"row:col"`. */
+  setDiffHighlights(highlights: DiffHighlightMap | null): void {
+    this.#diffHighlights = highlights;
     this.#invalidate();
   }
 
@@ -945,6 +953,7 @@ export class Grid {
       styles: this.#styles,
       formulaReferences: this.#formulaRefs,
       remotePresences: this.#remotePresences,
+      diffHighlights: this.#diffHighlights,
       fillPreview: this.#fillPreview,
       clipboardRange: this.#clipboardRange,
       reorderGuide: this.#reorderGuide,
