@@ -41,7 +41,7 @@ pub use types::{
     ClientAction, CommittedPermute, ConnectionState, MemberRole, ReplicaWatermark, ServerLimits,
     StagedTxn, TryApplyOutcome, VIEWER_REPLICA,
 };
-pub use validate::transform_ops_through_permute;
+pub use validate::{RemapState, transform_ops_through_permute};
 
 #[cfg(test)]
 #[allow(
@@ -2106,6 +2106,69 @@ mod tests {
         assert_eq!(
             cold_srv.workbook().sheet(SheetId(0)).unwrap().value(1, 0),
             Value::Number(777.0)
+        );
+    }
+
+    #[test]
+    fn register_external_replica_and_public_remap_state_avoid_conflicts() {
+        use reticula_core::id::IdAllocator;
+
+        let mut server = ServerDocMachine::new(
+            DOC_ID,
+            BRANCH_ID,
+            String::from("/api/w"),
+            ServerLimits::default(),
+        );
+        // Simulate PG allocating replica seq 5 on a draft branch before main allocates.
+        let draft_rep = pack_replica_id(0, 5).unwrap();
+        server.register_external_replica(draft_rep, USER_B);
+        assert_eq!(server.next_per_epoch_replica(), 6);
+
+        // Next handshake using external replica 7 advances counter to 8 without colliding.
+        let ext_rep = pack_replica_id(0, 7).unwrap();
+        let hello = WireSyncFrameV2::Hello {
+            protocol_version: SYNC_PROTOCOL_VERSION_V2,
+            doc_id: DOC_ID,
+            branch_id: BRANCH_ID,
+            replica: None,
+            last_applied_seq: 0,
+            known_epoch: 0,
+        };
+        let welcome = server
+            .on_hello_with_external_replica(USER_A, Some(MemberRole::Owner), &hello, Some(ext_rep))
+            .unwrap();
+        let WireSyncFrameV2::Welcome { replica, .. } = welcome else {
+            panic!("expected Welcome");
+        };
+        assert_eq!(replica, ext_rep);
+        assert_eq!(server.next_per_epoch_replica(), 8);
+
+        // RemapState remaps draft-inserted row IDs into merge_replica's stream.
+        let mut draft_alloc = IdAllocator::new(0, draft_rep, 1).unwrap();
+        let draft_rows = draft_alloc.alloc_run(2).unwrap();
+        let mut merge_alloc = IdAllocator::new(0, ext_rep, 1).unwrap();
+        let mut sheet_counter = 1_u8;
+        let mut remap = crate::RemapState::new(
+            0,
+            ext_rep,
+            &mut merge_alloc,
+            &mut sheet_counter,
+            server.workbook(),
+        );
+        let remapped_insert = remap
+            .remap_op(Op::InsertRows {
+                sheet: SheetId(0),
+                after: None,
+                ids: draft_rows,
+            })
+            .unwrap();
+        let Op::InsertRows { ids: new_ids, .. } = remapped_insert else {
+            panic!("expected InsertRows");
+        };
+        assert!(new_ids.belongs_to(0, ext_rep));
+        assert_eq!(
+            remap.map_row(RowId(draft_rows.first_id)),
+            RowId(new_ids.first_id)
         );
     }
 }

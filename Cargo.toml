@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/agent",
     "crates/core",
     "crates/formula",
     "crates/kernel-bench",
@@ -25,6 +26,7 @@ repository = "https://github.com/liaboveall/Reticula"
 publish = false
 
 [workspace.dependencies]
+reticula-agent = { path = "crates/agent" }
 reticula-core = { path = "crates/core" }
 reticula-formula = { path = "crates/formula" }
 reticula-sim = { path = "crates/sim" }

@@ -138,6 +138,60 @@ pub struct InspectedCell {
     pub error: Option<String>,
 }
 
+/// Error returned by [`FormulaEngine::evaluate_transient_formula`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransientEvalError {
+    /// Target worksheet does not exist or has been deleted.
+    SheetNotFound,
+    /// Anchor cell coordinates are outside the worksheet's live axes.
+    OutOfBounds,
+    /// Formula syntax or static limit error.
+    Parse(ParseError),
+}
+
+/// Result of evaluating a formula without mutating the workbook or dependency graph.
+#[derive(Clone, Debug, PartialEq)]
+pub enum TransientEvalValue {
+    /// Single scalar evaluation outcome.
+    Scalar(EvalScalar),
+    /// Dynamic 2D array outcome (`rows x cols`).
+    Array(Array2D),
+}
+
+/// Direct precedent cell inspected for an errored formula cell.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PrecedentTrace {
+    /// Target worksheet display name.
+    pub sheet_name: String,
+    /// Canonical A1 coordinate (`"B2"`).
+    pub address: String,
+    /// Formatted display text of the precedent cell.
+    pub display: String,
+    /// Error code string if the precedent cell itself holds an error.
+    pub error: Option<String>,
+}
+
+/// Diagnostic record for a cell currently holding a calculation error.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ErrorCellTrace {
+    /// Worksheet identity.
+    pub sheet_id: SheetId,
+    /// Worksheet display name.
+    pub sheet_name: String,
+    /// Row identity.
+    pub row: RowId,
+    /// Column identity.
+    pub col: ColId,
+    /// Canonical A1 coordinate (`"D5"`).
+    pub address: String,
+    /// Calculation error code (`"#DIV/0!"`, `"#REF!"`, `"#SPILL!"`, etc.).
+    pub error: String,
+    /// Raw formula string if this cell contains a formula (`None` for literal errors).
+    pub formula: Option<String>,
+    /// Direct precedent cells (capped at 16 per errored cell).
+    pub precedents: Vec<PrecedentTrace>,
+}
+
 #[derive(Clone, Debug)]
 struct FormulaSlot {
     key: WorkbookCellKey,
@@ -1018,6 +1072,159 @@ impl FormulaEngine {
             is_formula: false,
             error,
         })
+    }
+
+    /// Evaluates a formula string against the live workbook at `(sheet, anchor_pos)`
+    /// without persisting any cell edits, dependency-graph mutations, spill updates,
+    /// or `StateDigest` changes.
+    ///
+    /// If dirty formulas are pending, recalculates them first so precedents are clean.
+    pub fn evaluate_transient_formula(
+        &mut self,
+        sheet: SheetId,
+        anchor_pos: (u32, u32),
+        formula_text: &str,
+    ) -> Result<TransientEvalValue, TransientEvalError> {
+        if self.has_pending_recalc() {
+            let _ = self.recalc_all();
+        }
+        let (row_id, col_id) = {
+            let s = self
+                .workbook
+                .live_sheet(sheet)
+                .ok_or(TransientEvalError::SheetNotFound)?;
+            let r = s
+                .row_axis()
+                .pos_to_id(anchor_pos.0)
+                .ok_or(TransientEvalError::OutOfBounds)?;
+            let c = s
+                .col_axis()
+                .pos_to_id(anchor_pos.1)
+                .ok_or(TransientEvalError::OutOfBounds)?;
+            (RowId(r), ColId(c))
+        };
+
+        let trimmed = formula_text.trim();
+        let normalized = if trimmed.starts_with('=') {
+            String::from(trimmed)
+        } else {
+            let mut s = String::with_capacity(trimmed.len().saturating_add(1));
+            s.push('=');
+            s.push_str(trimmed);
+            s
+        };
+
+        let bound =
+            BoundFormula::parse_and_bind(&normalized, FormulaMode::Dynamic, &self.workbook, sheet)
+                .map_err(TransientEvalError::Parse)?;
+
+        let saved_env = self.env.clone();
+        let saved_name_stack = core::mem::take(&mut self.name_eval_stack);
+        let caller = CallerContext {
+            sheet,
+            row: row_id,
+            col: col_id,
+            mode: FormulaMode::Dynamic,
+        };
+        let outcome = self.eval_root_formula(&bound.root, caller);
+        self.env = saved_env;
+        self.name_eval_stack = saved_name_stack;
+
+        let value = match outcome {
+            ExprOutcome::Ready(v) => match v {
+                EvalValue::Scalar(s) => TransientEvalValue::Scalar(s),
+                EvalValue::Array(arr) => TransientEvalValue::Array(arr),
+                EvalValue::Missing => TransientEvalValue::Scalar(EvalScalar::Number(0.0)),
+                EvalValue::Reference(r) => {
+                    match materialise_reference(&r, &self.workbook, &self.spills) {
+                        Ok(ScalarOrArray::Scalar(s)) => TransientEvalValue::Scalar(s),
+                        Ok(ScalarOrArray::Array(arr)) => TransientEvalValue::Array(arr),
+                        Err(e) => TransientEvalValue::Scalar(EvalScalar::Error(e)),
+                    }
+                }
+            },
+            ExprOutcome::Cycle(_) => {
+                TransientEvalValue::Scalar(EvalScalar::Error(CalcError::Cycle))
+            }
+            ExprOutcome::Blocked(_) => {
+                TransientEvalValue::Scalar(EvalScalar::Error(CalcError::Calc))
+            }
+        };
+        Ok(value)
+    }
+
+    /// Lists cells currently displaying a calculation error in deterministic
+    /// `(sheet tab order, row, col)` order, together with each formula's direct
+    /// precedent cells (capped at 16 precedents per error cell).
+    #[must_use]
+    pub fn list_error_cells(
+        &self,
+        sheet_filter: Option<SheetId>,
+        max_count: usize,
+    ) -> Vec<ErrorCellTrace> {
+        let mut results = Vec::new();
+        if max_count == 0 {
+            return results;
+        }
+        for sheet in self.workbook.live_sheets() {
+            let sid = sheet.id();
+            if sheet_filter.is_some_and(|want| want != sid) {
+                continue;
+            }
+            let mut found: Vec<(u32, u32, RowId, ColId, String)> = Vec::new();
+            sheet.for_each_non_empty_cell(|r_pos, c_pos, row_id, col_id, val| match val {
+                Value::Error(e) => {
+                    found.push((r_pos, c_pos, row_id, col_id, String::from(e.as_str())));
+                }
+                Value::Array(_) => found.push((
+                    r_pos,
+                    c_pos,
+                    row_id,
+                    col_id,
+                    String::from(CalcError::Spill.as_str()),
+                )),
+                _ => {}
+            });
+            found.sort_by_key(|&(r_pos, c_pos, _, _, _)| (r_pos, c_pos));
+            for (r_pos, c_pos, row_id, col_id, err_str) in found {
+                if results.len() >= max_count {
+                    return results;
+                }
+                let mut address = String::new();
+                CellAddr {
+                    col: c_pos,
+                    row: r_pos,
+                    abs_col: false,
+                    abs_row: false,
+                }
+                .write_a1(&mut address);
+                let bound = self.workbook.formula(sid, row_id, col_id);
+                let formula = bound.map(|f| f.unparse(&self.workbook, sid));
+                let mut precedents = Vec::new();
+                if let Some(f) = bound {
+                    let mut seen = BTreeSet::new();
+                    collect_bound_precedents(
+                        &self.workbook,
+                        sid,
+                        &f.root,
+                        &mut seen,
+                        &mut precedents,
+                        16,
+                    );
+                }
+                results.push(ErrorCellTrace {
+                    sheet_id: sid,
+                    sheet_name: String::from(sheet.name()),
+                    row: row_id,
+                    col: col_id,
+                    address,
+                    error: err_str,
+                    formula,
+                    precedents,
+                });
+            }
+        }
+        results
     }
 
     /// Parses raw user input under E30 (respecting [`NumberFormat::PlainText`]
@@ -4484,6 +4691,160 @@ fn build_sample_row_formula(row: RowId) -> BoundFormula {
     }
 }
 
+fn push_precedent_cell(
+    workbook: &Workbook<BoundFormula>,
+    sheet_id: SheetId,
+    row: RowId,
+    col: ColId,
+    seen: &mut BTreeSet<WorkbookCellKey>,
+    out: &mut Vec<PrecedentTrace>,
+    limit: usize,
+) {
+    if out.len() >= limit || !seen.insert((sheet_id, row, col)) {
+        return;
+    }
+    let Some(sheet) = workbook.live_sheet(sheet_id) else {
+        return;
+    };
+    let (Some(r_pos), Some(c_pos)) = (
+        sheet.row_axis().id_to_pos(row.0),
+        sheet.col_axis().id_to_pos(col.0),
+    ) else {
+        return;
+    };
+    let mut address = String::new();
+    CellAddr {
+        col: c_pos,
+        row: r_pos,
+        abs_col: false,
+        abs_row: false,
+    }
+    .write_a1(&mut address);
+    let val = sheet.value_by_id(row, col);
+    let mut display = String::new();
+    sheet.format_value(val, row, col, &mut display);
+    let error = match val {
+        Value::Error(e) => Some(String::from(e.as_str())),
+        Value::Array(_) => Some(String::from(CalcError::Spill.as_str())),
+        _ => None,
+    };
+    out.push(PrecedentTrace {
+        sheet_name: String::from(sheet.name()),
+        address,
+        display,
+        error,
+    });
+}
+
+fn collect_bound_precedents(
+    workbook: &Workbook<BoundFormula>,
+    host_sheet: SheetId,
+    expr: &BoundExpr,
+    seen: &mut BTreeSet<WorkbookCellKey>,
+    out: &mut Vec<PrecedentTrace>,
+    limit: usize,
+) {
+    if out.len() >= limit {
+        return;
+    }
+    match expr {
+        BoundExpr::Reference(r) => match r {
+            BoundRef::Cell {
+                sheet,
+                missing_sheet,
+                row,
+                col,
+                ..
+            } if missing_sheet.is_none() => {
+                push_precedent_cell(
+                    workbook,
+                    sheet.unwrap_or(host_sheet),
+                    *row,
+                    *col,
+                    seen,
+                    out,
+                    limit,
+                );
+            }
+            BoundRef::Area {
+                sheet,
+                missing_sheet,
+                first_row,
+                first_col,
+                last_row,
+                last_col,
+                ..
+            } if missing_sheet.is_none() => {
+                let target_sid = sheet.unwrap_or(host_sheet);
+                let Some(s) = workbook.live_sheet(target_sid) else {
+                    return;
+                };
+                if let (Some((r0, r1)), Some((c0, c1))) = (
+                    live_span_positions(s.row_axis(), first_row.0, last_row.0),
+                    live_span_positions(s.col_axis(), first_col.0, last_col.0),
+                ) {
+                    // Prioritize errored cells inside the area, then corner cells.
+                    let mut corners_added = 0_usize;
+                    let mut r = r0;
+                    while r <= r1 && out.len() < limit && corners_added < 64 {
+                        if let Some(rid) = s.row_axis().pos_to_id(r) {
+                            let mut c = c0;
+                            while c <= c1 && out.len() < limit && corners_added < 64 {
+                                if let Some(cid) = s.col_axis().pos_to_id(c) {
+                                    let val = s.value_by_id(RowId(rid), ColId(cid));
+                                    if matches!(val, Value::Error(_) | Value::Array(_))
+                                        || (r == r0 && c == c0)
+                                        || (r == r1 && c == c1)
+                                    {
+                                        push_precedent_cell(
+                                            workbook,
+                                            target_sid,
+                                            RowId(rid),
+                                            ColId(cid),
+                                            seen,
+                                            out,
+                                            limit,
+                                        );
+                                    }
+                                }
+                                c = c.saturating_add(1);
+                                corners_added = corners_added.saturating_add(1);
+                            }
+                        }
+                        r = r.saturating_add(1);
+                    }
+                }
+            }
+            _ => {}
+        },
+        BoundExpr::Paren(inner) | BoundExpr::SpillRef(inner) => {
+            collect_bound_precedents(workbook, host_sheet, inner, seen, out, limit);
+        }
+        BoundExpr::Unary { expr: inner, .. } => {
+            collect_bound_precedents(workbook, host_sheet, inner, seen, out, limit);
+        }
+        BoundExpr::Binary { left, right, .. } => {
+            collect_bound_precedents(workbook, host_sheet, left, seen, out, limit);
+            collect_bound_precedents(workbook, host_sheet, right, seen, out, limit);
+        }
+        BoundExpr::Call { args, .. } => {
+            for arg in args {
+                if out.len() >= limit {
+                    break;
+                }
+                collect_bound_precedents(workbook, host_sheet, arg, seen, out, limit);
+            }
+        }
+        BoundExpr::Literal(_)
+        | BoundExpr::ArrayLiteral { .. }
+        | BoundExpr::Name(_)
+        | BoundExpr::ScopedName { .. }
+        | BoundExpr::Opaque { .. }
+        | BoundExpr::PreservedCached { .. }
+        | BoundExpr::MissingArg => {}
+    }
+}
+
 #[allow(dead_code)]
 const _KEEP_SHEET_TYPE: Option<&Sheet> = None;
 
@@ -4507,7 +4868,10 @@ mod tests {
     use reticula_core::value::{CalcError, Value};
     use smallvec::SmallVec;
 
-    use super::{FormulaEngine, RecalcStatus, merge_blocked};
+    use super::{
+        FormulaEngine, RecalcStatus, TransientEvalError, TransientEvalValue, merge_blocked,
+    };
+    use crate::value_eval::EvalScalar;
 
     #[test]
     fn layer0_functions_cycles_short_circuit_and_structural_recalc_work() {
@@ -6638,5 +7002,88 @@ mod tests {
             engine.workbook().sheet(s0).unwrap().value(1, 1),
             Value::number(75.0)
         );
+    }
+
+    #[test]
+    fn transient_formula_evaluates_without_side_effects_and_list_error_cells_traces_precedents() {
+        let mut engine = FormulaEngine::new();
+        let s0 = SheetId(0);
+        engine.edit_cell_raw(s0, RowId(0), ColId(0), "10").unwrap();
+        engine.edit_cell_raw(s0, RowId(1), ColId(0), "0").unwrap();
+        engine
+            .edit_cell_raw(s0, RowId(2), ColId(0), "=A1/A2")
+            .unwrap();
+        engine
+            .edit_cell_raw(s0, RowId(3), ColId(0), "=A3+5")
+            .unwrap();
+        engine.recalc_all();
+
+        let digest_before = engine.workbook().state_digest();
+        let formulas_before = engine.workbook().formulas().len();
+
+        // Scalar transient evaluation (with and without leading `=`).
+        let sum_val = engine
+            .evaluate_transient_formula(s0, (0, 1), "=SUM(A1:A2)*ROW()")
+            .unwrap();
+        assert_eq!(
+            sum_val,
+            TransientEvalValue::Scalar(EvalScalar::Number(10.0))
+        );
+        let no_eq = engine
+            .evaluate_transient_formula(s0, (4, 1), "IFERROR(A3, 99)")
+            .unwrap();
+        assert_eq!(no_eq, TransientEvalValue::Scalar(EvalScalar::Number(99.0)));
+
+        // Dynamic array transient evaluation.
+        let arr_val = engine
+            .evaluate_transient_formula(s0, (0, 2), "=SEQUENCE(2, 2, 1, 1)")
+            .unwrap();
+        match arr_val {
+            TransientEvalValue::Array(arr) => {
+                assert_eq!((arr.rows, arr.cols), (2, 2));
+                assert_eq!(arr.values[0], EvalScalar::Number(1.0));
+                assert_eq!(arr.values[3], EvalScalar::Number(4.0));
+            }
+            TransientEvalValue::Scalar(_) => panic!("expected 2x2 array"),
+        }
+
+        // Workbook state, formulas, spills, and digest are untouched.
+        assert_eq!(engine.workbook().state_digest(), digest_before);
+        assert_eq!(engine.workbook().formulas().len(), formulas_before);
+        assert_eq!(
+            engine.workbook().sheet(s0).unwrap().value(0, 1),
+            Value::Empty
+        );
+        assert_eq!(
+            engine.workbook().sheet(s0).unwrap().value(0, 2),
+            Value::Empty
+        );
+
+        // Bounds / missing sheet / parse error paths.
+        assert_eq!(
+            engine.evaluate_transient_formula(SheetId(999), (0, 0), "=1+1"),
+            Err(TransientEvalError::SheetNotFound)
+        );
+        assert_eq!(
+            engine.evaluate_transient_formula(s0, (u32::MAX, 0), "=1+1"),
+            Err(TransientEvalError::OutOfBounds)
+        );
+        assert!(matches!(
+            engine.evaluate_transient_formula(s0, (0, 0), "=SUM("),
+            Err(TransientEvalError::Parse(_))
+        ));
+
+        // Error trace lists A3 (#DIV/0!) and A4 (#DIV/0!) with direct precedents.
+        let errors = engine.list_error_cells(None, 10);
+        assert_eq!(errors.len(), 2);
+        assert_eq!(errors[0].address, "A3");
+        assert_eq!(errors[0].error, "#DIV/0!");
+        assert_eq!(errors[0].formula.as_deref(), Some("=A1/A2"));
+        assert_eq!(errors[0].precedents.len(), 2);
+        assert_eq!(errors[0].precedents[0].address, "A1");
+        assert_eq!(errors[0].precedents[1].address, "A2");
+        assert_eq!(errors[1].address, "A4");
+        assert_eq!(errors[1].precedents[0].address, "A3");
+        assert_eq!(errors[1].precedents[0].error.as_deref(), Some("#DIV/0!"));
     }
 }

@@ -66,8 +66,8 @@ pub fn max_id_counter_in_ops(epoch: u8, replica: u32, ops: &[Op<BoundFormula>]) 
 }
 
 /// Mutable identity remapping tables maintained across pending transactions
-/// when rewriting queue entries onto a new `(epoch, replica)`.
-pub(crate) struct RemapState<'a> {
+/// or branch merges when rewriting operations onto a fresh `(epoch, replica)`.
+pub struct RemapState<'a> {
     pub(crate) epoch: u8,
     pub(crate) replica: u32,
     pub(crate) id_alloc: &'a mut IdAllocator,
@@ -78,17 +78,62 @@ pub(crate) struct RemapState<'a> {
     pub(crate) cols: BTreeMap<ColId, ColId>,
 }
 
-impl RemapState<'_> {
-    fn map_sheet(&self, id: SheetId) -> SheetId {
+impl<'a> RemapState<'a> {
+    /// Creates an identity remapping context targeting `(epoch, replica)` against
+    /// the current confirmed `workbook`.
+    pub fn new(
+        epoch: u8,
+        replica: u32,
+        id_alloc: &'a mut IdAllocator,
+        next_sheet_counter: &'a mut u8,
+        confirmed: &'a Workbook<BoundFormula>,
+    ) -> Self {
+        Self {
+            epoch,
+            replica,
+            id_alloc,
+            next_sheet_counter,
+            confirmed,
+            sheets: BTreeMap::new(),
+            rows: BTreeMap::new(),
+            cols: BTreeMap::new(),
+        }
+    }
+
+    /// Maps a worksheet ID through the current remapping table.
+    #[must_use]
+    pub fn map_sheet(&self, id: SheetId) -> SheetId {
         self.sheets.get(&id).copied().unwrap_or(id)
     }
 
-    fn map_row(&self, id: RowId) -> RowId {
+    /// Maps a row ID through the current remapping table.
+    #[must_use]
+    pub fn map_row(&self, id: RowId) -> RowId {
         self.rows.get(&id).copied().unwrap_or(id)
     }
 
-    fn map_col(&self, id: ColId) -> ColId {
+    /// Maps a column ID through the current remapping table.
+    #[must_use]
+    pub fn map_col(&self, id: ColId) -> ColId {
         self.cols.get(&id).copied().unwrap_or(id)
+    }
+
+    /// Current remapped worksheet IDs (`draft_id -> target_id`).
+    #[must_use]
+    pub const fn sheet_map(&self) -> &BTreeMap<SheetId, SheetId> {
+        &self.sheets
+    }
+
+    /// Current remapped row IDs (`draft_id -> target_id`).
+    #[must_use]
+    pub const fn row_map(&self) -> &BTreeMap<RowId, RowId> {
+        &self.rows
+    }
+
+    /// Current remapped column IDs (`draft_id -> target_id`).
+    #[must_use]
+    pub const fn col_map(&self) -> &BTreeMap<ColId, ColId> {
+        &self.cols
     }
 
     fn map_row_runs(&self, runs: &[IdRun]) -> Vec<IdRun> {
@@ -130,7 +175,9 @@ impl RemapState<'_> {
         }
     }
 
-    pub(crate) fn remap_op(&mut self, op: Op<BoundFormula>) -> Option<Op<BoundFormula>> {
+    /// Remaps all sheet/row/column identities and bound formula references in `op`
+    /// onto fresh IDs belonging to `(self.epoch, self.replica)`.
+    pub fn remap_op(&mut self, op: Op<BoundFormula>) -> Option<Op<BoundFormula>> {
         match op {
             Op::SetCells { sheet, edits } => {
                 let mapped_edits = edits

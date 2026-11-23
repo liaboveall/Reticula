@@ -304,6 +304,23 @@ impl ServerDocMachine {
         Some(replica)
     }
 
+    /// Registers a replica ID allocated externally (for example by PostgreSQL's
+    /// atomic per-workbook allocator across branches), keeping `replicas` and
+    /// `next_per_epoch_replica` synchronized without triggering `StaleActor`.
+    pub fn register_external_replica(&mut self, replica: u32, user_id: [u8; 16]) {
+        let (rep_epoch, rep_seq) = reticula_core::id::unpack_replica_id(replica);
+        if rep_epoch == self.epoch {
+            self.next_per_epoch_replica =
+                self.next_per_epoch_replica.max(rep_seq.saturating_add(1));
+        }
+        self.replicas.entry(replica).or_insert(ReplicaWatermark {
+            replica,
+            user_id,
+            last_client_seq: 0,
+            max_id_counter: 0,
+        });
+    }
+
     /// Processes an incoming `Hello` handshake frame cleanly, checking permissions,
     /// protocol version (`1` or `2`), epoch/replica ownership, and catch-up eligibility.
     pub fn on_hello(
@@ -311,6 +328,18 @@ impl ServerDocMachine {
         user_id: [u8; 16],
         role: Option<MemberRole>,
         frame: &WireSyncFrameV2,
+    ) -> Result<WireSyncFrameV2, WireRejectReasonV1> {
+        self.on_hello_with_external_replica(user_id, role, frame, None)
+    }
+
+    /// Variant of [`Self::on_hello`] that uses a caller-provided externally allocated
+    /// replica ID whenever the handshake requires a fresh writable replica.
+    pub fn on_hello_with_external_replica(
+        &mut self,
+        user_id: [u8; 16],
+        role: Option<MemberRole>,
+        frame: &WireSyncFrameV2,
+        external_replica: Option<u32>,
     ) -> Result<WireSyncFrameV2, WireRejectReasonV1> {
         let member_role = role.ok_or(WireRejectReasonV1::Forbidden)?;
         let WireSyncFrameV2::Hello {
@@ -342,9 +371,13 @@ impl ServerDocMachine {
                 };
                 (VIEWER_REPLICA, 0, 0, eff_seq)
             } else if *known_epoch != self.epoch {
-                let r = self
-                    .allocate_replica(user_id)
-                    .ok_or(WireRejectReasonV1::QuotaExceeded)?;
+                let r = if let Some(ext) = external_replica {
+                    self.register_external_replica(ext, user_id);
+                    ext
+                } else {
+                    self.allocate_replica(user_id)
+                        .ok_or(WireRejectReasonV1::QuotaExceeded)?
+                };
                 (r, 0, 0, 0)
             } else if let Some(r) = *replica {
                 let Some(wm) = self.replicas.get(&r).copied() else {
@@ -360,9 +393,13 @@ impl ServerDocMachine {
                 };
                 (r, wm.last_client_seq, wm.max_id_counter, eff_seq)
             } else {
-                let r = self
-                    .allocate_replica(user_id)
-                    .ok_or(WireRejectReasonV1::QuotaExceeded)?;
+                let r = if let Some(ext) = external_replica {
+                    self.register_external_replica(ext, user_id);
+                    ext
+                } else {
+                    self.allocate_replica(user_id)
+                        .ok_or(WireRejectReasonV1::QuotaExceeded)?
+                };
                 let eff_seq = if *last_applied_seq > self.head_seq {
                     0
                 } else {

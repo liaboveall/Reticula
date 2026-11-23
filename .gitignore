@@ -16,6 +16,11 @@ dist-spikes/
 node_modules/
 /.tools/
 
+# Local environment files (never commit API keys or secrets)
+.env
+.env.local
+.env.*.local
+
 # Test output
 /test-results/
 /playwright-report/

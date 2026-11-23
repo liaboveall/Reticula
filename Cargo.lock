@@ -730,9 +730,9 @@ dependencies = [
 
 [[package]]
 name = "cookie"
-version = "0.18.2"
+version = "0.18.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1a373e3602691c3cdea496d2f0ee5935151e6168fe87739483c463db1b2f2f87"
+checksum = "d55f2d6c30eeec7d5c6f98bd4395d4abb1895629eab97ee6522d340623615f8a"
 dependencies = [
  "percent-encoding",
  "time",
@@ -2492,6 +2492,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "reticula-agent"
+version = "0.0.0"
+dependencies = [
+ "base64 0.23.1",
+ "futures-util",
+ "postcard",
+ "reqwest",
+ "reticula-core",
+ "reticula-formula",
+ "reticula-sync",
+ "reticula-wire",
+ "reticula-xlsx",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "utoipa",
+]
+
+[[package]]
 name = "reticula-core"
 version = "0.0.0"
 dependencies = [
@@ -2555,6 +2576,7 @@ dependencies = [
  "postcard",
  "rand 0.10.4",
  "reqwest",
+ "reticula-agent",
  "reticula-core",
  "reticula-formula",
  "reticula-sync",
@@ -2567,6 +2589,7 @@ dependencies = [
  "thiserror 2.0.21",
  "time",
  "tokio",
+ "tokio-stream",
  "tokio-tungstenite 0.30.0",
  "tokio-util",
  "tower",
@@ -4140,11 +4163,13 @@ checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
 name = "xtask"
 version = "0.0.0"
 dependencies = [
+ "reticula-agent",
  "reticula-core",
  "reticula-formula",
  "reticula-server",
  "reticula-wire",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
