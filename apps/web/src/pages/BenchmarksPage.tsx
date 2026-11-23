@@ -686,7 +686,7 @@ export default function BenchmarksPage({ onNavigate }: BenchmarksPageProps) {
           </p>
           <p className="page-muted">
             <strong>Live Model Status:</strong> Awaiting live S6 tool-loop probe (
-            <code>cargo xtask spike s6</code>) and D-025 model/budget sign-off once a live{" "}
+            <code>cargo xtask spike s6</code>) and evaluation model/budget selection once a live{" "}
             <code>RETICULA_LLM_API_KEY</code> is configured. No unmeasured numbers are shown; try
             all 10 deterministic interactive AI replays directly in the <a href="/app">Editor</a>.
           </p>

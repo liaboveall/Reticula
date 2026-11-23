@@ -234,7 +234,7 @@ fn demo_specs() -> Vec<DemoSpec> {
                         }),
                     ),
                     ScriptedTurn::tool(
-                        "Applying currency formatting and bold headers.",
+                        "Applying currency formatting to F2:F5.",
                         "t6",
                         "format_range",
                         json!({
@@ -248,7 +248,7 @@ fn demo_specs() -> Vec<DemoSpec> {
                         "t8",
                         "finish",
                         json!({
-                            "summary": "Built regional SUMIFS summary in E1:F5, sorted descending (South $3,850, West $3,100, North $2,150, East $1,850), and formatted as currency.",
+                            "summary": "Built regional SUMIFS summary in E1:F5, sorted descending (South $3,850.00, West $3,100.00, North $2,150.00, East $1,850.00), and formatted as currency.",
                             "highlights": ["Dynamic SUMIFS table in E1:F5", "Sorted descending via single SortHunk", "0 formula errors"]
                         }),
                     ),
@@ -463,7 +463,7 @@ fn demo_specs() -> Vec<DemoSpec> {
                         json!({ "action": "insert_rows", "index": 4, "count": 1 }),
                     ),
                     ScriptedTurn::tool(
-                        "Writing Q1 subtotal formulas and filling Variance % across D2:D6.",
+                        "Writing Q1 subtotal label and SUM formulas in A5:C5.",
                         "t3",
                         "write_cells",
                         json!({
@@ -514,6 +514,11 @@ fn demo_specs() -> Vec<DemoSpec> {
             tags: &["XLOOKUP", "cross-sheet", "fill_formula"],
             build_base: || {
                 let mut e = FormulaEngine::new();
+                e.apply_op(Op::RenameSheet {
+                    sheet: SheetId(0),
+                    name: "Orders".to_owned(),
+                })
+                .unwrap();
                 set_cells(
                     &mut e,
                     SheetId(0),
@@ -566,36 +571,36 @@ fn demo_specs() -> Vec<DemoSpec> {
                         "Dry-running cross-sheet XLOOKUP.",
                         "t2",
                         "evaluate_formula",
-                        json!({ "sheet": "Sheet1", "cell": "C2", "formula": "=XLOOKUP(A2,Catalog!$A$2:$A$4,Catalog!$B$2:$B$4,0)" }),
+                        json!({ "sheet": "Orders", "cell": "C2", "formula": "=XLOOKUP(A2,Catalog!$A$2:$A$4,Catalog!$B$2:$B$4,0)" }),
                     ),
                     ScriptedTurn::tool(
-                        "Filling XLOOKUP prices across C2:C4.",
+                        "Filling XLOOKUP prices across Orders!C2:C4.",
                         "t3",
                         "fill_formula",
                         json!({
-                            "sheet": "Sheet1",
+                            "sheet": "Orders",
                             "source_cell": "C2",
                             "formula": "=XLOOKUP(A2,Catalog!$A$2:$A$4,Catalog!$B$2:$B$4,0)",
                             "target_range": "C2:C4"
                         }),
                     ),
                     ScriptedTurn::tool(
-                        "Filling Line Total across D2:D4.",
+                        "Filling Line Total across Orders!D2:D4.",
                         "t4",
                         "fill_formula",
                         json!({
-                            "sheet": "Sheet1",
+                            "sheet": "Orders",
                             "source_cell": "D2",
                             "formula": "=B2*C2",
                             "target_range": "D2:D4"
                         }),
                     ),
                     ScriptedTurn::tool(
-                        "Formatting C2:D4 as currency.",
+                        "Formatting Orders!C2:D4 as currency.",
                         "t5",
                         "format_range",
                         json!({
-                            "sheet": "Sheet1",
+                            "sheet": "Orders",
                             "range": "C2:D4",
                             "number_format": "currency"
                         }),
@@ -605,8 +610,8 @@ fn demo_specs() -> Vec<DemoSpec> {
                         "t6",
                         "finish",
                         json!({
-                            "summary": "Joined unit prices from Catalog via XLOOKUP in C2:C4 and computed line totals in D2:D4 ($102, $160, $70).",
-                            "highlights": ["Cross-sheet XLOOKUP in C2:C4", "Line totals filled in D2:D4"]
+                            "summary": "Joined unit prices from Catalog via XLOOKUP in Orders!C2:C4 and computed line totals in D2:D4 ($102.00, $160.00, $70.00).",
+                            "highlights": ["Cross-sheet XLOOKUP in Orders!C2:C4", "Line totals filled in Orders!D2:D4"]
                         }),
                     ),
                 ]
@@ -765,7 +770,7 @@ fn demo_specs() -> Vec<DemoSpec> {
             title: "Workday SLA Due Date & Status",
             description: "Compute business-day SLA due dates with WORKDAY and classify overdue tickets via IFS.",
             prompt: "Compute 5-business-day SLA due dates in D2:D4 using WORKDAY and classify status vs Closed Date in E2:E4 using IFS.",
-            tags: &["WORKDAY", "NETWORKDAYS", "IFS"],
+            tags: &["WORKDAY", "IFS", "SLA"],
             build_base: || {
                 let mut e = FormulaEngine::new();
                 set_cells(
@@ -1398,34 +1403,112 @@ pub async fn write_demo_replays_to_dir(out_dir: &Path) -> Result<ReplayIndex, Ag
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn all_ten_demo_replays_build_cleanly_and_demo_10_has_conflict_and_closure() {
-        let (index, bundles) = build_all_demo_replays().await.unwrap();
-        assert_eq!(index.items.len(), 10);
-        assert_eq!(bundles.len(), 10);
-        let d6 = bundles
-            .iter()
-            .find(|b| b.id == "cohort-kpi-named-range")
-            .unwrap();
-        let d6_cells: BTreeMap<&str, &str> = d6
+    fn diff_cells(bundle: &ReplayBundle) -> BTreeMap<String, String> {
+        bundle
             .diff
             .hunks
             .iter()
             .flat_map(|h| h.cells.iter())
-            .map(|c| (c.address.as_str(), c.draft_value.as_str()))
-            .collect();
-        assert_eq!(d6_cells.get("B7").copied(), Some("$651.96"));
-        assert_eq!(d6_cells.get("B8").copied(), Some("11.39%"));
+            .map(|c| {
+                (
+                    format!("{}!{}", c.sheet_name, c.address),
+                    c.draft_value.clone(),
+                )
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn all_ten_demo_replays_build_cleanly_and_match_evaluated_cells() {
+        let (index, bundles) = build_all_demo_replays().await.unwrap();
+        assert_eq!(index.items.len(), 10);
+        assert_eq!(bundles.len(), 10);
+
+        let by_id: BTreeMap<&str, &ReplayBundle> =
+            bundles.iter().map(|b| (b.id.as_str(), b)).collect();
+
+        // 1. regional-sales-summary
+        let d1 = by_id["regional-sales-summary"];
+        let c1 = diff_cells(d1);
+        assert_eq!(c1.get("Sheet1!E2").map(String::as_str), Some("South"));
+        assert_eq!(c1.get("Sheet1!F2").map(String::as_str), Some("$3,850.00"));
+        assert_eq!(c1.get("Sheet1!F3").map(String::as_str), Some("$3,100.00"));
+        assert_eq!(c1.get("Sheet1!F4").map(String::as_str), Some("$2,150.00"));
+        assert_eq!(c1.get("Sheet1!F5").map(String::as_str), Some("$1,850.00"));
+        assert!(d1.summary.contains("$3,850.00") && d1.summary.contains("$1,850.00"));
+
+        // 2. gross-margin-audit
+        let d2 = by_id["gross-margin-audit"];
+        let c2 = diff_cells(d2);
+        assert_eq!(c2.get("Sheet1!D3").map(String::as_str), Some("0.00%"));
+        assert_eq!(c2.get("Sheet1!D5").map(String::as_str), Some("25.00%"));
+
+        // 3. dynamic-top5-spill (Top-3 leaderboard)
+        let d3 = by_id["dynamic-top5-spill"];
+        let c3 = diff_cells(d3);
+        assert_eq!(c3.get("Sheet1!D2").map(String::as_str), Some("Helios"));
+        assert_eq!(c3.get("Sheet1!E6").map(String::as_str), Some("$247,000"));
+        assert!(d3.summary.contains("$247,000"));
+
+        // 4. monthly-budget-variance
+        let d4 = by_id["monthly-budget-variance"];
+        let c4 = diff_cells(d4);
+        assert_eq!(c4.get("Sheet1!B5").map(String::as_str), Some("$33,000"));
+        assert_eq!(c4.get("Sheet1!C5").map(String::as_str), Some("$34,080"));
+        assert_eq!(c4.get("Sheet1!D5").map(String::as_str), Some("3.27%"));
+        assert!(
+            d4.summary.contains("$33,000")
+                && d4.summary.contains("$34,080")
+                && d4.summary.contains("3.27%")
+        );
+
+        // 5. xlookup-price-join (Orders sheet renamed to match prompt/description)
+        let d5 = by_id["xlookup-price-join"];
+        let c5 = diff_cells(d5);
+        assert_eq!(c5.get("Orders!C2").map(String::as_str), Some("$25.50"));
+        assert_eq!(c5.get("Orders!D2").map(String::as_str), Some("$102.00"));
+        assert_eq!(c5.get("Orders!D3").map(String::as_str), Some("$160.00"));
+        assert_eq!(c5.get("Orders!D4").map(String::as_str), Some("$70.00"));
+        assert!(d5.summary.contains("Orders!C2:C4") && d5.summary.contains("$102.00"));
+
+        // 6. cohort-kpi-named-range
+        let d6 = by_id["cohort-kpi-named-range"];
+        let c6 = diff_cells(d6);
+        assert_eq!(c6.get("Sheet1!B7").map(String::as_str), Some("$651.96"));
+        assert_eq!(c6.get("Sheet1!B8").map(String::as_str), Some("11.39%"));
         assert!(
             d6.summary.contains("$651.96") && d6.summary.contains("11.39%"),
             "cohort-kpi-named-range summary must match evaluated engine cells: {}",
             d6.summary
         );
 
-        let d10 = bundles
-            .iter()
-            .find(|b| b.id == "conflict-and-closure-demo")
-            .unwrap();
+        // 7. messy-text-cleanup
+        let d7 = by_id["messy-text-cleanup"];
+        let c7 = diff_cells(d7);
+        assert_eq!(c7.get("Sheet1!C2").map(String::as_str), Some("Alice Smith"));
+        assert_eq!(
+            c7.get("Sheet1!D2").map(String::as_str),
+            Some("Alice Smith · ENTERPRISE")
+        );
+
+        // 8. date-sla-tracking
+        let d8 = by_id["date-sla-tracking"];
+        let c8 = diff_cells(d8);
+        assert_eq!(c8.get("Sheet1!D2").map(String::as_str), Some("2026-11-09"));
+        assert_eq!(c8.get("Sheet1!E2").map(String::as_str), Some("On Time"));
+        assert_eq!(c8.get("Sheet1!E3").map(String::as_str), Some("Overdue"));
+        assert_eq!(c8.get("Sheet1!E4").map(String::as_str), Some("On Time"));
+
+        // 9. quarterly-sort-ranking
+        let d9 = by_id["quarterly-sort-ranking"];
+        let c9 = diff_cells(d9);
+        assert_eq!(c9.get("Sheet1!C8").map(String::as_str), Some("92.80"));
+        assert!(d9.summary.contains("92.80"));
+
+        // 10. conflict-and-closure-demo
+        let d10 = by_id["conflict-and-closure-demo"];
+        let c10 = diff_cells(d10);
+        assert_eq!(c10.get("Sheet1!C1").map(String::as_str), Some("555"));
         assert!(d10.diff.summary.conflict_cells >= 1);
         assert!(!d10.closure_dependencies.is_empty());
         assert!(!d10.main_concurrent_txns_b64.is_empty());

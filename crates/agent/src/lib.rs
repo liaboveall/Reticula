@@ -56,6 +56,46 @@ impl std::fmt::Debug for LlmConfig {
     }
 }
 
+/// Environment variable keys consumed by [`LlmConfig::from_env_and_dotenv`].
+pub const LLM_ENV_KEYS: [&str; 7] = [
+    "RETICULA_LLM_ENABLED",
+    "RETICULA_LLM_PROVIDER",
+    "RETICULA_LLM_BASE_URL",
+    "RETICULA_LLM_MODEL",
+    "RETICULA_LLM_API_KEY",
+    "RETICULA_LLM_REASONING_EFFORT",
+    "RETICULA_LLM_TIMEOUT_SECS",
+];
+
+/// Loads `keys` from an optional dotenv file and overlays non-blank values from
+/// `env_lookup`. Blank process env values (such as Compose `${VAR:-}` defaults)
+/// do not clobber non-empty entries from `.env.local`.
+pub fn load_env_map<F>(
+    dotenv_path: Option<&Path>,
+    keys: &[&str],
+    mut env_lookup: F,
+) -> BTreeMap<String, String>
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    let mut map = BTreeMap::new();
+    if let Some(path) = dotenv_path
+        && let Ok(text) = std::fs::read_to_string(path)
+    {
+        for (k, v) in parse_dotenv(&text) {
+            map.insert(k, v);
+        }
+    }
+    for &key in keys {
+        if let Some(val) = env_lookup(key)
+            && !val.trim().is_empty()
+        {
+            map.insert(key.to_owned(), val);
+        }
+    }
+    map
+}
+
 impl LlmConfig {
     /// Constructs a validated configuration for an OpenAI-compatible endpoint.
     pub fn new(
@@ -91,27 +131,7 @@ impl LlmConfig {
     /// local `.env.local` / `.env` file. Follows fail-closed validation: never
     /// echoes secret values in errors.
     pub fn from_env_and_dotenv(dotenv_path: Option<&Path>) -> Result<Option<Self>, AgentError> {
-        let mut map = BTreeMap::new();
-        if let Some(path) = dotenv_path
-            && let Ok(text) = std::fs::read_to_string(path)
-        {
-            for (k, v) in parse_dotenv(&text) {
-                map.insert(k, v);
-            }
-        }
-        for key in [
-            "RETICULA_LLM_ENABLED",
-            "RETICULA_LLM_PROVIDER",
-            "RETICULA_LLM_BASE_URL",
-            "RETICULA_LLM_MODEL",
-            "RETICULA_LLM_API_KEY",
-            "RETICULA_LLM_REASONING_EFFORT",
-            "RETICULA_LLM_TIMEOUT_SECS",
-        ] {
-            if let Ok(val) = std::env::var(key) {
-                map.insert(key.to_owned(), val);
-            }
-        }
+        let map = load_env_map(dotenv_path, &LLM_ENV_KEYS, |k| std::env::var(k).ok());
         Self::from_map(&map)
     }
 
@@ -167,12 +187,22 @@ impl LlmConfig {
             .get("RETICULA_LLM_REASONING_EFFORT")
             .map(|v| v.trim().to_owned())
             .filter(|v| !v.is_empty());
-        let timeout_secs: u64 = map
-            .get("RETICULA_LLM_TIMEOUT_SECS")
-            .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(90);
 
         let mut missing = Vec::new();
+        let timeout_secs: u64 = match map
+            .get("RETICULA_LLM_TIMEOUT_SECS")
+            .map(|v| v.trim())
+            .filter(|v| !v.is_empty())
+        {
+            None => 90,
+            Some(raw) => match raw.parse::<u64>() {
+                Ok(v) if v > 0 => v,
+                _ => {
+                    missing.push("RETICULA_LLM_TIMEOUT_SECS (must be a positive integer)");
+                    90
+                }
+            },
+        };
         if !(base_url.starts_with("https://") || base_url.starts_with("http://")) {
             missing.push("RETICULA_LLM_BASE_URL (must be http:// or https://)");
         }
@@ -201,14 +231,24 @@ impl LlmConfig {
     }
 }
 
-/// Parses KEY=VALUE lines from a local dotenv file, ignoring comments and quotes.
+/// Parses KEY=VALUE lines from a local dotenv file, handling UTF-8 BOM, optional
+/// `export ` prefixes, quoted values, and inline comments.
 pub fn parse_dotenv(text: &str) -> Vec<(String, String)> {
     let mut pairs = Vec::new();
-    for raw_line in text.lines() {
-        let line = raw_line.trim();
+    for (idx, raw_line) in text.lines().enumerate() {
+        let mut line = raw_line;
+        if idx == 0 {
+            line = line.strip_prefix('\u{feff}').unwrap_or(line);
+        }
+        let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
+        let line = line
+            .strip_prefix("export")
+            .filter(|rest| rest.starts_with(|c: char| c.is_ascii_whitespace()))
+            .map(str::trim_start)
+            .unwrap_or(line);
         let Some((k, v)) = line.split_once('=') else {
             continue;
         };
@@ -216,15 +256,40 @@ pub fn parse_dotenv(text: &str) -> Vec<(String, String)> {
         if key.is_empty() {
             continue;
         }
-        let mut val = v.trim();
-        if (val.starts_with('"') && val.ends_with('"') && val.len() >= 2)
-            || (val.starts_with('\'') && val.ends_with('\'') && val.len() >= 2)
+        let trimmed = v.trim();
+        let parsed = if trimmed.len() >= 2
+            && ((trimmed.starts_with('"') && trimmed.ends_with('"'))
+                || (trimmed.starts_with('\'') && trimmed.ends_with('\'')))
         {
-            val = &val[1..val.len() - 1];
-        }
-        pairs.push((key.to_owned(), val.to_owned()));
+            &trimmed[1..trimmed.len() - 1]
+        } else if trimmed.starts_with('"') || trimmed.starts_with('\'') {
+            let quote = trimmed.as_bytes()[0] as char;
+            if let Some(end) = trimmed[1..].find(quote) {
+                let after = trimmed[end + 2..].trim_start();
+                if after.is_empty() || after.starts_with('#') {
+                    &trimmed[1..1 + end]
+                } else {
+                    trimmed
+                }
+            } else {
+                trimmed
+            }
+        } else {
+            strip_unquoted_inline_comment(v)
+        };
+        pairs.push((key.to_owned(), parsed.to_owned()));
     }
     pairs
+}
+
+fn strip_unquoted_inline_comment(raw_after_eq: &str) -> &str {
+    let bytes = raw_after_eq.as_bytes();
+    for i in 1..bytes.len() {
+        if bytes[i] == b'#' && bytes[i - 1].is_ascii_whitespace() {
+            return raw_after_eq[..i].trim();
+        }
+    }
+    raw_after_eq.trim()
 }
 
 /// Shared execution guardrails for an agent run.
@@ -272,26 +337,90 @@ pub enum AgentError {
 mod tests {
     use super::*;
 
+    fn temp_env_file(tag: &str, content: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("reticula-env-test-{}-{tag}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join(".env.local");
+        std::fs::write(&path, content).unwrap();
+        path
+    }
+
     #[test]
     fn llm_config_falls_back_to_default_base_url_and_provider_when_blank_in_dotenv() {
-        let dir = std::env::temp_dir().join(format!("reticula-env-test-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
-        let env_path = dir.join(".env.local");
-        std::fs::write(
-            &env_path,
+        let env_path = temp_env_file(
+            "blank-defaults",
             "RETICULA_LLM_ENABLED=true\nRETICULA_LLM_BASE_URL=\nRETICULA_LLM_PROVIDER=\nRETICULA_LLM_REASONING_EFFORT=\nRETICULA_LLM_TIMEOUT_SECS=\nRETICULA_LLM_MODEL=test-model\nRETICULA_LLM_API_KEY=sk-test-secret-never-echo\n",
-        )
-        .unwrap();
-        let cfg = LlmConfig::from_env_and_dotenv(Some(&env_path))
-            .unwrap()
-            .expect("enabled config");
+        );
+        let map = load_env_map(Some(&env_path), &LLM_ENV_KEYS, |_| None);
+        let cfg = LlmConfig::from_map(&map).unwrap().expect("enabled config");
         assert_eq!(cfg.base_url, "https://api.openai.com/v1");
         assert_eq!(cfg.provider, "openai-compat");
         assert_eq!(cfg.model, "test-model");
         assert_eq!(cfg.reasoning_effort, None);
         assert_eq!(cfg.request_timeout, Duration::from_secs(90));
         assert!(!format!("{cfg:?}").contains("sk-test-secret-never-echo"));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(env_path.parent().unwrap());
+    }
+
+    #[test]
+    fn parse_dotenv_handles_utf8_bom_export_prefix_quotes_and_inline_comments() {
+        let content = "\u{feff}export RETICULA_LLM_ENABLED=true # enable\n\
+            RETICULA_LLM_MODEL=\"gpt-test #v2\" # quoted hash kept\n\
+            RETICULA_LLM_API_KEY=sk-abc#123\n\
+            RETICULA_LLM_TIMEOUT_SECS=120 # two minutes\n\
+            RETICULA_LLM_REASONING_EFFORT= # blank after comment\n";
+        let map: BTreeMap<String, String> = parse_dotenv(content).into_iter().collect();
+        let cfg = LlmConfig::from_map(&map).unwrap().expect("enabled config");
+        assert_eq!(cfg.model, "gpt-test #v2");
+        assert_eq!(cfg.api_key(), "sk-abc#123");
+        assert_eq!(cfg.request_timeout, Duration::from_secs(120));
+        assert_eq!(cfg.reasoning_effort, None);
+    }
+
+    #[test]
+    fn blank_process_env_does_not_clobber_dotenv_while_non_blank_overrides() {
+        let env_path = temp_env_file(
+            "overlay",
+            "RETICULA_LLM_ENABLED=true\nRETICULA_LLM_MODEL=dotenv-model\nRETICULA_LLM_API_KEY=sk-dotenv\nRETICULA_LLM_TIMEOUT_SECS=110\n",
+        );
+        let proc_env = BTreeMap::from([
+            ("RETICULA_LLM_MODEL", ""),
+            ("RETICULA_LLM_API_KEY", "   "),
+            ("RETICULA_LLM_TIMEOUT_SECS", "150"),
+        ]);
+        let map = load_env_map(Some(&env_path), &LLM_ENV_KEYS, |k| {
+            proc_env.get(k).map(|&v| v.to_owned())
+        });
+        let cfg = LlmConfig::from_map(&map).unwrap().expect("enabled config");
+        assert_eq!(cfg.model, "dotenv-model");
+        assert_eq!(cfg.api_key(), "sk-dotenv");
+        assert_eq!(cfg.request_timeout, Duration::from_secs(150));
+
+        // Explicit non-blank RETICULA_LLM_ENABLED=false disables dotenv live config.
+        let disable_env = BTreeMap::from([("RETICULA_LLM_ENABLED", "false")]);
+        let disabled_map = load_env_map(Some(&env_path), &LLM_ENV_KEYS, |k| {
+            disable_env.get(k).map(|&v| v.to_owned())
+        });
+        assert!(LlmConfig::from_map(&disabled_map).unwrap().is_none());
+        let _ = std::fs::remove_dir_all(env_path.parent().unwrap());
+    }
+
+    #[test]
+    fn llm_config_rejects_invalid_timeout_without_echoing_value() {
+        let map = BTreeMap::from([
+            ("RETICULA_LLM_ENABLED".to_owned(), "true".to_owned()),
+            ("RETICULA_LLM_MODEL".to_owned(), "test/model".to_owned()),
+            ("RETICULA_LLM_API_KEY".to_owned(), "sk-secret".to_owned()),
+            (
+                "RETICULA_LLM_TIMEOUT_SECS".to_owned(),
+                "not-a-number".to_owned(),
+            ),
+        ]);
+        let err = LlmConfig::from_map(&map).unwrap_err().to_string();
+        assert!(err.contains("RETICULA_LLM_TIMEOUT_SECS"));
+        assert!(!err.contains("not-a-number"));
+        assert!(!err.contains("sk-secret"));
     }
 
     #[test]

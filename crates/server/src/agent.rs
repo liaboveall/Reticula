@@ -15,7 +15,7 @@ use reticula_agent::runner::{
 use reticula_agent::tools::{AgentPresenceHint, AgentWorkbookSink, BoxFuture};
 use reticula_agent::{
     AgentError, AgentRunConfig, DEFAULT_MAX_STEPS, DEFAULT_MAX_TOKENS_PER_RUN,
-    DEFAULT_RUN_TIMEOUT_SECS, LlmConfig, parse_dotenv,
+    DEFAULT_RUN_TIMEOUT_SECS, LlmConfig, load_env_map,
 };
 use reticula_core::id::{IdAllocator, IdRun, SheetId, pack_sheet_id, unpack_replica_id};
 use reticula_core::ops::{Op, Workbook};
@@ -68,6 +68,43 @@ impl Default for AgentRuntimeConfig {
     }
 }
 
+const AGENT_RUNTIME_ENV_KEYS: [&str; 14] = [
+    "RETICULA_LLM_ENABLED",
+    "RETICULA_LLM_MODE",
+    "RETICULA_LLM_PROVIDER",
+    "RETICULA_LLM_BASE_URL",
+    "RETICULA_LLM_MODEL",
+    "RETICULA_LLM_API_KEY",
+    "RETICULA_LLM_REASONING_EFFORT",
+    "RETICULA_LLM_TIMEOUT_SECS",
+    "RETICULA_AGENT_DAILY_TOKEN_LIMIT",
+    "RETICULA_AGENT_DAILY_RUN_LIMIT",
+    "RETICULA_MAX_CONCURRENT_AGENT_RUNS",
+    "RETICULA_AGENT_MAX_STEPS",
+    "RETICULA_AGENT_MAX_TOKENS_PER_RUN",
+    "RETICULA_AGENT_TIMEOUT_SECS",
+];
+
+fn parse_optional_num<T: std::str::FromStr>(
+    map: &BTreeMap<String, String>,
+    key: &str,
+) -> Option<T> {
+    let raw = map.get(key)?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    match raw.parse::<T>() {
+        Ok(v) => Some(v),
+        Err(_) => {
+            tracing::warn!(
+                var = key,
+                "invalid numeric agent configuration; using default"
+            );
+            None
+        }
+    }
+}
+
 impl AgentRuntimeConfig {
     /// Deterministic mock configuration for PG18 integration and E2E tests.
     pub fn mock_for_tests() -> Self {
@@ -83,35 +120,17 @@ impl AgentRuntimeConfig {
     }
 
     /// Loads runtime limits and LLM mode from process env overlaid over an optional dotenv file.
+    /// Blank process env values (such as Compose `${VAR:-}` defaults) do not clobber non-empty
+    /// entries from `.env.local`.
     pub fn from_env_and_dotenv(dotenv_path: Option<&Path>) -> Self {
-        let mut map = BTreeMap::new();
-        if let Some(path) = dotenv_path
-            && let Ok(text) = std::fs::read_to_string(path)
-        {
-            for (k, v) in parse_dotenv(&text) {
-                map.insert(k, v);
-            }
-        }
-        for key in [
-            "RETICULA_LLM_ENABLED",
-            "RETICULA_LLM_MODE",
-            "RETICULA_LLM_PROVIDER",
-            "RETICULA_LLM_BASE_URL",
-            "RETICULA_LLM_MODEL",
-            "RETICULA_LLM_API_KEY",
-            "RETICULA_LLM_REASONING_EFFORT",
-            "RETICULA_LLM_TIMEOUT_SECS",
-            "RETICULA_AGENT_DAILY_TOKEN_LIMIT",
-            "RETICULA_AGENT_DAILY_RUN_LIMIT",
-            "RETICULA_MAX_CONCURRENT_AGENT_RUNS",
-            "RETICULA_AGENT_MAX_STEPS",
-            "RETICULA_AGENT_MAX_TOKENS_PER_RUN",
-            "RETICULA_AGENT_TIMEOUT_SECS",
-        ] {
-            if let Ok(val) = std::env::var(key) {
-                map.insert(key.to_owned(), val);
-            }
-        }
+        Self::from_dotenv_with_env(dotenv_path, |k| std::env::var(k).ok())
+    }
+
+    fn from_dotenv_with_env<F>(dotenv_path: Option<&Path>, env_lookup: F) -> Self
+    where
+        F: FnMut(&str) -> Option<String>,
+    {
+        let map = load_env_map(dotenv_path, &AGENT_RUNTIME_ENV_KEYS, env_lookup);
         Self::from_map(&map)
     }
 
@@ -120,49 +139,47 @@ impl AgentRuntimeConfig {
     /// pass-through entries work without overriding defaults.
     pub fn from_map(map: &BTreeMap<String, String>) -> Self {
         let mut cfg = Self::default();
-        if let Some(raw) = map.get("RETICULA_AGENT_DAILY_TOKEN_LIMIT")
-            && let Ok(v) = raw.trim().parse::<u64>()
-        {
+        if let Some(v) = parse_optional_num::<u64>(map, "RETICULA_AGENT_DAILY_TOKEN_LIMIT") {
             cfg.daily_token_limit = v;
         }
-        if let Some(raw) = map.get("RETICULA_AGENT_DAILY_RUN_LIMIT")
-            && let Ok(v) = raw.trim().parse::<u32>()
-        {
+        if let Some(v) = parse_optional_num::<u32>(map, "RETICULA_AGENT_DAILY_RUN_LIMIT") {
             cfg.daily_run_limit = v;
         }
-        if let Some(raw) = map.get("RETICULA_MAX_CONCURRENT_AGENT_RUNS")
-            && let Ok(v) = raw.trim().parse::<usize>()
-        {
+        if let Some(v) = parse_optional_num::<usize>(map, "RETICULA_MAX_CONCURRENT_AGENT_RUNS") {
             cfg.max_concurrent_runs = v.max(1);
         }
-        if let Some(raw) = map.get("RETICULA_AGENT_MAX_STEPS")
-            && let Ok(v) = raw.trim().parse::<u32>()
-        {
-            cfg.run_config.max_steps = v.clamp(1, 100);
-        } else {
-            cfg.run_config.max_steps = DEFAULT_MAX_STEPS;
-        }
-        if let Some(raw) = map.get("RETICULA_AGENT_MAX_TOKENS_PER_RUN")
-            && let Ok(v) = raw.trim().parse::<u64>()
-        {
-            cfg.run_config.max_tokens = v.max(1_000);
-        } else {
-            cfg.run_config.max_tokens = DEFAULT_MAX_TOKENS_PER_RUN;
-        }
-        if let Some(raw) = map.get("RETICULA_AGENT_TIMEOUT_SECS")
-            && let Ok(v) = raw.trim().parse::<u64>()
-        {
-            cfg.run_config.timeout = Duration::from_secs(v.clamp(5, 900));
-        } else {
-            cfg.run_config.timeout = Duration::from_secs(DEFAULT_RUN_TIMEOUT_SECS);
-        }
+        cfg.run_config.max_steps = parse_optional_num::<u32>(map, "RETICULA_AGENT_MAX_STEPS")
+            .map_or(DEFAULT_MAX_STEPS, |v| v.clamp(1, 100));
+        cfg.run_config.max_tokens =
+            parse_optional_num::<u64>(map, "RETICULA_AGENT_MAX_TOKENS_PER_RUN")
+                .map_or(DEFAULT_MAX_TOKENS_PER_RUN, |v| v.max(1_000));
+        cfg.run_config.timeout = Duration::from_secs(
+            parse_optional_num::<u64>(map, "RETICULA_AGENT_TIMEOUT_SECS")
+                .map_or(DEFAULT_RUN_TIMEOUT_SECS, |v| v.clamp(5, 900)),
+        );
 
-        if map
+        let mode_raw = map
             .get("RETICULA_LLM_MODE")
-            .is_some_and(|m| m.trim().eq_ignore_ascii_case("mock"))
-        {
-            cfg.mode = AgentProviderMode::Mock;
-            return cfg;
+            .map(String::as_str)
+            .unwrap_or("")
+            .trim();
+        match mode_raw.to_ascii_lowercase().as_str() {
+            "mock" => {
+                cfg.mode = AgentProviderMode::Mock;
+                return cfg;
+            }
+            "disabled" | "off" => {
+                cfg.mode = AgentProviderMode::Disabled;
+                return cfg;
+            }
+            "" | "live" => {}
+            _ => {
+                tracing::warn!(
+                    "RETICULA_LLM_MODE must be one of: mock | live | disabled (or empty); cloud AI analyst disabled"
+                );
+                cfg.mode = AgentProviderMode::Disabled;
+                return cfg;
+            }
         }
 
         match LlmConfig::from_map(map) {
@@ -1216,5 +1233,57 @@ mod tests {
             }
             other => panic!("expected live mode, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn dotenv_and_process_env_overlay_respects_blank_passthrough_and_mock_override() {
+        let dir =
+            std::env::temp_dir().join(format!("reticula-server-env-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let env_path = dir.join(".env.local");
+        std::fs::write(
+            &env_path,
+            "\u{feff}RETICULA_LLM_ENABLED=true\n\
+             RETICULA_LLM_MODEL=dotenv-live-model\n\
+             RETICULA_LLM_API_KEY=sk-dotenv-live\n\
+             RETICULA_AGENT_DAILY_RUN_LIMIT=9\n\
+             RETICULA_AGENT_MAX_STEPS=14\n",
+        )
+        .unwrap();
+
+        // Blank process env pass-throughs preserve `.env.local`; non-blank values override it.
+        let blank_overlay = BTreeMap::from([
+            ("RETICULA_LLM_MODEL", ""),
+            ("RETICULA_LLM_API_KEY", ""),
+            ("RETICULA_AGENT_MAX_STEPS", ""),
+            ("RETICULA_AGENT_DAILY_RUN_LIMIT", "11"),
+        ]);
+        let live = AgentRuntimeConfig::from_dotenv_with_env(Some(&env_path), |k| {
+            blank_overlay.get(k).map(|&v| v.to_owned())
+        });
+        assert_eq!(live.daily_run_limit, 11);
+        assert_eq!(live.run_config.max_steps, 14);
+        match live.mode {
+            AgentProviderMode::Live(llm) => {
+                assert_eq!(llm.model, "dotenv-live-model");
+            }
+            other => panic!("expected live mode from .env.local, got {other:?}"),
+        }
+
+        // Process env `RETICULA_LLM_MODE=mock` overrides `.env.local` live credentials.
+        let mock_overlay = BTreeMap::from([("RETICULA_LLM_MODE", "mock")]);
+        let mocked = AgentRuntimeConfig::from_dotenv_with_env(Some(&env_path), |k| {
+            mock_overlay.get(k).map(|&v| v.to_owned())
+        });
+        assert!(matches!(mocked.mode, AgentProviderMode::Mock));
+
+        // Unknown `RETICULA_LLM_MODE` fails closed rather than hitting a live endpoint.
+        let typo_overlay = BTreeMap::from([("RETICULA_LLM_MODE", "mck")]);
+        let disabled = AgentRuntimeConfig::from_dotenv_with_env(Some(&env_path), |k| {
+            typo_overlay.get(k).map(|&v| v.to_owned())
+        });
+        assert!(matches!(disabled.mode, AgentProviderMode::Disabled));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

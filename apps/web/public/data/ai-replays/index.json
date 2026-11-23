@@ -107,8 +107,8 @@
       "prompt": "Compute 5-business-day SLA due dates in D2:D4 using WORKDAY and classify status vs Closed Date in E2:E4 using IFS.",
       "tags": [
         "WORKDAY",
-        "NETWORKDAYS",
-        "IFS"
+        "IFS",
+        "SLA"
       ],
       "hasConflictDemo": false,
       "hasClosureDemo": false,
