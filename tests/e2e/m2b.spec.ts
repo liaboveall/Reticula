@@ -235,10 +235,16 @@ test.describe("M2b governance, workbooks, history, and account lifecycle", () =>
       await createAndShareSheet(page, `History Timeline ${testInfo.project.name}`);
 
       await editCell(page, 0, 0, "A1", "100");
+      await expect
+        .poll(() => page.evaluate(() => window.__reticula?.textAt(0, 0)), { timeout: 5_000 })
+        .toBe("100");
       await expect(page.getByTestId("collab-status-pill")).toHaveText("Synced", {
         timeout: 10_000,
       });
       await editCell(page, 0, 0, "A1", "250");
+      await expect
+        .poll(() => page.evaluate(() => window.__reticula?.textAt(0, 0)), { timeout: 5_000 })
+        .toBe("250");
       await expect(page.getByTestId("collab-status-pill")).toHaveText("Synced", {
         timeout: 10_000,
       });

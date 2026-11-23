@@ -222,6 +222,15 @@ export async function joinViaSharePath(
   await settled(page);
 }
 
+async function flushWorkerAndReact(page: Page): Promise<void> {
+  await page.evaluate(async () => {
+    await window.__reticula?.stateDigest();
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, 0);
+    });
+  });
+}
+
 export async function editCell(
   page: Page,
   row: number,
@@ -236,10 +245,18 @@ export async function editCell(
     },
     [row, col] as const,
   );
+  await flushWorkerAndReact(page);
   await expect(page.getByTestId("name-box")).toHaveText(address);
   const formulaInput = page.getByTestId("formula-input");
   await expect(formulaInput).toHaveAttribute("contenteditable", "true");
+  // Settle CodeMirror's delayed focus-change update before replacing text so its
+  // selection sync cannot collapse Playwright's `fill()` selection to offset 0.
+  await formulaInput.click();
+  await expect(page.locator(".formula-cm-wrap.focused")).toBeVisible();
+  await flushWorkerAndReact(page);
   await formulaInput.fill(raw);
+  await expect(formulaInput).toHaveText(raw);
   await formulaInput.press("Enter");
+  await flushWorkerAndReact(page);
   await settled(page);
 }
