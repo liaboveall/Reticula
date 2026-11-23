@@ -1,6 +1,6 @@
 //! SpreadsheetBench Verified headless evaluation runner, dual-path XLSX export
 //! (`patch_xlsx` vs `export_xlsx`), Wilson 95% CI statistics, token/cache cost
-//! estimator, and S6 multi-step tool loop probe (`18-m4.md` §2.8, §2.9, §9).
+//! estimator, and S6 multi-step tool loop probe.
 
 use std::path::Path;
 
@@ -17,7 +17,7 @@ use crate::runner::{MemoryStepStore, run_agent_loop};
 use crate::tools::{AgentWorkbookSink, HeadlessEvalSink};
 use crate::{AgentError, AgentRunConfig};
 
-/// Export fidelity path selected for an evaluation case (`18-m4.md` §2.8).
+/// Export fidelity path selected for an evaluation case.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EvalExportPath {
@@ -25,7 +25,7 @@ pub enum EvalExportPath {
     ExportXlsx,
 }
 
-/// Three mutually exclusive failure root-cause categories (`18-m4.md` §9.2).
+/// Three mutually exclusive failure root-cause categories.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FailureCategory {
@@ -53,7 +53,7 @@ pub struct EvalCaseResult {
     pub error: Option<String>,
 }
 
-/// Aggregated statistics with Wilson 95% confidence interval (`18-m4.md` §9.2).
+/// Aggregated statistics with Wilson 95% confidence interval.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EvalSummaryStats {
@@ -106,7 +106,7 @@ pub fn wilson_ci_95(passed: u64, total: u64) -> (f64, f64) {
     )
 }
 
-/// Token & cache-hit driven evaluation cost formula (`18-m4.md` §2.9).
+/// Token & cache-hit driven evaluation cost formula.
 /// Prices are per 1,000,000 tokens in USD.
 #[allow(clippy::too_many_arguments)]
 pub fn estimate_eval_cost_usd(
@@ -130,7 +130,7 @@ pub fn estimate_eval_cost_usd(
 /// Exports the agent-modified workbook to `.xlsx` using `patch_xlsx` by default
 /// (preserving original charts, merged cells, styles, conditional formatting,
 /// and macros) and falling back automatically to `export_xlsx_with_options`
-/// whenever structural sheet/row/column mutations occurred (`18-m4.md` §2.8).
+/// whenever structural sheet/row/column mutations occurred.
 pub fn export_eval_workbook(
     orig_xlsx: &[u8],
     sink: &HeadlessEvalSink,
@@ -291,7 +291,7 @@ pub struct S6ScenarioResult {
     pub error: Option<String>,
 }
 
-/// Aggregate S6 multi-step tool loop probe report (`18-m4.md` §9.1).
+/// Aggregate S6 multi-step tool loop probe report.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct S6ProbeReport {

@@ -32,7 +32,7 @@
     },
     {
       "id": "dynamic-top5-spill",
-      "title": "Dynamic Array Top-5 Customers",
+      "title": "Dynamic Array Top-3 Customers",
       "description": "Build a dynamic SORT/TAKE spill dashboard and sum with the # spill operator.",
       "prompt": "Create a dynamic Top-3 customer leaderboard in D2 using SORT and TAKE, and compute the combined total in E6 using the spill operator D2#.",
       "tags": [
@@ -89,7 +89,7 @@
     {
       "id": "messy-text-cleanup",
       "title": "Messy Customer Name Cleanup",
-      "description": "Normalize whitespace and casing with TRIM/PROPER and extract domains with TEXTSPLIT.",
+      "description": "Normalize whitespace and casing with TRIM/PROPER and build formatted contact tags with TEXTJOIN.",
       "prompt": "Clean customer names into C2:C4 with PROPER(TRIM(...)) and build formatted contact tags in D2:D4 with TEXTJOIN.",
       "tags": [
         "TRIM",

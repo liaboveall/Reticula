@@ -1,5 +1,5 @@
 //! Streaming OpenAI-compatible LLM client (`Response::chunk()` SSE line parser)
-//! and deterministic `ScriptedMockProvider` for tests & E2E (`18-m4.md` §6.1).
+//! and deterministic `ScriptedMockProvider` for tests & E2E.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};

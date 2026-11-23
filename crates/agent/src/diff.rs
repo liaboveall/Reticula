@@ -1,5 +1,5 @@
 //! Three-way cell & structural diff engine, static reference closure checker,
-//! and `RemapState`-backed selective merge planner (`18-m4.md` §2.3, §2.4, §5).
+//! and `RemapState`-backed selective merge planner.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -1082,8 +1082,8 @@ pub fn compute_branch_diff(
     }
 }
 
-/// Performs static reference closure validation over the user's selected hunks
-/// (`18-m4.md` §5.3). Checks every accepted cell formula, accepted named range,
+/// Performs static reference closure validation over the user's selected hunks.
+/// Checks every accepted cell formula, accepted named range,
 /// and accepted structural/sort/meta operation against every sheet/row/column
 /// introduced by rejected structural hunks.
 pub fn check_reference_closure(

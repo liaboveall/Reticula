@@ -23,9 +23,9 @@ Reticula splits rendering, calculation, wire persistence, `.xlsx` interop, and l
   - **10 Pure-Client Interactive Replays & Evaluation Harness**: `apps/web/public/data/ai-replays/` ships 10 deterministic `ReplayBundle` scenarios (lazy-fetched outside JS bundles and `sw.js` precaching) runnable locally in-browser by unauthenticated visitors via the real WASM `FormulaEngine`; `cargo xtask spike s6` and `cargo xtask eval` provide the S6 tool-loop probe and SpreadsheetBench Verified headless dual-path (`patch_xlsx` / `export_xlsx`) evaluation harness.
 - **Collaborative client & lazy product shell (`apps/web`, `crates/sim-wasm`)** — Outside the first-screen bundle via `React.lazy`: `/benchmarks` (unauthenticated zero-dependency SVG performance & differential verification dashboard fetching `/data/benchmarks-history.json`), `/workbooks` (owned, shared, local OPFS docs, `.rtcl` / `.xlsx` import, and one-click Convert to Cloud), `/account` (storage + daily AI quota & irreversible account deletion), `/privacy`, and `/sim` (loading `crates/sim-wasm` on demand for 2–3 interactive multi-grid collaborative replicas and a 5-replica seed runner). Inside `/app`, each tab claims its own OPFS replica directory, persists pending transactions before sending, takes over closed tabs' unsent edits, resolves remote cursors by stable row/column IDs, opens an isolated read-only `HistoryPlayer` drawer with sequence scrubbing and named versions, opens the lazy `AiPanel` / `DiffReviewDrawer` with isolated in-memory `DraftPreviewSession`, and locks the grid/formula bar when opened as a viewer.
 
-## Measured Performance (M3a)
+## Measured Performance
 
-Measured on an Intel Core i9-13980HX (pinned to P-cores `0xFFFF`, 32 GB RAM, Windows 11, Google Chrome `158.0.8127.36`, WebAssembly `-O3`, real disk-backed OPFS `FileSystemSyncAccessHandle`); raw reports archived under [`bench/results/`](bench/results/) (`31ca8a9`):
+Engine, OPFS, startup, and scroll workloads were measured on an Intel Core i9-13980HX (pinned to P-cores `0xFFFF`, 32 GB RAM, Windows 11, Google Chrome `158.0.8127.36`, WebAssembly `-O3`, real disk-backed OPFS `FileSystemSyncAccessHandle`; raw reports archived under [`bench/results/`](bench/results/) at `31ca8a9`, M3a); bundle and JS size rows reflect the current M4 release build (`cargo xtask build --check-budget`):
 
 | Workload | Chrome WASM | Native (`x86_64`) | Target |
 |---|---:|---:|---:|
@@ -44,10 +44,10 @@ Measured on an Intel Core i9-13980HX (pinned to P-cores `0xFFFF`, 32 GB RAM, Win
 | **B8** — Memory: 10M nums / 1M rep str / 1M uniq str / 1M formulas | `81.6` / `9.3` / `110.6` / `825.0 MB` WASM | `80.3` / `8.1` / `79.3` / `512.1 MB` est | baseline |
 | **B10** — Cold first visit (`20 Mbit/s`, `50 ms` RTT, 2-RTT TLS) | **`538 ms`** shell / **`1,115 ms`** first screen | — | `≤ 1.5 s` / `≤ 2.0 s` |
 | **1M × 22 Scroll** — 5 screens/s continuous scroll frame work | **`0.78 ms`** `p50` / **`1.28 ms`** `p99` | — | `p99 ≤ 16.7 ms` |
-| **Bundle Size** — Core / Sim / XLSX `.wasm` (brotli-11) | **`822.3 KB`** / **`590.0 KB`** / **`735.4 KB`** | — | `≤ 1.2 MB` / `≤ 800 KB` / `≤ 900 KB` |
-| **JS Budget** — First-screen / total JS (brotli-11) | **`163.9 KB`** / **`207.5 KB`** | — | `≤ 165 KB` / `≤ 220 KB` |
+| **Bundle Size (M4)** — Core / Sim / XLSX `.wasm` (brotli-11) | **`822.3 KB`** / **`590.0 KB`** / **`735.4 KB`** | — | `≤ 1.2 MB` / `≤ 800 KB` / `≤ 900 KB` |
+| **JS Budget (M4)** — First-screen / total JS (brotli-11) | **`163.9 KB`** / **`207.5 KB`** | — | `≤ 165 KB` / `≤ 220 KB` |
 
-## Measured Collaboration & Formula Verification (M3a)
+## Measured Collaboration, Formula & End-to-End Verification
 
 Benchmark B9 delivers remote commits to a client that still has local edits pending, on a 100,000-row document with 100,000 formulas (`31ca8a9`; `p50` / `p95`; raw reports in [`bench/results/`](bench/results/)):
 
@@ -59,7 +59,7 @@ Benchmark B9 delivers remote commits to a client that still has local edits pend
 
 - **Differential Formula Verification (`76dcc45`)**: Stratified evaluation against containerized **LibreOffice Calc `26.8.2.2`** (`infra/libreoffice/Dockerfile`) over **`51,250` formulas** (`76,510` compared cells across `195` catalog / `188` unique deterministic functions, `>= 250` samples each) reaches **`97.92%` non-error** (`>= 80%`), **`99.65%` agreement** (`>= 99.5%`), and **`0` unclassified divergences** (`12` documented LibreOffice discrepancy clusters published on `/benchmarks`). The `10,000`-formula Rust reference sweep matches `9,837` cases against `ironcalc_base` and `9,772` against `formualizer-eval`.
 - **50-Client Compose Load Test (`8a858fd`)**: Under `infra/compose.yml` container limits (`768 MiB` / `1.0` CPU server, `768 MiB` / `0.5` CPU PostgreSQL 18), `cargo xtask loadtest` drives `50` concurrent WebSocket clients at `100 txns/s` (`6,000` measured txns over `1,977,000` cells) at **`10.04 ms`** `p50` / **`35.95 ms`** `p95` loopback visibility (**`85.95 ms`** `p95` with `+50 ms` RTT, target `<= 150 ms`), **`320.2 MiB`** server peak (`41.7%` of limit), `0` disconnects, `0` lost transactions, and `0` `StateDigest` mismatches.
-- **Simulation, Compatibility & End-to-End Coverage**: All `100,000` simulation seeds pass across all 11 invariants, frozen compatibility fixtures (`v1`, `v2`, `v3`) pass byte/replay verification on every commit, `cargo xtask drill` validates backup/epoch recovery, and three-browser Playwright E2E suites (Chromium, Firefox, WebKit) verify spills/`#SPILL!`/`#`, two-level named ranges, local AutoFilter + `SUBTOTAL`, Find & Replace, `MoveCells` cut-paste, collaborative concurrent sort (`PermuteContent`), `.xlsx` round-trips including preserved opaque formulas, and `/benchmarks`.
+- **Simulation, Compatibility & End-to-End Coverage**: All `100,000` simulation seeds pass across all 11 invariants, frozen compatibility fixtures (`v1`, `v2`, `v3`) pass byte/replay verification on every commit, `cargo xtask drill` validates backup/epoch recovery, and three-browser Playwright E2E suites (Chromium, Firefox, WebKit) verify spills/`#SPILL!`/`#`, two-level named ranges, local AutoFilter + `SUBTOTAL`, Find & Replace, `MoveCells` cut-paste, collaborative concurrent sort (`PermuteContent`), `.xlsx` round-trips including preserved opaque formulas, `/benchmarks`, and M4 AI Analyst workflows (all 10 pure-client visitor replays, isolated AI draft branch previews, three-way concurrent edit conflicts, static reference closure guards, and live merged sync across collaborators).
 
 ## Development
 

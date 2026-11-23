@@ -1,5 +1,5 @@
 //! 10 built-in deterministic AI analyst demo tasks and self-contained client
-//! `ReplayBundle` generator (`18-m4.md` §2.7, §8.3).
+//! `ReplayBundle` generator.
 //!
 //! Each bundle runs through the real `FormulaEngine`, `run_agent_loop`,
 //! `compute_branch_diff`, `check_reference_closure`, and `plan_merge_ops` so
@@ -346,7 +346,7 @@ fn demo_specs() -> Vec<DemoSpec> {
         // 3. dynamic-top5-spill
         DemoSpec {
             id: "dynamic-top5-spill",
-            title: "Dynamic Array Top-5 Customers",
+            title: "Dynamic Array Top-3 Customers",
             description: "Build a dynamic SORT/TAKE spill dashboard and sum with the # spill operator.",
             prompt: "Create a dynamic Top-3 customer leaderboard in D2 using SORT and TAKE, and compute the combined total in E6 using the spill operator D2#.",
             tags: &["SORT", "TAKE", "Spill #"],
@@ -678,7 +678,7 @@ fn demo_specs() -> Vec<DemoSpec> {
                         "t5",
                         "finish",
                         json!({
-                            "summary": "Defined workbook name DiscountRate (=$B$1) and computed NPV ($652.00) and IRR (11.46%).",
+                            "summary": "Defined workbook name DiscountRate (=$B$1) and computed NPV ($651.96) and IRR (11.39%).",
                             "highlights": ["MetaHunk defines DiscountRate", "Financial NPV & IRR metrics in B7:B8"]
                         }),
                     ),
@@ -689,7 +689,7 @@ fn demo_specs() -> Vec<DemoSpec> {
         DemoSpec {
             id: "messy-text-cleanup",
             title: "Messy Customer Name Cleanup",
-            description: "Normalize whitespace and casing with TRIM/PROPER and extract domains with TEXTSPLIT.",
+            description: "Normalize whitespace and casing with TRIM/PROPER and build formatted contact tags with TEXTJOIN.",
             prompt: "Clean customer names into C2:C4 with PROPER(TRIM(...)) and build formatted contact tags in D2:D4 with TEXTJOIN.",
             tags: &["TRIM", "PROPER", "TEXTJOIN"],
             build_base: || {
@@ -1403,6 +1403,25 @@ mod tests {
         let (index, bundles) = build_all_demo_replays().await.unwrap();
         assert_eq!(index.items.len(), 10);
         assert_eq!(bundles.len(), 10);
+        let d6 = bundles
+            .iter()
+            .find(|b| b.id == "cohort-kpi-named-range")
+            .unwrap();
+        let d6_cells: BTreeMap<&str, &str> = d6
+            .diff
+            .hunks
+            .iter()
+            .flat_map(|h| h.cells.iter())
+            .map(|c| (c.address.as_str(), c.draft_value.as_str()))
+            .collect();
+        assert_eq!(d6_cells.get("B7").copied(), Some("$651.96"));
+        assert_eq!(d6_cells.get("B8").copied(), Some("11.39%"));
+        assert!(
+            d6.summary.contains("$651.96") && d6.summary.contains("11.39%"),
+            "cohort-kpi-named-range summary must match evaluated engine cells: {}",
+            d6.summary
+        );
+
         let d10 = bundles
             .iter()
             .find(|b| b.id == "conflict-and-closure-demo")

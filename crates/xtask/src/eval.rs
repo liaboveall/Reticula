@@ -1,5 +1,5 @@
 //! SpreadsheetBench Verified evaluation CLI & deterministic 10-task replay
-//! generator (`18-m4.md` §2.7, §2.8, §9).
+//! generator.
 
 use std::path::{Path, PathBuf};
 

@@ -1,6 +1,6 @@
 //! Shared AI analyst runtime, three-way branch diff/merge planner, context
 //! compressor, streaming OpenAI-compatible LLM client, deterministic replay
-//! bundler, and SpreadsheetBench evaluation harness (`18-m4.md`).
+//! bundler, and SpreadsheetBench evaluation harness.
 
 pub mod context;
 pub mod diff;
@@ -112,7 +112,13 @@ impl LlmConfig {
                 map.insert(key.to_owned(), val);
             }
         }
+        Self::from_map(&map)
+    }
 
+    /// Parses and validates LLM configuration from an explicit key-value map.
+    /// Blank optional values fall back cleanly to defaults so Compose `${VAR:-}`
+    /// pass-through entries work without overriding defaults.
+    pub fn from_map(map: &BTreeMap<String, String>) -> Result<Option<Self>, AgentError> {
         let enabled_raw = map
             .get("RETICULA_LLM_ENABLED")
             .map(String::as_str)
@@ -273,7 +279,7 @@ mod tests {
         let env_path = dir.join(".env.local");
         std::fs::write(
             &env_path,
-            "RETICULA_LLM_ENABLED=true\nRETICULA_LLM_BASE_URL=\nRETICULA_LLM_PROVIDER=\nRETICULA_LLM_MODEL=test-model\nRETICULA_LLM_API_KEY=sk-test-secret-never-echo\n",
+            "RETICULA_LLM_ENABLED=true\nRETICULA_LLM_BASE_URL=\nRETICULA_LLM_PROVIDER=\nRETICULA_LLM_REASONING_EFFORT=\nRETICULA_LLM_TIMEOUT_SECS=\nRETICULA_LLM_MODEL=test-model\nRETICULA_LLM_API_KEY=sk-test-secret-never-echo\n",
         )
         .unwrap();
         let cfg = LlmConfig::from_env_and_dotenv(Some(&env_path))
@@ -282,7 +288,33 @@ mod tests {
         assert_eq!(cfg.base_url, "https://api.openai.com/v1");
         assert_eq!(cfg.provider, "openai-compat");
         assert_eq!(cfg.model, "test-model");
+        assert_eq!(cfg.reasoning_effort, None);
+        assert_eq!(cfg.request_timeout, Duration::from_secs(90));
         assert!(!format!("{cfg:?}").contains("sk-test-secret-never-echo"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn llm_config_parses_custom_provider_reasoning_and_timeout() {
+        let map = BTreeMap::from([
+            ("RETICULA_LLM_ENABLED".to_owned(), "true".to_owned()),
+            ("RETICULA_LLM_PROVIDER".to_owned(), "openrouter".to_owned()),
+            (
+                "RETICULA_LLM_BASE_URL".to_owned(),
+                "https://openrouter.ai/api/v1/".to_owned(),
+            ),
+            ("RETICULA_LLM_MODEL".to_owned(), "test/model".to_owned()),
+            ("RETICULA_LLM_API_KEY".to_owned(), "sk-custom".to_owned()),
+            (
+                "RETICULA_LLM_REASONING_EFFORT".to_owned(),
+                "medium".to_owned(),
+            ),
+            ("RETICULA_LLM_TIMEOUT_SECS".to_owned(), "150".to_owned()),
+        ]);
+        let cfg = LlmConfig::from_map(&map).unwrap().expect("enabled config");
+        assert_eq!(cfg.provider, "openrouter");
+        assert_eq!(cfg.base_url, "https://openrouter.ai/api/v1");
+        assert_eq!(cfg.reasoning_effort.as_deref(), Some("medium"));
+        assert_eq!(cfg.request_timeout, Duration::from_secs(150));
     }
 }

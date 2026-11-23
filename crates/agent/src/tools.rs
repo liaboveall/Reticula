@@ -1,5 +1,5 @@
 //! 11-tool agent execution surface, JSON schemas, strict guardrails, and
-//! `AgentWorkbookSink` / `HeadlessEvalSink` abstractions (`18-m4.md` §6.2).
+//! `AgentWorkbookSink` / `HeadlessEvalSink` abstractions.
 
 use std::collections::BTreeSet;
 use std::future::Future;

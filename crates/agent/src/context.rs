@@ -1,5 +1,5 @@
 //! SpreadsheetLLM-inspired heuristic context compression (`SheetCompressor`)
-//! for `workbook_overview` and RLE-compressed `read_range` (`18-m4.md` §2.5, §6.2).
+//! for `workbook_overview` and RLE-compressed `read_range`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;

@@ -1,8 +1,8 @@
 //! Server-side AI analyst orchestration: concurrency guards, shared memory
 //! budget leases, `ServerBranchSink` (draft commits + purple AI presence cursor),
-//! SSE live event streaming, and startup crash-recovery / safe resume (`18-m4.md`).
+//! SSE live event streaming, and startup crash-recovery / safe resume.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,7 +15,7 @@ use reticula_agent::runner::{
 use reticula_agent::tools::{AgentPresenceHint, AgentWorkbookSink, BoxFuture};
 use reticula_agent::{
     AgentError, AgentRunConfig, DEFAULT_MAX_STEPS, DEFAULT_MAX_TOKENS_PER_RUN,
-    DEFAULT_RUN_TIMEOUT_SECS, LlmConfig,
+    DEFAULT_RUN_TIMEOUT_SECS, LlmConfig, parse_dotenv,
 };
 use reticula_core::id::{IdAllocator, IdRun, SheetId, pack_sheet_id, unpack_replica_id};
 use reticula_core::ops::{Op, Workbook};
@@ -32,7 +32,7 @@ use crate::docs::{BudgetLease, DocRooms, RoomError};
 use crate::ops::Metrics;
 use crate::store::{AgentRunRecord, BranchRecord, MAIN_BRANCH, Store, StoreError};
 
-/// High bit `0x80` marks server-synthesized AI cursors (`18-m4.md` §6.1, §8.1).
+/// High bit `0x80` marks server-synthesized AI cursors.
 /// Human WebSocket connections are clamped to `0..8`, preventing spoofing.
 pub const AI_CURSOR_COLOR_SLOT: u8 = 0x80 | 5;
 pub const AI_DISPLAY_NAME: &str = "AI Analyst";
@@ -79,37 +79,77 @@ impl AgentRuntimeConfig {
 
     /// Loads runtime limits and LLM mode from process env + optional `.env.local`.
     pub fn from_env() -> Self {
+        Self::from_env_and_dotenv(Some(Path::new(".env.local")))
+    }
+
+    /// Loads runtime limits and LLM mode from process env overlaid over an optional dotenv file.
+    pub fn from_env_and_dotenv(dotenv_path: Option<&Path>) -> Self {
+        let mut map = BTreeMap::new();
+        if let Some(path) = dotenv_path
+            && let Ok(text) = std::fs::read_to_string(path)
+        {
+            for (k, v) in parse_dotenv(&text) {
+                map.insert(k, v);
+            }
+        }
+        for key in [
+            "RETICULA_LLM_ENABLED",
+            "RETICULA_LLM_MODE",
+            "RETICULA_LLM_PROVIDER",
+            "RETICULA_LLM_BASE_URL",
+            "RETICULA_LLM_MODEL",
+            "RETICULA_LLM_API_KEY",
+            "RETICULA_LLM_REASONING_EFFORT",
+            "RETICULA_LLM_TIMEOUT_SECS",
+            "RETICULA_AGENT_DAILY_TOKEN_LIMIT",
+            "RETICULA_AGENT_DAILY_RUN_LIMIT",
+            "RETICULA_MAX_CONCURRENT_AGENT_RUNS",
+            "RETICULA_AGENT_MAX_STEPS",
+            "RETICULA_AGENT_MAX_TOKENS_PER_RUN",
+            "RETICULA_AGENT_TIMEOUT_SECS",
+        ] {
+            if let Ok(val) = std::env::var(key) {
+                map.insert(key.to_owned(), val);
+            }
+        }
+        Self::from_map(&map)
+    }
+
+    /// Parses runtime limits and LLM mode from an explicit key-value map.
+    /// Blank optional values fall back cleanly to defaults so Compose `${VAR:-}`
+    /// pass-through entries work without overriding defaults.
+    pub fn from_map(map: &BTreeMap<String, String>) -> Self {
         let mut cfg = Self::default();
-        if let Ok(raw) = std::env::var("RETICULA_AGENT_DAILY_TOKEN_LIMIT")
+        if let Some(raw) = map.get("RETICULA_AGENT_DAILY_TOKEN_LIMIT")
             && let Ok(v) = raw.trim().parse::<u64>()
         {
             cfg.daily_token_limit = v;
         }
-        if let Ok(raw) = std::env::var("RETICULA_AGENT_DAILY_RUN_LIMIT")
+        if let Some(raw) = map.get("RETICULA_AGENT_DAILY_RUN_LIMIT")
             && let Ok(v) = raw.trim().parse::<u32>()
         {
             cfg.daily_run_limit = v;
         }
-        if let Ok(raw) = std::env::var("RETICULA_MAX_CONCURRENT_AGENT_RUNS")
+        if let Some(raw) = map.get("RETICULA_MAX_CONCURRENT_AGENT_RUNS")
             && let Ok(v) = raw.trim().parse::<usize>()
         {
             cfg.max_concurrent_runs = v.max(1);
         }
-        if let Ok(raw) = std::env::var("RETICULA_AGENT_MAX_STEPS")
+        if let Some(raw) = map.get("RETICULA_AGENT_MAX_STEPS")
             && let Ok(v) = raw.trim().parse::<u32>()
         {
             cfg.run_config.max_steps = v.clamp(1, 100);
         } else {
             cfg.run_config.max_steps = DEFAULT_MAX_STEPS;
         }
-        if let Ok(raw) = std::env::var("RETICULA_AGENT_MAX_TOKENS_PER_RUN")
+        if let Some(raw) = map.get("RETICULA_AGENT_MAX_TOKENS_PER_RUN")
             && let Ok(v) = raw.trim().parse::<u64>()
         {
             cfg.run_config.max_tokens = v.max(1_000);
         } else {
             cfg.run_config.max_tokens = DEFAULT_MAX_TOKENS_PER_RUN;
         }
-        if let Ok(raw) = std::env::var("RETICULA_AGENT_TIMEOUT_SECS")
+        if let Some(raw) = map.get("RETICULA_AGENT_TIMEOUT_SECS")
             && let Ok(v) = raw.trim().parse::<u64>()
         {
             cfg.run_config.timeout = Duration::from_secs(v.clamp(5, 900));
@@ -117,15 +157,15 @@ impl AgentRuntimeConfig {
             cfg.run_config.timeout = Duration::from_secs(DEFAULT_RUN_TIMEOUT_SECS);
         }
 
-        if std::env::var("RETICULA_LLM_MODE")
-            .ok()
+        if map
+            .get("RETICULA_LLM_MODE")
             .is_some_and(|m| m.trim().eq_ignore_ascii_case("mock"))
         {
             cfg.mode = AgentProviderMode::Mock;
             return cfg;
         }
 
-        match LlmConfig::from_env_and_dotenv(Some(Path::new(".env.local"))) {
+        match LlmConfig::from_map(map) {
             Ok(Some(llm)) => {
                 cfg.mode = AgentProviderMode::Live(llm);
             }
@@ -366,8 +406,7 @@ impl AgentManager {
 
     /// Scans PostgreSQL on startup for `queued` / `running` runs interrupted by a
     /// crash (`SIGKILL` / restart) and either resumes cleanly from persisted
-    /// `agent_steps` or transitions unsafe runs deterministically to `failed`
-    /// (`18-m4.md` §2.3 & §6.3).
+    /// `agent_steps` or transitions unsafe runs deterministically to `failed`.
     pub async fn recover_interrupted_runs(&self) -> Result<(), StoreError> {
         let interrupted = self.store.list_interrupted_agent_runs().await?;
         for item in interrupted {
@@ -756,7 +795,7 @@ impl AgentManager {
 
             match result {
                 Ok(outcome) => {
-                    // Abandon empty draft branches when the analyst answered without edits (`18-m4.md` §6.3).
+                    // Abandon empty draft branches when the analyst answered without edits.
                     if outcome.commits_written == 0 {
                         let _ = store.abandon_branch(run.workbook_id, run.branch_id).await;
                     }
@@ -1040,7 +1079,7 @@ impl AgentWorkbookSink for ServerBranchSink {
 }
 
 /// Estimates `2×` draft workbook RAM reserved against `DocRooms::max_loaded_bytes`
-/// (`18-m4.md` §2.3: FormulaEngine dependency graph + evaluation caches).
+/// to account for the `FormulaEngine` dependency graph and evaluation caches.
 pub fn draft_engine_budget_bytes(est_workbook_bytes: u64) -> u64 {
     est_workbook_bytes.max(64 * 1024).saturating_mul(2)
 }
@@ -1073,4 +1112,109 @@ fn summarize_branch_title(prompt: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn blank_compose_defaults_fall_back_cleanly() {
+        let blank_keys = [
+            "RETICULA_LLM_MODE",
+            "RETICULA_LLM_PROVIDER",
+            "RETICULA_LLM_BASE_URL",
+            "RETICULA_LLM_MODEL",
+            "RETICULA_LLM_API_KEY",
+            "RETICULA_LLM_REASONING_EFFORT",
+            "RETICULA_LLM_TIMEOUT_SECS",
+            "RETICULA_AGENT_DAILY_TOKEN_LIMIT",
+            "RETICULA_AGENT_DAILY_RUN_LIMIT",
+            "RETICULA_MAX_CONCURRENT_AGENT_RUNS",
+            "RETICULA_AGENT_MAX_STEPS",
+            "RETICULA_AGENT_MAX_TOKENS_PER_RUN",
+            "RETICULA_AGENT_TIMEOUT_SECS",
+        ];
+        let mut map: BTreeMap<String, String> = blank_keys
+            .iter()
+            .map(|&k| (k.to_owned(), String::new()))
+            .collect();
+        map.insert("RETICULA_LLM_ENABLED".to_owned(), "false".to_owned());
+
+        let disabled = AgentRuntimeConfig::from_map(&map);
+        assert!(matches!(disabled.mode, AgentProviderMode::Disabled));
+        assert_eq!(disabled.daily_token_limit, 500_000);
+        assert_eq!(disabled.daily_run_limit, 20);
+        assert_eq!(disabled.max_concurrent_runs, 2);
+        assert_eq!(disabled.run_config.max_steps, DEFAULT_MAX_STEPS);
+        assert_eq!(disabled.run_config.max_tokens, DEFAULT_MAX_TOKENS_PER_RUN);
+        assert_eq!(
+            disabled.run_config.timeout,
+            Duration::from_secs(DEFAULT_RUN_TIMEOUT_SECS)
+        );
+
+        map.insert("RETICULA_LLM_ENABLED".to_owned(), "true".to_owned());
+        map.insert("RETICULA_LLM_MODEL".to_owned(), "demo-model".to_owned());
+        map.insert("RETICULA_LLM_API_KEY".to_owned(), "sk-demo".to_owned());
+        let live = AgentRuntimeConfig::from_map(&map);
+        match live.mode {
+            AgentProviderMode::Live(llm) => {
+                assert_eq!(llm.provider, "openai-compat");
+                assert_eq!(llm.base_url, "https://api.openai.com/v1");
+                assert_eq!(llm.reasoning_effort, None);
+                assert_eq!(llm.request_timeout, Duration::from_secs(90));
+            }
+            other => panic!("expected live mode, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn runtime_config_applies_all_agent_and_llm_overrides() {
+        let map = BTreeMap::from([
+            ("RETICULA_LLM_ENABLED".to_owned(), "true".to_owned()),
+            ("RETICULA_LLM_PROVIDER".to_owned(), "custom-gw".to_owned()),
+            (
+                "RETICULA_LLM_BASE_URL".to_owned(),
+                "https://llm.example/v1".to_owned(),
+            ),
+            ("RETICULA_LLM_MODEL".to_owned(), "model-x".to_owned()),
+            ("RETICULA_LLM_API_KEY".to_owned(), "sk-override".to_owned()),
+            (
+                "RETICULA_LLM_REASONING_EFFORT".to_owned(),
+                "high".to_owned(),
+            ),
+            ("RETICULA_LLM_TIMEOUT_SECS".to_owned(), "120".to_owned()),
+            (
+                "RETICULA_AGENT_DAILY_TOKEN_LIMIT".to_owned(),
+                "250000".to_owned(),
+            ),
+            ("RETICULA_AGENT_DAILY_RUN_LIMIT".to_owned(), "7".to_owned()),
+            (
+                "RETICULA_MAX_CONCURRENT_AGENT_RUNS".to_owned(),
+                "4".to_owned(),
+            ),
+            ("RETICULA_AGENT_MAX_STEPS".to_owned(), "12".to_owned()),
+            (
+                "RETICULA_AGENT_MAX_TOKENS_PER_RUN".to_owned(),
+                "40000".to_owned(),
+            ),
+            ("RETICULA_AGENT_TIMEOUT_SECS".to_owned(), "75".to_owned()),
+        ]);
+        let cfg = AgentRuntimeConfig::from_map(&map);
+        assert_eq!(cfg.daily_token_limit, 250_000);
+        assert_eq!(cfg.daily_run_limit, 7);
+        assert_eq!(cfg.max_concurrent_runs, 4);
+        assert_eq!(cfg.run_config.max_steps, 12);
+        assert_eq!(cfg.run_config.max_tokens, 40_000);
+        assert_eq!(cfg.run_config.timeout, Duration::from_secs(75));
+        match cfg.mode {
+            AgentProviderMode::Live(llm) => {
+                assert_eq!(llm.provider, "custom-gw");
+                assert_eq!(llm.base_url, "https://llm.example/v1");
+                assert_eq!(llm.reasoning_effort.as_deref(), Some("high"));
+                assert_eq!(llm.request_timeout, Duration::from_secs(120));
+            }
+            other => panic!("expected live mode, got {other:?}"),
+        }
+    }
 }

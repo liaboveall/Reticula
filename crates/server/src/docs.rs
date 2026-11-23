@@ -1199,7 +1199,7 @@ impl DocActor {
         }
 
         // Atomically allocate fresh replicas in PostgreSQL across all branches to avoid
-        // cross-room `StaleActor` races (`18-m4.md` §7.1).
+        // cross-room `StaleActor` races.
         let needs_fresh_replica = role.can_write()
             && matches!(
                 hello,

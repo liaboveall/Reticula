@@ -1,5 +1,5 @@
 //! Branch lifecycle, atomic cross-branch replica allocation, durable AI agent
-//! runs/steps, and per-user daily LLM quota persistence (`18-m4.md` §7.1).
+//! runs/steps, and per-user daily LLM quota persistence.
 
 use reticula_agent::runner::{AgentStepKind, PersistedStep};
 use reticula_core::id::pack_replica_id;

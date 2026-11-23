@@ -11,6 +11,10 @@
 #   RETICULA_IMAGE                  optional, defaults to the published image
 #   PORT                            optional loopback port, defaults to 3200
 #   METRICS_PORT                    optional loopback metrics port, defaults to 3201
+#   RETICULA_LLM_*                  optional AI analyst provider settings (see .env.example)
+#   RETICULA_AGENT_*                optional AI analyst quotas & run guardrails (see .env.example)
+#   RETICULA_MAX_CONCURRENT_AGENT_RUNS
+#                                   optional global AI analyst concurrency limit (default 2)
 #
 # `cargo xtask stack` runs this file against a locally built image.
 name: reticula
@@ -62,9 +66,18 @@ services:
       RETICULA_GITHUB_CLIENT_SECRET: ${RETICULA_GITHUB_CLIENT_SECRET:?set RETICULA_GITHUB_CLIENT_SECRET in the env file}
       RETICULA_LLM_ENABLED: ${RETICULA_LLM_ENABLED:-false}
       RETICULA_LLM_MODE: ${RETICULA_LLM_MODE:-}
+      RETICULA_LLM_PROVIDER: ${RETICULA_LLM_PROVIDER:-}
       RETICULA_LLM_BASE_URL: ${RETICULA_LLM_BASE_URL:-}
       RETICULA_LLM_MODEL: ${RETICULA_LLM_MODEL:-}
       RETICULA_LLM_API_KEY: ${RETICULA_LLM_API_KEY:-}
+      RETICULA_LLM_REASONING_EFFORT: ${RETICULA_LLM_REASONING_EFFORT:-}
+      RETICULA_LLM_TIMEOUT_SECS: ${RETICULA_LLM_TIMEOUT_SECS:-}
+      RETICULA_AGENT_DAILY_TOKEN_LIMIT: ${RETICULA_AGENT_DAILY_TOKEN_LIMIT:-}
+      RETICULA_AGENT_DAILY_RUN_LIMIT: ${RETICULA_AGENT_DAILY_RUN_LIMIT:-}
+      RETICULA_MAX_CONCURRENT_AGENT_RUNS: ${RETICULA_MAX_CONCURRENT_AGENT_RUNS:-}
+      RETICULA_AGENT_MAX_STEPS: ${RETICULA_AGENT_MAX_STEPS:-}
+      RETICULA_AGENT_MAX_TOKENS_PER_RUN: ${RETICULA_AGENT_MAX_TOKENS_PER_RUN:-}
+      RETICULA_AGENT_TIMEOUT_SECS: ${RETICULA_AGENT_TIMEOUT_SECS:-}
     volumes:
       - workbooks:/var/lib/reticula
     read_only: true

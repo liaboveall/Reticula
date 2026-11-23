@@ -1,4 +1,4 @@
-//! Branch management, three-way diff/merge, and AI agent HTTP + SSE routes (`18-m4.md` §7.2).
+//! Branch management, three-way diff/merge, and AI agent HTTP + SSE routes.
 
 use std::convert::Infallible;
 use std::time::Duration;
@@ -28,7 +28,7 @@ use crate::store::{
     AgentRunDetail, AgentRunRecord, BranchRecord, MAIN_BRANCH, User, WorkbookAccess,
 };
 
-/// Strict member-only check enforcing the 6-identity permission matrix (`18-m4.md` §7.2):
+/// Strict member-only check enforcing the 6-identity permission matrix:
 /// - unauthenticated -> `401`
 /// - anonymous share-link header without member session -> `403`
 /// - signed-in non-member -> `403`

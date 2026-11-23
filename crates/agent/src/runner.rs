@@ -1,5 +1,5 @@
 //! Persistent multi-step agent loop with guardrails, repeat-call detection,
-//! cancellation, and crash-recovery resume from persisted `agent_steps` (`18-m4.md` §6.3).
+//! cancellation, and crash-recovery resume from persisted `agent_steps`.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -725,7 +725,7 @@ async fn wait_cancelled(rx: &mut watch::Receiver<bool>) {
 }
 
 /// Evaluates whether a run interrupted by a server crash can safely resume from
-/// its persisted `agent_steps` (`18-m4.md` §2.6):
+/// its persisted `agent_steps`:
 /// - Safe to resume iff `resume_count < 2` and the last persisted step is
 ///   `UserPrompt` or `ToolResult` (no half-completed mutating tool call).
 pub fn can_safely_resume(steps: &[PersistedStep], resume_count: i32) -> bool {
