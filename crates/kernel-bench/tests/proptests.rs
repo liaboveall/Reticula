@@ -1979,6 +1979,205 @@ fn a1_ref(r: u32, c: u32) -> String {
     s
 }
 
+fn assert_spill_steps_match_full_recalc(steps: &[SpillStep]) -> Result<(), TestCaseError> {
+    let mut eng = FormulaEngine::new();
+    let s0 = SheetId(0);
+
+    for step in steps {
+        match *step {
+            SpillStep::SetScalar { r, c, val } => {
+                let sheet = eng.workbook().sheet(s0).unwrap();
+                if let (Some(rid), Some(cid)) =
+                    (sheet.row_axis().pos_to_id(r), sheet.col_axis().pos_to_id(c))
+                {
+                    let raw = val.map_or_else(String::new, |v| v.to_string());
+                    let _ = eng.edit_cell_raw(s0, RowId(rid), ColId(cid), &raw);
+                }
+            }
+            SpillStep::SetArray {
+                r,
+                c,
+                rows,
+                cols,
+                base,
+            } => {
+                let sheet = eng.workbook().sheet(s0).unwrap();
+                if let (Some(rid), Some(cid)) =
+                    (sheet.row_axis().pos_to_id(r), sheet.col_axis().pos_to_id(c))
+                {
+                    let mut f = String::from("={");
+                    let mut cur = u32::from(base);
+                    for ri in 0..rows {
+                        if ri > 0 {
+                            f.push(';');
+                        }
+                        for ci in 0..cols {
+                            if ci > 0 {
+                                f.push(',');
+                            }
+                            f.push_str(&cur.to_string());
+                            cur += 1;
+                        }
+                    }
+                    f.push('}');
+                    let _ = eng.edit_cell_raw(s0, RowId(rid), ColId(cid), &f);
+                }
+            }
+            SpillStep::SetRangeSpill {
+                r,
+                c,
+                sr,
+                sc,
+                er,
+                ec,
+            } => {
+                let sheet = eng.workbook().sheet(s0).unwrap();
+                if let (Some(rid), Some(cid)) =
+                    (sheet.row_axis().pos_to_id(r), sheet.col_axis().pos_to_id(c))
+                {
+                    let f = if sr == er && sc == ec {
+                        format!("={}", a1_ref(sr, sc))
+                    } else {
+                        format!("={}:{}", a1_ref(sr, sc), a1_ref(er, ec))
+                    };
+                    let _ = eng.edit_cell_raw(s0, RowId(rid), ColId(cid), &f);
+                }
+            }
+            SpillStep::SetConsumer { r, c, ar, ac, kind } => {
+                let sheet = eng.workbook().sheet(s0).unwrap();
+                if let (Some(rid), Some(cid)) =
+                    (sheet.row_axis().pos_to_id(r), sheet.col_axis().pos_to_id(c))
+                {
+                    let anchor_s = a1_ref(ar, ac);
+                    let rng_s = format!("{anchor_s}:{}", a1_ref(ar + 2, ac + 2));
+                    let f = match kind {
+                        0 => format!("={anchor_s}#"),
+                        1 => format!("=SUM({anchor_s}#)"),
+                        2 => format!("=COUNTIF({rng_s}, \">1\")"),
+                        3 => format!("=COUNTBLANK({rng_s})"),
+                        _ => format!("=IFERROR(VLOOKUP(2, {rng_s}, 1, FALSE), 0)"),
+                    };
+                    let _ = eng.edit_cell_raw(s0, RowId(rid), ColId(cid), &f);
+                }
+            }
+            SpillStep::InsertRowAfter { after } => {
+                let after_id = after
+                    .and_then(|p| eng.workbook().sheet(s0).unwrap().row_axis().pos_to_id(p))
+                    .map(RowId);
+                let run = eng.allocator_mut().alloc_run(1).unwrap();
+                let _ = eng.apply_op(Op::InsertRows {
+                    sheet: s0,
+                    after: after_id,
+                    ids: run,
+                });
+            }
+            SpillStep::DeleteRow { pos } => {
+                let sheet = eng.workbook().sheet(s0).unwrap();
+                if sheet.row_axis().live_len() > 2
+                    && let Some(rid) = sheet.row_axis().pos_to_id(pos)
+                {
+                    let _ = eng.apply_op(Op::DeleteRows {
+                        sheet: s0,
+                        ids: vec![IdRun::new(rid, 1).unwrap()],
+                    });
+                }
+            }
+            SpillStep::InsertColAfter { after } => {
+                let after_id = after
+                    .and_then(|p| eng.workbook().sheet(s0).unwrap().col_axis().pos_to_id(p))
+                    .map(ColId);
+                let run = eng.allocator_mut().alloc_run(1).unwrap();
+                let _ = eng.apply_op(Op::InsertCols {
+                    sheet: s0,
+                    after: after_id,
+                    ids: run,
+                });
+            }
+            SpillStep::DeleteCol { pos } => {
+                let sheet = eng.workbook().sheet(s0).unwrap();
+                if sheet.col_axis().live_len() > 2
+                    && let Some(cid) = sheet.col_axis().pos_to_id(pos)
+                {
+                    let _ = eng.apply_op(Op::DeleteCols {
+                        sheet: s0,
+                        ids: vec![IdRun::new(cid, 1).unwrap()],
+                    });
+                }
+            }
+        }
+
+        eng.recalc_all();
+        let fresh = FormulaEngine::from_workbook_recalc_all(eng.workbook().clone());
+
+        let s_inc = eng.workbook().sheet(s0).unwrap();
+        let s_ref = fresh.workbook().sheet(s0).unwrap();
+        prop_assert_eq!(s_inc.row_axis().live_len(), s_ref.row_axis().live_len());
+        prop_assert_eq!(s_inc.col_axis().live_len(), s_ref.col_axis().live_len());
+
+        for r in 0..s_inc.row_axis().live_len().min(12) {
+            for c in 0..s_inc.col_axis().live_len().min(10) {
+                let rid = RowId(s_inc.row_axis().pos_to_id(r).unwrap());
+                let cid = ColId(s_inc.col_axis().pos_to_id(c).unwrap());
+                prop_assert_eq!(
+                    s_inc.value_by_id(rid, cid),
+                    s_ref.value_by_id(rid, cid),
+                    "sheet value mismatch at pos ({}, {})",
+                    r,
+                    c
+                );
+                prop_assert_eq!(
+                    eng.spills().shadow_value(s0, rid, cid),
+                    fresh.spills().shadow_value(s0, rid, cid),
+                    "spill shadow mismatch at pos ({}, {})",
+                    r,
+                    c
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[test]
+fn regression_multi_spill_cycle_matches_full_recalc() {
+    let steps = [
+        SpillStep::SetRangeSpill {
+            r: 3,
+            c: 1,
+            sr: 1,
+            sc: 0,
+            er: 2,
+            ec: 1,
+        },
+        SpillStep::SetRangeSpill {
+            r: 5,
+            c: 0,
+            sr: 2,
+            sc: 0,
+            er: 2,
+            ec: 1,
+        },
+        SpillStep::InsertRowAfter { after: Some(2) },
+        SpillStep::SetConsumer {
+            r: 6,
+            c: 2,
+            ar: 2,
+            ac: 2,
+            kind: 2,
+        },
+        SpillStep::DeleteRow { pos: 0 },
+        SpillStep::SetConsumer {
+            r: 1,
+            c: 0,
+            ar: 4,
+            ac: 1,
+            kind: 2,
+        },
+    ];
+    assert_spill_steps_match_full_recalc(&steps).unwrap();
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(64))]
 
@@ -1986,135 +2185,6 @@ proptest! {
     fn prop_incremental_dynamic_spills_match_full_recalc(
         steps in prop::collection::vec(arb_spill_step(), 1..28),
     ) {
-        let mut eng = FormulaEngine::new();
-        let s0 = SheetId(0);
-
-        for step in steps {
-            match step {
-                SpillStep::SetScalar { r, c, val } => {
-                    let sheet = eng.workbook().sheet(s0).unwrap();
-                    if let (Some(rid), Some(cid)) = (
-                        sheet.row_axis().pos_to_id(r),
-                        sheet.col_axis().pos_to_id(c),
-                    ) {
-                        let raw = val.map_or_else(String::new, |v| v.to_string());
-                        let _ = eng.edit_cell_raw(s0, RowId(rid), ColId(cid), &raw);
-                    }
-                }
-                SpillStep::SetArray { r, c, rows, cols, base } => {
-                    let sheet = eng.workbook().sheet(s0).unwrap();
-                    if let (Some(rid), Some(cid)) = (
-                        sheet.row_axis().pos_to_id(r),
-                        sheet.col_axis().pos_to_id(c),
-                    ) {
-                        let mut f = String::from("={");
-                        let mut cur = u32::from(base);
-                        for ri in 0..rows {
-                            if ri > 0 {
-                                f.push(';');
-                            }
-                            for ci in 0..cols {
-                                if ci > 0 {
-                                    f.push(',');
-                                }
-                                f.push_str(&cur.to_string());
-                                cur += 1;
-                            }
-                        }
-                        f.push('}');
-                        let _ = eng.edit_cell_raw(s0, RowId(rid), ColId(cid), &f);
-                    }
-                }
-                SpillStep::SetRangeSpill { r, c, sr, sc, er, ec } => {
-                    let sheet = eng.workbook().sheet(s0).unwrap();
-                    if let (Some(rid), Some(cid)) = (
-                        sheet.row_axis().pos_to_id(r),
-                        sheet.col_axis().pos_to_id(c),
-                    ) {
-                        let f = if sr == er && sc == ec {
-                            format!("={}", a1_ref(sr, sc))
-                        } else {
-                            format!("={}:{}", a1_ref(sr, sc), a1_ref(er, ec))
-                        };
-                        let _ = eng.edit_cell_raw(s0, RowId(rid), ColId(cid), &f);
-                    }
-                }
-                SpillStep::SetConsumer { r, c, ar, ac, kind } => {
-                    let sheet = eng.workbook().sheet(s0).unwrap();
-                    if let (Some(rid), Some(cid)) = (
-                        sheet.row_axis().pos_to_id(r),
-                        sheet.col_axis().pos_to_id(c),
-                    ) {
-                        let anchor_s = a1_ref(ar, ac);
-                        let rng_s = format!("{anchor_s}:{}", a1_ref(ar + 2, ac + 2));
-                        let f = match kind {
-                            0 => format!("={anchor_s}#"),
-                            1 => format!("=SUM({anchor_s}#)"),
-                            2 => format!("=COUNTIF({rng_s}, \">1\")"),
-                            3 => format!("=COUNTBLANK({rng_s})"),
-                            _ => format!("=IFERROR(VLOOKUP(2, {rng_s}, 1, FALSE), 0)"),
-                        };
-                        let _ = eng.edit_cell_raw(s0, RowId(rid), ColId(cid), &f);
-                    }
-                }
-                SpillStep::InsertRowAfter { after } => {
-                    let after_id = after.and_then(|p| eng.workbook().sheet(s0).unwrap().row_axis().pos_to_id(p)).map(RowId);
-                    let run = eng.allocator_mut().alloc_run(1).unwrap();
-                    let _ = eng.apply_op(Op::InsertRows { sheet: s0, after: after_id, ids: run });
-                }
-                SpillStep::DeleteRow { pos } => {
-                    let sheet = eng.workbook().sheet(s0).unwrap();
-                    if sheet.row_axis().live_len() > 2
-                        && let Some(rid) = sheet.row_axis().pos_to_id(pos)
-                    {
-                        let _ = eng.apply_op(Op::DeleteRows {
-                            sheet: s0,
-                            ids: vec![IdRun::new(rid, 1).unwrap()],
-                        });
-                    }
-                }
-                SpillStep::InsertColAfter { after } => {
-                    let after_id = after.and_then(|p| eng.workbook().sheet(s0).unwrap().col_axis().pos_to_id(p)).map(ColId);
-                    let run = eng.allocator_mut().alloc_run(1).unwrap();
-                    let _ = eng.apply_op(Op::InsertCols { sheet: s0, after: after_id, ids: run });
-                }
-                SpillStep::DeleteCol { pos } => {
-                    let sheet = eng.workbook().sheet(s0).unwrap();
-                    if sheet.col_axis().live_len() > 2
-                        && let Some(cid) = sheet.col_axis().pos_to_id(pos)
-                    {
-                        let _ = eng.apply_op(Op::DeleteCols {
-                            sheet: s0,
-                            ids: vec![IdRun::new(cid, 1).unwrap()],
-                        });
-                    }
-                }
-            }
-
-            eng.recalc_all();
-            let fresh = FormulaEngine::from_workbook_recalc_all(eng.workbook().clone());
-
-            let s_inc = eng.workbook().sheet(s0).unwrap();
-            let s_ref = fresh.workbook().sheet(s0).unwrap();
-            prop_assert_eq!(s_inc.row_axis().live_len(), s_ref.row_axis().live_len());
-            prop_assert_eq!(s_inc.col_axis().live_len(), s_ref.col_axis().live_len());
-
-            for r in 0..s_inc.row_axis().live_len().min(12) {
-                for c in 0..s_inc.col_axis().live_len().min(10) {
-                    let rid = RowId(s_inc.row_axis().pos_to_id(r).unwrap());
-                    let cid = ColId(s_inc.col_axis().pos_to_id(c).unwrap());
-                    prop_assert_eq!(
-                        s_inc.value_by_id(rid, cid),
-                        s_ref.value_by_id(rid, cid),
-                        "sheet value mismatch at pos ({}, {})", r, c
-                    );
-                    prop_assert_eq!(
-                        eng.spills().shadow_value(s0, rid, cid),
-                        fresh.spills().shadow_value(s0, rid, cid),
-                        "spill shadow mismatch at pos ({}, {})", r, c
-                    );
-                }
-            }
-        }
+        assert_spill_steps_match_full_recalc(&steps)?;
     }
 }

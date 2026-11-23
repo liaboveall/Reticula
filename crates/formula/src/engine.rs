@@ -2009,9 +2009,12 @@ impl FormulaEngine {
                         self.push_unblocked_watchers(&unblocked_watchers, cur_fid, &mut post_dirty);
                         post_dirty.retain(|&fid| fid != cur_fid);
                         if !self.cycle_shadow_watch.is_empty()
-                            && let Some(fp) = self.spills.dynamic_blocked_footprint(key)
+                            && let Some(fp) = self
+                                .spills
+                                .dynamic_blocked_footprint(key)
+                                .map(<[WorkbookCellKey]>::to_vec)
                         {
-                            for &cell in fp {
+                            for cell in fp {
                                 self.wake_cycle_shadow_watchers(
                                     cell,
                                     Some(cur_fid),
@@ -2127,56 +2130,65 @@ impl FormulaEngine {
     }
 
     fn wake_cycle_shadow_watchers(
-        &self,
+        &mut self,
         cell: WorkbookCellKey,
         exclude_fid: Option<u32>,
         claimer: Option<WorkbookCellKey>,
         out: &mut Vec<u32>,
     ) {
-        let Some(anchors) = self.cycle_shadow_watch.get(&cell) else {
-            return;
-        };
-        let dep_view = DepView {
-            dep_graph: &self.dep_graph,
-            name_dep_graph: &self.name_dep_graph,
-            name_slots: &self.name_slots,
-            cell_to_fid: &self.cell_to_fid,
-            slots: &self.slots,
-            workbook: &self.workbook,
-        };
-        for &anchor in anchors {
-            let Some(&afid) = self.cell_to_fid.get(&anchor) else {
-                continue;
+        let mut matched: SmallVec<[(u32, bool); 4]> = SmallVec::new();
+        {
+            let Some(anchors) = self.cycle_shadow_watch.get(&cell) else {
+                return;
             };
-            if Some(afid) == exclude_fid || self.state_of(afid) != STATE_CLEAN {
-                continue;
-            }
-            if let Some(claimer_key) = claimer {
-                let cleared = self
-                    .cycle_spills
-                    .get(&anchor)
-                    .map_or(&[][..], |r| r.cleared_shadows.as_slice());
-                let anchor_reaches_claimer = Self::formula_reaches_in(
-                    &dep_view,
-                    &self.spills,
-                    anchor,
-                    claimer_key,
-                    anchor,
-                    cleared,
-                );
-                let claimer_reaches_anchor = Self::formula_reaches_in(
-                    &dep_view,
-                    &self.spills,
-                    claimer_key,
-                    anchor,
-                    anchor,
-                    cleared,
-                );
-                if anchor_reaches_claimer && !claimer_reaches_anchor {
+            let dep_view = DepView {
+                dep_graph: &self.dep_graph,
+                name_dep_graph: &self.name_dep_graph,
+                name_slots: &self.name_slots,
+                cell_to_fid: &self.cell_to_fid,
+                slots: &self.slots,
+                workbook: &self.workbook,
+            };
+            for &anchor in anchors {
+                let Some(&afid) = self.cell_to_fid.get(&anchor) else {
+                    continue;
+                };
+                if Some(afid) == exclude_fid {
                     continue;
                 }
+                if let Some(claimer_key) = claimer {
+                    let cleared = self
+                        .cycle_spills
+                        .get(&anchor)
+                        .map_or(&[][..], |r| r.cleared_shadows.as_slice());
+                    let anchor_reaches_claimer = Self::formula_reaches_in(
+                        &dep_view,
+                        &self.spills,
+                        anchor,
+                        claimer_key,
+                        anchor,
+                        cleared,
+                    );
+                    let claimer_reaches_anchor = Self::formula_reaches_in(
+                        &dep_view,
+                        &self.spills,
+                        claimer_key,
+                        anchor,
+                        anchor,
+                        cleared,
+                    );
+                    if anchor_reaches_claimer && !claimer_reaches_anchor {
+                        continue;
+                    }
+                }
+                matched.push((afid, self.state_of(afid) == STATE_CLEAN));
             }
-            out.push(afid);
+        }
+        for (afid, is_clean) in matched {
+            self.wave_cycle_verified.remove(&afid);
+            if is_clean {
+                out.push(afid);
+            }
         }
     }
 
@@ -3358,43 +3370,55 @@ impl FormulaEngine {
         }
 
         let mut active_spill_fids: SmallVec<[u32; 4]> = SmallVec::new();
+        let mut unverified_cycle_spill_fids: SmallVec<[u32; 4]> = SmallVec::new();
         let mut needs_verify = false;
         for &fid in &scc_fids {
-            if let Some(key) = self.slot_of(fid).map(|s| s.key)
-                && self.spills.active_spill(key).is_some()
-            {
-                active_spill_fids.push(fid);
-                if !self.wave_cycle_verified.contains(&fid) {
+            if let Some(key) = self.slot_of(fid).map(|s| s.key) {
+                if self.spills.active_spill(key).is_some() {
+                    active_spill_fids.push(fid);
+                    if !self.wave_cycle_verified.contains(&fid) {
+                        needs_verify = true;
+                    }
+                } else if self.cycle_spills.contains_key(&key)
+                    && !self.wave_cycle_verified.contains(&fid)
+                {
+                    unverified_cycle_spill_fids.push(fid);
                     needs_verify = true;
                 }
             }
         }
         if needs_verify {
-            // Clear stale active spills along the candidate SCC once per wave so
-            // conditional formulas that stop spilling re-evaluate before `#CYCLE!` is committed.
+            // Clear stale active spills (and unverified prior-wave cycle watches)
+            // along the candidate SCC once per wave so conditional formulas that
+            // stop spilling re-evaluate before `#CYCLE!` is committed.
             for fid in active_spill_fids {
                 self.wave_cycle_verified.insert(fid);
             }
+            for &fid in &unverified_cycle_spill_fids {
+                self.wave_cycle_verified.insert(fid);
+            }
             let mut cleared_anchors = Vec::new();
+            let mut post_dirty = Vec::new();
             for &fid in &scc_fids {
-                if let Some(key) = self.slot_of(fid).map(|s| s.key)
-                    && self.spills.active_spill(key).is_some()
-                {
-                    let clear_out = self.spills.clear_anchor(key);
-                    if clear_out.had_state {
-                        self.record_changed_cells(&clear_out.cleared_shadows);
-                        cleared_anchors.push((fid, key, clear_out));
+                if let Some(key) = self.slot_of(fid).map(|s| s.key) {
+                    if self.spills.active_spill(key).is_some() {
+                        let clear_out = self.spills.clear_anchor(key);
+                        if clear_out.had_state {
+                            self.record_changed_cells(&clear_out.cleared_shadows);
+                            cleared_anchors.push((fid, key, clear_out));
+                        }
+                    } else if unverified_cycle_spill_fids.contains(&fid) {
+                        self.drain_cycle_spill_anchor(key, None, &mut post_dirty);
                     }
                 }
                 self.set_state(fid, STATE_DIRTY);
                 self.dirty_queue.push(fid);
                 self.dirty_needs_sort = true;
             }
-            if !cleared_anchors.is_empty() {
-                let mut post_dirty = Vec::new();
-                for (fid, key, clear_out) in cleared_anchors {
-                    self.collect_cleared_spill_dependents(fid, key, &clear_out, &mut post_dirty);
-                }
+            for (fid, key, clear_out) in cleared_anchors {
+                self.collect_cleared_spill_dependents(fid, key, &clear_out, &mut post_dirty);
+            }
+            if !post_dirty.is_empty() {
                 self.propagate_dirty_in_wave(post_dirty, &[]);
             }
             self.flush_deferred_dirty();
@@ -3402,6 +3426,7 @@ impl FormulaEngine {
         }
 
         let mut cleared_anchors = Vec::new();
+        let mut retained_cycle_anchors: SmallVec<[WorkbookCellKey; 4]> = SmallVec::new();
         let mut unwound_keys: SmallVec<[WorkbookCellKey; 8]> = SmallVec::new();
         let mut post_dirty = Vec::new();
         for &fid in &scc_fids {
@@ -3410,13 +3435,25 @@ impl FormulaEngine {
                 if clear_out.had_state {
                     self.record_changed_cells(&clear_out.cleared_shadows);
                     cleared_anchors.push((fid, key, clear_out));
+                } else if self.cycle_spills.contains_key(&key) {
+                    retained_cycle_anchors.push(key);
+                } else {
+                    self.drain_cycle_spill_anchor(key, None, &mut post_dirty);
                 }
-                self.drain_cycle_spill_anchor(key, None, &mut post_dirty);
                 self.store_eval_scalar(key, EvalScalar::Error(CalcError::Cycle));
                 unwound_keys.push(key);
             }
             self.set_state(fid, STATE_CLEAN);
             self.wave_done = self.wave_done.saturating_add(1);
+        }
+        for key in retained_cycle_anchors {
+            if let Some(rec) = self.cycle_spills.get_mut(&key) {
+                for &peer in &unwound_keys {
+                    if peer != key && !rec.peers.contains(&peer) {
+                        rec.peers.push(peer);
+                    }
+                }
+            }
         }
         for (fid, key, clear_out) in cleared_anchors {
             self.record_cycle_spill(key, &unwound_keys, &clear_out.cleared_shadows);
@@ -4423,6 +4460,25 @@ impl FormulaEngine {
         }
     }
 
+    fn record_fid_wait(
+        &self,
+        fid: u32,
+        blocked: &mut SmallVec<[u32; 4]>,
+        cycle_low: &mut Option<usize>,
+    ) {
+        match self.state_of(fid) {
+            STATE_EVALUATING | STATE_SCC_WAIT => {
+                if let Some(low) = self.cycle_low_of(fid) {
+                    merge_cycle(cycle_low, low);
+                }
+            }
+            STATE_DIRTY if !blocked.contains(&fid) => {
+                blocked.push(fid);
+            }
+            _ => {}
+        }
+    }
+
     fn ensure_value_ready(&self, val: &EvalValue) -> Result<(), ExprOutcome> {
         let EvalValue::Reference(r) = val else {
             return Ok(());
@@ -4431,25 +4487,25 @@ impl FormulaEngine {
             ResolvedRef::Invalid(_) => Ok(()),
             ResolvedRef::Cell { sheet, row, col } => {
                 let target_key = (*sheet, *row, *col);
+                let mut blocked: SmallVec<[u32; 4]> = SmallVec::new();
+                let mut cycle_low: Option<usize> = None;
                 let fid_opt = self.cell_to_fid.get(&target_key).copied().or_else(|| {
                     self.spills
                         .anchor_of_cell(target_key)
                         .and_then(|anchor| self.cell_to_fid.get(&anchor).copied())
                 });
                 if let Some(fid) = fid_opt {
-                    match self.state_of(fid) {
-                        STATE_EVALUATING | STATE_SCC_WAIT => {
-                            if let Some(low) = self.cycle_low_of(fid) {
-                                return Err(ExprOutcome::Cycle(low));
-                            }
+                    self.record_fid_wait(fid, &mut blocked, &mut cycle_low);
+                }
+                if let Some(anchors) = self.cycle_shadow_watch.get(&target_key) {
+                    for &anchor in anchors {
+                        if let Some(&fid) = self.cell_to_fid.get(&anchor) {
+                            self.record_fid_wait(fid, &mut blocked, &mut cycle_low);
                         }
-                        STATE_DIRTY => {
-                            let mut b = SmallVec::new();
-                            b.push(fid);
-                            return Err(ExprOutcome::Blocked(b));
-                        }
-                        _ => {}
                     }
+                }
+                if let Some(wait) = Self::wait_outcome(blocked, cycle_low) {
+                    return Err(wait);
                 }
                 Ok(())
             }
@@ -4538,7 +4594,7 @@ impl FormulaEngine {
                     }
                 }
             });
-        if active_cols.is_empty() && shadow_cols.is_empty() {
+        if active_cols.is_empty() && shadow_cols.is_empty() && self.cycle_shadow_watch.is_empty() {
             return Ok(());
         }
 
@@ -4552,17 +4608,7 @@ impl FormulaEngine {
                         let row = RowId(raw_r);
                         for &col in &active_cols {
                             if let Some(&fid) = self.cell_to_fid.get(&(sheet_id, row, col)) {
-                                match self.state_of(fid) {
-                                    STATE_EVALUATING | STATE_SCC_WAIT => {
-                                        if let Some(low) = self.cycle_low_of(fid) {
-                                            merge_cycle(&mut cycle_low, low);
-                                        }
-                                    }
-                                    STATE_DIRTY => {
-                                        blocked.push(fid);
-                                    }
-                                    _ => {}
-                                }
+                                self.record_fid_wait(fid, &mut blocked, &mut cycle_low);
                             }
                         }
                     }
@@ -4576,19 +4622,36 @@ impl FormulaEngine {
                         if let Some(anchor) = self.spills.anchor_of_cell((sheet_id, row_id, col))
                             && let Some(&fid) = self.cell_to_fid.get(&anchor)
                         {
-                            match self.state_of(fid) {
-                                STATE_EVALUATING | STATE_SCC_WAIT => {
-                                    if let Some(low) = self.cycle_low_of(fid) {
-                                        merge_cycle(&mut cycle_low, low);
-                                    }
-                                }
-                                STATE_DIRTY if !blocked.contains(&fid) => {
-                                    blocked.push(fid);
-                                }
-                                _ => {}
-                            }
+                            self.record_fid_wait(fid, &mut blocked, &mut cycle_low);
                         }
                     });
+            }
+        }
+
+        if !self.cycle_shadow_watch.is_empty()
+            && let Some((c1_ord, c2_ord)) =
+                live_span_positions(sheet.col_axis(), first_col, last_col)
+        {
+            let start = (sheet_id, RowId(0), ColId(0));
+            let end = (sheet_id, RowId(u64::MAX), ColId(u64::MAX));
+            for (&(_, cell_row, cell_col), anchors) in self.cycle_shadow_watch.range(start..=end) {
+                let Some(r_pos) = sheet.row_axis().id_to_pos(cell_row.0) else {
+                    continue;
+                };
+                if r_pos < r1_ord || r_pos > r2_ord {
+                    continue;
+                }
+                let Some(c_pos) = sheet.col_axis().id_to_pos(cell_col.0) else {
+                    continue;
+                };
+                if c_pos < c1_ord || c_pos > c2_ord {
+                    continue;
+                }
+                for &anchor in anchors {
+                    if let Some(&fid) = self.cell_to_fid.get(&anchor) {
+                        self.record_fid_wait(fid, &mut blocked, &mut cycle_low);
+                    }
+                }
             }
         }
 
