@@ -318,6 +318,11 @@ pub(super) async fn merge_branch(
             branch.status
         )));
     }
+    if state.agent.has_active_run_for_branch(id, bid).await {
+        return Err(ApiError::Conflict(
+            "cannot merge branch while an AI analyst run is still in progress".to_owned(),
+        ));
+    }
     let fork_seq: u64 = branch.fork_seq.parse().map_err(|_| ApiError::Internal)?;
     let base = state.store.load_workbook_at_seq(id, bid, 0).await?;
     let draft_snap = state.rooms.snapshot_state(id, bid).await?;
@@ -589,17 +594,20 @@ fn build_sse_stream(
             loop {
                 match rx_live.recv().await {
                     Ok(msg) => {
-                        if msg.event == "step" && msg.id <= max_step_id {
-                            continue;
-                        }
-                        if msg.event == "step" {
-                            max_step_id = max_step_id.max(msg.id);
+                        if let Some(step_id) = msg.id {
+                            if msg.event == "step" && step_id <= max_step_id {
+                                continue;
+                            }
+                            if msg.event == "step" {
+                                max_step_id = max_step_id.max(step_id);
+                            }
                         }
                         let is_status = msg.event == "status";
-                        if let Ok(ev) = Event::default()
-                            .id(msg.id.to_string())
-                            .event(msg.event)
-                            .json_data(&msg.data)
+                        let mut builder = Event::default().event(msg.event);
+                        if let Some(step_id) = msg.id {
+                            builder = builder.id(step_id.to_string());
+                        }
+                        if let Ok(ev) = builder.json_data(&msg.data)
                             && tx.send(Ok(ev)).await.is_err()
                         {
                             return;

@@ -33,6 +33,8 @@ import {
 export interface AiPanelProps {
   readonly collabDocId: string | null;
   readonly canWriteCloud: boolean;
+  readonly activeSheetId: number;
+  readonly draftActive: boolean;
   readonly onClose: () => void;
   readonly onOpenCloudDraft: (docId: string, branchId: string) => void;
   readonly onOpenReplayDraft: (baseSnapshot: ArrayBuffer) => void;
@@ -66,6 +68,8 @@ function presenceFromHint(h: ReplayPresenceHint): RemotePresenceOverlay {
 export default function AiPanel({
   collabDocId,
   canWriteCloud,
+  activeSheetId,
+  draftActive,
   onClose,
   onOpenCloudDraft,
   onOpenReplayDraft,
@@ -79,6 +83,9 @@ export default function AiPanel({
   const cloudAvailable = collabDocId !== null && canWriteCloud;
   const [tab, setTab] = useState<"cloud" | "demos">(cloudAvailable ? "cloud" : "demos");
   const [followCursor, setFollowCursor] = useState(true);
+  const followCursorRef = useRef(followCursor);
+  followCursorRef.current = followCursor;
+  const prevDraftActiveRef = useRef(draftActive);
 
   // Cloud mode state
   const [prompt, setPrompt] = useState("");
@@ -119,6 +126,20 @@ export default function AiPanel({
   }, []);
 
   useEffect(() => () => closeSse(), [closeSse]);
+
+  // If the user clicks "Back to Main" on the editor banner, clear any open review drawer & SSE stream.
+  useEffect(() => {
+    const wasActive = prevDraftActiveRef.current;
+    prevDraftActiveRef.current = draftActive;
+    if (wasActive && !draftActive) {
+      closeSse();
+      setPlaying(false);
+      setCloudDiff(null);
+      setReplayReview(false);
+      onSetAiPresence(null);
+      onSetDiffHighlights(null);
+    }
+  }, [closeSse, draftActive, onSetAiPresence, onSetDiffHighlights]);
 
   const loadCloudReview = useCallback(async (docId: string, branchId: string) => {
     try {
@@ -161,7 +182,7 @@ export default function AiPanel({
         try {
           const h = JSON.parse((ev as MessageEvent).data) as ReplayPresenceHint;
           onSetAiPresence(presenceFromHint(h));
-          if (followCursor) onJumpToCell(h.sheet, h.row, h.col);
+          if (followCursorRef.current) onJumpToCell(h.sheet, h.row, h.col);
         } catch {
           // ignore
         }
@@ -172,6 +193,7 @@ export default function AiPanel({
             status: string;
             summary?: string;
             error?: string;
+            commitsWritten?: number;
           };
           setActiveRun((prev) =>
             prev
@@ -184,7 +206,12 @@ export default function AiPanel({
               : prev,
           );
           if (d.status === "waiting_review") {
-            void loadCloudReview(docId, run.branchId);
+            if (d.commitsWritten === 0) {
+              // Read-only answer with no draft edits: exit preview and display summary.
+              onExitDraft();
+            } else {
+              void loadCloudReview(docId, run.branchId);
+            }
           } else if (d.error) {
             setCloudError(d.error);
           }
@@ -199,7 +226,7 @@ export default function AiPanel({
         }
       });
     },
-    [closeSse, followCursor, loadCloudReview, onJumpToCell, onOpenCloudDraft, onSetAiPresence],
+    [closeSse, loadCloudReview, onExitDraft, onJumpToCell, onOpenCloudDraft, onSetAiPresence],
   );
 
   const handleStartRun = async (e: React.FormEvent) => {
@@ -242,8 +269,11 @@ export default function AiPanel({
     if (detail.run.status === "running" || detail.run.status === "queued") {
       attachSse(collabDocId, detail.run);
     } else if (detail.run.status === "waiting_review") {
-      onOpenCloudDraft(collabDocId, detail.run.branchId);
-      await loadCloudReview(collabDocId, detail.run.branchId);
+      const hasCommits = detail.steps.some((s) => s.kind === "txn_commit");
+      if (hasCommits) {
+        onOpenCloudDraft(collabDocId, detail.run.branchId);
+        await loadCloudReview(collabDocId, detail.run.branchId);
+      }
     }
   };
 
@@ -388,14 +418,22 @@ export default function AiPanel({
 
   const handleReplayApply = async (sel: MergeSelection) => {
     if (!bundle) return;
+    onSetDiffHighlights(null);
+    onSetAiPresence(null);
+    if (collabDocId !== null) {
+      onExitDraft();
+      setReplayReview(false);
+      setReplayMsg(
+        `Previewed "${bundle.title}" merge selection; returned to your cloud workbook without overwriting it.`,
+      );
+      return;
+    }
     const txns = buildLocalReplayMergeTxns(
       bundle,
       new Set(sel.acceptedHunks),
       sel.conflictChoices ?? {},
       Boolean(sel.allowRefErrors),
     );
-    onSetDiffHighlights(null);
-    onSetAiPresence(null);
     onCommitLocalMerge(decodeBase64(bundle.baseSnapshotB64), txns);
     setReplayReview(false);
     setReplayMsg(`Merged selected changes from "${bundle.title}" into your sheet.`);
@@ -532,6 +570,7 @@ export default function AiPanel({
             {cloudDiff && activeRun && (
               <DiffReviewDrawer
                 diff={cloudDiff}
+                activeSheetId={activeSheetId}
                 summaryText={activeRun.summary}
                 busy={cloudBusy}
                 errorText={cloudError}
@@ -673,6 +712,7 @@ export default function AiPanel({
                 {replayReview && (
                   <DiffReviewDrawer
                     diff={bundle.diff}
+                    activeSheetId={activeSheetId}
                     summaryText={bundle.summary}
                     onPreview={handleReplayPreview}
                     onApply={handleReplayApply}

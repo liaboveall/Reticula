@@ -387,7 +387,11 @@ pub fn read_range_compressed(
             let mut col_letters = String::new();
             write_col_letters(c, &mut col_letters);
             if include_formulas && info.is_formula {
-                cells_rendered.push(format!("{col_letters}={} [={}]", info.display, info.raw));
+                if info.raw.starts_with('=') {
+                    cells_rendered.push(format!("{col_letters}={} [{}]", info.display, info.raw));
+                } else {
+                    cells_rendered.push(format!("{col_letters}={} [={}]", info.display, info.raw));
+                }
             } else {
                 cells_rendered.push(format!("{col_letters}={}", info.display));
             }

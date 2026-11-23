@@ -31,6 +31,7 @@ use crate::context::{
 pub const MAX_WRITE_CELLS_PER_CALL: usize = 2_000;
 pub const MAX_STRUCT_ROWS_PER_CALL: u32 = 10_000;
 pub const MAX_STRUCT_COLS_PER_CALL: u32 = 256;
+pub const MAX_FORMAT_CELLS_PER_CALL: u64 = 100_000;
 
 /// Boxed future helper for object-safe async traits without adding `async-trait`.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -128,8 +129,29 @@ impl HeadlessEvalSink {
             | Op::InsertCols { .. }
             | Op::DeleteCols { .. }
             | Op::MoveRows { .. }
-            | Op::MoveCols { .. } => {
+            | Op::MoveCols { .. }
+            | Op::DefineNamedRange { .. }
+            | Op::DeleteNamedRange { .. } => {
                 self.has_structural_ops = true;
+            }
+            Op::SetFormat { sheet, target, .. } => {
+                if let FormatTarget::Cells { rows, cols } = target {
+                    if let Some(s) = self.engine.workbook().sheet(*sheet) {
+                        let sname = s.name().to_owned();
+                        for r in rows.iter().flat_map(|run| run.iter()) {
+                            for c in cols.iter().flat_map(|run| run.iter()) {
+                                if let (Some(rp), Some(cp)) =
+                                    (s.row_axis().id_to_pos(r), s.col_axis().id_to_pos(c))
+                                {
+                                    self.touched_cells.insert((sname.clone(), rp, cp));
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    // Whole-row or whole-column style/format edits fall back to export_xlsx.
+                    self.has_structural_ops = true;
+                }
             }
             Op::SetCells { sheet, edits } => {
                 if let Some(s) = self.engine.workbook().sheet(*sheet) {
@@ -1007,11 +1029,13 @@ async fn exec_edit_structure(
         "insert_rows" => {
             let sid = resolve_sheet_id(sink.engine(), sheet_name)?;
             let idx = args.get("index").and_then(JsonValue::as_u64).unwrap_or(0) as u32;
-            let count = args
-                .get("count")
-                .and_then(JsonValue::as_u64)
-                .unwrap_or(1)
-                .clamp(1, u64::from(MAX_STRUCT_ROWS_PER_CALL)) as u32;
+            let raw_count = args.get("count").and_then(JsonValue::as_u64).unwrap_or(1);
+            if raw_count == 0 || raw_count > u64::from(MAX_STRUCT_ROWS_PER_CALL) {
+                return Err(format!(
+                    "insert_rows `count` must be between 1 and {MAX_STRUCT_ROWS_PER_CALL}"
+                ));
+            }
+            let count = raw_count as u32;
             let after = {
                 let s = sink
                     .engine()
@@ -1046,11 +1070,13 @@ async fn exec_edit_structure(
         "delete_rows" => {
             let sid = resolve_sheet_id(sink.engine(), sheet_name)?;
             let idx = args.get("index").and_then(JsonValue::as_u64).unwrap_or(0) as u32;
-            let count = args
-                .get("count")
-                .and_then(JsonValue::as_u64)
-                .unwrap_or(1)
-                .clamp(1, u64::from(MAX_STRUCT_ROWS_PER_CALL)) as u32;
+            let raw_count = args.get("count").and_then(JsonValue::as_u64).unwrap_or(1);
+            if raw_count == 0 || raw_count > u64::from(MAX_STRUCT_ROWS_PER_CALL) {
+                return Err(format!(
+                    "delete_rows `count` must be between 1 and {MAX_STRUCT_ROWS_PER_CALL}"
+                ));
+            }
+            let count = raw_count as u32;
             let mut runs = Vec::new();
             {
                 let s = sink
@@ -1084,11 +1110,13 @@ async fn exec_edit_structure(
         "insert_cols" => {
             let sid = resolve_sheet_id(sink.engine(), sheet_name)?;
             let idx = args.get("index").and_then(JsonValue::as_u64).unwrap_or(0) as u32;
-            let count = args
-                .get("count")
-                .and_then(JsonValue::as_u64)
-                .unwrap_or(1)
-                .clamp(1, u64::from(MAX_STRUCT_COLS_PER_CALL)) as u32;
+            let raw_count = args.get("count").and_then(JsonValue::as_u64).unwrap_or(1);
+            if raw_count == 0 || raw_count > u64::from(MAX_STRUCT_COLS_PER_CALL) {
+                return Err(format!(
+                    "insert_cols `count` must be between 1 and {MAX_STRUCT_COLS_PER_CALL}"
+                ));
+            }
+            let count = raw_count as u32;
             let after = {
                 let s = sink
                     .engine()
@@ -1123,11 +1151,13 @@ async fn exec_edit_structure(
         "delete_cols" => {
             let sid = resolve_sheet_id(sink.engine(), sheet_name)?;
             let idx = args.get("index").and_then(JsonValue::as_u64).unwrap_or(0) as u32;
-            let count = args
-                .get("count")
-                .and_then(JsonValue::as_u64)
-                .unwrap_or(1)
-                .clamp(1, u64::from(MAX_STRUCT_COLS_PER_CALL)) as u32;
+            let raw_count = args.get("count").and_then(JsonValue::as_u64).unwrap_or(1);
+            if raw_count == 0 || raw_count > u64::from(MAX_STRUCT_COLS_PER_CALL) {
+                return Err(format!(
+                    "delete_cols `count` must be between 1 and {MAX_STRUCT_COLS_PER_CALL}"
+                ));
+            }
+            let count = raw_count as u32;
             let mut runs = Vec::new();
             {
                 let s = sink
@@ -1216,7 +1246,13 @@ async fn exec_edit_structure(
         "move_rows" => {
             let sid = resolve_sheet_id(sink.engine(), sheet_name)?;
             let idx = args.get("index").and_then(JsonValue::as_u64).unwrap_or(0) as u32;
-            let count = args.get("count").and_then(JsonValue::as_u64).unwrap_or(1) as u32;
+            let raw_count = args.get("count").and_then(JsonValue::as_u64).unwrap_or(1);
+            if raw_count == 0 || raw_count > u64::from(MAX_STRUCT_ROWS_PER_CALL) {
+                return Err(format!(
+                    "move_rows `count` must be between 1 and {MAX_STRUCT_ROWS_PER_CALL}"
+                ));
+            }
+            let count = raw_count as u32;
             let target = args
                 .get("target_index")
                 .and_then(JsonValue::as_u64)
@@ -1258,7 +1294,13 @@ async fn exec_edit_structure(
         "move_cols" => {
             let sid = resolve_sheet_id(sink.engine(), sheet_name)?;
             let idx = args.get("index").and_then(JsonValue::as_u64).unwrap_or(0) as u32;
-            let count = args.get("count").and_then(JsonValue::as_u64).unwrap_or(1) as u32;
+            let raw_count = args.get("count").and_then(JsonValue::as_u64).unwrap_or(1);
+            if raw_count == 0 || raw_count > u64::from(MAX_STRUCT_COLS_PER_CALL) {
+                return Err(format!(
+                    "move_cols `count` must be between 1 and {MAX_STRUCT_COLS_PER_CALL}"
+                ));
+            }
+            let count = raw_count as u32;
             let target = args
                 .get("target_index")
                 .and_then(JsonValue::as_u64)
@@ -1334,7 +1376,7 @@ async fn exec_edit_structure(
                     hidden: false,
                 },
                 None,
-                format!("Defined named range '{name}' = {normalized}"),
+                format!("Defined named range '{name}' ({normalized})"),
             )
         }
         "delete_named_range" => {
@@ -1477,6 +1519,13 @@ async fn exec_format_range(
     let style = args.get("style").map(parse_style_patch).transpose()?;
     if number_format.is_none() && style.is_none() {
         return Err("format_range requires `number_format` and/or `style`".to_owned());
+    }
+
+    let total_cells = u64::from(r1 - r0 + 1).saturating_mul(u64::from(c1 - c0 + 1));
+    if total_cells > MAX_FORMAT_CELLS_PER_CALL {
+        return Err(format!(
+            "format_range exceeded cap of {MAX_FORMAT_CELLS_PER_CALL} cells per call (got {total_cells})"
+        ));
     }
 
     let (row_runs, col_runs, cell_count) = {

@@ -1383,7 +1383,7 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
                 setDraftPreview(message.kind === "draftReady");
                 if (message.kind === "draftExited") {
                   grid.setDiffHighlights(null);
-                  grid.setRemotePresences([]);
+                  grid.setRemotePresences(collabPresencesRef.current);
                 }
               }
               requestInspect(grid.selectionDetails(), true);
@@ -3142,6 +3142,8 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
           <LazyAiPanel
             collabDocId={collabTarget?.docId ?? null}
             canWriteCloud={collabTarget !== null && collabTarget.role !== "viewer"}
+            activeSheetId={engine.status === "ready" ? engine.sheet.sheet : 0}
+            draftActive={draftPreview}
             onClose={() => {
               setAiOpen(false);
               if (draftPreview) clientRef.current?.sendHost({ kind: "draftExit" });
@@ -3163,7 +3165,11 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
               ])
             }
             onExitDraft={() => clientRef.current?.sendHost({ kind: "draftExit" })}
-            onSetAiPresence={(p) => gridRef.current?.setRemotePresences(p ? [p] : [])}
+            onSetAiPresence={(p) =>
+              gridRef.current?.setRemotePresences(
+                p ? [...collabPresencesRef.current, p] : collabPresencesRef.current,
+              )
+            }
             onSetDiffHighlights={(m) => gridRef.current?.setDiffHighlights(m)}
             onJumpToCell={(sheet, row, col) => {
               if (activeSheetRef.current === sheet) {

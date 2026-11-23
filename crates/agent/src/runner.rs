@@ -317,7 +317,7 @@ pub async fn run_agent_loop(
         .count() as u32;
     let mut steps_executed: u32 = existing
         .iter()
-        .filter(|s| s.kind == AgentStepKind::AssistantThought || s.kind == AgentStepKind::ToolCall)
+        .filter(|s| s.kind == AgentStepKind::AssistantThought)
         .count() as u32;
     let mut total_usage = LlmUsage::default();
     for s in &existing {
@@ -356,6 +356,7 @@ pub async fn run_agent_loop(
     let mut last_tool_sig: Option<String> = None;
     let mut identical_repeat_count: u32 = 0;
 
+    let mut cancel_rx = cancel_rx;
     loop {
         if let Some(ref rx) = cancel_rx
             && *rx.borrow()
@@ -391,9 +392,19 @@ pub async fn run_agent_loop(
 
         let remaining = config.timeout.saturating_sub(started.elapsed());
         let turn_fut = provider.stream_turn(req, &mut delta_handler);
-        let turn = tokio::time::timeout(remaining, turn_fut)
-            .await
-            .map_err(|_| AgentError::TimedOut(config.timeout.as_secs()))??;
+        let turn = if let Some(ref mut rx) = cancel_rx {
+            tokio::select! {
+                biased;
+                _ = wait_cancelled(rx) => return Err(AgentError::Cancelled),
+                res = tokio::time::timeout(remaining, turn_fut) => {
+                    res.map_err(|_| AgentError::TimedOut(config.timeout.as_secs()))??
+                }
+            }
+        } else {
+            tokio::time::timeout(remaining, turn_fut)
+                .await
+                .map_err(|_| AgentError::TimedOut(config.timeout.as_secs()))??
+        };
 
         if let Some(ref rx) = cancel_rx
             && *rx.borrow()
@@ -485,6 +496,11 @@ pub async fn run_agent_loop(
         let mut finish_report: Option<FinishReport> = None;
 
         for tc in &turn.tool_calls {
+            if let Some(ref rx) = cancel_rx
+                && *rx.borrow()
+            {
+                return Err(AgentError::Cancelled);
+            }
             let parsed_args: Result<JsonValue, _> = serde_json::from_str(&tc.arguments);
             let args_val = match parsed_args {
                 Ok(v) => v,
@@ -700,6 +716,14 @@ pub async fn run_agent_loop(
     }
 }
 
+async fn wait_cancelled(rx: &mut watch::Receiver<bool>) {
+    while !*rx.borrow() {
+        if rx.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
 /// Evaluates whether a run interrupted by a server crash can safely resume from
 /// its persisted `agent_steps` (`18-m4.md` §2.6):
 /// - Safe to resume iff `resume_count < 2` and the last persisted step is
@@ -832,11 +856,45 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(outcome.summary, "Sorted and summed sales.");
+        assert_eq!(outcome.steps_executed, 6);
         assert_eq!(outcome.commits_written, 3);
         let sheet = sink.engine().workbook().sheet(s0).unwrap();
         // After descending sort on B2:B3, South (350) is now row 1 (A2:B2), total B4 is 450!
         assert_eq!(sheet.value(1, 1), Value::Number(350.0));
         assert_eq!(sheet.value(3, 1), Value::Number(450.0));
+    }
+
+    #[tokio::test]
+    async fn cancel_aborts_in_flight_slow_llm_turn_immediately() {
+        let rep = pack_replica_id(0, 2).unwrap();
+        let mut sink = HeadlessEvalSink::new(reticula_core::ops::Workbook::new(), 0, rep).unwrap();
+        let store = MemoryStepStore::default();
+        let provider = ScriptedMockProvider::new(vec![
+            ScriptedTurn::tool("slow turn", "c1", "workbook_overview", json!({})).with_delay(5_000),
+        ]);
+        let (tx, rx) = watch::channel(false);
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+            let _ = tx.send(true);
+        });
+        let started = Instant::now();
+        let err = run_agent_loop(
+            "cancel me",
+            &provider,
+            &mut sink,
+            &store,
+            AgentRunConfig::default(),
+            Some(rx),
+            |_| {},
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, AgentError::Cancelled));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "cancel waited for slow turn: {:?}",
+            started.elapsed()
+        );
     }
 
     #[tokio::test]

@@ -11,7 +11,7 @@ use reticula_core::ops::{
 use reticula_core::sheet::Sheet;
 use reticula_core::style::StylePatch;
 use reticula_core::value::Value;
-use reticula_formula::address::CellAddr;
+use reticula_formula::address::{CellAddr, write_col_letters};
 use reticula_formula::binder::{BoundExpr, BoundFormula, BoundRef};
 use reticula_formula::engine::FormulaEngine;
 use reticula_sync::RemapState;
@@ -186,10 +186,12 @@ struct PlannedCellChange {
     col: ColId,
     address: String,
     sheet_name: String,
+    formula_text: Option<String>,
     input: CellInput<BoundFormula>,
     format: FormatPatch,
     style: Option<StylePatch>,
     conflict: bool,
+    deleted_on_main: bool,
 }
 
 /// Internal per-hunk operational payload paired with [`DiffHunk`].
@@ -223,6 +225,12 @@ pub struct BranchDiffPlan {
     hunks: Vec<PlannedHunk>,
     /// Named sheet lookup from the draft workbook for human-readable `#REF!` labels.
     draft_sheet_names: BTreeMap<SheetId, String>,
+    /// 0-based row positions in the draft workbook for human-readable closure alerts.
+    draft_row_pos: BTreeMap<(SheetId, RowId), u32>,
+    /// 0-based column positions in the draft workbook for human-readable closure alerts.
+    draft_col_pos: BTreeMap<(SheetId, ColId), u32>,
+    /// Unparsed named range formulas from draft keyed by hunk ID.
+    named_range_formula_texts: BTreeMap<String, String>,
     /// Pre-sort to post-sort row mapping for each `SortHunk`, allowing post-sort
     /// edits on a rejected sort to remap cleanly back to the original row identity.
     sort_inverse_rows: SortInverseMap,
@@ -340,6 +348,9 @@ fn collect_sheet_populated_keys(
             keys.insert((r, c));
         }
     }
+    for &(r, c) in sheet.cell_styles().keys() {
+        keys.insert((r, c));
+    }
     keys
 }
 
@@ -368,10 +379,13 @@ pub fn compute_branch_diff(
             .or_insert_with(|| s.name().to_owned());
     }
 
-    // Step 1: Decode draft transactions to isolate structural operations and E15 sorts.
+    // Step 1: Decode draft transactions to isolate structural operations, E15 sorts,
+    // and any explicitly formatted empty cells.
     let mut raw_structural_ops: Vec<Op<BoundFormula>> = Vec::new();
     let mut raw_sort_ops: Vec<Op<BoundFormula>> = Vec::new();
+    let mut format_touched_keys: BTreeMap<SheetId, BTreeSet<(RowId, ColId)>> = BTreeMap::new();
     let mut base_after_sorts = base.clone();
+    let mut main_after_sorts = main_head.clone();
 
     for committed in draft_txns {
         if let Ok((_, ops)) = ops_from_wire_txn_v3(committed.txn.clone()) {
@@ -391,7 +405,20 @@ pub fn compute_branch_diff(
                     }
                     Op::PermuteContent { .. } => {
                         let _ = base_after_sorts.apply(op.clone());
+                        let _ = main_after_sorts.apply(op.clone());
                         raw_sort_ops.push(op);
+                    }
+                    Op::SetFormat {
+                        sheet,
+                        target: FormatTarget::Cells { rows, cols },
+                        ..
+                    } => {
+                        let entry = format_touched_keys.entry(*sheet).or_default();
+                        for r in rows.iter().flat_map(|run| run.iter()) {
+                            for c in cols.iter().flat_map(|run| run.iter()) {
+                                entry.insert((RowId(r), ColId(c)));
+                            }
+                        }
                     }
                     _ => {}
                 }
@@ -399,6 +426,11 @@ pub fn compute_branch_diff(
         }
     }
     let base_after_sorts_eval = FormulaEngine::from_workbook_recalc_all(base_after_sorts.clone());
+    let main_after_sorts_eval = FormulaEngine::from_workbook_recalc_all(main_after_sorts.clone());
+
+    let mut draft_row_pos: BTreeMap<(SheetId, RowId), u32> = BTreeMap::new();
+    let mut draft_col_pos: BTreeMap<(SheetId, ColId), u32> = BTreeMap::new();
+    let mut named_range_formula_texts: BTreeMap<String, String> = BTreeMap::new();
 
     let mut public_hunks: Vec<DiffHunk> = Vec::new();
     let mut planned_hunks: Vec<PlannedHunk> = Vec::new();
@@ -444,9 +476,21 @@ pub fn compute_branch_diff(
         }
         for &key in &created_rows {
             new_row_owner.insert(key, idx);
+            if let Some(pos) = draft
+                .sheet(key.0)
+                .and_then(|s| s.row_axis().id_to_pos(key.1.0))
+            {
+                draft_row_pos.insert(key, pos);
+            }
         }
         for &key in &created_cols {
             new_col_owner.insert(key, idx);
+            if let Some(pos) = draft
+                .sheet(key.0)
+                .and_then(|s| s.col_axis().id_to_pos(key.1.0))
+            {
+                draft_col_pos.insert(key, pos);
+            }
         }
         let has_conflict = conflict_reason.is_some() || !conflict_cells.is_empty();
         let anchor_cell = conflict_cells.first().map(|c| c.address.clone());
@@ -496,21 +540,38 @@ pub fn compute_branch_diff(
             let range_str = format_id_rect(draft.sheet(sheet), rows, cols);
             let mut has_conflict = false;
             let mut conflict_reason = None;
-            if let (Some(base_s), Some(main_s)) = (base.sheet(sheet), main_head.sheet(sheet)) {
-                'outer: for &r in rows {
-                    for &c in cols {
-                        if logical_cell(base, sheet, r, c) != logical_cell(main_head, sheet, r, c)
-                            && !base_s.is_deleted()
-                            && !main_s.is_deleted()
-                        {
-                            has_conflict = true;
-                            conflict_reason = Some(
-                                "Main branch modified cells inside the sorted range".to_owned(),
-                            );
-                            break 'outer;
+            let mut sort_target_deleted = false;
+            if let Some(main_s) = main_head.live_sheet(sheet) {
+                if rows
+                    .iter()
+                    .any(|r| main_s.row_axis().id_to_pos(r.0).is_none())
+                    || cols.iter().any(|c| !main_s.col_axis().is_live(c.0))
+                {
+                    has_conflict = true;
+                    sort_target_deleted = true;
+                    conflict_reason = Some(
+                        "Main branch deleted rows or columns inside the sorted range".to_owned(),
+                    );
+                } else if let Some(base_s) = base.sheet(sheet) {
+                    'outer: for &r in rows {
+                        for &c in cols {
+                            if logical_cell(base, sheet, r, c)
+                                != logical_cell(main_head, sheet, r, c)
+                                && !base_s.is_deleted()
+                            {
+                                has_conflict = true;
+                                conflict_reason = Some(
+                                    "Main branch modified cells inside the sorted range".to_owned(),
+                                );
+                                break 'outer;
+                            }
                         }
                     }
                 }
+            } else if base.live_sheet(sheet).is_some() {
+                has_conflict = true;
+                sort_target_deleted = true;
+                conflict_reason = Some("Target worksheet was deleted on main".to_owned());
             }
             // Build inverse mapping: destination RowId -> source RowId before sort.
             let mut inv_map = BTreeMap::new();
@@ -532,7 +593,7 @@ pub fn compute_branch_diff(
                 sheet_id: sheet.0.to_string(),
                 sheet_name,
                 label: label.clone(),
-                default_accepted: true,
+                default_accepted: !sort_target_deleted && !has_conflict,
                 has_conflict,
                 conflict_reason,
                 anchor_cell: range_str.split(':').next().map(str::to_owned),
@@ -573,6 +634,9 @@ pub fn compute_branch_diff(
         if let Some(base_s) = base_after_sorts.sheet(sid) {
             candidate_keys.extend(collect_sheet_populated_keys(&base_after_sorts, base_s));
         }
+        if let Some(fmt_keys) = format_touched_keys.get(&sid) {
+            candidate_keys.extend(fmt_keys.iter().copied());
+        }
 
         for (row, col) in candidate_keys {
             let Some(r_pos) = draft_sheet.row_axis().id_to_pos(row.0) else {
@@ -609,7 +673,7 @@ pub fn compute_branch_diff(
                     base_value: String::new(),
                     base_formula: None,
                     draft_value: draft_val,
-                    draft_formula: draft_form,
+                    draft_formula: draft_form.clone(),
                     main_value: String::new(),
                     main_formula: None,
                     conflict: false,
@@ -629,17 +693,22 @@ pub fn compute_branch_diff(
                         col,
                         address,
                         sheet_name: sheet_name.clone(),
+                        formula_text: draft_form,
                         input: draft_lc.content.to_cell_input(),
                         format: draft_lc.format.map_or(FormatPatch::Keep, FormatPatch::Set),
                         style: (!draft_lc.style.is_empty()).then_some(draft_lc.style),
                         conflict: false,
+                        deleted_on_main: false,
                     });
                 }
                 continue;
             }
 
             let base_lc = logical_cell(&base_after_sorts, sid, row, col);
-            let main_lc = logical_cell(main_head, sid, row, col);
+            let main_target_live = main_head.live_sheet(sid).is_some_and(|ms| {
+                ms.row_axis().id_to_pos(row.0).is_some() && ms.col_axis().is_live(col.0)
+            });
+            let main_lc = logical_cell(&main_after_sorts, sid, row, col);
 
             if draft_lc == base_lc {
                 // E21 check: logical content & format unchanged. Only report non-volatile cascade
@@ -663,19 +732,24 @@ pub fn compute_branch_diff(
                 continue;
             }
 
-            if main_lc == draft_lc {
+            if main_target_live && main_lc == draft_lc {
                 // Converged identically on both branches.
                 continue;
             }
 
-            let is_conflict = main_lc != base_lc;
-            let pure_format = draft_lc.content == base_lc.content;
+            let deleted_on_main = !main_target_live;
+            let is_conflict = deleted_on_main || main_lc != base_lc;
+            let pure_format = !deleted_on_main && draft_lc.content == base_lc.content;
             let address = format_a1(r_pos, c_pos);
             let cell_key = format_cell_key(sid, row, col);
             let (base_val, base_form) =
                 format_display_and_formula(&base_after_sorts_eval, sid, row, col);
             let (draft_val, draft_form) = format_display_and_formula(&draft_eval, sid, row, col);
-            let (main_val, main_form) = format_display_and_formula(&main_eval, sid, row, col);
+            let (main_val, main_form) = if deleted_on_main {
+                ("<deleted on main>".to_owned(), None)
+            } else {
+                format_display_and_formula(&main_after_sorts_eval, sid, row, col)
+            };
 
             let entry = CellDiffEntry {
                 cell_key: cell_key.clone(),
@@ -686,7 +760,7 @@ pub fn compute_branch_diff(
                 base_value: base_val,
                 base_formula: base_form,
                 draft_value: draft_val,
-                draft_formula: draft_form,
+                draft_formula: draft_form.clone(),
                 main_value: main_val,
                 main_formula: main_form,
                 conflict: is_conflict,
@@ -716,10 +790,12 @@ pub fn compute_branch_diff(
                 col,
                 address,
                 sheet_name: sheet_name.clone(),
+                formula_text: draft_form,
                 input: draft_lc.content.to_cell_input(),
                 format: format_patch,
                 style: style_patch,
                 conflict: is_conflict,
+                deleted_on_main,
             };
             existing_changes_by_sheet.entry(sid).or_default().push((
                 r_pos,
@@ -757,17 +833,21 @@ pub fn compute_branch_diff(
             let hunk_id = next_hunk_id("conflict");
             let label = format!("Conflict at {sheet_name}!{}", entry.address);
             let anchor = Some(entry.address.clone());
+            let reason = if change.deleted_on_main {
+                "Main branch deleted this cell's row, column, or worksheet since the fork point"
+                    .to_owned()
+            } else {
+                "Both main and AI draft modified this cell since the fork point".to_owned()
+            };
             public_hunks.push(DiffHunk {
                 id: hunk_id.clone(),
                 kind: DiffHunkKind::CellBlock,
                 sheet_id: sid.0.to_string(),
                 sheet_name: sheet_name.clone(),
                 label: label.clone(),
-                default_accepted: true,
+                default_accepted: !change.deleted_on_main,
                 has_conflict: true,
-                conflict_reason: Some(
-                    "Both main and AI draft modified this cell since the fork point".to_owned(),
-                ),
+                conflict_reason: Some(reason),
                 anchor_cell: anchor,
                 cells: vec![entry],
                 structural_op_summary: None,
@@ -914,20 +994,21 @@ pub fn compute_branch_diff(
             .and_then(|s| draft_sheet_names.get(&s).cloned())
             .unwrap_or_else(|| "Workbook".to_owned());
         let (label, meta_op) = match d_def {
-            Some(def) => (
-                format!(
-                    "Define named range {} = {}",
-                    def.name,
-                    def.formula.unparse(draft, scope_sheet)
-                ),
-                Op::DefineNamedRange {
-                    scope: key.scope,
-                    name: def.name.clone(),
-                    formula: def.formula.clone(),
-                    comment: def.comment.clone(),
-                    hidden: def.hidden,
-                },
-            ),
+            Some(def) => {
+                let unparsed = def.formula.unparse(draft, scope_sheet);
+                named_range_formula_texts.insert(hunk_id.clone(), unparsed.clone());
+                let rhs = unparsed.strip_prefix('=').unwrap_or(&unparsed);
+                (
+                    format!("Define named range {} = {rhs}", def.name),
+                    Op::DefineNamedRange {
+                        scope: key.scope,
+                        name: def.name.clone(),
+                        formula: def.formula.clone(),
+                        comment: def.comment.clone(),
+                        hidden: def.hidden,
+                    },
+                )
+            }
             None => (
                 format!("Delete named range {}", key.canonical_name),
                 Op::DeleteNamedRange {
@@ -994,13 +1075,17 @@ pub fn compute_branch_diff(
         },
         hunks: planned_hunks,
         draft_sheet_names,
+        draft_row_pos,
+        draft_col_pos,
+        named_range_formula_texts,
         sort_inverse_rows,
     }
 }
 
 /// Performs static reference closure validation over the user's selected hunks
-/// (`18-m4.md` §5.3). Checks every accepted cell formula and accepted named range
-/// against every sheet/row/column introduced by rejected structural hunks.
+/// (`18-m4.md` §5.3). Checks every accepted cell formula, accepted named range,
+/// and accepted structural/sort/meta operation against every sheet/row/column
+/// introduced by rejected structural hunks.
 pub fn check_reference_closure(
     plan: &BranchDiffPlan,
     selection: &MergeSelection,
@@ -1020,6 +1105,13 @@ pub fn check_reference_closure(
         if !accepted_set.contains(h.hunk_id.as_str()) {
             continue;
         }
+        // Check structural/sort/meta operation targets against rejected created sheets/rows/cols.
+        for op in &h.structural_ops {
+            check_op_target_closure(op, &h.label, plan, &rejected, &mut issues);
+        }
+        if let Some(ref sop) = h.sort_op {
+            check_op_target_closure(sop, &h.label, plan, &rejected, &mut issues);
+        }
         for cell in &h.cell_changes {
             if cell.conflict
                 && selection.conflict_choices.get(&cell.cell_key)
@@ -1029,19 +1121,23 @@ pub fn check_reference_closure(
             }
             if let CellInput::Formula { ref formula, .. } = cell.input {
                 let source = format!("{}!{}", cell.sheet_name, cell.address);
-                let formula_text = format_bound_summary(&formula.root);
+                let formula_text = cell
+                    .formula_text
+                    .clone()
+                    .unwrap_or_else(|| format_bound_summary(&formula.root));
                 walk_expr_closure(
                     &formula.root,
                     cell.sheet,
                     &source,
                     &formula_text,
                     &rejected,
-                    &plan.draft_sheet_names,
+                    plan,
                     &mut issues,
                 );
             }
         }
         for op in &h.meta_ops {
+            check_op_target_closure(op, &h.label, plan, &rejected, &mut issues);
             if let Op::DefineNamedRange {
                 scope,
                 name,
@@ -1051,14 +1147,18 @@ pub fn check_reference_closure(
             {
                 let host = scope.unwrap_or(SheetId(0));
                 let source = format!("NamedRange:{name}");
-                let formula_text = format_bound_summary(&formula.root);
+                let formula_text = plan
+                    .named_range_formula_texts
+                    .get(&h.hunk_id)
+                    .cloned()
+                    .unwrap_or_else(|| format_bound_summary(&formula.root));
                 walk_expr_closure(
                     &formula.root,
                     host,
                     &source,
                     &formula_text,
                     &rejected,
-                    &plan.draft_sheet_names,
+                    plan,
                     &mut issues,
                 );
             }
@@ -1147,6 +1247,7 @@ pub fn plan_merge_ops(
     let mut inserts = Vec::new();
     let mut moves_renames = Vec::new();
     let mut sorts = Vec::new();
+    let mut named_range_defs = Vec::new();
     let mut cell_edits_by_sheet: BTreeMap<SheetId, Vec<CellEdit<BoundFormula>>> = BTreeMap::new();
     let mut style_ops = Vec::new();
     let mut meta_ops = Vec::new();
@@ -1180,6 +1281,12 @@ pub fn plan_merge_ops(
             {
                 continue;
             }
+            if cell.deleted_on_main {
+                return Err(MergePlanError::RemapFailed(format!(
+                    "cannot apply draft edit at {}!{}: target row, column, or worksheet was deleted on main",
+                    cell.sheet_name, cell.address
+                )));
+            }
             let mut target_row = cell.row;
             if h.kind == DiffHunkKind::CellBlock {
                 // Reverse-map row across any rejected sorts covering `(sheet, col)`.
@@ -1199,12 +1306,7 @@ pub fn plan_merge_ops(
                     ref mut formula, ..
                 } = input
             {
-                sanitize_rejected_expr(
-                    &mut formula.root,
-                    cell.sheet,
-                    &rejected,
-                    &plan.draft_sheet_names,
-                );
+                sanitize_rejected_expr(&mut formula.root, cell.sheet, &rejected, plan);
             }
             cell_edits_by_sheet
                 .entry(cell.sheet)
@@ -1245,10 +1347,14 @@ pub fn plan_merge_ops(
                     &mut formula.root,
                     scope.unwrap_or(SheetId(0)),
                     &rejected,
-                    &plan.draft_sheet_names,
+                    plan,
                 );
             }
-            meta_ops.push(cloned);
+            if matches!(cloned, Op::DefineNamedRange { .. }) {
+                named_range_defs.push(cloned);
+            } else {
+                meta_ops.push(cloned);
+            }
         }
     }
 
@@ -1257,11 +1363,29 @@ pub fn plan_merge_ops(
     ordered.extend(inserts);
     ordered.extend(moves_renames);
     ordered.extend(sorts);
+    ordered.extend(named_range_defs);
     for (sheet, edits) in cell_edits_by_sheet {
-        for chunk in edits.chunks(MERGE_SET_CELLS_CHUNK) {
+        let mut chunk = Vec::new();
+        let mut chunk_bytes = 0_usize;
+        for edit in edits {
+            let edit_bytes = postcard::to_allocvec(&edit).map_or(256, |v| v.len());
+            if !chunk.is_empty()
+                && (chunk.len() >= MERGE_SET_CELLS_CHUNK
+                    || chunk_bytes.saturating_add(edit_bytes) > 900_000)
+            {
+                ordered.push(Op::SetCells {
+                    sheet,
+                    edits: std::mem::take(&mut chunk),
+                });
+                chunk_bytes = 0;
+            }
+            chunk_bytes = chunk_bytes.saturating_add(edit_bytes);
+            chunk.push(edit);
+        }
+        if !chunk.is_empty() {
             ordered.push(Op::SetCells {
                 sheet,
-                edits: chunk.to_vec(),
+                edits: chunk,
             });
         }
     }
@@ -1368,19 +1492,242 @@ fn collect_unresolved_conflicts(plan: &BranchDiffPlan, selection: &MergeSelectio
     unresolved
 }
 
+fn format_row_label(plan: &BranchDiffPlan, sheet: SheetId, sname: &str, row: RowId) -> String {
+    if let Some(&pos) = plan.draft_row_pos.get(&(sheet, row)) {
+        format!("{sname} row {}", pos + 1)
+    } else {
+        format!("{sname} row#{}", row.0)
+    }
+}
+
+fn format_col_label(plan: &BranchDiffPlan, sheet: SheetId, sname: &str, col: ColId) -> String {
+    if let Some(&pos) = plan.draft_col_pos.get(&(sheet, col)) {
+        let mut letters = String::new();
+        write_col_letters(pos, &mut letters);
+        format!("{sname} col {letters}")
+    } else {
+        format!("{sname} col#{}", col.0)
+    }
+}
+
+fn push_rejected_sheet_issue(
+    sid: SheetId,
+    source_label: &str,
+    plan: &BranchDiffPlan,
+    rejected: &RejectedIds,
+    issues: &mut Vec<ClosureIssue>,
+) {
+    if let Some((hid, hlabel)) = rejected.sheets.get(&sid) {
+        let sname = plan
+            .draft_sheet_names
+            .get(&sid)
+            .cloned()
+            .unwrap_or_else(|| format!("Sheet#{}", sid.0));
+        issues.push(ClosureIssue {
+            source_cell: source_label.to_owned(),
+            formula_text: source_label.to_owned(),
+            target_hunk_id: hid.clone(),
+            target_hunk_label: hlabel.clone(),
+            ref_display: format!("sheet '{sname}'"),
+        });
+    }
+}
+
+fn push_rejected_row_issue(
+    sid: SheetId,
+    row: RowId,
+    source_label: &str,
+    plan: &BranchDiffPlan,
+    rejected: &RejectedIds,
+    issues: &mut Vec<ClosureIssue>,
+) {
+    if let Some((hid, hlabel)) = rejected.rows.get(&(sid, row)) {
+        let sname = plan
+            .draft_sheet_names
+            .get(&sid)
+            .cloned()
+            .unwrap_or_else(|| format!("Sheet#{}", sid.0));
+        issues.push(ClosureIssue {
+            source_cell: source_label.to_owned(),
+            formula_text: source_label.to_owned(),
+            target_hunk_id: hid.clone(),
+            target_hunk_label: hlabel.clone(),
+            ref_display: format_row_label(plan, sid, &sname, row),
+        });
+    }
+}
+
+fn push_rejected_col_issue(
+    sid: SheetId,
+    col: ColId,
+    source_label: &str,
+    plan: &BranchDiffPlan,
+    rejected: &RejectedIds,
+    issues: &mut Vec<ClosureIssue>,
+) {
+    if let Some((hid, hlabel)) = rejected.cols.get(&(sid, col)) {
+        let sname = plan
+            .draft_sheet_names
+            .get(&sid)
+            .cloned()
+            .unwrap_or_else(|| format!("Sheet#{}", sid.0));
+        issues.push(ClosureIssue {
+            source_cell: source_label.to_owned(),
+            formula_text: source_label.to_owned(),
+            target_hunk_id: hid.clone(),
+            target_hunk_label: hlabel.clone(),
+            ref_display: format_col_label(plan, sid, &sname, col),
+        });
+    }
+}
+
+fn check_op_target_closure(
+    op: &Op<BoundFormula>,
+    source_label: &str,
+    plan: &BranchDiffPlan,
+    rejected: &RejectedIds,
+    issues: &mut Vec<ClosureIssue>,
+) {
+    match op {
+        Op::AddSheet {
+            after: Some(prev), ..
+        } => push_rejected_sheet_issue(*prev, source_label, plan, rejected, issues),
+        Op::DeleteSheet { sheet } | Op::RenameSheet { sheet, .. } => {
+            push_rejected_sheet_issue(*sheet, source_label, plan, rejected, issues);
+        }
+        Op::MoveSheet { sheet, after } => {
+            push_rejected_sheet_issue(*sheet, source_label, plan, rejected, issues);
+            if let Some(prev) = after {
+                push_rejected_sheet_issue(*prev, source_label, plan, rejected, issues);
+            }
+        }
+        Op::InsertRows { sheet, after, .. } => {
+            push_rejected_sheet_issue(*sheet, source_label, plan, rejected, issues);
+            if let Some(anchor) = after {
+                push_rejected_row_issue(*sheet, *anchor, source_label, plan, rejected, issues);
+            }
+        }
+        Op::InsertCols { sheet, after, .. } => {
+            push_rejected_sheet_issue(*sheet, source_label, plan, rejected, issues);
+            if let Some(anchor) = after {
+                push_rejected_col_issue(*sheet, *anchor, source_label, plan, rejected, issues);
+            }
+        }
+        Op::DeleteRows { sheet, ids } => {
+            push_rejected_sheet_issue(*sheet, source_label, plan, rejected, issues);
+            for raw in ids.iter().flat_map(|r| r.iter()) {
+                push_rejected_row_issue(*sheet, RowId(raw), source_label, plan, rejected, issues);
+            }
+        }
+        Op::DeleteCols { sheet, ids } => {
+            push_rejected_sheet_issue(*sheet, source_label, plan, rejected, issues);
+            for raw in ids.iter().flat_map(|c| c.iter()) {
+                push_rejected_col_issue(*sheet, ColId(raw), source_label, plan, rejected, issues);
+            }
+        }
+        Op::MoveRows { sheet, ids, after } => {
+            push_rejected_sheet_issue(*sheet, source_label, plan, rejected, issues);
+            for raw in ids.iter().flat_map(|r| r.iter()) {
+                push_rejected_row_issue(*sheet, RowId(raw), source_label, plan, rejected, issues);
+            }
+            if let Some(anchor) = after {
+                push_rejected_row_issue(*sheet, *anchor, source_label, plan, rejected, issues);
+            }
+        }
+        Op::MoveCols { sheet, ids, after } => {
+            push_rejected_sheet_issue(*sheet, source_label, plan, rejected, issues);
+            for raw in ids.iter().flat_map(|c| c.iter()) {
+                push_rejected_col_issue(*sheet, ColId(raw), source_label, plan, rejected, issues);
+            }
+            if let Some(anchor) = after {
+                push_rejected_col_issue(*sheet, *anchor, source_label, plan, rejected, issues);
+            }
+        }
+        Op::PermuteContent {
+            sheet, rows, cols, ..
+        } => {
+            push_rejected_sheet_issue(*sheet, source_label, plan, rejected, issues);
+            for &r in rows {
+                push_rejected_row_issue(*sheet, r, source_label, plan, rejected, issues);
+            }
+            for &c in cols {
+                push_rejected_col_issue(*sheet, c, source_label, plan, rejected, issues);
+            }
+        }
+        Op::SetFormat { sheet, target, .. } => {
+            push_rejected_sheet_issue(*sheet, source_label, plan, rejected, issues);
+            match target {
+                FormatTarget::Cells { rows, cols } => {
+                    for raw in rows.iter().flat_map(|r| r.iter()) {
+                        push_rejected_row_issue(
+                            *sheet,
+                            RowId(raw),
+                            source_label,
+                            plan,
+                            rejected,
+                            issues,
+                        );
+                    }
+                    for raw in cols.iter().flat_map(|c| c.iter()) {
+                        push_rejected_col_issue(
+                            *sheet,
+                            ColId(raw),
+                            source_label,
+                            plan,
+                            rejected,
+                            issues,
+                        );
+                    }
+                }
+                FormatTarget::Rows(rows) => {
+                    for raw in rows.iter().flat_map(|r| r.iter()) {
+                        push_rejected_row_issue(
+                            *sheet,
+                            RowId(raw),
+                            source_label,
+                            plan,
+                            rejected,
+                            issues,
+                        );
+                    }
+                }
+                FormatTarget::Cols(cols) => {
+                    for raw in cols.iter().flat_map(|c| c.iter()) {
+                        push_rejected_col_issue(
+                            *sheet,
+                            ColId(raw),
+                            source_label,
+                            plan,
+                            rejected,
+                            issues,
+                        );
+                    }
+                }
+            }
+        }
+        Op::DefineNamedRange {
+            scope: Some(sid), ..
+        }
+        | Op::DeleteNamedRange {
+            scope: Some(sid), ..
+        } => push_rejected_sheet_issue(*sid, source_label, plan, rejected, issues),
+        _ => {}
+    }
+}
+
 fn walk_expr_closure(
     expr: &BoundExpr,
     host_sheet: SheetId,
     source_cell: &str,
     formula_text: &str,
     rejected: &RejectedIds,
-    sheet_names: &BTreeMap<SheetId, String>,
+    plan: &BranchDiffPlan,
     issues: &mut Vec<ClosureIssue>,
 ) {
     match expr {
         BoundExpr::Reference(r) => {
             if let Some((hunk_id, hunk_label, ref_display)) =
-                ref_hits_rejected(r, host_sheet, rejected, sheet_names)
+                ref_hits_rejected(r, host_sheet, rejected, plan)
             {
                 issues.push(ClosureIssue {
                     source_cell: source_cell.to_owned(),
@@ -1397,7 +1744,8 @@ fn walk_expr_closure(
             ..
         } => {
             if let Some((hunk_id, hunk_label)) = rejected.sheets.get(sid) {
-                let sname = sheet_names
+                let sname = plan
+                    .draft_sheet_names
                     .get(sid)
                     .cloned()
                     .unwrap_or_else(|| format!("Sheet#{}", sid.0));
@@ -1417,7 +1765,7 @@ fn walk_expr_closure(
                 source_cell,
                 formula_text,
                 rejected,
-                sheet_names,
+                plan,
                 issues,
             );
         }
@@ -1428,7 +1776,7 @@ fn walk_expr_closure(
                 source_cell,
                 formula_text,
                 rejected,
-                sheet_names,
+                plan,
                 issues,
             );
         }
@@ -1439,7 +1787,7 @@ fn walk_expr_closure(
                 source_cell,
                 formula_text,
                 rejected,
-                sheet_names,
+                plan,
                 issues,
             );
             walk_expr_closure(
@@ -1448,7 +1796,7 @@ fn walk_expr_closure(
                 source_cell,
                 formula_text,
                 rejected,
-                sheet_names,
+                plan,
                 issues,
             );
         }
@@ -1460,7 +1808,7 @@ fn walk_expr_closure(
                     source_cell,
                     formula_text,
                     rejected,
-                    sheet_names,
+                    plan,
                     issues,
                 );
             }
@@ -1479,7 +1827,7 @@ fn ref_hits_rejected(
     r: &BoundRef,
     host_sheet: SheetId,
     rejected: &RejectedIds,
-    sheet_names: &BTreeMap<SheetId, String>,
+    plan: &BranchDiffPlan,
 ) -> Option<(String, String, String)> {
     let target_sheet = match r {
         BoundRef::Cell { sheet, .. }
@@ -1488,7 +1836,8 @@ fn ref_hits_rejected(
         | BoundRef::RowRange { sheet, .. } => sheet.unwrap_or(host_sheet),
         BoundRef::Invalid { .. } => return None,
     };
-    let sname = sheet_names
+    let sname = plan
+        .draft_sheet_names
         .get(&target_sheet)
         .cloned()
         .unwrap_or_else(|| format!("Sheet#{}", target_sheet.0));
@@ -1503,14 +1852,14 @@ fn ref_hits_rejected(
                 return Some((
                     hid.clone(),
                     hlabel.clone(),
-                    format!("{sname} row#{}", row.0),
+                    format_row_label(plan, target_sheet, &sname, *row),
                 ));
             }
             if let Some((hid, hlabel)) = rejected.cols.get(&(target_sheet, *col)) {
                 return Some((
                     hid.clone(),
                     hlabel.clone(),
-                    format!("{sname} col#{}", col.0),
+                    format_col_label(plan, target_sheet, &sname, *col),
                 ));
             }
         }
@@ -1526,7 +1875,7 @@ fn ref_hits_rejected(
                     return Some((
                         hid.clone(),
                         hlabel.clone(),
-                        format!("{sname} row#{}", row.0),
+                        format_row_label(plan, target_sheet, &sname, row),
                     ));
                 }
             }
@@ -1535,7 +1884,7 @@ fn ref_hits_rejected(
                     return Some((
                         hid.clone(),
                         hlabel.clone(),
-                        format!("{sname} col#{}", col.0),
+                        format_col_label(plan, target_sheet, &sname, col),
                     ));
                 }
             }
@@ -1550,7 +1899,7 @@ fn ref_hits_rejected(
                     return Some((
                         hid.clone(),
                         hlabel.clone(),
-                        format!("{sname} col#{}", col.0),
+                        format_col_label(plan, target_sheet, &sname, col),
                     ));
                 }
             }
@@ -1565,7 +1914,7 @@ fn ref_hits_rejected(
                     return Some((
                         hid.clone(),
                         hlabel.clone(),
-                        format!("{sname} row#{}", row.0),
+                        format_row_label(plan, target_sheet, &sname, row),
                     ));
                 }
             }
@@ -1579,17 +1928,17 @@ fn sanitize_rejected_expr(
     expr: &mut BoundExpr,
     host_sheet: SheetId,
     rejected: &RejectedIds,
-    sheet_names: &BTreeMap<SheetId, String>,
+    plan: &BranchDiffPlan,
 ) {
     match expr {
         BoundExpr::Reference(r) => {
-            if ref_hits_rejected(r, host_sheet, rejected, sheet_names).is_some() {
+            if ref_hits_rejected(r, host_sheet, rejected, plan).is_some() {
                 let sheet_name = match r {
                     BoundRef::Cell { sheet, .. }
                     | BoundRef::Area { sheet, .. }
                     | BoundRef::ColRange { sheet, .. }
                     | BoundRef::RowRange { sheet, .. } => {
-                        sheet.and_then(|sid| sheet_names.get(&sid).cloned())
+                        sheet.and_then(|sid| plan.draft_sheet_names.get(&sid).cloned())
                     }
                     BoundRef::Invalid { sheet_name } => sheet_name.clone(),
                 };
@@ -1604,23 +1953,23 @@ fn sanitize_rejected_expr(
             if let Some(sid) = *sheet
                 && rejected.sheets.contains_key(&sid)
             {
-                *missing_sheet = sheet_names.get(&sid).cloned();
+                *missing_sheet = plan.draft_sheet_names.get(&sid).cloned();
                 *sheet = None;
             }
         }
         BoundExpr::Paren(inner) | BoundExpr::SpillRef(inner) => {
-            sanitize_rejected_expr(inner, host_sheet, rejected, sheet_names);
+            sanitize_rejected_expr(inner, host_sheet, rejected, plan);
         }
         BoundExpr::Unary { expr: inner, .. } => {
-            sanitize_rejected_expr(inner, host_sheet, rejected, sheet_names);
+            sanitize_rejected_expr(inner, host_sheet, rejected, plan);
         }
         BoundExpr::Binary { left, right, .. } => {
-            sanitize_rejected_expr(left, host_sheet, rejected, sheet_names);
-            sanitize_rejected_expr(right, host_sheet, rejected, sheet_names);
+            sanitize_rejected_expr(left, host_sheet, rejected, plan);
+            sanitize_rejected_expr(right, host_sheet, rejected, plan);
         }
         BoundExpr::Call { args, .. } => {
             for arg in args {
-                sanitize_rejected_expr(arg, host_sheet, rejected, sheet_names);
+                sanitize_rejected_expr(arg, host_sheet, rejected, plan);
             }
         }
         BoundExpr::Literal(_)
@@ -2183,6 +2532,8 @@ mod tests {
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].target_hunk_id, struct_hunk.id);
         assert_eq!(issues[0].source_cell, "Sheet1!B1");
+        assert_eq!(issues[0].formula_text, "=A2*2");
+        assert_eq!(issues[0].ref_display, "Sheet1 row 2");
         let merge_rep = pack_replica_id(0, 8).unwrap();
         assert!(matches!(
             plan_merge_ops(&plan, &sel_blocked, &main_head, 0, merge_rep, 1),
@@ -2290,5 +2641,242 @@ mod tests {
         assert_eq!(plan.diff.summary.cell_block_hunks, 0);
         assert_eq!(plan.diff.hunks.len(), 1);
         assert_eq!(plan.diff.hunks[0].kind, DiffHunkKind::Sort);
+    }
+
+    #[test]
+    fn post_sort_cell_edit_has_no_false_conflict_on_unmodified_main_and_detects_real_conflict() {
+        let mut base_eng = FormulaEngine::new();
+        let s0 = SheetId(0);
+        base_eng
+            .edit_cell_raw(s0, RowId(0), ColId(0), "Name")
+            .unwrap();
+        base_eng
+            .edit_cell_raw(s0, RowId(0), ColId(1), "Sales")
+            .unwrap();
+        base_eng
+            .edit_cell_raw(s0, RowId(1), ColId(0), "North")
+            .unwrap();
+        base_eng
+            .edit_cell_raw(s0, RowId(1), ColId(1), "100")
+            .unwrap();
+        base_eng
+            .edit_cell_raw(s0, RowId(2), ColId(0), "South")
+            .unwrap();
+        base_eng
+            .edit_cell_raw(s0, RowId(2), ColId(1), "300")
+            .unwrap();
+        base_eng.recalc_all();
+        let base = base_eng.workbook().clone();
+
+        // Draft sorts descending (Row 1 becomes South/300, Row 2 becomes North/100)
+        // and then edits Row 1's sales (B2) from 300 -> 100 (coincidentally North's old value!).
+        let mut draft_eng = FormulaEngine::from_workbook_recalc_all(base.clone());
+        let sort_op = plan_sort(
+            draft_eng.workbook().sheet(s0).unwrap(),
+            0,
+            2,
+            0,
+            1,
+            true,
+            &[SortKey {
+                col_offset: 1,
+                ascending: false,
+                case_sensitive: false,
+            }],
+            None,
+        )
+        .unwrap();
+        draft_eng.apply_op(sort_op.clone()).unwrap();
+        let edit_op = Op::SetCells {
+            sheet: s0,
+            edits: vec![CellEdit {
+                row: RowId(1),
+                col: ColId(1),
+                input: CellInput::Scalar(ScalarValue::Number(100.0)),
+                format: FormatPatch::Keep,
+            }],
+        };
+        draft_eng.apply_op(edit_op.clone()).unwrap();
+        draft_eng.recalc_all();
+
+        let draft_rep = pack_replica_id(0, 4).unwrap();
+        let txns = vec![
+            commit_txn(1, draft_rep, &[sort_op]),
+            commit_txn(2, draft_rep, &[edit_op]),
+        ];
+
+        // 1. Against unmodified main: must NOT report a false conflict AND must NOT drop the B2->100 edit!
+        let plan_clean = compute_branch_diff(&base, draft_eng.workbook(), &base, 0, 0, &txns);
+        assert_eq!(plan_clean.diff.summary.conflict_cells, 0);
+        assert_eq!(plan_clean.diff.summary.sort_hunks, 1);
+        assert_eq!(plan_clean.diff.summary.cell_block_hunks, 1);
+        let cell_hunk = plan_clean
+            .diff
+            .hunks
+            .iter()
+            .find(|h| h.kind == DiffHunkKind::CellBlock)
+            .unwrap();
+        assert_eq!(cell_hunk.cells[0].address, "B2");
+        assert_eq!(cell_hunk.cells[0].base_value, "300");
+        assert_eq!(cell_hunk.cells[0].main_value, "300");
+        assert_eq!(cell_hunk.cells[0].draft_value, "100");
+
+        // 2. Against main that concurrently edited South's row (Row 2: 300 -> 320): MUST report conflict on South!
+        let mut main_eng = FormulaEngine::from_workbook_recalc_all(base.clone());
+        main_eng
+            .edit_cell_raw(s0, RowId(2), ColId(1), "320")
+            .unwrap();
+        main_eng.recalc_all();
+        let plan_conflict = compute_branch_diff(
+            &base,
+            draft_eng.workbook(),
+            main_eng.workbook(),
+            0,
+            1,
+            &txns,
+        );
+        assert_eq!(plan_conflict.diff.summary.conflict_cells, 1);
+        let ch = plan_conflict
+            .diff
+            .hunks
+            .iter()
+            .find(|h| h.kind == DiffHunkKind::CellBlock && h.has_conflict)
+            .unwrap();
+        assert_eq!(ch.cells[0].base_value, "300");
+        assert_eq!(ch.cells[0].main_value, "320");
+        assert_eq!(ch.cells[0].draft_value, "100");
+    }
+
+    #[test]
+    fn concurrent_main_row_deletion_flags_conflict_on_cell_edit_and_sort() {
+        let mut base_eng = FormulaEngine::new();
+        let s0 = SheetId(0);
+        base_eng
+            .edit_cell_raw(s0, RowId(0), ColId(0), "Header")
+            .unwrap();
+        base_eng
+            .edit_cell_raw(s0, RowId(1), ColId(0), "20")
+            .unwrap();
+        base_eng
+            .edit_cell_raw(s0, RowId(2), ColId(0), "10")
+            .unwrap();
+        base_eng.recalc_all();
+        let base = base_eng.workbook().clone();
+
+        // Main deletes Row 1.
+        let mut main_eng = FormulaEngine::from_workbook_recalc_all(base.clone());
+        main_eng
+            .apply_op(Op::DeleteRows {
+                sheet: s0,
+                ids: vec![IdRun::new(1, 1).unwrap()],
+            })
+            .unwrap();
+
+        // Draft edits Row 1 -> 99.
+        let mut draft_eng = FormulaEngine::from_workbook_recalc_all(base.clone());
+        draft_eng
+            .edit_cell_raw(s0, RowId(1), ColId(0), "99")
+            .unwrap();
+        let plan = compute_branch_diff(&base, draft_eng.workbook(), main_eng.workbook(), 0, 1, &[]);
+        assert_eq!(plan.diff.summary.conflict_cells, 1);
+        let conflict_hunk = plan.diff.hunks.iter().find(|h| h.has_conflict).unwrap();
+        assert!(!conflict_hunk.default_accepted);
+        assert_eq!(conflict_hunk.cells[0].main_value, "<deleted on main>");
+
+        // Forcing TakeDraft onto a deleted row fails cleanly instead of writing to a tombstone.
+        let mut choices = BTreeMap::new();
+        choices.insert(
+            conflict_hunk.cells[0].cell_key.clone(),
+            ConflictResolution::TakeDraft,
+        );
+        let sel = MergeSelection {
+            accepted_hunks: vec![conflict_hunk.id.clone()],
+            conflict_choices: choices,
+            allow_ref_errors: false,
+            expected_main_seq: Some("1".to_owned()),
+        };
+        let merge_rep = pack_replica_id(0, 7).unwrap();
+        assert!(matches!(
+            plan_merge_ops(&plan, &sel, main_eng.workbook(), 0, merge_rep, 1),
+            Err(MergePlanError::RemapFailed(_))
+        ));
+
+        // Sort touching Row 1 also flags SortConflict and defaults unchecked.
+        let mut sort_draft = FormulaEngine::from_workbook_recalc_all(base.clone());
+        let sort_op = plan_sort(
+            sort_draft.workbook().sheet(s0).unwrap(),
+            0,
+            2,
+            0,
+            0,
+            true,
+            &[SortKey {
+                col_offset: 0,
+                ascending: true,
+                case_sensitive: false,
+            }],
+            None,
+        )
+        .unwrap();
+        sort_draft.apply_op(sort_op.clone()).unwrap();
+        let draft_rep = pack_replica_id(0, 5).unwrap();
+        let sort_plan = compute_branch_diff(
+            &base,
+            sort_draft.workbook(),
+            main_eng.workbook(),
+            0,
+            1,
+            &[commit_txn(1, draft_rep, &[sort_op])],
+        );
+        let sort_hunk = sort_plan
+            .diff
+            .hunks
+            .iter()
+            .find(|h| h.kind == DiffHunkKind::Sort)
+            .unwrap();
+        assert!(sort_hunk.has_conflict);
+        assert!(!sort_hunk.default_accepted);
+    }
+
+    #[test]
+    fn structural_to_structural_closure_blocks_insert_on_rejected_new_sheet() {
+        let base_eng = FormulaEngine::new();
+        let base = base_eng.workbook().clone();
+        let draft_rep = pack_replica_id(0, 3).unwrap();
+        let new_sid = reticula_core::id::pack_sheet_id(0, draft_rep, 1).unwrap();
+        let mut alloc = IdAllocator::new(0, draft_rep, 1).unwrap();
+        let new_row = alloc.alloc_run(1).unwrap();
+
+        let add_op = Op::AddSheet {
+            sheet: new_sid,
+            name: "Summary".to_owned(),
+            after: Some(SheetId(0)),
+        };
+        let ins_op = Op::InsertRows {
+            sheet: new_sid,
+            after: Some(RowId(0)),
+            ids: new_row,
+        };
+        let mut draft_eng = FormulaEngine::from_workbook_recalc_all(base.clone());
+        draft_eng.apply_op(add_op.clone()).unwrap();
+        draft_eng.apply_op(ins_op.clone()).unwrap();
+
+        let txns = vec![
+            commit_txn(1, draft_rep, &[add_op]),
+            commit_txn(2, draft_rep, &[ins_op]),
+        ];
+        let plan = compute_branch_diff(&base, draft_eng.workbook(), &base, 0, 0, &txns);
+        let add_hunk = &plan.diff.hunks[0];
+        let ins_hunk = &plan.diff.hunks[1];
+
+        let sel = MergeSelection {
+            accepted_hunks: vec![ins_hunk.id.clone()],
+            conflict_choices: BTreeMap::new(),
+            allow_ref_errors: false,
+            expected_main_seq: None,
+        };
+        let issues = check_reference_closure(&plan, &sel);
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].target_hunk_id, add_hunk.id);
     }
 }

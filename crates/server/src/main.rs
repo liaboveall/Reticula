@@ -206,6 +206,14 @@ async fn main() {
                     if let Err(error) = api_state.agent().recover_interrupted_runs().await {
                         tracing::error!(error = %error, "failed to recover interrupted AI agent runs");
                     }
+                    if let Ok(cleaned) = api_state.store().cleanup_expired_branch_snapshots(7).await
+                        && cleaned > 0
+                    {
+                        tracing::info!(
+                            cleaned,
+                            "cleaned expired branch snapshots older than 7 days"
+                        );
+                    }
                     Some(api_state)
                 }
                 Err(error) => {

@@ -95,6 +95,7 @@ let localPresenceTimer: ReturnType<typeof setTimeout> | null = null;
 let lastLocalPresenceSentAt = 0;
 let lastSubscription: Extract<EngineCommand, { kind: "subscribe" }> | null = null;
 let activeSheetId = 0;
+let mainSheetBeforeDraft = 0;
 let historyPlayer: HistoryPlayer | null = null;
 let historyPreviewActive = false;
 let draftPreview: DraftPreviewSession | null = null;
@@ -128,7 +129,11 @@ sliceChannel.port1.onmessage = () => {
       return;
     }
     if (engine.hasPendingRecalc()) {
-      await runEngineCommand({ kind: "continueRecalc" });
+      if (draftPreview || historyPreviewActive) {
+        engine.handle({ kind: "continueRecalc" });
+      } else {
+        await runEngineCommand({ kind: "continueRecalc" });
+      }
     } else if (activeSnap) {
       await stepBackgroundSnapshot();
     }
@@ -878,8 +883,12 @@ async function runSyncCommand(command: SyncCommand): Promise<void> {
   }
   const event = engine.handleSync(command);
   if (event?.kind === "ready") collaborative = true;
+  const previewing = historyPreviewActive || draftPreview !== null;
   if (event) {
-    if (!historyPreviewActive || (event.kind !== "ready" && event.kind !== "sheetChanged")) {
+    if (
+      !previewing ||
+      (event.kind !== "ready" && event.kind !== "sheetChanged" && event.kind !== "recalcDone")
+    ) {
       scope.postMessage(event);
     }
   }
@@ -897,7 +906,7 @@ async function runSyncCommand(command: SyncCommand): Promise<void> {
       scheduleCollabCheckpoint();
     }
   }
-  if (!historyPreviewActive) {
+  if (!previewing) {
     flushDuePagesAndAux(engine);
   }
   scheduleWorkSlice();
@@ -1793,12 +1802,15 @@ async function handleHostCommand(cmd: HostCommand): Promise<void> {
     }
     case "draftOpenCloud":
     case "draftOpenReplay": {
+      historyPreviewActive = false;
+      if (!draftPreview) {
+        mainSheetBeforeDraft = activeSheetId;
+      }
       draftPreview?.close();
       const { DraftPreviewSession } = await import("./draft-preview.ts");
       draftPreview = new DraftPreviewSession({
         post: (msg, transfer) =>
           transfer?.length ? scope.postMessage(msg, transfer) : scope.postMessage(msg),
-        getLastSubscription: () => lastSubscription,
         setActiveSheet: (s) => {
           activeSheetId = s;
         },
@@ -1836,13 +1848,24 @@ async function handleHostCommand(cmd: HostCommand): Promise<void> {
         activeSheetId = sheet.sheet;
         scope.postMessage({ kind: "draftExited", sheet });
         flushDuePagesAndAux(engine);
+        break;
       }
+      // Fall back to cleanly exiting draft preview on collaborative workbooks.
+      let ev = engine.handle({ kind: "switchSheet", sheet: mainSheetBeforeDraft });
+      if (ev?.kind === "rejected") {
+        ev = engine.handle({ kind: "switchSheet", sheet: 0 });
+      }
+      if (ev?.kind === "sheetChanged") {
+        activeSheetId = ev.sheet.sheet;
+        scope.postMessage({ kind: "draftExited", sheet: ev.sheet });
+      }
+      flushDuePagesAndAux(engine);
       break;
     }
     case "draftExit": {
       draftPreview?.close();
       draftPreview = null;
-      let ev = engine.handle({ kind: "switchSheet", sheet: activeSheetId });
+      let ev = engine.handle({ kind: "switchSheet", sheet: mainSheetBeforeDraft });
       if (ev?.kind === "rejected") {
         ev = engine.handle({ kind: "switchSheet", sheet: 0 });
       }

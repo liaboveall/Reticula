@@ -1101,6 +1101,7 @@ async fn delete_account(
     state.agent.cancel_all_for_user(user.id).await;
     let lists = state.store.list_workbooks(user.id).await?;
     for wb in &lists.owned {
+        state.agent.cancel_all_for_workbook(wb.id).await;
         state.rooms.shutdown_room(wb.id).await;
     }
     for wb in &lists.shared {

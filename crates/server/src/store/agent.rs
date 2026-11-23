@@ -622,7 +622,7 @@ impl Store {
         step: &PersistedStep,
     ) -> Result<(), StoreError> {
         let mut db = self.pool.begin().await?;
-        sqlx::query(
+        let inserted = sqlx::query(
             "INSERT INTO agent_steps
              (run_id, idx, kind, payload, prompt_tokens, cached_prompt_tokens, completion_tokens, latency_ms)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
@@ -638,11 +638,12 @@ impl Store {
         .bind(step.latency_ms)
         .execute(&mut *db)
         .await?;
+        if inserted.rows_affected() == 0 {
+            db.commit().await?;
+            return Ok(());
+        }
 
-        let add_steps = i32::from(matches!(
-            step.kind,
-            AgentStepKind::AssistantThought | AgentStepKind::ToolCall
-        ));
+        let add_steps = i32::from(step.kind == AgentStepKind::AssistantThought);
         sqlx::query(
             "UPDATE agent_runs
              SET step_count = step_count + $2,

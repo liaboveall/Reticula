@@ -1358,3 +1358,165 @@ async fn sigkill_real_child_process_recovery_resume_and_clean_fail() {
     let _ = child3.wait().await;
     db.cleanup().await;
 }
+
+#[tokio::test]
+#[ignore = "requires an isolated PostgreSQL database in RETICULA_TEST_DATABASE_URL"]
+async fn sse_last_event_id_concurrent_start_active_merge_guard_and_owner_delete() {
+    let db = IsolatedDb::create().await;
+    let server = TestServer::start(
+        &db,
+        StorageLimits::default(),
+        GovernanceConfig::default(),
+        AgentRuntimeConfig::mock_for_tests(),
+    )
+    .await;
+
+    let (alice_cookie, _) = server.dev_login("alice").await;
+    let (bob_cookie, _) = server.dev_login("bob").await;
+    let doc = server
+        .create_workbook(&alice_cookie, "SSE & Race Guards")
+        .await;
+
+    // Invite Bob as editor.
+    let link: Value = server
+        .req(
+            Method::POST,
+            &format!("/api/workbooks/{doc}/share-links"),
+            Some(&alice_cookie),
+            None,
+            Some(json!({ "role": "editor", "label": "b" })),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+    let tok = link["url"].as_str().unwrap().trim_start_matches("/join/");
+    assert_eq!(
+        server
+            .req(
+                Method::POST,
+                &format!("/api/join/{tok}"),
+                Some(&bob_cookie),
+                None,
+                None,
+            )
+            .await
+            .status(),
+        StatusCode::OK
+    );
+
+    // 1. Concurrent start_run race for the same user: exactly one 201, one 409!
+    let runs_path = format!("/api/workbooks/{doc}/agent/runs");
+    let (r_a, r_b) = tokio::join!(
+        server.req(
+            Method::POST,
+            &runs_path,
+            Some(&alice_cookie),
+            None,
+            Some(json!({ "prompt": "[slow] Concurrent race A" })),
+        ),
+        server.req(
+            Method::POST,
+            &runs_path,
+            Some(&alice_cookie),
+            None,
+            Some(json!({ "prompt": "[slow] Concurrent race B" })),
+        ),
+    );
+    let statuses = [r_a.status(), r_b.status()];
+    assert!(
+        statuses.contains(&StatusCode::CREATED) && statuses.contains(&StatusCode::CONFLICT),
+        "expected one 201 and one 409, got {statuses:?}"
+    );
+    let winner = if r_a.status() == StatusCode::CREATED {
+        r_a.json::<Value>().await.unwrap()
+    } else {
+        r_b.json::<Value>().await.unwrap()
+    };
+    let run_id = Uuid::parse_str(winner["id"].as_str().unwrap()).unwrap();
+    let branch_id = Uuid::parse_str(winner["branchId"].as_str().unwrap()).unwrap();
+
+    // 2. Merging while the AI run is still active MUST return 409 Conflict!
+    let early_merge = server
+        .req(
+            Method::POST,
+            &format!("/api/workbooks/{doc}/branches/{branch_id}/merge"),
+            Some(&alice_cookie),
+            None,
+            Some(json!({ "acceptedHunks": [], "conflictChoices": {}, "allowRefErrors": false })),
+        )
+        .await;
+    assert_eq!(early_merge.status(), StatusCode::CONFLICT);
+
+    // 3. Stream live SSE and verify ephemeral text_delta/presence events do NOT emit `id:`
+    //    (so Last-Event-ID never gets poisoned to 1_000_000+), then reconnect with `Last-Event-ID: 1`
+    //    and confirm all steps with idx >= 1 are replayed cleanly.
+    let sse_text = server
+        .client
+        .get(format!(
+            "{}/api/workbooks/{doc}/agent/runs/{run_id}/events",
+            server.base
+        ))
+        .header(header::COOKIE, &alice_cookie)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    for block in sse_text.split("\n\n") {
+        if block.contains("event: text_delta") || block.contains("event: presence") {
+            assert!(
+                !block.lines().any(|l| l.starts_with("id:")),
+                "ephemeral SSE frame must not emit id: header: {block}"
+            );
+        }
+    }
+    let replay_text = server
+        .client
+        .get(format!(
+            "{}/api/workbooks/{doc}/agent/runs/{run_id}/events",
+            server.base
+        ))
+        .header(header::COOKIE, &alice_cookie)
+        .header("Last-Event-ID", "1")
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        replay_text.contains("event: step"),
+        "reconnect with Last-Event-ID: 1 must replay subsequent steps, got: {replay_text}"
+    );
+    assert!(
+        !replay_text.contains("\nid: 1\n") && !replay_text.starts_with("id: 1\n"),
+        "step 1 must not be re-emitted when Last-Event-ID: 1"
+    );
+
+    // 4. Bob starts a slow run on Alice's OWNED workbook, then Alice deletes her account!
+    let bob_run = server
+        .req(
+            Method::POST,
+            &format!("/api/workbooks/{doc}/agent/runs"),
+            Some(&bob_cookie),
+            None,
+            Some(json!({ "prompt": "[slow] Bob run on Alice owned doc" })),
+        )
+        .await;
+    assert_eq!(bob_run.status(), StatusCode::CREATED);
+    let del_alice = server
+        .req(
+            Method::DELETE,
+            "/api/account",
+            Some(&alice_cookie),
+            None,
+            Some(json!({ "confirm": "DELETE" })),
+        )
+        .await;
+    assert_eq!(del_alice.status(), StatusCode::NO_CONTENT);
+
+    drop(server);
+    db.cleanup().await;
+}

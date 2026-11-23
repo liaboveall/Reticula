@@ -10,7 +10,6 @@ import type { WorkerOutput } from "./client.ts";
 
 export interface DraftPreviewHost {
   post(msg: WorkerOutput, transfer?: Transferable[]): void;
-  getLastSubscription(): Extract<EngineCommand, { kind: "subscribe" }> | null;
   setActiveSheet(sheet: number): void;
   getActiveSheet(): number;
 }
@@ -71,7 +70,6 @@ export class DraftPreviewSession {
     );
     this.#host.setActiveSheet(outcome.sheet.sheet);
     this.#host.post({ kind: "draftReady", sheet: outcome.sheet });
-    this.#resubscribe(outcome.sheet.sheet);
     this.#flushPagesAndAux();
   }
 
@@ -79,14 +77,24 @@ export class DraftPreviewSession {
     if (this.#closed) return;
     const sheet = this.#engine.applyWireTxnV3(new Uint8Array(txn));
     this.#host.setActiveSheet(sheet.sheet);
-    this.#host.post({ kind: "draftReady", sheet });
+    this.#host.post({ kind: "sheetChanged", sheet, actionMs: 0, recalculated: 0 });
     this.#flushPagesAndAux();
   }
 
   handleCommand(command: EngineCommand): void {
     if (this.#closed) return;
+    if (command.kind === "subscribe") {
+      // Clear Engine's cached subscribed_set so any post-draftReady or post-setSheet
+      // subscribe always emits all visible pages for the grid's current epoch.
+      this.#engine.handle({
+        kind: "switchSheet",
+        sheet: command.sheet ?? this.#host.getActiveSheet(),
+      });
+      this.#engine.handle(command);
+      this.#flushPagesAndAux();
+      return;
+    }
     if (
-      command.kind === "subscribe" ||
       command.kind === "switchSheet" ||
       command.kind === "inspectCell" ||
       command.kind === "setEvalEnv"
@@ -162,31 +170,17 @@ export class DraftPreviewSession {
   }
 
   #emitEngineEvent(ev: EngineEvent): void {
-    if (ev.kind === "ready" || ev.kind === "sheetChanged") {
+    if (ev.kind === "ready") {
       this.#host.setActiveSheet(ev.sheet.sheet);
       this.#host.post({ kind: "draftReady", sheet: ev.sheet });
-      this.#resubscribe(ev.sheet.sheet);
       return;
     }
-    if (ev.kind === "recalcDone") {
+    if (ev.kind === "sheetChanged" || ev.kind === "recalcDone") {
       this.#host.setActiveSheet(ev.sheet.sheet);
       this.#host.post(ev);
       return;
     }
     this.#host.post(ev);
-  }
-
-  #resubscribe(sheet: number): void {
-    const sub = this.#host.getLastSubscription();
-    this.#engine.handle({
-      kind: "subscribe",
-      sheet,
-      epoch: sub?.epoch ?? 1,
-      firstRow: sub?.firstRow ?? 0,
-      rowCount: sub?.rowCount ?? 64,
-      firstCol: sub?.firstCol ?? 0,
-      colCount: sub?.colCount ?? 16,
-    });
   }
 
   #flushPagesAndAux(): void {

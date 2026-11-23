@@ -1467,6 +1467,11 @@ impl DocActor {
             .expected_main_seq
             .as_deref()
             .is_some_and(|exp| exp != plan.diff.main_head_seq);
+        let accepted_set: std::collections::HashSet<&str> = selection
+            .accepted_hunks
+            .iter()
+            .map(String::as_str)
+            .collect();
         let unaddressed_conflicts: Vec<String> = plan
             .diff
             .hunks
@@ -1475,7 +1480,14 @@ impl DocActor {
             .filter(|c| c.conflict && !selection.conflict_choices.contains_key(&c.cell_key))
             .map(|c| c.cell_key.clone())
             .collect();
-        if stale_hunk_selection || (main_advanced && !unaddressed_conflicts.is_empty()) {
+        let newly_conflicting_non_cell_hunk = main_advanced
+            && plan.diff.hunks.iter().any(|h| {
+                accepted_set.contains(h.id.as_str()) && h.has_conflict && h.cells.is_empty()
+            });
+        if stale_hunk_selection
+            || newly_conflicting_non_cell_hunk
+            || (main_advanced && !unaddressed_conflicts.is_empty())
+        {
             let preview = preview_merge(&plan, &selection);
             let unresolved = if !unaddressed_conflicts.is_empty() {
                 unaddressed_conflicts

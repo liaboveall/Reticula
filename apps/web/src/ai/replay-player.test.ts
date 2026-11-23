@@ -56,6 +56,8 @@ describe("AI replay bundles & local closure/conflict planner", () => {
     expect(blocked.canMerge).toBe(false);
     expect(blocked.closureIssues.length).toBeGreaterThan(0);
     expect(blocked.closureIssues[0]?.targetHunkId).toBe(structHunk.id);
+    expect(blocked.closureIssues[0]?.formulaText).toBe("=B2+B3");
+    expect(blocked.closureIssues[0]?.refDisplay).toBe("Sheet1 row 2");
 
     // Explicitly allowing #REF! unblocks and chooses sanitized txns.
     const allowedRef = previewLocalReplayMerge(

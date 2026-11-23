@@ -11,6 +11,7 @@ import { useEffect, useMemo, useState } from "react";
 
 export interface DiffReviewDrawerProps {
   readonly diff: BranchDiff;
+  readonly activeSheetId: number;
   readonly summaryText?: string;
   readonly busy?: boolean;
   readonly errorText?: string | null;
@@ -24,9 +25,11 @@ export interface DiffReviewDrawerProps {
 function buildHighlights(
   hunks: readonly DiffHunk[],
   accepted: ReadonlySet<string>,
+  activeSheetId: number,
 ): DiffHighlightMap {
   const map = new Map<string, DiffHighlightKind>();
   for (const h of hunks) {
+    if (Number(h.sheetId) !== activeSheetId) continue;
     const isDelete = h.label.toLowerCase().includes("delete");
     for (const c of h.cells) {
       const kind: DiffHighlightKind = c.conflict
@@ -42,8 +45,17 @@ function buildHighlights(
   return map;
 }
 
+function defaultAcceptedIds(hunks: readonly DiffHunk[]): Set<string> {
+  return new Set(
+    hunks
+      .filter((h) => h.defaultAccepted || (h.hasConflict && h.kind === "cell_block"))
+      .map((h) => h.id),
+  );
+}
+
 export function DiffReviewDrawer({
   diff,
+  activeSheetId,
   summaryText,
   busy = false,
   errorText,
@@ -53,17 +65,13 @@ export function DiffReviewDrawer({
   onJumpToCell,
   onSetHighlights,
 }: DiffReviewDrawerProps) {
-  const [accepted, setAccepted] = useState<Set<string>>(
-    () => new Set(diff.hunks.filter((h) => h.defaultAccepted || h.hasConflict).map((h) => h.id)),
-  );
+  const [accepted, setAccepted] = useState<Set<string>>(() => defaultAcceptedIds(diff.hunks));
   const [choices, setChoices] = useState<Record<string, ConflictResolution>>({});
   const [allowRef, setAllowRef] = useState(false);
   const [preview, setPreview] = useState<MergePreviewResponse | null>(null);
 
   useEffect(() => {
-    setAccepted(
-      new Set(diff.hunks.filter((h) => h.defaultAccepted || h.hasConflict).map((h) => h.id)),
-    );
+    setAccepted(defaultAcceptedIds(diff.hunks));
     setChoices({});
     setAllowRef(false);
   }, [diff]);
@@ -79,9 +87,9 @@ export function DiffReviewDrawer({
   );
 
   useEffect(() => {
-    onSetHighlights(buildHighlights(diff.hunks, accepted));
+    onSetHighlights(buildHighlights(diff.hunks, accepted, activeSheetId));
     return () => onSetHighlights(null);
-  }, [diff.hunks, accepted, onSetHighlights]);
+  }, [diff.hunks, accepted, activeSheetId, onSetHighlights]);
 
   useEffect(() => {
     let alive = true;
@@ -156,6 +164,11 @@ export function DiffReviewDrawer({
                 </label>
                 <span className="ai-tag warn">Conflict</span>
               </div>
+              {h.conflictReason && (
+                <div className="ai-muted" style={{ marginTop: 4, color: "#b45309" }}>
+                  {h.conflictReason}
+                </div>
+              )}
               {h.cells.map((c) => (
                 <div key={c.cellKey} style={{ marginTop: 6, fontSize: 11 }}>
                   <button
@@ -174,24 +187,26 @@ export function DiffReviewDrawer({
                   <div>
                     <strong>AI Draft:</strong> {c.draftFormula ?? (c.draftValue || "(empty)")}
                   </div>
-                  <div className="ai-row" style={{ marginTop: 4, justifyContent: "flex-start" }}>
-                    <button
-                      type="button"
-                      className={`ai-btn ${choices[c.cellKey] === "keep_main" ? "primary" : ""}`}
-                      data-testid={`conflict-keep-main-${c.address}`}
-                      onClick={() => setChoice(c.cellKey, "keep_main")}
-                    >
-                      Keep Main
-                    </button>
-                    <button
-                      type="button"
-                      className={`ai-btn ${choices[c.cellKey] === "take_draft" ? "primary" : ""}`}
-                      data-testid={`conflict-take-draft-${c.address}`}
-                      onClick={() => setChoice(c.cellKey, "take_draft")}
-                    >
-                      Use AI Draft
-                    </button>
-                  </div>
+                  {h.kind === "cell_block" && (
+                    <div className="ai-row" style={{ marginTop: 4, justifyContent: "flex-start" }}>
+                      <button
+                        type="button"
+                        className={`ai-btn ${choices[c.cellKey] === "keep_main" ? "primary" : ""}`}
+                        data-testid={`conflict-keep-main-${c.address}`}
+                        onClick={() => setChoice(c.cellKey, "keep_main")}
+                      >
+                        Keep Main
+                      </button>
+                      <button
+                        type="button"
+                        className={`ai-btn ${choices[c.cellKey] === "take_draft" ? "primary" : ""}`}
+                        data-testid={`conflict-take-draft-${c.address}`}
+                        onClick={() => setChoice(c.cellKey, "take_draft")}
+                      >
+                        Use AI Draft
+                      </button>
+                    </div>
+                  )}
                 </div>
               ))}
             </div>

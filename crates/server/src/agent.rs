@@ -5,7 +5,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use reticula_agent::diff::{BranchDiffPlan, compute_branch_diff};
@@ -143,10 +142,12 @@ impl AgentRuntimeConfig {
 }
 
 /// Live SSE message forwarded to `/api/workbooks/{id}/agent/runs/{rid}/events`.
+/// Only durable `step` events carry `id: Some(step_cursor)` so browser `Last-Event-ID`
+/// reconnects never skip durable steps after receiving ephemeral `text_delta` / `presence` frames.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SseMessage {
-    pub id: u64,
+    pub id: Option<u64>,
     pub event: String,
     pub data: JsonValue,
 }
@@ -177,6 +178,38 @@ struct ActiveRunEntry {
 struct ActiveRuns {
     by_run: HashMap<Uuid, ActiveRunEntry>,
     by_user: HashMap<Uuid, HashSet<Uuid>>,
+    starting_users: HashSet<Uuid>,
+}
+
+/// RAII reservation preventing concurrent `start_run` calls by the same user from
+/// racing past the per-user active-run guard across async setup awaits.
+struct StartingUserGuard {
+    active: Arc<Mutex<ActiveRuns>>,
+    user_id: Uuid,
+    released: bool,
+}
+
+impl StartingUserGuard {
+    fn disarm(mut self) {
+        self.released = true;
+    }
+}
+
+impl Drop for StartingUserGuard {
+    fn drop(&mut self) {
+        if self.released {
+            return;
+        }
+        let active = Arc::clone(&self.active);
+        let user_id = self.user_id;
+        if let Ok(mut guard) = active.try_lock() {
+            guard.starting_users.remove(&user_id);
+        } else {
+            tokio::spawn(async move {
+                active.lock().await.starting_users.remove(&user_id);
+            });
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -240,17 +273,24 @@ impl AgentManager {
         };
         let prompt = validate_prompt(raw_prompt)?;
 
-        // Check per-user active run guard before taking global resources.
-        {
-            let guard = self.active.lock().await;
+        // Atomically reserve the per-user active slot BEFORE any async awaits to eliminate TOCTOU races.
+        let starting_guard = {
+            let mut guard = self.active.lock().await;
             if guard
                 .by_user
                 .get(&user_id)
                 .is_some_and(|runs| !runs.is_empty())
+                || guard.starting_users.contains(&user_id)
             {
                 return Err(AgentStartError::UserAlreadyRunning);
             }
-        }
+            guard.starting_users.insert(user_id);
+            StartingUserGuard {
+                active: Arc::clone(&self.active),
+                user_id,
+                released: false,
+            }
+        };
 
         let global_permit = Arc::clone(&self.global_slots)
             .try_acquire_owned()
@@ -319,6 +359,7 @@ impl AgentManager {
             budget_lease,
         )
         .await;
+        starting_guard.disarm();
 
         Ok(run)
     }
@@ -524,6 +565,15 @@ impl AgentManager {
         }
     }
 
+    /// Returns `true` if an AI analyst task is currently executing on `(workbook_id, branch_id)`.
+    pub async fn has_active_run_for_branch(&self, workbook_id: Uuid, branch_id: Uuid) -> bool {
+        let guard = self.active.lock().await;
+        guard
+            .by_run
+            .values()
+            .any(|entry| entry.workbook_id == workbook_id && entry.branch_id == branch_id)
+    }
+
     /// Subscribes to live SSE events if `run_id` is currently running.
     pub async fn subscribe_events(&self, run_id: Uuid) -> Option<broadcast::Receiver<SseMessage>> {
         let guard = self.active.lock().await;
@@ -584,6 +634,7 @@ impl AgentManager {
 
         {
             let mut guard = self.active.lock().await;
+            guard.starting_users.remove(&run.user_id);
             guard.by_run.insert(
                 run.id,
                 ActiveRunEntry {
@@ -606,7 +657,6 @@ impl AgentManager {
         tokio::spawn(async move {
             let _permit = global_permit;
             let _active_guard = ActiveRunMetricGuard::new(Arc::clone(&metrics));
-            let event_seq = AtomicU64::new(1_000_000);
 
             let engine = tokio::task::spawn_blocking(move || {
                 FormulaEngine::from_workbook_recalc_all(draft_workbook)
@@ -622,7 +672,7 @@ impl AgentManager {
                         .await;
                     metrics.record_agent_run_status("failed");
                     let _ = events_tx.send(SseMessage {
-                        id: event_seq.fetch_add(1, Ordering::Relaxed),
+                        id: None,
                         event: "status".to_owned(),
                         data: json!({ "status": "failed", "summary": "", "error": msg }),
                     });
@@ -674,28 +724,28 @@ impl AgentManager {
                         );
                         let id = u64::try_from(step.idx.max(0)).unwrap_or(0) + 1;
                         let _ = events_tx.send(SseMessage {
-                            id,
+                            id: Some(id),
                             event: "step".to_owned(),
                             data: serde_json::to_value(&step).unwrap_or_else(|_| json!({})),
                         });
                     }
                     AgentStreamEvent::TextDelta { text } => {
                         let _ = events_tx.send(SseMessage {
-                            id: event_seq.fetch_add(1, Ordering::Relaxed),
+                            id: None,
                             event: "text_delta".to_owned(),
                             data: json!({ "text": text }),
                         });
                     }
                     AgentStreamEvent::Presence { presence } => {
                         let _ = events_tx.send(SseMessage {
-                            id: event_seq.fetch_add(1, Ordering::Relaxed),
+                            id: None,
                             event: "presence".to_owned(),
                             data: serde_json::to_value(presence).unwrap_or_else(|_| json!({})),
                         });
                     }
                     AgentStreamEvent::Status { status, summary } => {
                         let _ = events_tx.send(SseMessage {
-                            id: event_seq.fetch_add(1, Ordering::Relaxed),
+                            id: None,
                             event: "status".to_owned(),
                             data: json!({ "status": status, "summary": summary }),
                         });
@@ -715,7 +765,7 @@ impl AgentManager {
                         .await;
                     metrics.record_agent_run_status("waiting_review");
                     let _ = events_tx.send(SseMessage {
-                        id: event_seq.fetch_add(1, Ordering::Relaxed),
+                        id: None,
                         event: "status".to_owned(),
                         data: json!({
                             "status": "waiting_review",
@@ -730,7 +780,7 @@ impl AgentManager {
                         .await;
                     metrics.record_agent_run_status("cancelled");
                     let _ = events_tx.send(SseMessage {
-                        id: event_seq.fetch_add(1, Ordering::Relaxed),
+                        id: None,
                         event: "status".to_owned(),
                         data: json!({ "status": "cancelled", "summary": "" }),
                     });
@@ -742,7 +792,7 @@ impl AgentManager {
                         .await;
                     metrics.record_agent_run_status("failed");
                     let _ = events_tx.send(SseMessage {
-                        id: event_seq.fetch_add(1, Ordering::Relaxed),
+                        id: None,
                         event: "status".to_owned(),
                         data: json!({ "status": "failed", "summary": "", "error": msg }),
                     });

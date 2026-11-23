@@ -140,9 +140,9 @@ impl LlmConfig {
 
         let base_url = map
             .get("RETICULA_LLM_BASE_URL")
-            .map(String::as_str)
+            .map(|v| v.trim())
+            .filter(|v| !v.is_empty())
             .unwrap_or("https://api.openai.com/v1")
-            .trim()
             .trim_end_matches('/')
             .to_owned();
         let model = map
@@ -153,9 +153,9 @@ impl LlmConfig {
             .to_owned();
         let provider = map
             .get("RETICULA_LLM_PROVIDER")
-            .map(String::as_str)
+            .map(|v| v.trim())
+            .filter(|v| !v.is_empty())
             .unwrap_or("openai-compat")
-            .trim()
             .to_owned();
         let reasoning_effort = map
             .get("RETICULA_LLM_REASONING_EFFORT")
@@ -260,4 +260,29 @@ pub enum AgentError {
     BudgetExceeded(String),
     #[error("merge planning error: {0}")]
     Merge(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn llm_config_falls_back_to_default_base_url_and_provider_when_blank_in_dotenv() {
+        let dir = std::env::temp_dir().join(format!("reticula-env-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let env_path = dir.join(".env.local");
+        std::fs::write(
+            &env_path,
+            "RETICULA_LLM_ENABLED=true\nRETICULA_LLM_BASE_URL=\nRETICULA_LLM_PROVIDER=\nRETICULA_LLM_MODEL=test-model\nRETICULA_LLM_API_KEY=sk-test-secret-never-echo\n",
+        )
+        .unwrap();
+        let cfg = LlmConfig::from_env_and_dotenv(Some(&env_path))
+            .unwrap()
+            .expect("enabled config");
+        assert_eq!(cfg.base_url, "https://api.openai.com/v1");
+        assert_eq!(cfg.provider, "openai-compat");
+        assert_eq!(cfg.model, "test-model");
+        assert!(!format!("{cfg:?}").contains("sk-test-secret-never-echo"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

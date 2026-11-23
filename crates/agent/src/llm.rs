@@ -297,7 +297,9 @@ impl LlmProvider for OpenAiCompatProvider {
                             .headers()
                             .get(reqwest::header::CONTENT_TYPE)
                             .and_then(|v| v.to_str().ok())
-                            .is_some_and(|ct| ct.contains("text/event-stream"));
+                            .is_some_and(|ct| {
+                                ct.to_ascii_lowercase().contains("text/event-stream")
+                            });
 
                         if !is_sse {
                             let text_body = response.text().await.map_err(|e| {
@@ -310,6 +312,14 @@ impl LlmProvider for OpenAiCompatProvider {
                                         truncate_err(&text_body)
                                     ))
                                 })?;
+                            if let Some(err_obj) = parsed.get("error") {
+                                let msg = err_obj
+                                    .get("message")
+                                    .and_then(JsonValue::as_str)
+                                    .map(str::to_owned)
+                                    .unwrap_or_else(|| truncate_err(&err_obj.to_string()));
+                                return Err(AgentError::Llm(format!("upstream error: {msg}")));
+                            }
                             let elapsed = started.elapsed().as_millis() as u64;
                             return parse_non_streaming_json(
                                 &parsed,
@@ -332,12 +342,12 @@ impl LlmProvider for OpenAiCompatProvider {
                             while let Some(nl) = line_buf.iter().position(|&b| b == b'\n') {
                                 let raw_line: Vec<u8> = line_buf.drain(..=nl).collect();
                                 let line = String::from_utf8_lossy(&raw_line);
-                                acc.feed_line(line.trim(), on_delta);
+                                acc.feed_line(line.trim(), on_delta)?;
                             }
                         }
                         if !line_buf.is_empty() {
                             let line = String::from_utf8_lossy(&line_buf);
-                            acc.feed_line(line.trim(), on_delta);
+                            acc.feed_line(line.trim(), on_delta)?;
                         }
 
                         return Ok(acc.finish(retries, rate_limited_hits));
@@ -396,17 +406,27 @@ impl SseAccumulator {
         }
     }
 
-    fn feed_line(&mut self, line: &str, on_delta: DeltaCallback<'_>) {
+    fn feed_line(&mut self, line: &str, on_delta: DeltaCallback<'_>) -> Result<(), AgentError> {
         let Some(data) = line.strip_prefix("data:") else {
-            return;
+            return Ok(());
         };
         let payload = data.trim();
         if payload.is_empty() || payload == "[DONE]" {
-            return;
+            return Ok(());
         }
         let Ok(val) = serde_json::from_str::<JsonValue>(payload) else {
-            return;
+            return Ok(());
         };
+        if let Some(err_obj) = val.get("error")
+            && !err_obj.is_null()
+        {
+            let msg = err_obj
+                .get("message")
+                .and_then(JsonValue::as_str)
+                .map(str::to_owned)
+                .unwrap_or_else(|| truncate_err(&err_obj.to_string()));
+            return Err(AgentError::Llm(format!("SSE upstream error: {msg}")));
+        }
         if self.resolved_model.is_none()
             && let Some(m) = val.get("model").and_then(JsonValue::as_str)
         {
@@ -422,13 +442,13 @@ impl SseAccumulator {
             .and_then(JsonValue::as_array)
             .and_then(|arr| arr.first())
         else {
-            return;
+            return Ok(());
         };
         if let Some(fr) = choice.get("finish_reason").and_then(JsonValue::as_str) {
             self.finish_reason = Some(fr.to_owned());
         }
         let Some(delta) = choice.get("delta") else {
-            return;
+            return Ok(());
         };
         if let Some(rc) = delta
             .get("reasoning_content")
@@ -480,6 +500,7 @@ impl SseAccumulator {
                 }
             }
         }
+        Ok(())
     }
 
     fn finish(self, retries: u32, rate_limited_hits: u32) -> LlmTurnResponse {
@@ -901,24 +922,29 @@ mod tests {
         acc.feed_line(
             r#"data: {"model":"gpt-test","choices":[{"delta":{"reasoning_content":"think "}}]}"#,
             &mut cb,
-        );
+        )
+        .unwrap();
         acc.feed_line(
             r#"data: {"choices":[{"delta":{"content":"Checking range."}}]}"#,
             &mut cb,
-        );
+        )
+        .unwrap();
         acc.feed_line(
             r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"read_range","arguments":"{\"range\":"}}]}}]}"#,
             &mut cb,
-        );
+        )
+        .unwrap();
         acc.feed_line(
             r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"A1:C5\"}"}}]}}]}"#,
             &mut cb,
-        );
+        )
+        .unwrap();
         acc.feed_line(
             r#"data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":1200,"completion_tokens":80,"prompt_tokens_details":{"cached_tokens":900}}}"#,
             &mut cb,
-        );
-        acc.feed_line("data: [DONE]", &mut cb);
+        )
+        .unwrap();
+        acc.feed_line("data: [DONE]", &mut cb).unwrap();
 
         let resp = acc.finish(0, 0);
         assert_eq!(resp.resolved_model.as_deref(), Some("gpt-test"));
@@ -931,5 +957,87 @@ mod tests {
         assert_eq!(resp.usage.prompt_tokens, 1200);
         assert_eq!(resp.usage.cached_prompt_tokens, 900);
         assert_eq!(resp.usage.completion_tokens, 80);
+    }
+
+    #[tokio::test]
+    async fn openai_compat_handles_split_utf8_chunks_429_retry_and_sse_errors_over_real_tcp() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let attempt = Arc::new(AtomicUsize::new(0));
+        let attempt_srv = Arc::clone(&attempt);
+
+        let server_task = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let n = attempt_srv.fetch_add(1, Ordering::SeqCst);
+                let mut req_buf = vec![0_u8; 4096];
+                let _ = sock.read(&mut req_buf).await;
+                if n == 0 {
+                    // First attempt: 429 with Retry-After: 1
+                    let resp = "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 1\r\nContent-Length: 4\r\nConnection: close\r\n\r\nbusy";
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                } else if n == 1 {
+                    // Second attempt: uppercase Content-Type, split multi-byte UTF-8 across TCP chunks,
+                    // prompt_cache_hit_tokens, and [DONE] without trailing newline!
+                    let hdr = "HTTP/1.1 200 OK\r\nContent-Type: TEXT/EVENT-STREAM; charset=utf-8\r\nConnection: close\r\n\r\n";
+                    let _ = sock.write_all(hdr.as_bytes()).await;
+                    let line1 = "data: {\"model\":\"mock-live\",\"choices\":[{\"delta\":{\"content\":\"中文测试\"}}]}\n\n".as_bytes();
+                    // Split right inside the 3-byte UTF-8 sequence of '中' (0xE4 0xB8 0xAD)
+                    let split = line1.iter().position(|&b| b == 0xE4).unwrap() + 1;
+                    let _ = sock.write_all(&line1[..split]).await;
+                    let _ = sock.flush().await;
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    let _ = sock.write_all(&line1[split..]).await;
+                    let line2 = b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":500,\"completion_tokens\":20,\"prompt_cache_hit_tokens\":350}}\n\ndata: [DONE]";
+                    let _ = sock.write_all(line2).await;
+                    let _ = sock.flush().await;
+                } else {
+                    // Third request: mid-stream SSE error object must fail explicitly.
+                    let hdr = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n";
+                    let _ = sock.write_all(hdr.as_bytes()).await;
+                    let _ = sock
+                        .write_all(
+                            b"data: {\"error\":{\"message\":\"context length exceeded\"}}\n\n",
+                        )
+                        .await;
+                    break;
+                }
+            }
+        });
+
+        let cfg = LlmConfig::new(format!("http://{addr}/v1"), "mock-live", "sk-test-local");
+        let provider = OpenAiCompatProvider::new(cfg).unwrap();
+        let req = LlmTurnRequest {
+            messages: vec![LlmMessage::user("hi")],
+            tools: Vec::new(),
+        };
+        let mut streamed = String::new();
+        let mut cb = |d: LlmDelta| {
+            if let LlmDelta::Text(t) = d {
+                streamed.push_str(&t);
+            }
+        };
+        let resp = provider.stream_turn(req.clone(), &mut cb).await.unwrap();
+        assert_eq!(resp.retries, 1);
+        assert_eq!(resp.rate_limited_hits, 1);
+        assert_eq!(resp.text, "中文测试");
+        assert_eq!(streamed, "中文测试");
+        assert_eq!(resp.usage.prompt_tokens, 500);
+        assert_eq!(resp.usage.cached_prompt_tokens, 350);
+        assert_eq!(resp.usage.completion_tokens, 20);
+
+        let mut noop = |_: LlmDelta| {};
+        let err = provider.stream_turn(req, &mut noop).await.unwrap_err();
+        assert!(
+            err.to_string().contains("context length exceeded"),
+            "unexpected error: {err}"
+        );
+        server_task.abort();
     }
 }

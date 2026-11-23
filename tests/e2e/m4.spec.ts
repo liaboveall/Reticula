@@ -130,6 +130,14 @@ test.describe("M4 AI Analyst — collaborative cloud draft, conflict/closure rev
       await editCell(bob, 0, 1, "B1", "999");
       await synced(bob);
 
+      // Verify Alice's isolated AI Draft Preview canvas was NOT overwritten by Bob's live main edit!
+      await expect
+        .poll(() => alice.evaluate(() => window.__reticula?.textAt(0, 1)), { timeout: 10_000 })
+        .toBe("50");
+      await expect
+        .poll(() => alice.evaluate(() => window.__reticula?.textAt(1, 0)), { timeout: 10_000 })
+        .toBe("25");
+
       // Alice clicks Apply -> server detects concurrent conflict (409) and updates Alice's Diff drawer!
       await alice.getByTestId("ai-merge-apply").click();
       await expect(alice.getByTestId("conflict-take-draft-B1")).toBeVisible({ timeout: 10_000 });

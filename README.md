@@ -45,7 +45,7 @@ Measured on an Intel Core i9-13980HX (pinned to P-cores `0xFFFF`, 32 GB RAM, Win
 | **B10** — Cold first visit (`20 Mbit/s`, `50 ms` RTT, 2-RTT TLS) | **`538 ms`** shell / **`1,115 ms`** first screen | — | `≤ 1.5 s` / `≤ 2.0 s` |
 | **1M × 22 Scroll** — 5 screens/s continuous scroll frame work | **`0.78 ms`** `p50` / **`1.28 ms`** `p99` | — | `p99 ≤ 16.7 ms` |
 | **Bundle Size** — Core / Sim / XLSX `.wasm` (brotli-11) | **`822.3 KB`** / **`590.0 KB`** / **`735.4 KB`** | — | `≤ 1.2 MB` / `≤ 800 KB` / `≤ 900 KB` |
-| **JS Budget** — First-screen / total JS (brotli-11) | **`163.8 KB`** / **`207.0 KB`** | — | `≤ 165 KB` / `≤ 220 KB` |
+| **JS Budget** — First-screen / total JS (brotli-11) | **`163.9 KB`** / **`207.5 KB`** | — | `≤ 165 KB` / `≤ 220 KB` |
 
 ## Measured Collaboration & Formula Verification (M3a)
 
