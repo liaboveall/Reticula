@@ -120,7 +120,8 @@ export class FormulaBarEditor {
     this.#options = options;
     const disabled = options.disabled ?? false;
     const contentAttrs: Record<string, string> = {
-      "aria-label": options.ariaLabel ?? "Formula bar",
+      "aria-multiline": "false",
+      ...(options.ariaLabel ? { "aria-label": options.ariaLabel } : {}),
       spellcheck: "false",
       autocorrect: "off",
       autocapitalize: "off",

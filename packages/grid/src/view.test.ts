@@ -1,6 +1,7 @@
 import { describe, expect, test } from "vitest";
 import { FilterRowMap, filterButtonBox } from "./filter.ts";
 import {
+  boxOfSpan,
   cellArea,
   cellAt,
   cellBox,
@@ -313,6 +314,43 @@ describe("the pointer", () => {
     }
   });
 
+  test("grabs the fill handle on both sides of the freeze line", () => {
+    for (const zoom of ZOOM_STEPS.filter((step) => step >= 0.5)) {
+      for (const scroll of [
+        { top: 0, left: 0 },
+        { top: 5_003, left: 4_017 },
+      ]) {
+        const view = viewOf({ zoom, frozenRows: 2, frozenCols: 1 }, scroll);
+        const box = boxIn(view, 1, 0);
+        const corner = { x: box.left + box.width, y: box.top + box.height };
+        const range = { firstRow: 0, endRow: 2, firstCol: 0, endCol: 1 };
+        for (const dx of [-3, 0, 3]) {
+          for (const dy of [-2, 0, 2]) {
+            const point = { x: corner.x + dx, y: corner.y + dy };
+            expect(isOverFillHandle(view, range, point), JSON.stringify({ zoom, dx, dy })).toBe(
+              true,
+            );
+          }
+        }
+        expect(isOverFillHandle(view, range, { x: corner.x + 12, y: corner.y })).toBe(false);
+        // A selection that ends elsewhere has its handle elsewhere.
+        const other = { ...range, endCol: 2, endRow: 3 };
+        const isAtOther = isOverFillHandle(view, other, corner);
+        expect(isAtOther).toBe(false);
+      }
+    }
+  });
+
+  test("grabs no handle that is under what is frozen", () => {
+    const view = viewOf({ frozenRows: 2, frozenCols: 1 }, { top: 30, left: 130 });
+    // The last cell ends 18 pixels to the left of the freeze line, over a frozen column.
+    const range = { firstRow: 5, endRow: 6, firstCol: 1, endCol: 2 };
+    const box = boxIn(view, 5, 1);
+    expect(
+      isOverFillHandle(view, range, { x: box.left + box.width, y: box.top + box.height }),
+    ).toBe(false);
+  });
+
   test("is in the device pixel it points into", () => {
     const axis = new SparseAxis(24, [], 1.5, 0.25);
     expect(axis.sizeOf(0)).toBe(6);
@@ -529,6 +567,64 @@ describe("what is at a point stays there", () => {
     expect(again.row.index).toBe(500_002);
     expect(again.col.index).toBe(1_000);
     expect(scrollToCorner(view, corner)).toEqual(scrolled.scroll);
+  });
+});
+
+describe("what is in view of a selection", () => {
+  const span = (firstRow: number, endRow: number, firstCol: number, endCol: number) => ({
+    firstRow,
+    endRow,
+    firstCol,
+    endCol,
+  });
+
+  test("is a cell's box, or as much of it as is in view", () => {
+    const view = viewOf({}, { top: 240, left: 1_120 });
+    expect(boxOfSpan(view, span(12, 13, 11, 12))).toEqual(boxIn(view, 12, 11));
+    const cut = viewOf({}, { top: 250, left: 1_120 });
+    expect(boxOfSpan(cut, span(10, 11, 11, 12))).toEqual({
+      ...boxIn(cut, 10, 11),
+      top: 24,
+      height: 14,
+    });
+    expect(boxOfSpan(view, span(9, 10, 11, 12))).toBeNull();
+    expect(boxOfSpan(view, span(12, 13, 2, 5))).toBeNull();
+  });
+
+  test("of rows or columns is all that is in view of them", () => {
+    const view = viewOf({ width: 64 + 500 + 12, height: 24 + 300 + 12 }, { top: 240, left: 0 });
+    expect(boxOfSpan(view, span(12, 14, 0, SHEET.cols))).toEqual({
+      left: 64,
+      top: 24 + 2 * 24,
+      width: 500,
+      height: 48,
+    });
+    expect(boxOfSpan(view, span(0, SHEET.rows, 1, 2))).toEqual({
+      left: 64 + 112,
+      top: 24,
+      width: 112,
+      height: 300,
+    });
+  });
+
+  test("goes on past the freeze line, under which some of it is", () => {
+    const view = viewOf({ frozenRows: 2, frozenCols: 1 }, { top: 240, left: 1_120 });
+    const corner = { left: 64, top: 24 };
+    expect(boxOfSpan(view, span(0, 1, 0, 1))).toEqual({ ...corner, width: 112, height: 24 });
+    // Frozen columns and some that are scrolled away: what is in view are the frozen ones.
+    expect(boxOfSpan(view, span(1, 2, 0, 5))).toEqual({
+      ...corner,
+      top: 48,
+      width: 112,
+      height: 24,
+    });
+    expect(boxOfSpan(view, span(1, 2, 0, 13))).toEqual({
+      ...corner,
+      top: 48,
+      width: 13 * 112 - 1_120,
+      height: 24,
+    });
+    expect(boxOfSpan(view, span(5, 6, 0, 1))).toBeNull();
   });
 });
 

@@ -47,6 +47,7 @@ export {
   type Span,
   SparseAxis,
 } from "./layout.ts";
+export type { JumpDirection } from "./navigation.ts";
 export type {
   DiffHighlightKind,
   DiffHighlightMap,
@@ -55,6 +56,7 @@ export type {
   RemotePresenceOverlay,
 } from "./render/frame.ts";
 export type { RendererPreference, RendererReason } from "./render/upgrade.ts";
+export type { GridStrings } from "./strings.ts";
 export {
   DARK_PALETTE_FILL,
   DARK_PALETTE_TEXT,

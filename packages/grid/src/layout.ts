@@ -616,7 +616,11 @@ export interface Point {
   readonly y: number;
 }
 
-/** Whether a point is over the handle at the last corner of some selected cells. */
+/**
+ * Whether a point is over the handle at the last corner of some selected cells.
+ * Half of it is on the cells that come next on the screen: past the last frozen
+ * ones, those are the first in view of the ones that scroll.
+ */
 export function isOverFillHandle(view: View, range: Span, { x, y }: Point): boolean {
   const { metrics, sheet, size, layout, scroll } = view;
   if (isEmpty(range) || x < metrics.headerWidth || y < metrics.headerHeight) {
@@ -624,6 +628,9 @@ export function isOverFillHandle(view: View, range: Span, { x, y }: Point): bool
   }
   const row = range.endRow - 1;
   const col = range.endCol - 1;
+  const frozen = frozenPixels(metrics, sheet, size, layout);
+  const follows = (index: number, last: number, frozenCount: number) =>
+    index === last + 1 || (last === frozenCount - 1 && index > last);
   const corner = cellBox(metrics, scroll, row, col, size, sheet, layout);
   const dx = Math.abs(x - corner.left - corner.width);
   const dy = Math.abs(y - corner.top - corner.height);
@@ -633,8 +640,8 @@ export function isOverFillHandle(view: View, range: Span, { x, y }: Point): bool
     return dx <= FILL_HANDLE_RADIUS && dy <= FILL_HANDLE_RADIUS;
   }
   return (
-    (cell.row === row || cell.row === row + 1) &&
-    (cell.col === col || cell.col === col + 1) &&
+    (cell.row === row || follows(cell.row, row, frozen.frozenRows)) &&
+    (cell.col === col || follows(cell.col, col, frozen.frozenCols)) &&
     isNearEdge(dx, FILL_HANDLE_RADIUS, layout.colAxis.sizeOf(cell.col)) &&
     isNearEdge(dy, FILL_HANDLE_RADIUS, layout.rowAxis.sizeOf(cell.row))
   );
@@ -673,6 +680,38 @@ function axesOf(view: View): { readonly rows: AxisView; readonly cols: AxisView 
       scroll: scroll.left,
     },
   };
+}
+
+/** What is in view of some rows or columns: the first and last of them may be frozen and not. */
+function shownOf(
+  { axis, header, frozen, room, scroll }: AxisView,
+  frozenCount: number,
+  first: number,
+  end: number,
+): { readonly start: number; readonly end: number } | null {
+  const pinned = {
+    start: axis.offsetOf(Math.min(first, frozenCount)),
+    end: axis.offsetOf(Math.min(end, frozenCount)),
+  };
+  const scrolled = {
+    start: Math.max(frozen, axis.offsetOf(Math.max(first, frozenCount)) - scroll),
+    end: Math.min(room, axis.offsetOf(Math.max(end, frozenCount)) - scroll),
+  };
+  const shown = [pinned, scrolled].filter((part) => part.start < part.end);
+  const [from] = shown;
+  const to = shown.at(-1);
+  return from && to ? { start: header + from.start, end: header + to.end } : null;
+}
+
+/** What is in view of some cells, or `null` if nothing is. */
+export function boxOfSpan(view: View, span: Span): Box | null {
+  const frozen = frozenPixels(view.metrics, view.sheet, view.size, view.layout);
+  const { rows, cols } = axesOf(view);
+  const y = shownOf(rows, frozen.frozenRows, span.firstRow, span.endRow);
+  const x = shownOf(cols, frozen.frozenCols, span.firstCol, span.endCol);
+  return x && y
+    ? { left: x.start, top: y.start, width: x.end - x.start, height: y.end - y.start }
+    : null;
 }
 
 /** The sheet's place in the corner of the part of a view that scrolls. */

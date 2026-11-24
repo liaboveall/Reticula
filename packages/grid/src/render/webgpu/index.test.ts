@@ -250,6 +250,87 @@ describe("a device", () => {
     expect(devices[0]?.destroyed).toBe(true);
   });
 
+  test.each([
+    ["and says so later", false],
+    ["and fails before it says so", true],
+  ])("lost while it was being opened %s is asked for again", async (_, fails) => {
+    const { devices } = fakeBrowser();
+    const { grid, host } = fakeGrid();
+    vi.spyOn(FakeDevice.prototype, "createRenderPipelineAsync").mockImplementationOnce(function (
+      this: FakeDevice,
+    ) {
+      if (fails) {
+        setTimeout(() => this.destroy(), 5);
+        return Promise.reject(new Error("no pipelines of a device that is gone"));
+      }
+      this.destroy();
+      return Promise.resolve({});
+    });
+    await attach(host);
+    await settle();
+    expect(grid.reports).toEqual(["device-lost"]);
+    expect(grid.renderer).toBeNull();
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(grid.renderer?.kind).toBe("webgpu");
+    expect(devices).toHaveLength(2);
+    // It counts as a loss like any other.
+    devices[1]?.destroy();
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(grid.renderer).toBeNull();
+    expect(grid.reports.at(-1)).toBe("device-lost");
+    expect(devices).toHaveLength(2);
+  });
+
+  test("that fails without being lost is not asked for again", async () => {
+    const { devices } = fakeBrowser();
+    const { grid, host } = fakeGrid();
+    vi.spyOn(FakeDevice.prototype, "createRenderPipelineAsync").mockRejectedValueOnce(
+      new Error("a shader that does not compile"),
+    );
+    await attach(host);
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(grid.reports).toEqual(["failed"]);
+    expect(devices).toHaveLength(1);
+    expect(devices[0]?.destroyed).toBe(true);
+    // Nor does that count as a loss: there are still two to go.
+    for (const losses of [1, 2]) {
+      const other = fakeGrid();
+      await attach(other.host);
+      await settle();
+      expect(other.grid.renderer?.kind).toBe("webgpu");
+      devices.at(-1)?.destroy();
+      await settle();
+      expect(other.grid.reports.at(-1), String(losses)).toBe("device-lost");
+      await vi.advanceTimersByTimeAsync(losses === 1 ? 2000 : 5000);
+    }
+  });
+
+  test("is another one once the page is in another language", async () => {
+    const { canvases, devices } = fakeBrowser();
+    const { grid, host } = fakeGrid();
+    await attach(host);
+    await settle();
+    const languages = () =>
+      canvases.flatMap(({ context }) => (typeof context.lang === "string" ? [context.lang] : []));
+    expect(new Set(languages())).toEqual(new Set(["en"]));
+    canvases.length = 0;
+    document.documentElement.lang = "zh-CN";
+    // The grid begins anew while its renderer is still shown.
+    const next = fakeGrid();
+    await attach(next.host);
+    await settle();
+    expect(devices).toHaveLength(2);
+    expect(new Set(languages())).toEqual(new Set(["zh-CN"]));
+    expect(devices[0]?.destroyed).toBe(false);
+    grid.renderer?.destroy();
+    expect(devices.map(({ destroyed }) => destroyed)).toEqual([true, false]);
+    // The next one shares the one that is left.
+    const third = fakeGrid();
+    await attach(third.host);
+    await settle();
+    expect(devices).toHaveLength(2);
+  });
+
   test("lost while it was not yet drawn with is asked for again", async () => {
     const { devices } = fakeBrowser();
     const { grid, host } = fakeGrid(null);

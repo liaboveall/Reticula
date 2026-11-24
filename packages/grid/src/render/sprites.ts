@@ -1,5 +1,5 @@
 import { cssColor, type PackedColor } from "./color.ts";
-import { textContext } from "./text-measure.ts";
+import { detachedContext } from "./text-measure.ts";
 
 /** A small picture that is drawn once with a 2D context and then copied. */
 export type SpriteSpec =
@@ -53,7 +53,7 @@ export function rasterize(spec: SpriteSpec): HTMLCanvasElement {
   const canvas = document.createElement("canvas");
   canvas.width = Math.max(1, spec.width);
   canvas.height = Math.max(1, spec.height);
-  const context = textContext(canvas);
+  const context = detachedContext(canvas);
   context.fillStyle = cssColor(spec.kind === "plate" ? spec.fill : spec.color);
   if (spec.kind === "corner") {
     path(context, [

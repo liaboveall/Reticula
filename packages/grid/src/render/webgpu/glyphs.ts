@@ -66,6 +66,81 @@ export interface FontCheck {
   readonly ascii: boolean;
 }
 
+// --- where a 2D canvas has its pen --------------------------------------------
+
+/** Many different widths, whatever the fonts that text is in are like. */
+const UNIT_SAMPLE = {
+  text: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
+  fonts: ["11.3px serif", "17.9px sans-serif"],
+};
+/** Units there may be to a pixel, depending on the screen and on the zoom of the page. */
+const UNITS = { least: 6, most: 240 };
+
+/**
+ * How many of the units that a browser counts in there are to a pixel, if it
+ * moves the pen by whole numbers of them, as Firefox does; else 0. What it says
+ * of widths is less precise than that, and the sum of many of them off by so
+ * much that a character half way between two phases ends up at the other one.
+ */
+export function unitsPerPixel(advances: readonly number[]): number {
+  for (let units = UNITS.least; units <= UNITS.most; units++) {
+    if (
+      advances.every((advance) => Math.abs(advance * units - Math.round(advance * units)) < 1e-3)
+    ) {
+      return units;
+    }
+  }
+  return 0;
+}
+
+function unitsOf(context: CanvasRenderingContext2D): number {
+  // Elsewhere widths may be such multiples by chance, as of a font at a round size.
+  if (!("mozInnerScreenX" in globalThis)) {
+    return 0;
+  }
+  const { font } = context;
+  const advances = UNIT_SAMPLE.fonts.flatMap((sample) => {
+    context.font = sample;
+    return [...UNIT_SAMPLE.text].map((character) => context.measureText(character).width);
+  });
+  context.font = font;
+  return unitsPerPixel(advances);
+}
+
+/** The pen of a text that starts at `x`, in the precision of a 2D canvas, on which the phases depend. */
+class Pen {
+  #units: number;
+  #start: number;
+  #moved = 0;
+
+  constructor(x: number, units: number) {
+    this.#units = units;
+    this.#start = units > 0 ? Math.fround(Math.fround(x) * units) : Math.fround(x);
+  }
+
+  get at(): number {
+    const at = Math.fround(this.#start + this.#moved);
+    return this.#units > 0 ? Math.fround(at / this.#units) : at;
+  }
+
+  /** How far it is from where it started. */
+  get moved(): number {
+    return this.#units > 0 ? this.#moved / this.#units : this.#moved;
+  }
+
+  move(advance: number): void {
+    const units = this.#units;
+    this.#moved = Math.fround(this.#moved + (units > 0 ? Math.round(advance * units) : advance));
+  }
+}
+
+/** The phase that the pen is nearest to, in phases from the left edge. */
+function stepOf(at: number, phases: number): number {
+  return Math.floor(Math.fround(at + 0.5 / phases) * phases);
+}
+
+// --- what a font's texts are like ---------------------------------------------
+
 // A quarter of a pixel, by which characters between two phases may be off, makes less of a difference.
 const CHECK = { width: 1024, line: 28, size: 20, far: 88, most: 2 };
 const PLAIN_TEXT = "Hamburg 0123456789 nimble";
@@ -87,11 +162,12 @@ function phasesOf(font: string, text: string): Phases | null {
   const baseline = (line: number) => Math.round((line + 0.75) * CHECK.line);
   context.fillText(text, start, baseline(0));
   const rules = [4, 1] as const;
+  const units = unitsOf(context);
   for (const [index, phases] of rules.entries()) {
-    let pen = start;
+    const pen = new Pen(start, units);
     for (const character of text) {
-      context.fillText(character, Math.floor(pen * phases + 0.5) / phases, baseline(index + 1));
-      pen += context.measureText(character).width;
+      context.fillText(character, stepOf(pen.at, phases) / phases, baseline(index + 1));
+      pen.move(context.measureText(character).width);
     }
   }
   const { data } = context.getImageData(0, 0, CHECK.width, 3 * CHECK.line);
@@ -204,14 +280,17 @@ class FontGlyphs {
   readonly font: string;
   readonly size: number;
   readonly check: FontCheck;
+  /** Units to a pixel that the pen is moved by. */
+  readonly units: number;
   readonly sets = new Map<PackedColor, GlyphSet>();
   /** Sizes of characters, which in some browsers take longer to find out than to draw them. */
   readonly sizes = new Map<number, InkSize>();
 
-  constructor(font: string, check: FontCheck) {
+  constructor(font: string, check: FontCheck, units: number) {
     this.font = font;
     this.size = Number.parseFloat(/([\d.]+)px/.exec(font)?.[1] ?? "0");
     this.check = check;
+    this.units = units;
   }
 
   set(color: PackedColor): GlyphSet {
@@ -253,6 +332,7 @@ export class Glyphs {
   hits = 0;
   misses = 0;
   #check: (font: string) => FontCheck;
+  #unitsOf: (context: CanvasRenderingContext2D) => number;
   #checks = new Map<string, FontCheck>();
   #fonts = new Map<string, FontGlyphs>();
   #pictures = new Map<string, Sprite>();
@@ -264,9 +344,11 @@ export class Glyphs {
   constructor(
     open: (onEvict: (layer: number) => void) => Atlas,
     check: (font: string) => FontCheck = checkFont,
+    units: (context: CanvasRenderingContext2D) => number = unitsOf,
   ) {
     this.atlas = open((layer) => this.#evict(layer));
     this.#check = check;
+    this.#unitsOf = units;
   }
 
   /** Starts a frame, which may take this many milliseconds for new pictures. */
@@ -342,14 +424,11 @@ export class Glyphs {
   ): boolean | null {
     const { fast } = set;
     const { phases } = glyphs.check;
-    // In the precision of a 2D canvas, which decides between two phases.
-    const start = Math.fround(origin + x);
-    const half = 0.5 / phases;
-    let pen = 0;
+    const pen = new Pen(origin + x, glyphs.units);
     for (let index = 0; index < text.length; index++) {
       const code = text.charCodeAt(index);
       // The nearest phase: the one that a 2D canvas draws it at.
-      const steps = Math.floor(Math.fround(Math.fround(start + pen) + half) * phases);
+      const steps = stepOf(pen.at, phases);
       const whole = Math.floor(steps / phases);
       const phase = steps - whole * phases;
       const key = code * 4 + phase;
@@ -368,10 +447,10 @@ export class Glyphs {
         this.layers |= 1 << glyph.layer;
         out.sprite(glyph, whole - origin + glyph.dx, baseline + glyph.dy, clip, row);
       }
-      pen = Math.fround(pen + glyph.advance);
+      pen.move(glyph.advance);
     }
     // Anything else in how the font sets texts shows in their widths.
-    return Math.abs(pen - width) <= 0.01 * (text.length + 1);
+    return Math.abs(pen.moved - width) <= 0.01 * (text.length + 1);
   }
 
   /** The picture of a character; `false` if it has none, `null` if it cannot be drawn now. */
@@ -513,7 +592,7 @@ export class Glyphs {
         check = this.#check(font);
         this.#checks.set(face, check);
       }
-      glyphs = new FontGlyphs(font, check);
+      glyphs = new FontGlyphs(font, check, this.#unitsOf(this.atlas.raster.context));
       this.#fonts.set(font, glyphs);
     }
     return glyphs;

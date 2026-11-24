@@ -135,7 +135,9 @@ export class FakeDevice extends EventTarget {
   createPipelineLayout = () => ({});
   createBindGroup = (descriptor: GPUBindGroupDescriptor) => ({ descriptor });
   createRenderPipeline = (descriptor: unknown) => ({ descriptor });
-  createRenderPipelineAsync = (descriptor: unknown) => Promise.resolve({ descriptor });
+  createRenderPipelineAsync(descriptor: unknown): Promise<unknown> {
+    return Promise.resolve({ descriptor });
+  }
 
   createCommandEncoder() {
     const draws: FakeDraw[] = [];

@@ -3,7 +3,11 @@ import { EditorView } from "@codemirror/view";
 import type { WireFormulaAnalysis } from "@reticula/protocol";
 import { formulaDecorationExtension, setFormulaAnalysisEffect } from "./formula-input.ts";
 import type { Grid } from "./grid.ts";
+import { type JumpDirection, navigate, STEPS } from "./navigation.ts";
 import { PADDING } from "./render/frame.ts";
+import type { TapEvent } from "./touch-input.ts";
+
+const TAP_EVENT: TapEvent = "reticula-tap";
 
 /** A cell, by position. */
 export interface CellPosition {
@@ -53,7 +57,7 @@ export interface CellEditorOptions {
   /** Returns `true` when clicking the grid should insert a formula reference instead of committing. */
   readonly isPointAndClickActive?: () => boolean;
   /** `Ctrl+Arrow` / `Ctrl+Shift+Arrow` data-edge jump request. */
-  readonly onJumpEdge?: (dir: "up" | "down" | "left" | "right", select: boolean) => void;
+  readonly onJumpEdge?: (dir: JumpDirection, select: boolean) => void;
   /** `Ctrl+End` / `Ctrl+Shift+End` jump to last used cell. */
   readonly onJumpUsedEnd?: (select: boolean) => void;
   /** `Ctrl+Z` undo shortcut. */
@@ -66,22 +70,10 @@ export interface CellEditorOptions {
   readonly onPaste?: (tsv: string, html: string | null) => void;
   /** Optional guard preventing in-cell typing, editing, undo/redo, clear, cut, and paste. */
   readonly isReadOnly?: () => boolean;
+  /** Whether there is nothing but a touch screen, which would show a keyboard for the editor. */
+  readonly isTouchOnly?: () => boolean;
   readonly onEvent?: (event: EditorEvent) => void;
 }
-
-const STEPS: Readonly<Record<string, readonly [number, number]>> = {
-  ArrowUp: [-1, 0],
-  ArrowDown: [1, 0],
-  ArrowLeft: [0, -1],
-  ArrowRight: [0, 1],
-};
-
-const JUMP_DIRS: Readonly<Record<string, "up" | "down" | "left" | "right">> = {
-  ArrowUp: "up",
-  ArrowDown: "down",
-  ArrowLeft: "left",
-  ArrowRight: "right",
-};
 
 /**
  * The editor of the selected cell (`13-m1a.md` 6.2 & `14-m1b.md` 6.1–6.3).
@@ -96,7 +88,10 @@ export class CellEditor {
   #mode: "input" | "edit" = "input";
   #suppressAutoStart = false;
   #suppressNotify = false;
+  /** Whether a finger was the last to do anything here. */
+  #isTouched = false;
   #stopWatching: () => void;
+  #detach: () => void;
 
   constructor(grid: Grid, host: HTMLElement, options: CellEditorOptions) {
     this.#grid = grid;
@@ -110,7 +105,7 @@ export class CellEditor {
       parent: this.#box,
       state: EditorState.create({
         extensions: [
-          EditorView.contentAttributes.of({ "aria-label": "Cell editor" }),
+          EditorView.contentAttributes.of(() => this.#attributes()),
           EditorState.transactionFilter.of((transaction) => {
             if (transaction.newDoc.lines > 1) {
               return [];
@@ -174,7 +169,9 @@ export class CellEditor {
 
     host.addEventListener("focus", this.#takeFocus);
     host.addEventListener("pointerdown", this.#onPointerDown, { capture: true });
+    host.addEventListener(TAP_EVENT, this.#onTap);
     this.#stopWatching = grid.watchFrames(this.#place);
+    this.#detach = grid.attachEditor(() => this.refreshAttributes());
     this.#place();
   }
 
@@ -200,6 +197,33 @@ export class CellEditor {
 
   focus(): void {
     this.#view.focus();
+  }
+
+  /** To be called when what `isReadOnly` or `isTouchOnly` says has changed. */
+  refreshAttributes(): void {
+    // They are asked for with every update. What is being composed is left alone until the next.
+    if (!this.composing) {
+      this.#view.dispatch({});
+    }
+  }
+
+  /** What the editor is for assistive technology: one line, which may not be for typing into. */
+  #attributes(): Record<string, string> {
+    const { cellEditor } = this.#grid.strings;
+    return {
+      "aria-multiline": "false",
+      ...(cellEditor ? { "aria-label": cellEditor } : {}),
+      ...(this.#options.isReadOnly?.() ? { "aria-readonly": "true" } : {}),
+      // It has the focus of a grid that is tapped, for a keyboard that is one.
+      ...(this.#isTouched || this.#options.isTouchOnly?.() ? { inputmode: "none" } : {}),
+    };
+  }
+
+  #setTouched(isTouched: boolean): void {
+    if (isTouched !== this.#isTouched) {
+      this.#isTouched = isTouched;
+      this.refreshAttributes();
+    }
   }
 
   /** Opens the currently selected cell in `"edit"` mode (double-click or `F2`). */
@@ -306,8 +330,10 @@ export class CellEditor {
 
   destroy(): void {
     this.#stopWatching();
+    this.#detach();
     this.#host.removeEventListener("focus", this.#takeFocus);
     this.#host.removeEventListener("pointerdown", this.#onPointerDown, { capture: true });
+    this.#host.removeEventListener(TAP_EVENT, this.#onTap);
     this.#view.destroy();
     this.#box.remove();
   }
@@ -407,6 +433,7 @@ export class CellEditor {
     if (event.isComposing || event.keyCode === 229 || view.composing || view.compositionStarted) {
       return "input method";
     }
+    this.#setTouched(false);
     if (event.key === "Escape" && this.#grid.cancelDrag()) {
       event.preventDefault();
       return "swallowed";
@@ -472,63 +499,11 @@ export class CellEditor {
         }
         return "swallowed";
       }
-      if (lower === "a" && !event.shiftKey) {
-        event.preventDefault();
-        this.#grid.selectAll();
-        return "swallowed";
-      }
-      const jumpDir = JUMP_DIRS[event.key];
-      if (jumpDir && this.#options.onJumpEdge) {
-        event.preventDefault();
-        this.#options.onJumpEdge(jumpDir, event.shiftKey);
-        return "moved";
-      }
-      if (event.key === "Home") {
-        event.preventDefault();
-        this.#grid.jumpTo(0, 0, event.shiftKey);
-        return "moved";
-      }
-      if (event.key === "End" && this.#options.onJumpUsedEnd) {
-        event.preventDefault();
-        this.#options.onJumpUsedEnd(event.shiftKey);
-        return "moved";
-      }
     }
 
-    if (plain && STEPS[event.key]) {
-      const [rows, cols] = STEPS[event.key] ?? [0, 0];
-      if (event.shiftKey) {
-        this.#grid.extendSelection(rows, cols);
-      } else {
-        this.#grid.moveSelection(rows, cols);
-      }
+    const { onJumpEdge, onJumpUsedEnd } = this.#options;
+    if (navigate(this.#grid, event, { toEdge: onJumpEdge, toUsedEnd: onJumpUsedEnd })) {
       return "moved";
-    }
-    if (plain && event.key === "PageDown") {
-      event.preventDefault();
-      this.#grid.pageVertical(1, event.shiftKey);
-      return "moved";
-    }
-    if (plain && event.key === "PageUp") {
-      event.preventDefault();
-      this.#grid.pageVertical(-1, event.shiftKey);
-      return "moved";
-    }
-    if (plain && event.key === "Home") {
-      const cur = this.#grid.selection;
-      if (cur) {
-        event.preventDefault();
-        this.#grid.jumpTo(cur.row, 0, event.shiftKey);
-        return "moved";
-      }
-    }
-    if (plain && event.key === "End") {
-      const cur = this.#grid.selection;
-      if (cur && this.#grid.sheetSize.cols > 0) {
-        event.preventDefault();
-        this.#grid.jumpTo(cur.row, this.#grid.sheetSize.cols - 1, event.shiftKey);
-        return "moved";
-      }
     }
     if (plain && (event.key === "Enter" || event.key === "Tab")) {
       this.#move(event);
@@ -580,8 +555,23 @@ export class CellEditor {
     return true;
   }
 
+  /** A tap leaves the cell that is edited, as a click does. It is no way to pick a reference. */
+  #onTap = (event: Event): void => {
+    if (this.#options.isPointAndClickActive?.()) {
+      event.preventDefault();
+    } else {
+      this.#commit();
+    }
+  };
+
   #onPointerDown = (event: PointerEvent): void => {
-    if (!this.#cell || (event.target instanceof Node && this.#box.contains(event.target))) {
+    this.#setTouched(event.pointerType === "touch");
+    // What a finger is there for shows when it is lifted.
+    if (
+      this.#isTouched ||
+      !this.#cell ||
+      (event.target instanceof Node && this.#box.contains(event.target))
+    ) {
       return;
     }
     if (this.#options.isPointAndClickActive?.()) {
@@ -590,7 +580,11 @@ export class CellEditor {
     delete this.#box.dataset.editing;
     setTimeout(() => {
       this.#commit();
-      this.#view.focus();
+      // A menu that opens with the same press has the focus by now.
+      const { activeElement, body } = document;
+      if (!activeElement || activeElement === body || this.#host.contains(activeElement)) {
+        this.#view.focus();
+      }
     }, 0);
   };
 }

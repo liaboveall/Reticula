@@ -242,6 +242,30 @@ describe("a selection", () => {
     expect(without).toHaveLength(strokes.length - 1);
   });
 
+  test("that ends at the freeze line has its whole handle, over the line and what is past it", () => {
+    const frame = frameOf({
+      ...FROZEN,
+      cache: cacheOf({ "0:0": "frozen" }, 1, 1),
+      selection: { row: 0, col: 0 },
+      selectionRange: { firstRow: 0, endRow: 1, firstCol: 0, endCol: 1 },
+    });
+    const painted = rectsOf(sceneOf(frame));
+    const handle = { left: 117, top: 47, width: 6, height: 6, color: packed(theme.selection) };
+    expect(painted.at(-1)).toEqual(handle);
+    expect(painted.findLastIndex(({ color }) => color === packed(theme.freezeLine))).toBeLessThan(
+      painted.length - 2,
+    );
+    // Not over the rows that are frozen, though, when it is below them.
+    const below = { row: 1, col: 0 };
+    const scrolled = sceneOf({
+      ...frame,
+      scroll: { top: 19, left: 5 },
+      selection: below,
+      selectionRange: { firstRow: 1, endRow: 2, firstCol: 0, endCol: 1 },
+    });
+    expect(rectsOf(scrolled).at(-1)).toEqual({ ...handle, top: 50, height: 4 });
+  });
+
   test("marks the headers of all its ranges", () => {
     const ranges = [range, { firstRow: 5, endRow: 6, firstCol: 0, endCol: 1 }];
     const scene = sceneOf(

@@ -35,6 +35,20 @@ export function textContext(canvas: HTMLCanvasElement): CanvasRenderingContext2D
   return context;
 }
 
+/**
+ * A context of a canvas that is in no document, and would not know by itself
+ * what language its text is in: on that depend the forms of some characters.
+ */
+export function detachedContext(
+  canvas: HTMLCanvasElement,
+  open: (canvas: HTMLCanvasElement) => CanvasRenderingContext2D = textContext,
+  lang: string = document.documentElement.lang,
+): CanvasRenderingContext2D {
+  // Where contexts have no language of their own, it is their canvas's.
+  Object.assign(canvas, lang && { lang });
+  return Object.assign(open(canvas), lang && { lang });
+}
+
 /** The state of a context that resizing and losing it set back. */
 export function resetText(context: CanvasRenderingContext2D): void {
   context.textAlign = "left";
@@ -115,7 +129,7 @@ export class TextMeasurer implements TextMeasure {
       const canvas = document.createElement("canvas");
       canvas.width = 1;
       canvas.height = 1;
-      return textContext(canvas);
+      return detachedContext(canvas);
     },
     limit: number = MAX_WIDTHS,
   ) {
@@ -132,8 +146,9 @@ export class TextMeasurer implements TextMeasure {
     return size;
   }
 
-  /** Forgets everything that was measured. */
+  /** Forgets everything that was measured, and in what language. */
   reset(): void {
+    this.#context = null;
     this.#fonts.clear();
     this.#current = new FontWidths("");
     this.#newer = 0;

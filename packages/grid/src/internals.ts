@@ -22,6 +22,7 @@ export type {
   RemotePresenceOverlay,
   ReorderGuide,
 } from "./render/frame.ts";
+export { BAND_ROWS } from "./render/page-layout.ts";
 export { type DrawWebGpu, drawCanvas2d, masksOf } from "./render/testing.ts";
 export { TextMeasurer } from "./render/text-measure.ts";
 export type {

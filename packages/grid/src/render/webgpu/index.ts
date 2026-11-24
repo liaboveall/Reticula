@@ -1,7 +1,7 @@
 // Everything that draws the grid with WebGPU, loaded once it is wanted.
 
 import type { RendererHost } from "../upgrade.ts";
-import { acquire, type Lease, Refusal } from "./device.ts";
+import { acquire, type Lease, mayRetry, Refusal } from "./device.ts";
 import { WebGpuRenderer } from "./renderer.ts";
 
 /** Milliseconds until a lost device is asked for again. */
@@ -72,7 +72,11 @@ export function attach(host: RendererHost, software: boolean): () => void {
         pending?.destroy();
         pending = null;
         lease?.release();
-        host.report(error instanceof Refusal ? error.reason : "failed");
+        const reason = error instanceof Refusal ? error.reason : "failed";
+        host.report(reason);
+        if (reason === "device-lost" && mayRetry()) {
+          timer = window.setTimeout(start, RETRY_DELAY);
+        }
       }
     }
   };

@@ -1,4 +1,4 @@
-import { resetText, textContext } from "../text-measure.ts";
+import { detachedContext, resetText, textContext } from "../text-measure.ts";
 import { LAYER_SIZE, STRIP_HEIGHT } from "./atlas.ts";
 import { TEXTURE } from "./pipeline.ts";
 
@@ -19,12 +19,11 @@ export interface Raster {
 
 type Open = (canvas: HTMLCanvasElement) => CanvasRenderingContext2D;
 
-/** A canvas in no document, which would not know by itself what language its text is in. */
 function open(lang: string, context: Open): CanvasRenderingContext2D {
   const canvas = document.createElement("canvas");
   canvas.width = LAYER_SIZE;
   canvas.height = STRIP_HEIGHT;
-  return Object.assign(context(canvas), lang && { lang });
+  return detachedContext(canvas, context, lang);
 }
 
 abstract class CanvasRaster {

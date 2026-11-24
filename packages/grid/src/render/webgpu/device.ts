@@ -15,6 +15,8 @@ export class Refusal extends Error {
 
 /** A device that was lost twice is not asked for again. */
 const MOST_LOSSES = 2;
+/** Milliseconds in which a device that fails says that it is lost, if that is why. */
+const LOSS_DELAY = 100;
 
 /** A device with what all the grids of a page share on it. */
 export class Gpu {
@@ -90,6 +92,8 @@ export interface Lease {
 }
 
 interface Shared {
+  /** The language its texts are drawn in. */
+  readonly lang: string;
   readonly opening: Promise<Gpu>;
   device: Gpu | null;
   users: number;
@@ -98,7 +102,12 @@ interface Shared {
 let shared: Shared | null = null;
 let losses = 0;
 
-async function open(software: boolean): Promise<Gpu> {
+/** Whether a device that was lost is worth asking for again. */
+export function mayRetry(): boolean {
+  return losses < MOST_LOSSES;
+}
+
+async function open(software: boolean, lang: string): Promise<Gpu> {
   const adapter = await navigator.gpu?.requestAdapter();
   if (!adapter) {
     throw new Refusal("no-adapter");
@@ -111,12 +120,19 @@ async function open(software: boolean): Promise<Gpu> {
   const { maxTextureDimension2D } = adapter.limits;
   // A canvas across several screens may be larger than what is guaranteed.
   const device = await adapter.requestDevice({ requiredLimits: { maxTextureDimension2D } });
+  let gpu: Gpu | null = null;
   try {
     const name = [info.vendor, info.architecture, info.description].join(" ").trim();
-    const gpu = new Gpu(device, name, document.documentElement.lang);
+    gpu = new Gpu(device, name, lang);
     await gpu.pipelines.prepare(navigator.gpu.getPreferredCanvasFormat());
     return gpu;
   } catch (error) {
+    const patience = new Promise<null>((resolve) => setTimeout(resolve, LOSS_DELAY, null));
+    const lost = await Promise.race([device.lost, patience]);
+    if (gpu && lost) {
+      throw new Refusal("device-lost");
+    }
+    gpu?.close();
     device.destroy();
     throw error;
   }
@@ -124,10 +140,14 @@ async function open(software: boolean): Promise<Gpu> {
 
 /** The page's device, opened if there is none; a software adapter only if that is wanted. */
 export async function acquire(software: boolean, onLost: () => void): Promise<Lease> {
-  if (losses >= MOST_LOSSES) {
+  if (!mayRetry()) {
     throw new Refusal("device-lost");
   }
-  const share: Shared = shared ?? { opening: open(software), device: null, users: 0 };
+  const { lang } = document.documentElement;
+  const share: Shared =
+    shared?.lang === lang
+      ? shared
+      : { lang, opening: open(software, lang), device: null, users: 0 };
   shared = share;
   share.users++;
   let released = false;

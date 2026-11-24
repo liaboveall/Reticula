@@ -4,7 +4,7 @@ import { advanceOf, measure } from "../fixtures.ts";
 import { Atlas } from "./atlas.ts";
 import { FakeCanvas, FakeDevice, fakeBrowser, quadsOf } from "./fakes.ts";
 import { InstanceWriter } from "./frame-buffer.ts";
-import { type FontCheck, Glyphs, isSeparable, type RunPlace } from "./glyphs.ts";
+import { type FontCheck, Glyphs, isSeparable, type RunPlace, unitsPerPixel } from "./glyphs.ts";
 import type { Raster } from "./raster.ts";
 
 const FONT = "13px sans-serif";
@@ -23,7 +23,7 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-function open(check: FontCheck = { phases: 4, ascii: true }) {
+function open(check: FontCheck = { phases: 4, ascii: true }, units = 0) {
   const device = new FakeDevice();
   const canvas = new FakeCanvas();
   const upload = vi.fn<Raster["upload"]>();
@@ -40,6 +40,7 @@ function open(check: FontCheck = { phases: 4, ascii: true }) {
       checked.push(font);
       return check;
     },
+    () => units,
   );
   glyphs.begin(1000);
   const out = new InstanceWriter();
@@ -108,6 +109,13 @@ describe("a text is put together from its characters", () => {
   });
 });
 
+test("the unit of a browser that counts in one shows in what it measures", () => {
+  const widths = [279, 368, 264, 446, 305, 518, 397].map((count) => Math.fround(count / 40));
+  expect(unitsPerPixel(widths)).toBe(40);
+  expect(unitsPerPixel(widths.map((width) => Math.fround((width * 40) / 55)))).toBe(55);
+  expect(unitsPerPixel([7.0078125, 9.23456, 11.317])).toBe(0);
+});
+
 describe("the characters of a text", () => {
   test("are drawn once for each phase of a pixel, and in each colour", () => {
     const { glyphs, run, drawn } = open();
@@ -125,6 +133,31 @@ describe("the characters of a text", () => {
     run("a", { x }, packColor(255, 0, 0));
     expect(glyphs.misses).toBe(misses + 1);
     expect(drawn().at(-1)?.at(-1)).toBe("#ff0000");
+  });
+
+  test("are where a browser draws them that moves the pen by whole units", () => {
+    // Forty to a pixel: some pens are half way between two phases.
+    const units = 40;
+    const advance = 279;
+    const text = "1".repeat(200);
+    const width = (text.length * advance) / units;
+    const placed = (counted: number) => {
+      const { run, canvas } = open(undefined, counted);
+      const { measureText } = canvas.context as { measureText: (text: string) => object };
+      canvas.context.measureText = (measured: string) => ({
+        ...measureText(measured),
+        width: Math.fround((measured.length * advance) / units),
+      });
+      return run(text, { x: 142, width }).map(({ x }) => x);
+    };
+    const steps = Array.from(text, (_, index) =>
+      Math.floor((4 * (142 * units + index * advance) + units / 2) / units),
+    );
+    const [first = 0] = placed(units);
+    const expected = steps.map((step) => Math.floor(step / 4) - 142 + first);
+    expect(placed(units)).toEqual(expected);
+    // Widths alone do not say it precisely enough.
+    expect(placed(0)).not.toEqual(expected);
   });
 
   test("are where a 2D canvas draws them: at the nearest quarter of a pixel", () => {

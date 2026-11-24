@@ -104,6 +104,7 @@ let canvases: FakeCanvas[] = [];
 beforeEach(() => {
   canvases = [];
   vi.stubGlobal("document", {
+    documentElement: { lang: "en" },
     createElement: () => {
       const canvas = new FakeCanvas();
       canvases.push(canvas);
@@ -269,8 +270,8 @@ describe("a lost context", () => {
     expect(onRestored).toHaveBeenCalledOnce();
 
     renderer.draw(frame);
-    // The corner's mark is drawn anew, and all the text.
-    expect(canvases).toHaveLength(before + 1);
+    // The corner's mark is drawn anew, and all the text, which is measured anew.
+    expect(canvases).toHaveLength(before + 2);
     expect(canvas.named("fillText").length).toBeGreaterThan(texts);
   });
 

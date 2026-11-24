@@ -167,6 +167,8 @@ export class SceneBuilder {
   #mark = 0;
   #cells = 0;
   #missing = 0;
+  /** The fill handle, if half of it is past the freeze line and drawn after what is there. */
+  #handle: { readonly box: PixelBox; readonly clip: PixelBox } | null = null;
 
   constructor(measure: TextMeasure, colors: Colors) {
     this.measure = measure;
@@ -277,6 +279,11 @@ export class SceneBuilder {
     ];
     this.#headers(frame, look, sheet, { left, top, right: width, bottom: height }, strips);
     this.#dividers(look, frozen, { left: 0, top: 0, right, bottom }, frozenX, frozenY);
+    if (this.#handle) {
+      const { box, clip } = this.#handle;
+      this.#drawHandle(look, box, { ...clip, right, bottom });
+      this.#handle = null;
+    }
     this.#reorderGuide(frame, look, sheet, frozen, { left, top, right, bottom }, strips);
     this.#flush();
 
@@ -673,17 +680,20 @@ export class SceneBuilder {
       );
       const left = x(endCol) - Math.floor(size / 2);
       const top = y(endRow) - Math.floor(size / 2);
-      const rim = look.hairline;
-      this.#rects.add(
-        clip,
-        left - rim,
-        top - rim,
-        left + size + rim,
-        top + size + rim,
-        look.background,
-      );
-      this.#rects.add(clip, left, top, left + size, top + size, look.selection);
+      const box = { left, top, right: left + size, bottom: top + size };
+      const { frozenRows = 0, frozenCols = 0 } = frame.layout ?? {};
+      if (endCol === frozenCols || endRow === frozenRows) {
+        this.#handle = { box, clip };
+      } else {
+        this.#drawHandle(look, box, clip);
+      }
     }
+  }
+
+  #drawHandle(look: Look, { left, top, right, bottom }: PixelBox, clip: PixelBox): void {
+    const rim = look.hairline;
+    this.#rects.add(clip, left - rim, top - rim, right + rim, bottom + rim, look.background);
+    this.#rects.add(clip, left, top, right, bottom, look.selection);
   }
 
   #diffHighlights(frame: Frame, quadrant: Quadrant): void {

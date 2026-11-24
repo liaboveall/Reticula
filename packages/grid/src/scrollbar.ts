@@ -40,6 +40,10 @@ export class Scrollbar {
     this.element.addEventListener("pointerdown", this.#page);
   }
 
+  get isDragging(): boolean {
+    return this.#grip !== null;
+  }
+
   /** Shows where `position` is within `content`, of which `viewport` is visible. */
   update(content: number, viewport: number, position: number): void {
     this.#content = content;
@@ -81,8 +85,14 @@ export class Scrollbar {
     }
     event.preventDefault();
     event.stopPropagation();
+    // Without the capture nothing would say when the drag has ended. It is
+    // refused if the pointer is gone by now.
+    try {
+      this.#thumb.setPointerCapture(event.pointerId);
+    } catch {
+      return;
+    }
     this.#grip = this.#along(event) - placed.offset;
-    this.#thumb.setPointerCapture(event.pointerId);
     this.#thumb.dataset.dragging = "";
   };
 
