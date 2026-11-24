@@ -94,7 +94,7 @@ jobs:
             cargo install --locked --version 0.20.0 gungraun-runner
           fi
       - name: Run Callgrind instruction-count gate
-        run: cargo bench --locked --package reticula-kernel-bench --bench callgrind -- --save-baseline=main --callgrind-limits='ir=5.0%'
+        run: cargo bench --locked --package reticula-kernel-bench --bench callgrind -- --save-baseline=main --callgrind-limits='ir=5.0%' --allow-aslr=yes
 
   wasm:
     runs-on: ubuntu-24.04

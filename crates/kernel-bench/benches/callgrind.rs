@@ -1,6 +1,9 @@
 //! Deterministic Callgrind instruction-count benchmarks for Linux CI gating
 //! (`cargo bench --package reticula-kernel-bench --bench callgrind`).
 
+#[cfg(target_os = "linux")]
+use gungraun::{library_benchmark, library_benchmark_group, main};
+
 mod fixtures {
     use std::hint::black_box;
 
@@ -124,35 +127,35 @@ mod fixtures {
 }
 
 #[cfg(target_os = "linux")]
-#[gungraun::library_benchmark]
+#[library_benchmark]
 #[bench::run(fixtures::setup_b3_10k())]
 fn b3_strip_eval_10k(eng: reticula_formula::engine::FormulaEngine) -> u32 {
     fixtures::run_b3_10k(eng)
 }
 
 #[cfg(target_os = "linux")]
-#[gungraun::library_benchmark]
+#[library_benchmark]
 #[bench::run(fixtures::setup_b5_10k())]
 fn b5_recurrence_10k(eng: reticula_formula::engine::FormulaEngine) -> u32 {
     fixtures::run_b5_10k(eng)
 }
 
 #[cfg(target_os = "linux")]
-#[gungraun::library_benchmark]
+#[library_benchmark]
 #[bench::run(fixtures::setup_b6_1k())]
 fn b6_vlookup_1k(eng: reticula_formula::engine::FormulaEngine) -> u32 {
     fixtures::run_b6_1k(eng)
 }
 
 #[cfg(target_os = "linux")]
-#[gungraun::library_benchmark]
+#[library_benchmark]
 #[bench::run(fixtures::setup_early_cutoff_1k())]
 fn early_cutoff_1k(eng: reticula_formula::engine::FormulaEngine) -> u32 {
     fixtures::run_early_cutoff_1k(eng)
 }
 
 #[cfg(target_os = "linux")]
-#[gungraun::library_benchmark]
+#[library_benchmark]
 #[bench::run(fixtures::setup_b7a_10k())]
 fn b7a_insert_top_row(
     input: (
@@ -164,7 +167,7 @@ fn b7a_insert_top_row(
 }
 
 #[cfg(target_os = "linux")]
-gungraun::library_benchmark_group!(
+library_benchmark_group!(
     name = kernel_callgrind,
     benchmarks = [
         b3_strip_eval_10k,
@@ -176,7 +179,7 @@ gungraun::library_benchmark_group!(
 );
 
 #[cfg(target_os = "linux")]
-gungraun::main!(library_benchmark_groups = kernel_callgrind);
+main!(library_benchmark_groups = kernel_callgrind);
 
 #[cfg(not(target_os = "linux"))]
 fn main() {
