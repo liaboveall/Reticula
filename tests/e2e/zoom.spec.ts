@@ -419,7 +419,8 @@ test.describe("in detail", () => {
   });
 
   test("frozen panes stay where they are", async ({ page }) => {
-    await page.getByTestId("freeze-select").selectOption("row1col1");
+    await page.getByTestId("freeze-select").click();
+    await page.getByTestId("freeze-row1col1").click();
     await nextFrames(page);
     await scrollToRowUnderHeader(page, 500_000);
     for (const notches of [-4, 7, -3]) {

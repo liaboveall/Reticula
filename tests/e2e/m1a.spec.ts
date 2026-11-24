@@ -131,6 +131,7 @@ test("narrow viewport on /app shows mobile fallback with escape hatch", async ({
     "please open this link on desktop",
   );
 
+  await expect(page.getByTestId("open-anyway")).toHaveText("Open editor anyway");
   await page.getByTestId("open-anyway").click();
   await expect(page.getByTestId("engine-status")).toHaveText("ready");
 });

@@ -1,25 +1,10 @@
 import { readFileSync } from "node:fs";
-import { afterEach, describe, expect, it, vi } from "vitest";
-import { fill, type Params } from "../i18n/index.ts";
-import { connectionName, invariantStatusName, invariants, labText, parseSeed } from "./labels.ts";
+import { describe, expect, it } from "vitest";
+import zhEngine from "../i18n/zh-engine.ts";
+import { connectionName, invariantStatusName, invariants, parseSeed } from "./labels.ts";
 
 const rust = (path: string) =>
   readFileSync(new URL(`../../../../crates/${path}`, import.meta.url), "utf8");
-
-/** The module with a translation that shows where it was used. */
-async function marking() {
-  const t = (text: string, params?: Params) => `«${fill(text, params)}»`;
-  vi.resetModules();
-  vi.doMock("../i18n/index.ts", async (original) => ({
-    ...(await original<typeof import("../i18n/index.ts")>()),
-    t,
-  }));
-  return import("./labels.ts");
-}
-
-afterEach(() => {
-  vi.doUnmock("../i18n/index.ts");
-});
 
 describe("the simulator's page", () => {
   it("lists as many invariants as the simulator numbers", () => {
@@ -41,20 +26,18 @@ describe("the simulator's page", () => {
   });
 
   it.each([
-    ["Restarted from persisted OPFS state", "Restarted from persisted OPFS state"],
-    ["Rescued {} terminally rejected edit(s)", "Rescued 3 terminally rejected edit(s)"],
-    ["Server epoch changed {old_epoch} -> {new_epoch}", "Server epoch changed 1 -> 2"],
-    ["Digest mismatch detected at #{seq}; resyncing", "Digest mismatch detected at #7; resyncing"],
-    ["row index {row} out of range", "row index 9000000 out of range"],
-    ["column index {col} out of range", "column index 70000 out of range"],
-    ["invalid cell input: {err:?}", "invalid cell input: Parse {\n at: 1 }"],
-    ["local edit rejected: {err:?}", "local edit rejected: ReadOnly"],
-  ])("translates %j, which the engine writes", async (template, message) => {
+    "Restarted from persisted OPFS state",
+    "Rescued {} terminally rejected edit(s)",
+    "Server epoch changed {old_epoch} -> {new_epoch}",
+    "Digest mismatch detected at #{seq}; resyncing",
+    "row index {row} out of range",
+    "column index {col} out of range",
+    "invalid cell input: {err:?}",
+    "local edit rejected: {err:?}",
+  ])("has a translation of %j, which the engine writes", (template) => {
     expect(rust("sim-wasm/src/lib.rs")).toContain(`"${template}"`);
-    expect(labText(message)).toBe(message);
-    const marked = await marking();
-    expect(marked.labText(message)).toBe(`«${message}»`);
-    expect(marked.labText(`? ${message}`)).toBe(`? ${message}`);
+    const bare = (text: string) => text.replace(/\{[^}]*\}/g, "{}");
+    expect(Object.keys(zhEngine).map(bare)).toContain(bare(template));
   });
 
   it("takes seeds", () => {

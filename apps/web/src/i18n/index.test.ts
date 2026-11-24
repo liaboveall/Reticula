@@ -1,8 +1,12 @@
 import { createElement, Fragment } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { pack } from "../../build/catalogues.ts";
+import type { Catalogue } from "./index.ts";
 
-type I18n = typeof import("./index.ts") & typeof import("./react.ts");
+type I18n = typeof import("./index.ts") &
+  typeof import("./formats.ts") &
+  typeof import("./react.ts");
 
 const CORE = {
   "Insert row above": "在上方插入行",
@@ -62,7 +66,11 @@ async function open(
       return last;
     },
   }));
-  const i18n: I18n = { ...(await import("./index.ts")), ...(await import("./react.ts")) };
+  const i18n: I18n = {
+    ...(await import("./index.ts")),
+    ...(await import("./formats.ts")),
+    ...(await import("./react.ts")),
+  };
   renderToStaticMarkup(createElement(Page, { useLocale: i18n.useLocale }));
   const opened: Opened = { i18n, html, stored, replaceState, renders: () => renders };
   return opened;
@@ -84,6 +92,7 @@ beforeEach(() => {
 afterEach(() => {
   vi.useRealTimers();
   vi.unstubAllGlobals();
+  vi.unstubAllEnvs();
 });
 
 describe("in English", () => {
@@ -132,7 +141,15 @@ describe("in English", () => {
   });
 });
 
-describe("in Chinese", () => {
+describe.each([
+  ["as it is written", (_: string, catalogue: Catalogue) => catalogue],
+  ["as it is built", pack],
+])("in Chinese, %s", (_, form) => {
+  beforeEach(() => {
+    vi.stubEnv("PROD", form === pack);
+    core = () => form("zh-core", CORE);
+  });
+
   it("shows the translations, and English where there is none", async () => {
     const { i18n, html } = await open(ENGLISH, ["zh-CN", "en"]);
     await i18n.initLocale("app");
@@ -188,7 +205,7 @@ describe("in Chinese", () => {
     expect(i18n.getLocale()).toBe("en");
     expect(i18n.t("Insert row above")).toBe("Insert row above");
 
-    arrive(CORE);
+    arrive(form("zh-core", CORE));
     await vi.waitFor(() => expect(renders()).toBe(1));
     expect(i18n.t("Insert row above")).toBe("在上方插入行");
     expect(html.lang).toBe("zh-CN");
@@ -208,13 +225,14 @@ describe("in Chinese", () => {
     await vi.waitFor(() => expect(attempts).toBe(2));
     expect(renders()).toBe(0);
 
-    core = () => CORE;
+    core = () => form("zh-core", CORE);
     await vi.advanceTimersByTimeAsync(4_000);
     await vi.waitFor(() => expect(i18n.getLocale()).toBe("zh-CN"));
     expect(renders()).toBe(1);
   });
 
   it("does not wait for texts that may come later", async () => {
+    const sum = form("zh-functions", { SUM: "求和" });
     let arrive = (_texts: object) => {};
     functions = () => new Promise<object>((resolve) => (arrive = resolve));
     const { i18n, renders } = await open(CHINESE, []);
@@ -222,10 +240,10 @@ describe("in Chinese", () => {
     expect(i18n.t("Insert row above")).toBe("在上方插入行");
     const before = renders();
     await vi.waitFor(() => {
-      arrive({ SUM: "求和" });
+      arrive(sum);
       expect(renders()).toBe(before + 1);
     });
-    expect(i18n.catalogueOf("zh-functions")).toEqual({ SUM: "求和" });
+    expect(i18n.catalogueOf("zh-functions")).toEqual(sum);
     expect(i18n.t("SUM")).toBe("SUM");
     await i18n.setLocale("en");
     expect(i18n.catalogueOf("zh-functions")).toBeUndefined();

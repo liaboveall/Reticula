@@ -1,23 +1,13 @@
-/** The names the grid's inputs have for assistive technology. */
-export interface GridStrings {
-  readonly cellEditor: string;
-  readonly formulaBar: string;
-}
+import type { Grid } from "@reticula/grid";
+import { type RefObject, useEffect } from "react";
+import { t } from "../i18n/index.ts";
 
-function takesStrings(
-  grid: object,
-): grid is { readonly setStrings: (strings: GridStrings) => void } {
-  return "setStrings" in grid && typeof grid.setStrings === "function";
-}
-
-/**
- * Gives a grid its texts in the language of the page. A grid that takes none
- * has its one input named from outside.
- */
-export function passGridStrings(grid: object, host: Element, strings: GridStrings): void {
-  if (takesStrings(grid)) {
-    grid.setStrings(strings);
-  } else {
-    host.querySelector('[role="textbox"]')?.setAttribute("aria-label", strings.cellEditor);
-  }
+/** Hands a grid its texts, again whenever they read differently. */
+export function useGridStrings(grid: RefObject<Grid | null>): void {
+  const name = t("Worksheet grid");
+  const cellEditor = t("Cell editor");
+  const selectedCell = t("Selected cell");
+  useEffect(() => {
+    grid.current?.setStrings({ grid: name, cellEditor, selectedCell });
+  }, [grid, name, cellEditor, selectedCell]);
 }

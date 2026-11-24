@@ -167,6 +167,7 @@ test("formula language service, F4 toggle, cross-sheet point-and-click, sheet de
   // Delete `Sheet2` via tab context menu -> `B1` becomes `#REF!` (`=SUM(#REF!$A$1)`).
   await page.getByTestId("sheet-tab-1").click({ button: "right" });
   await page.getByTestId("ctx-delete-sheet").click();
+  await page.getByTestId("delete-sheet-confirm").click();
   await expect(page.getByTestId("sheet-tab-1")).toHaveCount(0);
   await page.waitForFunction(() => window.__reticula?.textAt(0, 1) === "#REF!");
 
@@ -254,6 +255,24 @@ test("clipboard copy/cut/paste shifts formulas, parses HTML tables, and multi-se
   );
   await page.evaluate(() => window.__reticula?.select(0, 3));
   await expect(page.getByTestId("fmt-bold")).toHaveAttribute("aria-pressed", "true");
+});
+
+test("the menu of another cell opens and stays while a cell is being edited", async ({ page }) => {
+  await openWorkbook(page, "doc=menu-editing");
+  await clickCell(page, 0, 0);
+  await page.keyboard.type("half");
+  await clickCell(page, 2, 1, { button: "right" });
+  const menu = page.getByTestId("context-menu");
+  await expect(menu).toBeVisible();
+  // What was being edited is entered a moment after the press, and takes no focus for that.
+  await expect.poll(() => page.evaluate(() => window.__reticula?.textAt(0, 0))).toBe("half");
+  await page.waitForTimeout(200);
+  await expect(menu).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(menu).toHaveCount(0);
+  await page.keyboard.type("more");
+  await page.keyboard.press("Enter");
+  await expect.poll(() => page.evaluate(() => window.__reticula?.textAt(2, 1))).toBe("more");
 });
 
 test("1,000,000-row formula fill handle encodes in constant O(1) WAL transaction bytes", async ({

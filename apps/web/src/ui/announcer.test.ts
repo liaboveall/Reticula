@@ -89,6 +89,23 @@ describe("announcements", () => {
     expect(page.assertive.textContent).toBe("The engine has stopped");
   });
 
+  it("of a place come after what else there is to say", () => {
+    const announcer = new Announcer();
+    const page = region();
+    announcer.registerPage(page);
+    announcer.announce("B2, 5", { isPlace: true });
+    announcer.announce("Undid: Edit B2.");
+    announcer.announce("B2, 4", { isPlace: true });
+    settle();
+    expect(page.polite.textContent).toBe("Undid: Edit B2. B2, 4");
+    announcer.announce("B3, blank", { isPlace: true });
+    settle();
+    expect(page.polite.textContent).toBe("B3, blank");
+    announcer.announce("Copied");
+    settle();
+    expect(page.polite.textContent).toBe("Copied");
+  });
+
   it("without a text are none", () => {
     const announcer = new Announcer();
     const page = region();
@@ -144,6 +161,22 @@ describe("the region of an announcement", () => {
     settle();
     expect(page.polite.textContent).toBe("Imported");
     expect(upper.history.filter((text) => text !== "")).toEqual([]);
+  });
+
+  it("is not a dialog's that has been opened since, for a place", () => {
+    const announcer = new Announcer();
+    const page = region();
+    announcer.registerPage(page);
+    announcer.announce("A1, blank", { isPlace: true });
+    const upper = dialog();
+    const close = announcer.registerDialog(upper);
+    announcer.announce("Share link created.");
+    settle();
+    expect(upper.polite.textContent).toBe("Share link created.");
+    close();
+    announcer.announce("A1, blank", { isPlace: true });
+    settle();
+    expect(page.polite.textContent).toBe("A1, blank");
   });
 
   it("is given up only by whoever has it", () => {

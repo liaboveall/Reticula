@@ -5,7 +5,8 @@
  * loaded; Chinese texts come in catalogues, which are chunks of their own.
  * Where one English text has two meanings, a suffix tells them apart:
  * `t("Open|verb")` reads "Open". `completeness.test.ts` keeps the catalogues
- * complete, which is why the texts have to be literals.
+ * complete, which is why the texts have to be literals. In the build the
+ * catalogues are in another form than they are written in: see `packed.ts`.
  *
  * What needs React is in `react.ts`: with it in here, the bundler makes a chunk
  * of its own out of React, one more for every page to start with.
@@ -21,24 +22,33 @@ import {
   LOCALE_KEY,
   type Locale,
 } from "./locale-rule.ts";
+import type { PackedMessages } from "./messages.ts";
+import { type Packed, unpack } from "./packed.ts";
 
 export type { Locale } from "./locale-rule.ts";
 
-/** Chinese texts by the English ones. */
+/** Chinese texts by the English ones, or by names. */
 export type Catalogue = Readonly<Record<string, string>>;
+
+export type Lookup = (source: string) => string | undefined;
+
+/** A catalogue as it is written, or as the build has made it. */
+export type LoadedCatalogue = Catalogue | Packed | PackedMessages;
 
 /** What goes into the `{placeholders}` of a text. */
 export type Params = Readonly<Record<string, string | number>>;
 
-const LOADERS: Readonly<Record<CatalogueName, () => Promise<{ readonly default: Catalogue }>>> = {
+const LOADERS: Readonly<
+  Record<CatalogueName, () => Promise<{ readonly default: LoadedCatalogue }>>
+> = {
   "zh-core": () => import("./zh-core.ts"),
   "zh-pages": () => import("./zh-pages.ts"),
+  "zh-landing": () => import("./zh-landing.ts"),
   "zh-labs": () => import("./zh-labs.ts"),
   "zh-engine": () => import("./zh-engine.ts"),
   "zh-functions": () => import("./zh-functions.ts"),
 };
 
-/** The language of numbers and dates. */
 const INTL_TAG: Readonly<Record<Locale, string>> = { en: "en-US", "zh-CN": "zh-CN" };
 
 const MILLISECONDS: Readonly<Record<Locale, string>> = { en: "ms", "zh-CN": "毫秒" };
@@ -54,24 +64,32 @@ let wanted: Locale = "en";
 let shown: Locale = "en";
 let retryTimer: ReturnType<typeof setTimeout> | undefined;
 
-const texts = new Map<string, string>();
-const catalogues = new Map<CatalogueName, Catalogue>();
+const texts: Lookup[] = [];
+/** What has been looked up in them. */
+const translations = new Map<string, string | undefined>();
+const catalogues = new Map<CatalogueName, LoadedCatalogue>();
 const loads = new Map<CatalogueName, Promise<void>>();
 const listeners = new Set<() => void>();
 let revision = 0;
 let hasNewTexts = false;
 
+/** How to look something up in a catalogue. */
+export function textsOf(catalogue: LoadedCatalogue): Lookup {
+  return import.meta.env.PROD
+    ? unpack(catalogue as Packed)
+    : (source) => (Object.hasOwn(catalogue, source) ? (catalogue as Catalogue)[source] : undefined);
+}
+
 function load(name: CatalogueName): Promise<void> {
   let loading = loads.get(name);
   if (!loading) {
-    loading = LOADERS[name]().then((module) => {
-      catalogues.set(name, module.default);
-      for (const [source, translation] of Object.entries(module.default)) {
-        if (!KEYED_OTHERWISE.includes(name)) {
-          texts.set(source, translation);
-        }
-        hasNewTexts = true;
+    loading = LOADERS[name]().then(({ default: catalogue }) => {
+      catalogues.set(name, catalogue);
+      if (!KEYED_OTHERWISE.includes(name)) {
+        texts.push(textsOf(catalogue));
+        translations.clear();
       }
+      hasNewTexts ||= Object.keys(catalogue).length > 0;
     });
     loads.set(name, loading);
     loading.catch(() => loads.delete(name));
@@ -167,13 +185,21 @@ export function localeRevision(): number {
 }
 
 /** A catalogue by itself, if its language is shown and it has been loaded. */
-export function catalogueOf(name: CatalogueName): Catalogue | undefined {
+export function catalogueOf(name: CatalogueName): LoadedCatalogue | undefined {
   return shown === "en" ? undefined : catalogues.get(name);
+}
+
+function translationOf(source: string): string | undefined {
+  if (!translations.has(source)) {
+    const lookUp = texts.find((one) => one(source) !== undefined);
+    translations.set(source, lookUp?.(source));
+  }
+  return translations.get(source);
 }
 
 /** A text in the language shown, without its values. */
 export function textOf(source: string): string {
-  const translation = shown === "en" ? undefined : texts.get(source);
+  const translation = shown === "en" ? undefined : translationOf(source);
   return translation ?? (source.includes("|") ? source.replace(/\|[a-z]+$/, "") : source);
 }
 
@@ -188,25 +214,44 @@ export function t(source: string, params?: Params): string {
   return fill(textOf(source), params);
 }
 
+/** Reads texts in English, whatever language is shown. */
+export function inEnglish(read: () => string): string {
+  const language = shown;
+  shown = "en";
+  try {
+    return read();
+  } finally {
+    shown = language;
+  }
+}
+
 /** A text about `n` of something. Chinese has one form, whose key is `other`. */
 export function tn(n: number, one: string, other: string, params?: Params): string {
   const source = shown === "en" && n === 1 ? one : other;
   return t(source, { n: fmtInt(n), ...params });
 }
 
+/** The language of numbers and dates. */
+export function intlTag(): string {
+  return INTL_TAG[shown];
+}
+
 const numberFormats = new Map<string, Intl.NumberFormat>();
 
-function numberFormat(options: Intl.NumberFormatOptions): Intl.NumberFormat {
+export function numberFormat(options: Intl.NumberFormatOptions): Intl.NumberFormat {
   const key = shown + JSON.stringify(options);
   let format = numberFormats.get(key);
   if (!format) {
-    format = new Intl.NumberFormat(INTL_TAG[shown], options);
+    format = new Intl.NumberFormat(intlTag(), options);
     numberFormats.set(key, format);
   }
   return format;
 }
 
-const digits = (count: number) => ({ minimumFractionDigits: count, maximumFractionDigits: count });
+export const digits = (count: number) => ({
+  minimumFractionDigits: count,
+  maximumFractionDigits: count,
+});
 
 /** A number with a fixed number of decimals. */
 export function fmtNumber(value: number, decimals: number): string {
@@ -220,33 +265,4 @@ export function fmtInt(value: number): string {
 /** A duration in milliseconds, with its unit. */
 export function fmtMs(ms: number): string {
   return `${fmtNumber(ms, 1)} ${MILLISECONDS[shown]}`;
-}
-
-/** A size in bytes, with its unit, which is the same in both languages. */
-export function fmtBytes(bytes: number): string {
-  const steps = ["B", "KB", "MB", "GB"];
-  let value = Number.isFinite(bytes) ? Math.max(0, bytes) : 0;
-  let step = 0;
-  while (value >= 1024 && step < steps.length - 1) {
-    value /= 1024;
-    step++;
-  }
-  const format = numberFormat({ useGrouping: false, ...digits(Math.min(step, 2)) });
-  return `${format.format(value)} ${steps[step]}`;
-}
-
-const DATE_AND_TIME: Intl.DateTimeFormatOptions = {
-  year: "numeric",
-  month: "numeric",
-  day: "numeric",
-  hour: "numeric",
-  minute: "numeric",
-  second: "numeric",
-};
-
-export function fmtDateTime(
-  date: Date | number,
-  options: Intl.DateTimeFormatOptions = DATE_AND_TIME,
-): string {
-  return new Intl.DateTimeFormat(INTL_TAG[shown], options).format(date);
 }

@@ -4,7 +4,6 @@ import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { type Activity, activityText } from "./activity.ts";
-import { passGridStrings } from "./grid-strings.ts";
 import { StatusBar, type StatusBarProps } from "./StatusBar.tsx";
 import type { EngineStatus } from "./types.ts";
 
@@ -126,10 +125,12 @@ describe("the status bar", () => {
     const stats = { frameWork: { samples: 3, p50: 0.12, p99: 2 } } as GridStats;
     const selection = { name: "B2", text: "x" } as Selection;
     const [activity] = ACTIVITIES[0] ?? [];
-    const text = bar({ sheet, stats, selection, activity: activity ?? null }).replace(
-      /<[^>]+>/g,
-      "|",
-    );
+    const text = bar({
+      sheet,
+      stats,
+      selection,
+      activity: activity ? activityText(activity) : null,
+    }).replace(/<[^>]+>/g, "|");
     expect(text.split(/\|+/).filter(Boolean)).toEqual([
       "ready",
       "B2 · x",
@@ -140,24 +141,5 @@ describe("the status bar", () => {
       "kernel 1.2.3",
     ]);
     expect(bar({ opening: true, status: "starting" })).toContain("Opening local workbook…");
-  });
-});
-
-describe("the grid's texts", () => {
-  const strings = { cellEditor: "a", formulaBar: "b" };
-
-  it("are handed to a grid that takes them", () => {
-    const setStrings = vi.fn();
-    const host = { querySelector: vi.fn() };
-    passGridStrings({ setStrings }, host as unknown as Element, strings);
-    expect(setStrings).toHaveBeenCalledExactlyOnceWith(strings);
-    expect(host.querySelector).not.toHaveBeenCalled();
-  });
-
-  it("name the input of one that does not", () => {
-    const setAttribute = vi.fn();
-    const host = { querySelector: () => ({ setAttribute }) };
-    passGridStrings({}, host as unknown as Element, strings);
-    expect(setAttribute).toHaveBeenCalledExactlyOnceWith("aria-label", "a");
   });
 });

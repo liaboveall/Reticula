@@ -33,8 +33,22 @@ const zhLabs: Readonly<Record<string, string>> = {
   "{server} MiB server · 0 lost": "服务器 {server} MiB · 丢失 0 个事务",
   "LibreOffice Differential": "LibreOffice 差分对比",
   "{formulas} formulas · {n} unclassified": "{formulas} 个公式 · {n} 个未归类",
-  "<0>Hardware & Cross-Browser Methodology:</0> Measured on <1>{cpu}</1> ({browser}). Canvas2D scroll work stays at <0>{scroll}</0> p99 in Chrome (<1>margin=2</1> prefetch: {margin}), whereas headed Firefox Canvas2D jump frame work measured <0>{firefox}</0> p99 due to Gecko software 2D text upload overhead — both strictly inside the 16.7 ms 60 Hz frame budget.":
-    "<0>硬件与跨浏览器的测量方法：</0>在 <1>{cpu}</1>（{browser}）上测得。Chrome 中 Canvas2D 滚动的每帧工作耗时 p99 为 <0>{scroll}</0>（<1>margin=2</1> 预取：{margin}）；带界面的 Firefox 中 Canvas2D 跳转帧的 p99 为 <0>{firefox}</0>，原因是 Gecko 软件 2D 上传文字的开销。两者都严格低于 60 Hz 下 16.7 毫秒的帧预算。",
+  "<0>Hardware & Cross-Browser Methodology:</0> Measured on <1>{cpu}</1> ({browser}). Scrolling a thousand cells takes the main thread <0>{scroll}</0> a frame at p99 with Canvas 2D in {chrome}; the frame that completes a jump, <0>{firefox}</0> at p99 and <0>{worst}</0> at worst in Firefox ({date}). At 60 Hz there are 16.7 ms to a frame.":
+    "<0>硬件与跨浏览器的测量方法：</0>在 <1>{cpu}</1>（{browser}）上测得。{chrome} 中用 Canvas 2D 滚动一千个单元格，主线程每帧的耗时 p99 为 <0>{scroll}</0>；Firefox 中完成一次跳转的那一帧，p99 为 <0>{firefox}</0>，最长 <0>{worst}</0>（{date}）。60 Hz 下一帧有 16.7 毫秒。",
+  "{cells} cells, {motion}": "{cells} 格，{motion}",
+  scrolling: "滚动",
+  jumping: "跳转",
+  zooming: "缩放",
+  editing: "编辑",
+  "App: {name}": "应用：{name}",
+  "{name}, repeating texts": "{name}，文字重复",
+  "Canvas 2D": "Canvas 2D",
+  "Canvas 2D and WebGPU: Median (Dot) and p99 (Ring)":
+    "Canvas 2D 与 WebGPU：中位数（点）与 p99（圈）",
+  "{date} · {commit} · {browser} · {cpu} · {hz} Hz. All numbers are in the table below.":
+    "{date} · {commit} · {browser} · {cpu} · {hz} Hz。全部数字在下面的表里。",
+  "Frame work, ms": "每帧工作耗时，毫秒",
+  "Between frames, ms": "帧间隔，毫秒",
   "Cross-Milestone SVG Trends": "各里程碑的趋势",
   "Engine & Startup Latency (ms, Chrome WASM p50)": "引擎与启动延迟（毫秒，Chrome WASM p50）",
   "B9 Collaborative Sync Evolution (p50 ms)": "B9 协作同步的演进（p50，毫秒）",
@@ -95,6 +109,12 @@ const zhLabs: Readonly<Record<string, string>> = {
     "S1/S2 Canvas2D 滚动工作耗时 p99（对比带界面 Firefox 的跳转）",
   "{chrome} (FF {firefox})": "{chrome}（FF {firefox}）",
   "{chrome} (Chrome only)": "{chrome}（仅 Chrome）",
+  "{browser}, main thread {n}× slower": "{browser}，主线程慢 {n} 倍",
+  "B13 {workload}, {renderer}: frame work (p50 / p99 / max)":
+    "B13 {workload}，{renderer}：每帧工作耗时（p50 / p99 / 最长）",
+  "{date} · a frame every {interval} (p99 {tail}) at {hz} Hz · {late} over 16.7 ms":
+    "{date} · {hz} Hz 下每 {interval} 一帧（p99 {tail}）· {late} 超过 16.7 毫秒",
+  "{n} frames with placeholders": "{n} 帧有占位符",
 
   // Formula correctness
   "Formula Correctness & Differential Pipeline": "公式正确性与差分流水线",
@@ -146,6 +166,7 @@ const zhLabs: Readonly<Record<string, string>> = {
   "Diverged / Pending Sync": "未收敛 / 等待同步",
   "{name} ({role})": "{name}（{role}）",
   "Replica {n}": "副本 {n}",
+  "Worksheet of {name}": "{name} 的工作表",
   Converged: "已收敛",
   "initializing|connection": "正在初始化",
   "offline|connection": "离线",
@@ -166,14 +187,6 @@ const zhLabs: Readonly<Record<string, string>> = {
   "Link: Delayed": "连接：延迟",
   "Link: Dropped": "连接：断开",
   "Crash & Restart": "崩溃并重启",
-  "Restarted from persisted OPFS state": "已从 OPFS 中保存的状态重启",
-  "Rescued {n} terminally rejected edit(s)": "已留存 {n} 条最终被拒绝的修改",
-  "Server epoch changed {from} -> {to}": "服务器代际由 {from} 变为 {to}",
-  "Digest mismatch detected at #{seq}; resyncing": "在 #{seq} 处发现摘要不一致，正在重新同步",
-  "row index {row} out of range": "行号 {row} 超出范围",
-  "column index {col} out of range": "列号 {col} 超出范围",
-  "invalid cell input: {reason}": "单元格输入无效：{reason}",
-  "local edit rejected: {reason}": "本地修改被拒绝：{reason}",
   "Wire Queue Inspector ({n} frames queued)": "传输队列（{n} 帧排队中）",
   "No queued network frames. Switch a replica link to Delayed to hold frames for step-by-step inspection.":
     "没有排队的网络帧。把某个副本的连接切换为“延迟”，即可留住网络帧，逐步查看。",

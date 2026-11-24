@@ -241,7 +241,10 @@ test("whatever is done to the sheet looks the same", async ({ page, browser }) =
   });
   await expectSame("after an edit", 6, 1);
 
-  await onEach((page) => page.getByTestId("freeze-select").selectOption("row1col1"));
+  await onEach(async (page) => {
+    await page.getByTestId("freeze-select").click();
+    await page.getByTestId("freeze-row1col1").click();
+  });
   await scrollTo(24 * 300 + 5, 112 * 3 + 40);
   await expectSame("with frozen panes", 310, 5);
 

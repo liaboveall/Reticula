@@ -1,9 +1,12 @@
 import { type RefObject, useEffect, useRef, useState } from "react";
 import { flushSync } from "react-dom";
+import type { EditorHandle } from "./commands/handle.ts";
+import { download } from "./download.ts";
 import type { SafeModeInfo } from "./engine/client.ts";
 import { readRawDocFilesFromOpfs, type WorkbookCatalogEntry } from "./engine/storage.ts";
 import { translateEngineText } from "./i18n/engine-text.ts";
-import { fmtDateTime, fmtInt, t } from "./i18n/index.ts";
+import { fmtDateTime } from "./i18n/formats.ts";
+import { fmtInt, t } from "./i18n/index.ts";
 import { tx } from "./i18n/react.ts";
 import { announce } from "./ui/announcer.ts";
 import { Dialog } from "./ui/Dialog.tsx";
@@ -12,10 +15,14 @@ import { isComposing } from "./ui/focus.ts";
 const MAX_CSV_RAW_BYTES = 256 * 1024 * 1024;
 
 export type LocalModalMode =
-  | { readonly kind: "workbooks" }
+  | {
+      readonly kind: "workbooks";
+      /** Whether it is opened to import a file. */
+      readonly importing?: boolean;
+    }
   | { readonly kind: "safeMode"; readonly info: SafeModeInfo };
 
-export interface LocalModalsProps {
+interface WorkbookDialogsProps {
   readonly mode: LocalModalMode;
   /** What had the focus when it was opened. */
   readonly opener: RefObject<Element | null>;
@@ -83,7 +90,7 @@ function crc32Bytes(data: Uint8Array): number {
  */
 export function packStoreZip(
   files: readonly { readonly filename: string; readonly bytes: Uint8Array }[],
-): Uint8Array {
+): Uint8Array<ArrayBuffer> {
   const enc = new TextEncoder();
   const entries = files.map((f) => ({
     nameBytes: enc.encode(f.filename),
@@ -155,29 +162,10 @@ export function packStoreZip(
   return out;
 }
 
-export function triggerBrowserDownload(filename: string, bytes: ArrayBuffer | Uint8Array): void {
-  const part: BlobPart =
-    bytes instanceof Uint8Array
-      ? new Uint8Array(
-          bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer,
-        )
-      : bytes;
-  const blob = new Blob([part], { type: "application/octet-stream" });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = filename;
-  a.style.display = "none";
-  document.body.append(a);
-  a.click();
-  a.remove();
-  setTimeout(() => URL.revokeObjectURL(url), 2_000);
-}
-
 /** At which parts of an import its progress is read out. */
 const ANNOUNCED_PERCENT = 25;
 
-export default function LocalModals({
+function WorkbookDialogs({
   mode,
   opener,
   onFocusGrid,
@@ -199,14 +187,23 @@ export default function LocalModals({
   onImportRejected,
   onSafeModeOpenFrozen,
   onSafeModeSkipTail,
-}: LocalModalsProps) {
+}: WorkbookDialogsProps) {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const firstActionRef = useRef<HTMLButtonElement>(null);
+  const importRef = useRef<HTMLButtonElement>(null);
+  const isImporting = mode.kind === "workbooks" && mode.importing === true;
   const deletingRef = useRef<WorkbookCatalogEntry | null>(null);
   const [editingDoc, setEditingDoc] = useState<{ id: string; draft: string } | null>(null);
   const [skipCountOverride, setSkipCountOverride] = useState<number | null>(null);
   /** How many raw files were downloaded, or `null` while nobody has asked for them. */
   const [rawFileCount, setRawFileCount] = useState<number | null>(null);
+
+  // Where a browser takes this for nobody's wish, the button has the focus.
+  useEffect(() => {
+    if (isImporting) {
+      fileInputRef.current?.click();
+    }
+  }, [isImporting]);
 
   const csvPart = csvProgress === null ? null : Math.floor(csvProgress.percent / ANNOUNCED_PERCENT);
   useEffect(() => {
@@ -349,7 +346,7 @@ export default function LocalModals({
               onClick={async () => {
                 const files = await readRawDocFilesFromOpfs(info.docId);
                 if (files.length > 0) {
-                  triggerBrowserDownload(`${info.docId}-raw-backup.zip`, packStoreZip(files));
+                  download(`${info.docId}-raw-backup.zip`, packStoreZip(files));
                 }
                 setRawFileCount(files.length);
                 announce(rawFilesText(files.length));
@@ -443,7 +440,7 @@ export default function LocalModals({
       key="workbooks"
       labelledBy="workbooks-heading"
       closeOnBackdrop
-      initialFocus={firstActionRef}
+      initialFocus={isImporting ? importRef : firstActionRef}
       opener={opener}
       fallbackFocus={onFocusGrid}
       onClose={onClose}
@@ -483,6 +480,7 @@ export default function LocalModals({
           {t("+ 1M Sample")}
         </button>
         <button
+          ref={importRef}
           type="button"
           className="toolbar-btn"
           data-testid="import-file-btn"
@@ -631,5 +629,76 @@ export default function LocalModals({
         )}
       </div>
     </Dialog>
+  );
+}
+
+export type LocalModalsProps = Pick<
+  WorkbookDialogsProps,
+  | "mode"
+  | "opener"
+  | "onFocusGrid"
+  | "activeDocId"
+  | "docs"
+  | "storageUsedMb"
+  | "csvProgress"
+  | "onClose"
+> & {
+  readonly handle: EditorHandle;
+  readonly onNotice: (message: string) => void;
+  readonly onRejected: (reason: string) => void;
+};
+
+/** The same, in the editor. */
+export default function LocalModals({ handle, onNotice, onRejected, ...props }: LocalModalsProps) {
+  const { onClose } = props;
+  return (
+    <WorkbookDialogs
+      {...props}
+      onOpenDoc={(docId, title) => {
+        onClose();
+        handle.openWith(docId, { kind: "openDoc", docId, title }, handle.collab() !== null);
+      }}
+      onCreateDoc={(title, template) => handle.createWorkbook(title, template)}
+      onRenameDoc={(docId, title) => {
+        handle.noteChange();
+        handle.sendHost({ kind: "renameDoc", docId, title });
+      }}
+      onDeleteDoc={(docId) => {
+        handle.noteChange();
+        handle.sendHost({ kind: "deleteDoc", docId });
+      }}
+      onExportRtcl={() => handle.sendHost({ kind: "exportRtcl" })}
+      onExportCsv={() => handle.sendHost({ kind: "exportCsv", sheet: handle.sheetId() })}
+      onExportXlsx={() => handle.sendHost({ kind: "exportXlsxSnapshot" })}
+      onImportNotice={onNotice}
+      onImportRtcl={(title, bytes) => {
+        handle.noteChange();
+        onClose();
+        handle.sendHost({ kind: "importRtcl", docId: handle.freshDocId(), title, bytes }, [bytes]);
+      }}
+      onImportCsv={(title, sheetName, bytes) => {
+        handle.noteChange();
+        handle.sendHost(
+          { kind: "importCsv", docId: handle.freshDocId(), title, sheetName, bytes },
+          [bytes],
+        );
+      }}
+      onImportRejected={(reason) => {
+        onClose();
+        onRejected(reason);
+      }}
+      onSafeModeOpenFrozen={(docId) => {
+        onClose();
+        handle.sendHost({ kind: "safeModeRecover", docId, mode: { type: "openFrozen" } });
+      }}
+      onSafeModeSkipTail={(docId, skipCount, salvageMid) => {
+        onClose();
+        handle.sendHost({
+          kind: "safeModeRecover",
+          docId,
+          mode: { type: "skipTail", skipCount, salvageMid },
+        });
+      }}
+    />
   );
 }

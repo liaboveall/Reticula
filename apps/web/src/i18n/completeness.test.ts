@@ -2,6 +2,7 @@ import { readdirSync, readFileSync } from "node:fs";
 import { join, posix, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
+import { checkKeys, pack } from "../../build/catalogues.ts";
 import type { AppRoute } from "../routes.ts";
 import { ALLOWED, PENDING } from "./allowlist.ts";
 import type { Catalogue } from "./index.ts";
@@ -11,11 +12,14 @@ import {
   KEYED_OTHERWISE,
   LATER_CATALOGUES,
 } from "./locale-rule.ts";
+import { hasValues } from "./messages.ts";
+import { type Packed, unpack } from "./packed.ts";
 import { placeholders, type ScannedModule, scanModule, slots } from "./scan.ts";
 import zhCore from "./zh-core.ts";
 import zhEngine from "./zh-engine.ts";
 import zhFunctions from "./zh-functions.ts";
 import zhLabs from "./zh-labs.ts";
+import zhLanding from "./zh-landing.ts";
 import zhPages from "./zh-pages.ts";
 
 // Every text of the interface is translated, every translation is used, and
@@ -27,6 +31,7 @@ const SRC = "apps/web/src";
 const TRANSLATIONS: Readonly<Record<CatalogueName, Catalogue>> = {
   "zh-core": zhCore,
   "zh-pages": zhPages,
+  "zh-landing": zhLanding,
   "zh-labs": zhLabs,
   "zh-engine": zhEngine,
   "zh-functions": zhFunctions,
@@ -204,6 +209,38 @@ describe("translations", () => {
       .map(({ name, key }) => `${name}: ${key}`);
     expect(untidy).toEqual([]);
   });
+});
+
+describe("in the build, translations", () => {
+  const lookups = new Map(
+    (Object.keys(TRANSLATIONS) as CatalogueName[]).map((name) => [
+      name,
+      unpack(pack(name, TRANSLATIONS[name]) as Packed),
+    ]),
+  );
+
+  it("are told apart by their keys", () => {
+    expect(() => checkKeys(new Map(Object.entries(TRANSLATIONS)))).not.toThrow();
+  });
+
+  it.each([...lookups])("of %s are all found", (name, lookUp) => {
+    const lost = Object.entries(TRANSLATIONS[name])
+      // The others are patterns, which `engine-text.test.ts` is about.
+      .filter(([key]) => name !== "zh-engine" || !hasValues(key))
+      .filter(([key, translation]) => lookUp(key) !== translation)
+      .map(([key]) => key);
+    expect(lost).toEqual([]);
+  });
+
+  it.each([...lookups].filter(([name]) => !KEYED_OTHERWISE.includes(name)))(
+    "of %s are found for no other text",
+    (name, lookUp) => {
+      const found = calls
+        .filter(({ key }) => !Object.hasOwn(TRANSLATIONS[name], key) && lookUp(key) !== undefined)
+        .map(({ at, key }) => `${at}: ${key}`);
+      expect(found).toEqual([]);
+    },
+  );
 });
 
 describe("English on the screen", () => {

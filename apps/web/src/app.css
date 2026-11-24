@@ -184,14 +184,26 @@ body {
 }
 
 .name-box {
+  box-sizing: border-box;
   min-width: 76px;
   padding: 2px 6px;
+  border: 0;
   border-right: 1px solid var(--shell-line);
+  background: transparent;
   color: var(--shell-text);
   font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
   font-size: 12px;
   text-align: center;
   white-space: nowrap;
+  cursor: text;
+}
+
+input.name-box {
+  width: 140px;
+  border: 1px solid var(--shell-accent);
+  border-radius: 4px;
+  background: var(--shell-background);
+  text-align: start;
 }
 
 .fx-badge {
@@ -392,17 +404,6 @@ body {
   flex-wrap: wrap;
 }
 
-.fmt-select {
-  height: 24px;
-  padding: 0 6px;
-  border: 1px solid var(--shell-control);
-  border-radius: 4px;
-  background: var(--shell-surface);
-  color: var(--shell-text);
-  font: inherit;
-  font-size: 12px;
-}
-
 .fmt-btn {
   display: inline-flex;
   align-items: center;
@@ -421,7 +422,7 @@ body {
   white-space: nowrap;
 }
 
-.fmt-btn:hover:not(:disabled) {
+.fmt-btn:hover:not([aria-disabled="true"]) {
   border-color: var(--shell-line);
   background: var(--shell-surface);
 }
@@ -432,21 +433,11 @@ body {
   color: var(--shell-accent);
 }
 
-.fmt-btn:disabled,
-.fmt-select:disabled {
-  opacity: 0.45;
-  cursor: default;
-}
-
 .fmt-divider {
   width: 1px;
   height: 16px;
   margin: 0 3px;
   background: var(--shell-line);
-}
-
-.color-popover-wrap {
-  position: relative;
 }
 
 .color-glyph {
@@ -460,21 +451,9 @@ body {
   border-radius: 1px;
 }
 
-.color-popover {
-  position: absolute;
-  top: calc(100% + 4px);
-  left: 0;
-  z-index: 40;
-  padding: 8px;
-  border: 1px solid var(--shell-line);
-  border-radius: 6px;
-  background: var(--shell-surface);
-  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.16);
-}
-
 .color-clear-btn {
   width: 100%;
-  margin-bottom: 6px;
+  margin-top: 6px;
   padding: 4px 8px;
   border: 1px solid var(--shell-control);
   border-radius: 4px;
@@ -545,6 +524,7 @@ body {
 
 /* Worksheet tabs bar */
 .sheetbar {
+  position: relative;
   display: flex;
   align-items: center;
   gap: 2px;
@@ -552,6 +532,11 @@ body {
   border-top: 1px solid var(--shell-line);
   background: var(--shell-background);
   overflow-x: auto;
+}
+
+.sheet-list {
+  display: flex;
+  gap: 2px;
 }
 
 .sheet-tab {
@@ -580,6 +565,9 @@ body {
 }
 
 .sheet-rename-input {
+  position: absolute;
+  top: 2px;
+  box-sizing: border-box;
   width: 110px;
   padding: 3px 6px;
   border: 1px solid var(--shell-accent);
@@ -609,15 +597,13 @@ body {
   color: var(--shell-text);
 }
 
-/* Right-click context menu */
-.context-menu {
-  position: fixed;
+/* Menus, which are placed in the window */
+.popover.context-menu {
   z-index: 60;
   min-width: 196px;
+  max-height: calc(100vh - 16px);
   padding: 4px;
-  border: 1px solid var(--shell-line);
-  border-radius: 6px;
-  background: var(--shell-surface);
+  overflow-y: auto;
   box-shadow: 0 10px 28px rgba(0, 0, 0, 0.2);
 }
 
@@ -638,22 +624,22 @@ body {
   cursor: pointer;
 }
 
-.ctx-item:hover:not(:disabled) {
+.ctx-item:is(:hover, :focus):not([aria-disabled="true"]) {
   background: var(--shell-accent-soft);
   color: var(--shell-accent);
 }
 
-.ctx-item.danger:hover:not(:disabled) {
+.ctx-item.danger:is(:hover, :focus):not([aria-disabled="true"]) {
   background: var(--shell-danger-soft);
   color: var(--shell-danger);
 }
 
-.ctx-item:disabled {
-  opacity: 0.45;
-  cursor: default;
+.ctx-item[aria-checked="true"] {
+  color: var(--shell-accent);
+  font-weight: 600;
 }
 
-.ctx-item kbd {
+.ctx-keys {
   color: var(--shell-muted);
   font-size: 11px;
   font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
@@ -662,7 +648,74 @@ body {
 .ctx-sep {
   height: 1px;
   margin: 4px 2px;
+  border: 0;
   background: var(--shell-line);
+}
+
+/* Commands to be found by their names */
+.dialog.palette {
+  gap: 8px;
+  padding: 10px;
+}
+
+.palette > input {
+  padding: 8px 10px;
+  border: 1px solid var(--shell-control);
+  border-radius: 6px;
+  background: var(--shell-background);
+  color: var(--shell-text);
+  font: inherit;
+}
+
+.palette-list {
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.palette-item {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 5px 10px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.palette-item[aria-selected="true"] {
+  background: var(--shell-accent-soft);
+}
+
+.palette-title {
+  flex: 1;
+}
+
+.palette-group {
+  order: 1;
+  color: var(--shell-muted);
+  font-size: 12px;
+}
+
+.palette-item kbd,
+.keys-table kbd {
+  order: 2;
+  color: var(--shell-muted);
+  font-size: 11px;
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  white-space: nowrap;
+}
+
+.keys-table th {
+  padding: 3px 24px 3px 0;
+  font-weight: normal;
+  text-align: start;
+}
+
+.dialog.small-dialog {
+  width: min(360px, calc(100vw - 40px));
+}
+
+.small-dialog p {
+  margin: 0;
 }
 
 /* Storage badge, lock overlay, Safe Mode & Local Workbooks modals (`14-m1b.md` 7) */
@@ -999,225 +1052,11 @@ body {
   cursor: default;
 }
 
-.zoom-menu {
+.popover.zoom-menu {
   min-width: 72px;
   /* The bar it opens above is all that is below it. */
   max-height: calc(100vh - 48px);
-  overflow-y: auto;
   font-variant-numeric: tabular-nums;
-}
-
-.zoom-menu .ctx-item[aria-checked="true"] {
-  color: var(--shell-accent);
-  font-weight: 600;
-}
-
-/* --- Landing page (/) ---------------------------------------------------- */
-
-.landing {
-  height: 100%;
-  overflow-y: auto;
-  background: var(--shell-surface);
-  color: var(--shell-text);
-}
-
-.landing-nav {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  max-width: 980px;
-  margin: 0 auto;
-  padding: 18px 24px;
-}
-
-.landing-brand {
-  font-size: 16px;
-  font-weight: 700;
-  letter-spacing: 0.02em;
-}
-
-.landing-nav-links {
-  display: flex;
-  align-items: center;
-  gap: 20px;
-}
-
-.landing-link {
-  color: var(--shell-muted);
-  text-decoration: none;
-  font-size: 14px;
-}
-
-.landing-link:hover {
-  color: var(--shell-text);
-}
-
-.landing-cta-small {
-  padding: 6px 12px;
-  border-radius: 6px;
-  background: var(--shell-accent-soft);
-  color: var(--shell-accent);
-  text-decoration: none;
-  font-weight: 600;
-}
-
-.landing-main {
-  max-width: 980px;
-  margin: 0 auto;
-  padding: 24px 24px 64px;
-}
-
-.landing-hero {
-  max-width: 760px;
-  margin-bottom: 36px;
-}
-
-.landing-eyebrow {
-  margin: 0 0 10px;
-  color: var(--shell-accent);
-  font-size: 12px;
-  font-weight: 700;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
-}
-
-.landing-hero h1 {
-  margin: 0 0 16px;
-  font-size: clamp(26px, 4vw, 38px);
-  line-height: 1.2;
-  letter-spacing: -0.02em;
-}
-
-.landing-hero h1 code {
-  font-size: 0.9em;
-  padding: 2px 6px;
-  border-radius: 6px;
-  background: var(--shell-background);
-}
-
-.landing-lead {
-  margin: 0 0 24px;
-  color: var(--shell-muted);
-  font-size: 15px;
-  line-height: 1.6;
-}
-
-.landing-actions {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 12px;
-}
-
-.landing-cta {
-  display: inline-flex;
-  align-items: center;
-  padding: 11px 20px;
-  border-radius: 7px;
-  background: var(--shell-accent);
-  color: var(--shell-on-accent);
-  font-size: 14px;
-  font-weight: 600;
-  text-decoration: none;
-}
-
-.landing-secondary {
-  display: inline-flex;
-  align-items: center;
-  padding: 11px 18px;
-  border: 1px solid var(--shell-control);
-  border-radius: 7px;
-  color: var(--shell-text);
-  font-size: 14px;
-  font-weight: 500;
-  text-decoration: none;
-}
-
-.landing-metrics {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
-  gap: 14px;
-  margin-bottom: 12px;
-}
-
-.metric-card {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  padding: 16px;
-  border: 1px solid var(--shell-line);
-  border-radius: 8px;
-  background: var(--shell-background);
-}
-
-.metric-label {
-  color: var(--shell-muted);
-  font-size: 12px;
-  font-weight: 600;
-}
-
-.metric-value {
-  font-size: 26px;
-  font-weight: 700;
-  font-variant-numeric: tabular-nums;
-  color: var(--shell-text);
-}
-
-.metric-detail {
-  color: var(--shell-muted);
-  font-size: 12px;
-  line-height: 1.45;
-}
-
-.landing-footnote {
-  margin: 0 0 36px;
-  color: var(--shell-muted);
-  font-size: 12px;
-}
-
-.landing-arch h2 {
-  margin: 0 0 12px;
-  font-size: 16px;
-}
-
-.arch-diagram {
-  width: 100%;
-  max-width: 860px;
-  height: auto;
-  border: 1px solid var(--shell-line);
-  border-radius: 8px;
-  background: var(--shell-background);
-}
-
-.arch-box {
-  fill: var(--shell-surface);
-  stroke: var(--shell-line);
-  stroke-width: 1.5;
-}
-
-.arch-title {
-  fill: var(--shell-text);
-  font-size: 13px;
-  font-weight: 700;
-}
-
-.arch-item {
-  fill: var(--shell-muted);
-  font-size: 12px;
-}
-
-.arch-arrow {
-  stroke: var(--shell-accent);
-  stroke-width: 2;
-}
-
-.arch-arrow-head {
-  fill: var(--shell-accent);
-}
-
-.arch-edge {
-  fill: var(--shell-text);
-  font-size: 11.5px;
-  font-weight: 600;
 }
 
 /* --- Mobile fallback (< 768px on /app) ----------------------------------- */
@@ -1333,6 +1172,21 @@ body {
   font-size: 12px;
 }
 
+.mobile-open .primary-btn {
+  width: 100%;
+  min-height: 48px;
+  border: 1px solid var(--shell-accent);
+  border-radius: 8px;
+  font: inherit;
+  font-size: 16px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.mobile-open .mobile-notice {
+  margin-top: 8px;
+}
+
 .mobile-anyway {
   padding: 6px 12px;
   border: 1px solid var(--shell-control);
@@ -1342,6 +1196,175 @@ body {
   font: inherit;
   font-size: 12px;
   cursor: pointer;
+}
+
+/* --- Narrow windows ------------------------------------------------------- */
+
+@media (max-width: 767px) {
+  .titlebar {
+    gap: 8px;
+    padding-inline: 8px;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+
+  .titlebar > * {
+    flex: none;
+  }
+
+  .titlebar .document {
+    max-width: 60vw;
+  }
+}
+
+/* --- A touch screen and nothing else: for looking only --------------------- */
+
+.app[data-touch] {
+  position: relative;
+  touch-action: manipulation;
+}
+
+.app[data-touch] :is(.formatbar, .demo-tip, .titlebar > .toolbar, .storage-badge, .sheet-add-btn) {
+  display: none;
+}
+
+.app[data-touch] .titlebar {
+  gap: 6px;
+  padding: 2px 8px;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.app[data-touch] .titlebar > * {
+  flex: none;
+}
+
+.app[data-touch] .titlebar > .document {
+  flex: 1 1 0;
+  min-width: 0;
+  max-width: none;
+}
+
+.app[data-touch] :is(.titlebar .toolbar-btn, .brand-link) {
+  min-width: 44px;
+  min-height: 44px;
+}
+
+.app[data-touch] .brand-link {
+  display: flex;
+  align-items: center;
+}
+
+/* Safari enlarges the page for what is smaller and has the focus. */
+.app[data-touch] :is(input, select, textarea, .reticula-editor .cm-content) {
+  font-size: 16px;
+}
+
+.app[data-touch] :is(.ctx-item, .palette-item, .listbox-option) {
+  min-height: 44px;
+  font-size: 15px;
+}
+
+.app[data-touch] :is(.ai-btn, .ai-tab, .dialog .toolbar-btn, .drawer-open-btn) {
+  min-height: 40px;
+}
+
+.app[data-touch] :is(.tip-close, .tip-action) {
+  min-width: 40px;
+  min-height: 40px;
+}
+
+.formulabar.touchbar {
+  align-items: flex-start;
+  padding: 0 12px 0 4px;
+  border-top: 1px solid var(--shell-line);
+  border-bottom: 0;
+}
+
+.touchbar .name-box {
+  align-self: stretch;
+  min-width: 64px;
+  min-height: 44px;
+  font-size: 14px;
+}
+
+/* All of what is in a cell, which can be selected and copied. */
+.touchbar-text {
+  flex: 1;
+  min-width: 0;
+  max-height: min(30vh, 140px);
+  padding: 11px 0;
+  overflow-y: auto;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+  font-size: 15px;
+  user-select: text;
+}
+
+.touchbar-text > code {
+  display: block;
+  color: var(--shell-muted);
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-size: 14px;
+}
+
+/* The tabs and the zoom share a row. */
+.app[data-touch] .sheetbar {
+  align-items: stretch;
+  min-height: 48px;
+  padding: 2px 156px 0 8px;
+  box-sizing: border-box;
+  scrollbar-width: none;
+}
+
+.app[data-touch] .sheet-tab {
+  min-width: 44px;
+  min-height: 44px;
+}
+
+.app[data-touch] .statusbar {
+  gap: 8px;
+  padding: 1px 8px;
+}
+
+.app[data-touch] .statusbar > span:not(.spacer, [data-status]),
+.app[data-touch] .statusbar > [data-status="ready"] {
+  display: none;
+}
+
+.app[data-touch]:has(> .sheetbar) > .statusbar {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  z-index: 1;
+  box-sizing: border-box;
+  height: 48px;
+  border: 0;
+  background: none;
+}
+
+.app[data-touch] .zoom-btn {
+  min-width: 44px;
+  min-height: 44px;
+  font-size: 15px;
+}
+
+.app[data-touch] .sw-update-banner {
+  left: 16px;
+  bottom: 104px;
+}
+
+.app[data-touch] .ai-panel {
+  top: 0;
+  bottom: 0;
+  width: min(400px, 100vw);
+  box-sizing: border-box;
+}
+
+.app[data-touch] .history-drawer {
+  bottom: 48px;
+  width: min(360px, 100vw);
+  box-sizing: border-box;
 }
 
 .spill-badge {

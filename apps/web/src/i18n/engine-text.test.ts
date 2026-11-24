@@ -1,14 +1,10 @@
 import { readdirSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import {
-  functionParameters,
-  functionSummary,
-  MESSAGE,
-  NUMBER,
-  translateEngineText,
-} from "./engine-text.ts";
-import { type Catalogue, fill } from "./index.ts";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { pack } from "../../build/catalogues.ts";
+import { functionParameters, functionSummary, translateEngineText } from "./engine-text.ts";
+import { type Catalogue, fill, type LoadedCatalogue } from "./index.ts";
+import { MESSAGE, NUMBER } from "./messages.ts";
 import { placeholders } from "./scan.ts";
 import { isEnglish, messagesIn } from "./scan-engine.ts";
 import zhEngine from "./zh-engine.ts";
@@ -64,15 +60,31 @@ const messages = new Set([
 ]);
 
 /** The catalogues of the language shown. */
-let shown: Readonly<Record<string, Catalogue>> = {};
+let shown: Readonly<Record<string, LoadedCatalogue>> = {};
 
 vi.mock("./index.ts", async (original) => ({
   ...(await original<typeof import("./index.ts")>()),
   catalogueOf: (name: string) => shown[name],
 }));
 
-beforeEach(() => {
-  shown = { "zh-engine": zhEngine, "zh-functions": zhFunctions };
+/** The forms in which catalogues are loaded: as they are written, and as they are built. */
+const FORMS = [
+  ["as it is written", (_: string, catalogue: Catalogue) => catalogue],
+  ["as it is built", pack],
+] as const;
+
+type Form = (typeof FORMS)[number][1];
+
+function show(form: Form): void {
+  vi.stubEnv("PROD", form === pack);
+  shown = {
+    "zh-engine": form("zh-engine", zhEngine),
+    "zh-functions": form("zh-functions", zhFunctions),
+  };
+}
+
+afterEach(() => {
+  vi.unstubAllEnvs();
 });
 
 describe("the messages", () => {
@@ -125,7 +137,9 @@ function valueFor(name: string, at: number): string {
   return MESSAGE.test(name) ? "Select at least one row to move." : `“Größe” ${at}`;
 }
 
-describe("translateEngineText", () => {
+describe.each(FORMS)("translateEngineText, %s", (_, form) => {
+  beforeEach(() => show(form));
+
   it.each(Object.entries(zhEngine))("knows %j by what is written", (message, translation) => {
     const written: Record<string, string> = {};
     const read: Record<string, string> = {};
@@ -209,7 +223,7 @@ describe("translateEngineText", () => {
 
   it("forgets what another catalogue has made of a text", () => {
     expect(translateEngineText("Paste")).toBe("粘贴");
-    shown = { "zh-engine": { Paste: "贴上" } };
+    shown = { "zh-engine": form("zh-engine", { Paste: "贴上" }) };
     expect(translateEngineText("Paste")).toBe("贴上");
     expect(translateEngineText("Delete rows")).toBe("Delete rows");
   });
@@ -221,7 +235,9 @@ describe("translateEngineText", () => {
   });
 });
 
-describe("the functions of formulas", () => {
+describe.each(FORMS)("the functions of formulas, %s", (_, form) => {
+  beforeEach(() => show(form));
+
   const { functions } = fixture;
   const parameters = new Set(functions.flatMap(({ params }) => params));
 

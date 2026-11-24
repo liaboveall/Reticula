@@ -8,7 +8,8 @@ import {
 } from "@reticula/protocol/collab-api";
 import { type FormEvent, type RefObject, useCallback, useEffect, useRef, useState } from "react";
 import { translateEngineText } from "../i18n/engine-text.ts";
-import { fmtDateTime, t } from "../i18n/index.ts";
+import { fmtDateTime } from "../i18n/formats.ts";
+import { t } from "../i18n/index.ts";
 import { apiErrorMessage, pickNearestSnapshotSeq } from "../pages/helpers.ts";
 import { ActionButton } from "../ui/ActionButton.tsx";
 import { announce } from "../ui/announcer.ts";

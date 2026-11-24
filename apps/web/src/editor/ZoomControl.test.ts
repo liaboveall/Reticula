@@ -2,13 +2,15 @@ import { ZOOM_STEPS } from "@reticula/grid";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it, vi } from "vitest";
+import type { EditorHandle } from "../commands/handle.ts";
 import { ZoomControl, ZoomSignal } from "./ZoomControl.tsx";
 
 function markup(zoom: number): string {
   const signal = new ZoomSignal();
   signal.set(zoom);
+  const handle = {} as EditorHandle;
   return renderToStaticMarkup(
-    createElement(ZoomControl, { zoom: signal, onStep: () => {}, onZoom: () => {} }),
+    createElement(ZoomControl, { zoom: signal, handle, onStep: () => {} }),
   );
 }
 

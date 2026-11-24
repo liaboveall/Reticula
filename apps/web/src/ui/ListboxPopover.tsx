@@ -1,6 +1,5 @@
-import { type KeyboardEvent, useId, useRef, useState } from "react";
+import { useId, useState } from "react";
 import { Popover } from "./Popover.tsx";
-import { TypeAhead } from "./roving.ts";
 
 export interface ListboxOption<V extends string> {
   readonly value: V;
@@ -37,40 +36,13 @@ export function ListboxPopover<V extends string>({
 }: ListboxPopoverProps<V>) {
   const id = useId();
   const [open, setOpen] = useState(false);
-  const typeAhead = useRef<TypeAhead | null>(null);
   const chosen = options.find((option) => option.value === value);
-
-  const onItemKeyDown = (event: KeyboardEvent, items: HTMLElement[], index: number) => {
-    typeAhead.current ??= new TypeAhead();
-    const plain = !event.ctrlKey && !event.metaKey && !event.altKey;
-    const isLetter = event.key.length === 1 && event.key !== " ";
-    if (!plain || !(isLetter || (event.key === " " && typeAhead.current.active))) {
-      return;
-    }
-    const found = typeAhead.current.find(
-      event.key,
-      options.map((option) => option.text),
-      index,
-    );
-    // A space that continues no label chooses, as it does otherwise.
-    if (isLetter || found !== null) {
-      event.preventDefault();
-    }
-    if (found !== null) {
-      items[found]?.focus();
-    }
-  };
-
   return (
     <Popover
       label={label}
       kind="listbox"
       open={open}
-      onOpenChange={(next) => {
-        typeAhead.current = null;
-        setOpen(next);
-      }}
-      onItemKeyDown={onItemKeyDown}
+      onOpenChange={setOpen}
       className="listbox"
       trigger={(props) => (
         <button

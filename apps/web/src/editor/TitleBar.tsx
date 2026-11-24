@@ -1,9 +1,17 @@
 import type { SheetInfo } from "@reticula/protocol";
+import { Suspense, useRef, useState } from "react";
 import type { CollabWorkbookTarget } from "../collab/CollabShell.tsx";
-import { translateEngineText } from "../i18n/engine-text.ts";
+import type { EditorHandle } from "../commands/handle.ts";
+import { TITLES } from "../commands/titles.ts";
 import { fmtInt, t } from "../i18n/index.ts";
+import { ActionButton } from "../ui/ActionButton.tsx";
+import { engineText, hint, lazyPart, withKeys } from "./load-later.ts";
+import { keepFocus } from "./ZoomControl.tsx";
+
+const LazyViewMenu = lazyPart(({ ViewMenu }) => ViewMenu);
 
 export interface TitleBarProps {
+  readonly handle: EditorHandle;
   readonly title: string;
   /** The sheet in view, or `null` while there is none to work on. */
   readonly sheet: SheetInfo | null;
@@ -12,16 +20,10 @@ export interface TitleBarProps {
   readonly readOnly: boolean;
   readonly canDeleteRows: boolean;
   readonly storageUsedMb: string;
+  readonly aiOpen: boolean;
+  readonly historyOpen: boolean;
   readonly onNavigate: (path: string) => void;
-  readonly onOpenWorkbooks: () => void;
-  readonly onOpenCloud: () => void;
-  readonly onToggleAi: () => void;
-  readonly onToggleHistory: () => void;
-  readonly onExportRtcl: () => void;
-  readonly onUndo: () => void;
-  readonly onRedo: () => void;
-  readonly onInsertRowAbove: () => void;
-  readonly onDeleteRows: () => void;
+  readonly onCommand: (id: string) => void;
 }
 
 function storagePlace(collabRole: TitleBarProps["collabRole"]): string {
@@ -32,23 +34,20 @@ function storagePlace(collabRole: TitleBarProps["collabRole"]): string {
 }
 
 export function TitleBar({
+  handle,
   title,
   sheet,
   collabRole,
   readOnly,
   canDeleteRows,
   storageUsedMb,
+  aiOpen,
+  historyOpen,
   onNavigate,
-  onOpenWorkbooks,
-  onOpenCloud,
-  onToggleAi,
-  onToggleHistory,
-  onExportRtcl,
-  onUndo,
-  onRedo,
-  onInsertRowAbove,
-  onDeleteRows,
+  onCommand,
 }: TitleBarProps) {
+  const viewRef = useRef<HTMLButtonElement>(null);
+  const [viewOpen, setViewOpen] = useState(false);
   return (
     <header className="titlebar">
       <a
@@ -65,8 +64,9 @@ export function TitleBar({
         type="button"
         className="toolbar-btn"
         data-testid="workbooks-btn"
-        onClick={onOpenWorkbooks}
-        title={t("Manage local browser workbooks, import or export .rtcl / .csv")}
+        aria-haspopup="dialog"
+        onClick={() => onCommand("workbooks")}
+        title={hint("workbooks")}
       >
         {t("Workbooks")}
       </button>
@@ -74,8 +74,9 @@ export function TitleBar({
         type="button"
         className="toolbar-btn"
         data-testid="cloud-menu-btn"
-        onClick={onOpenCloud}
-        title={t("Sign in, create, or share collaborative cloud workbooks")}
+        aria-haspopup="dialog"
+        onClick={() => onCommand("cloud")}
+        title={hint("cloud")}
       >
         {t("Cloud")}
       </button>
@@ -83,8 +84,9 @@ export function TitleBar({
         type="button"
         className="toolbar-btn"
         data-testid="ai-panel-btn"
-        onClick={onToggleAi}
-        title={t("Open AI Analyst draft assistant and recorded demos")}
+        aria-expanded={aiOpen}
+        onClick={() => onCommand("ai")}
+        title={hint("ai")}
       >
         {t("AI")}
       </button>
@@ -92,12 +94,37 @@ export function TitleBar({
         <button
           type="button"
           className="toolbar-btn"
+          onMouseDown={keepFocus}
           data-testid="history-btn"
-          onClick={onToggleHistory}
-          title={t("Browse revision history and named versions")}
+          aria-expanded={historyOpen}
+          onClick={() => onCommand("history")}
+          title={hint("history")}
         >
           {t("History")}
         </button>
+      )}
+      <button
+        ref={viewRef}
+        type="button"
+        className="toolbar-btn"
+        data-testid="view-menu-btn"
+        aria-haspopup="menu"
+        aria-expanded={viewOpen}
+        onMouseDown={keepFocus}
+        onClick={() => setViewOpen((open) => !open)}
+        onKeyDown={(event) => {
+          if (event.key === "ArrowDown") {
+            event.preventDefault();
+            setViewOpen(true);
+          }
+        }}
+      >
+        {t("View")}
+      </button>
+      {viewOpen && (
+        <Suspense fallback={null}>
+          <LazyViewMenu handle={handle} anchor={viewRef} onClose={() => setViewOpen(false)} />
+        </Suspense>
       )}
       {sheet && (
         <span className="document" data-testid="document">
@@ -112,65 +139,64 @@ export function TitleBar({
       <span className="titlebar-spacer" />
       <span className="storage-badge" data-testid="storage-badge">
         {storagePlace(collabRole)} · {t("{size} MB used", { size: storageUsedMb })} ·{" "}
-        <button
-          type="button"
+        <ActionButton
+          inactive={!sheet}
           className="storage-export-link"
           data-testid="export-rtcl-btn"
-          disabled={!sheet}
-          onClick={onExportRtcl}
+          onClick={() => onCommand("exportRtcl")}
         >
           {t("Export .rtcl")}
-        </button>
+        </ActionButton>
       </span>
       <div className="toolbar">
-        <button
-          type="button"
+        <ActionButton
+          inactive={!sheet?.canUndo || readOnly}
           className="toolbar-btn"
+          onMouseDown={keepFocus}
           data-testid="undo-btn"
-          disabled={!sheet?.canUndo || readOnly}
-          onClick={onUndo}
-          title={
+          onClick={() => onCommand("undo")}
+          title={withKeys(
             sheet?.undoLabel
-              ? t("Undo {action} (Ctrl+Z)", { action: translateEngineText(sheet.undoLabel) })
-              : t("Undo (Ctrl+Z)")
-          }
+              ? t("Undo {action}", { action: engineText(sheet.undoLabel) })
+              : TITLES.undo(),
+            "undo",
+          )}
         >
-          ↶ {t("Undo")}
-        </button>
-        <button
-          type="button"
+          ↶ {TITLES.undo()}
+        </ActionButton>
+        <ActionButton
+          inactive={!sheet?.canRedo || readOnly}
           className="toolbar-btn"
+          onMouseDown={keepFocus}
           data-testid="redo-btn"
-          disabled={!sheet?.canRedo || readOnly}
-          onClick={onRedo}
-          title={
+          onClick={() => onCommand("redo")}
+          title={withKeys(
             sheet?.redoLabel
-              ? t("Redo {action} (Ctrl+Y)", { action: translateEngineText(sheet.redoLabel) })
-              : t("Redo (Ctrl+Y)")
-          }
+              ? t("Redo {action}", { action: engineText(sheet.redoLabel) })
+              : TITLES.redo(),
+            "redo",
+          )}
         >
-          ↷ {t("Redo")}
-        </button>
-        <button
-          type="button"
+          ↷ {TITLES.redo()}
+        </ActionButton>
+        <ActionButton
+          inactive={!sheet || readOnly}
           className="toolbar-btn"
+          onMouseDown={keepFocus}
           data-testid="insert-row-above"
-          disabled={!sheet || readOnly}
-          onClick={onInsertRowAbove}
-          title={t("Insert 1 row above the selected row (at row 1 if nothing is selected)")}
+          onClick={() => onCommand("insertRowAbove")}
         >
-          + {t("Insert Row Above")}
-        </button>
-        <button
-          type="button"
+          + {TITLES.insertRowAbove()}
+        </ActionButton>
+        <ActionButton
+          inactive={!sheet || !canDeleteRows}
           className="toolbar-btn"
+          onMouseDown={keepFocus}
           data-testid="delete-rows"
-          disabled={!sheet || !canDeleteRows}
-          onClick={onDeleteRows}
-          title={t("Delete all rows spanned by the current selection")}
+          onClick={() => onCommand("deleteRows")}
         >
-          {t("Delete Selected Rows")}
-        </button>
+          {TITLES.deleteRows()}
+        </ActionButton>
       </div>
     </header>
   );

@@ -1,29 +1,89 @@
 import type { SheetInfo } from "@reticula/protocol";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { translateEngineText } from "../i18n/engine-text.ts";
 import { t } from "../i18n/index.ts";
-import { tx } from "../i18n/react.ts";
+import { announce } from "../ui/announcer.ts";
 
-export interface QuotaBannerProps {
-  readonly message: string | null;
-  readonly onExportRtcl: () => void;
-  readonly onOpenWorkbooks: () => void;
-  readonly onDismiss: () => void;
+/** Has a banner read out that has just appeared: a live region that comes with its text is not. */
+function useAnnounced(text: string, politeness: "polite" | "assertive" = "polite"): void {
+  useEffect(() => announce(text, { politeness }), [text, politeness]);
 }
 
-/** Says that the browser is running out of storage, and what an import left behind. */
-export function QuotaBanner({
+export interface BannersProps {
+  readonly sheet: SheetInfo | null;
+  /** Why the engine refused the last command. */
+  readonly rejected: string | null;
+  readonly onDismissRejected: () => void;
+  /** That the browser is running out of storage, and what an import left behind. */
+  readonly storage: string | null;
+  readonly onDismissStorage: () => void;
+  readonly onExportRtcl: () => void;
+  readonly onOpenWorkbooks: () => void;
+  readonly updateReady: boolean;
+  /** Reloads into the new version; rejects if that did not work out. */
+  readonly onUpdate: () => Promise<void> | undefined;
+  readonly onDismissUpdate: () => void;
+  readonly onResumeRecalc: () => void;
+  readonly isDraft: boolean;
+  readonly onExitDraft: () => void;
+  /** The revision in view, or `null` outside the history. */
+  readonly historySeq: string | null;
+  readonly onReturnLive: () => void;
+}
+
+/** What there is to know about the workbook that is not always the case. */
+export default function Banners(props: BannersProps) {
+  return (
+    <>
+      {props.storage && (
+        <StorageBanner
+          message={props.storage}
+          onExportRtcl={props.onExportRtcl}
+          onOpenWorkbooks={props.onOpenWorkbooks}
+          onDismiss={props.onDismissStorage}
+        />
+      )}
+      {props.updateReady && (
+        <UpdateBanner onApply={props.onUpdate} onDismiss={props.onDismissUpdate} />
+      )}
+      {props.sheet?.recalcFrozen && <FrozenRecalcBanner onResume={props.onResumeRecalc} />}
+      {props.isDraft && <DraftBanner onExit={props.onExitDraft} />}
+      {props.historySeq !== null && (
+        <HistoryBanner seq={props.historySeq} onReturn={props.onReturnLive} />
+      )}
+      {props.rejected && (
+        <div className="rejected-banner" data-testid="rejected-banner">
+          <span>{translateEngineText(props.rejected)}</span>
+          <button
+            type="button"
+            className="tip-close"
+            aria-label={t("Dismiss error")}
+            onClick={props.onDismissRejected}
+          >
+            ×
+          </button>
+        </div>
+      )}
+    </>
+  );
+}
+
+function StorageBanner({
   message,
   onExportRtcl,
   onOpenWorkbooks,
   onDismiss,
-}: QuotaBannerProps) {
-  if (!message) {
-    return null;
-  }
+}: {
+  readonly message: string;
+  readonly onExportRtcl: () => void;
+  readonly onOpenWorkbooks: () => void;
+  readonly onDismiss: () => void;
+}) {
+  const text = translateEngineText(message);
+  useAnnounced(text, "assertive");
   return (
-    <div className="rejected-banner" role="alert" data-testid="quota-banner">
-      <span>{translateEngineText(message)}</span>
+    <div className="rejected-banner" data-testid="quota-banner">
+      <span>{text}</span>
       <div className="banner-actions">
         <button type="button" className="tip-action" onClick={onExportRtcl}>
           {t("Export .rtcl")}
@@ -44,25 +104,21 @@ export function QuotaBanner({
   );
 }
 
-export interface UpdateBannerProps {
-  readonly ready: boolean;
-  /** Reloads into the new version; rejects if that did not work out. */
+function UpdateBanner({
+  onApply,
+  onDismiss,
+}: {
   readonly onApply: () => Promise<void> | undefined;
   readonly onDismiss: () => void;
-}
-
-export function UpdateBanner({ ready, onApply, onDismiss }: UpdateBannerProps) {
+}) {
   const [updating, setUpdating] = useState(false);
-  if (!ready) {
-    return null;
-  }
+  const text = t(
+    "A new version of Reticula is ready. Confirming flushes all open tabs and reloads safely.",
+  );
+  useAnnounced(text);
   return (
-    <div className="sw-update-banner" role="status" data-testid="sw-update-banner">
-      <span>
-        {t(
-          "A new version of Reticula is ready. Confirming flushes all open tabs and reloads safely.",
-        )}
-      </span>
+    <div className="sw-update-banner" data-testid="sw-update-banner">
+      <span>{text}</span>
       <div className="quota-banner-actions">
         <button
           type="button"
@@ -89,22 +145,14 @@ export function UpdateBanner({ ready, onApply, onDismiss }: UpdateBannerProps) {
   );
 }
 
-export interface FrozenRecalcBannerProps {
-  readonly sheet: SheetInfo | null;
-  readonly onResume: () => void;
-}
-
-export function FrozenRecalcBanner({ sheet, onResume }: FrozenRecalcBannerProps) {
-  if (!sheet?.recalcFrozen) {
-    return null;
-  }
+function FrozenRecalcBanner({ onResume }: { readonly onResume: () => void }) {
+  const text = t(
+    "Safe Mode opened this workbook with automatic recalculation paused so you can inspect or edit formulas safely.",
+  );
+  useAnnounced(text);
   return (
-    <div className="frozen-recalc-banner" role="status" data-testid="recalc-frozen-banner">
-      <span>
-        {t(
-          "Safe Mode opened this workbook with automatic recalculation paused so you can inspect or edit formulas safely.",
-        )}
-      </span>
+    <div className="frozen-recalc-banner" data-testid="recalc-frozen-banner">
+      <span>{text}</span>
       <button
         type="button"
         className="tip-action"
@@ -117,52 +165,12 @@ export function FrozenRecalcBanner({ sheet, onResume }: FrozenRecalcBannerProps)
   );
 }
 
-export interface DemoTipProps {
-  readonly sheet: SheetInfo | null;
-  readonly onJump: () => void;
-}
-
-/** What to try first, above the first sheet of a generated sample. */
-export function DemoTip({ sheet, onJump }: DemoTipProps) {
-  const [open, setOpen] = useState(true);
-  if (!open || !sheet || sheet.seed === 0 || sheet.sheet !== 0) {
-    return null;
-  }
+function DraftBanner({ onExit }: { readonly onExit: () => void }) {
+  const text = t("Viewing AI Draft · Main untouched");
+  useAnnounced(text);
   return (
-    <div className="demo-tip" data-testid="demo-tip">
-      <span>
-        {tx(
-          "Try live recalculation: edit parameter cell <0>V1</0> (e.g. type <1>5%</1> and press Enter) to recalculate <2>100,001</2> dependent formulas.",
-          { 0: <code />, 1: <code />, 2: <strong /> },
-        )}
-      </span>
-      <button type="button" className="tip-action" data-testid="jump-v1" onClick={onJump}>
-        {t("Jump to V1")}
-      </button>
-      <button
-        type="button"
-        className="tip-close"
-        aria-label={t("Dismiss tip")}
-        onClick={() => setOpen(false)}
-      >
-        ×
-      </button>
-    </div>
-  );
-}
-
-export interface AiDraftBannerProps {
-  readonly active: boolean;
-  readonly onExit: () => void;
-}
-
-export function AiDraftBanner({ active, onExit }: AiDraftBannerProps) {
-  if (!active) {
-    return null;
-  }
-  return (
-    <div className="history-preview-banner" data-testid="ai-draft-banner" role="status">
-      <span>{t("Viewing AI Draft · Main untouched")}</span>
+    <div className="history-preview-banner" data-testid="ai-draft-banner">
+      <span>{text}</span>
       <button
         type="button"
         className="toolbar-btn primary-btn"
@@ -175,18 +183,9 @@ export function AiDraftBanner({ active, onExit }: AiDraftBannerProps) {
   );
 }
 
-export interface HistoryPreviewBannerProps {
-  /** The revision in view, or `null` outside the history. */
-  readonly seq: string | null;
-  readonly onReturn: () => void;
-}
-
-export function HistoryPreviewBanner({ seq, onReturn }: HistoryPreviewBannerProps) {
-  if (seq === null) {
-    return null;
-  }
+function HistoryBanner({ seq, onReturn }: { readonly seq: string; readonly onReturn: () => void }) {
   return (
-    <div className="history-preview-banner" data-testid="history-preview-banner" role="status">
+    <div className="history-preview-banner" data-testid="history-preview-banner">
       <span>{t("Previewing history #{seq} (read-only)", { seq })}</span>
       <button
         type="button"
@@ -195,31 +194,6 @@ export function HistoryPreviewBanner({ seq, onReturn }: HistoryPreviewBannerProp
         onClick={onReturn}
       >
         {t("Return to Live")}
-      </button>
-    </div>
-  );
-}
-
-export interface RejectedBannerProps {
-  readonly reason: string | null;
-  readonly onDismiss: () => void;
-}
-
-/** Says why the engine refused the last command. */
-export function RejectedBanner({ reason, onDismiss }: RejectedBannerProps) {
-  if (!reason) {
-    return null;
-  }
-  return (
-    <div className="rejected-banner" role="alert" data-testid="rejected-banner">
-      <span>{translateEngineText(reason)}</span>
-      <button
-        type="button"
-        className="tip-close"
-        aria-label={t("Dismiss error")}
-        onClick={onDismiss}
-      >
-        ×
       </button>
     </div>
   );

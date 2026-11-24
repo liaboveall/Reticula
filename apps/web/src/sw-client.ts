@@ -115,7 +115,9 @@ export function createSwClient(options: SwClientOptions): SwClientHandle {
     }
     reg.addEventListener("updatefound", () => {
       const installing = reg.installing;
-      if (!installing) {
+      // The first version replaces none. It may be in control already by the time
+      // the page hears that it has been installed.
+      if (!installing || !reg.active) {
         return;
       }
       installing.addEventListener("statechange", () => {

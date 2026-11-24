@@ -1,7 +1,7 @@
 import type { GridStats, Selection } from "@reticula/grid";
 import type { SheetInfo } from "@reticula/protocol";
 import { fmtMs, t } from "../i18n/index.ts";
-import { type Activity, activityText } from "./activity.ts";
+import { hint } from "./load-later.ts";
 import type { EngineStatus } from "./types.ts";
 import { ZoomControl, type ZoomControlProps } from "./ZoomControl.tsx";
 
@@ -12,7 +12,8 @@ export interface StatusBarProps {
   /** The sheet in view, or `null` while there is none to work on. */
   readonly sheet: SheetInfo | null;
   readonly selection: Selection | null;
-  readonly activity: Activity | null;
+  /** What the engine has done last, or is doing. */
+  readonly activity: string | null;
   readonly stats: GridStats | null;
   readonly kernelVersion: string;
   readonly zoom: ZoomControlProps | null;
@@ -64,23 +65,18 @@ export function StatusBar({
           )}
           {activity && (
             <span className="recalc-pill" data-testid="recalc-status">
-              {activityText(activity)}
+              {activity}
             </span>
           )}
           <span className="spacer" />
           {sheet.seed !== 0 && (
-            <span title={t("The sample is computed from this seed, not downloaded")}>
-              {t("seed {seed}", { seed: sheet.seed })}
-            </span>
+            <span title={hint("seed")}>{t("seed {seed}", { seed: sheet.seed })}</span>
           )}
-          <span data-testid="generation" title={t("Time the engine took to generate or open")}>
+          <span data-testid="generation" title={hint("generation")}>
             {t("generated in {time}", { time: fmtMs(sheet.generationMs) })}
           </span>
           {stats && stats.frameWork.samples > 0 && (
-            <span
-              data-testid="frame-work"
-              title={t("Main-thread work per frame: input, receiving pages and issuing draw calls")}
-            >
+            <span data-testid="frame-work" title={hint("frame")}>
               {t("frame {p50} · p99 {p99}", {
                 p50: fmtMs(stats.frameWork.p50),
                 p99: fmtMs(stats.frameWork.p99),

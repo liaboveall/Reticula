@@ -1,15 +1,17 @@
 import { FormulaBarEditor } from "@reticula/grid";
 import type { WireCompletionItem, WireFormulaAnalysis } from "@reticula/protocol";
 import {
+  type ReactNode,
   type Ref,
   useCallback,
   useEffect,
+  useId,
   useImperativeHandle,
   useLayoutEffect,
   useRef,
   useState,
 } from "react";
-import { functionParameters, functionSummary, translateEngineText } from "./i18n/engine-text.ts";
+import { engineText, laterNow, loadLater } from "./editor/load-later.ts";
 import { t } from "./i18n/index.ts";
 
 export interface FormulaBarHandle {
@@ -24,10 +26,13 @@ export interface FormulaBarHandle {
 
 export interface FormulaBarProps {
   readonly ref?: Ref<FormulaBarHandle>;
-  readonly nameBoxText: string;
+  /** What shows and takes what is selected. */
+  readonly nameBox: ReactNode;
   readonly value: string;
   readonly placeholder: string;
   readonly disabled: boolean;
+  /** Whether it has nothing to do with the page at the moment. */
+  readonly inert?: boolean;
   readonly isEditing: boolean;
   readonly inspected?: boolean;
   readonly isSpillShadow?: boolean;
@@ -48,20 +53,27 @@ export interface FormulaBarProps {
 
 const MAX_VISIBLE_COMPLETIONS = 8;
 
-/** What the engine says about a name that has no comment. */
-const NO_COMMENT = "Named range";
-
-/** What is said about a worksheet or a name. The formula and the comment of a name are the user's. */
-function ownText({ kind }: Pick<WireCompletionItem, "kind">, text: string): string {
-  return kind === "namedRange" && text !== NO_COMMENT ? text : translateEngineText(text);
+/** The help with formulas, once it is there. Typing goes on without it. */
+function useFormulaAssist(wanted: boolean) {
+  const [, setLoaded] = useState(false);
+  useEffect(() => {
+    if (wanted && !laterNow()) {
+      loadLater().then(
+        () => setLoaded(true),
+        () => {},
+      );
+    }
+  }, [wanted]);
+  return laterNow()?.FormulaAssist;
 }
 
 export function FormulaBar({
   ref,
-  nameBoxText,
+  nameBox,
   value,
   placeholder,
   disabled,
+  inert = false,
   isEditing,
   inspected,
   isSpillShadow,
@@ -91,6 +103,13 @@ export function FormulaBar({
       ? assistState
       : { forValue: value, selectedIndex: 0, navigated: false, dismissed: false };
 
+  // What has been chosen from the list of one edit means nothing in the next.
+  useEffect(() => {
+    if (!isEditing) {
+      setAssistState({ forValue: "", selectedIndex: 0, navigated: false, dismissed: false });
+    }
+  }, [isEditing]);
+
   const analysisMatchesValue = analysisSource === undefined || analysisSource === value;
 
   const completions =
@@ -103,22 +122,7 @@ export function FormulaBar({
       : [];
 
   // Keep latest callbacks/completions in a ref for CodeMirror's synchronous DOM keydown listener.
-  const latestRef = useRef({
-    value,
-    inputName,
-    disabled,
-    analysisSource,
-    completions,
-    selectedIndex: currentAssist.selectedIndex,
-    navigatedList: currentAssist.navigated,
-    onChange,
-    onFocus,
-    onCommit,
-    onCancel,
-    onToggleDollar,
-    onAcceptCompletion,
-  });
-  latestRef.current = {
+  const latest = {
     value,
     inputName,
     disabled,
@@ -133,6 +137,8 @@ export function FormulaBar({
     onToggleDollar,
     onAcceptCompletion,
   };
+  const latestRef = useRef(latest);
+  latestRef.current = latest;
 
   const handleAssistKey = useCallback(
     (
@@ -149,23 +155,12 @@ export function FormulaBar({
       if (list.length === 0) {
         return false;
       }
-      if (event.key === "ArrowDown") {
+      const step = event.key === "ArrowDown" ? 1 : event.key === "ArrowUp" ? -1 : 0;
+      if (step !== 0) {
         event.preventDefault();
-        const next = (cur.selectedIndex + 1) % list.length;
         setAssistState({
           forValue: text,
-          selectedIndex: next,
-          navigated: true,
-          dismissed: false,
-        });
-        return true;
-      }
-      if (event.key === "ArrowUp") {
-        event.preventDefault();
-        const next = (cur.selectedIndex - 1 + list.length) % list.length;
-        setAssistState({
-          forValue: text,
-          selectedIndex: next,
+          selectedIndex: (cur.selectedIndex + step + list.length) % list.length,
           navigated: true,
           dismissed: false,
         });
@@ -250,13 +245,22 @@ export function FormulaBar({
     };
   }, [handleAssistKey]);
 
+  // What cannot be typed into is still there to be read.
   useLayoutEffect(() => {
     editorRef.current?.setDisabled(disabled);
+    const content = mountRef.current?.querySelector(".cm-content");
+    if (disabled) {
+      content?.setAttribute("tabindex", "0");
+      content?.setAttribute("aria-readonly", "true");
+    } else {
+      content?.removeAttribute("tabindex");
+      content?.removeAttribute("aria-readonly");
+    }
   }, [disabled]);
 
   // The editor takes its name when it is made; the language may change later.
   useEffect(() => {
-    mountRef.current?.querySelector('[role="textbox"]')?.setAttribute("aria-label", inputName);
+    mountRef.current?.querySelector(".cm-content")?.setAttribute("aria-label", inputName);
   }, [inputName]);
 
   useLayoutEffect(() => {
@@ -293,21 +297,43 @@ export function FormulaBar({
       ? analysis.diagnostics[0]
       : undefined;
   const clampedIndex = Math.min(currentAssist.selectedIndex, Math.max(0, completions.length - 1));
+  const hasList = completions.length > 0;
+  const Assist = useFormulaAssist(signature !== undefined || hasList);
+  const listId = useId();
+  const option = currentAssist.navigated ? `${listId}-${clampedIndex}` : null;
+
+  // Of the two editors of a formula, the list is for the one that has the focus.
+  useEffect(() => {
+    const input = document.activeElement;
+    if (!hasList || !Assist || !input?.matches(".cm-content")) {
+      return;
+    }
+    const attributes = new Map([
+      ["aria-haspopup", "listbox"],
+      ["aria-autocomplete", "list"],
+      ["aria-controls", listId],
+    ]);
+    if (option !== null) {
+      attributes.set("aria-activedescendant", option);
+    }
+    for (const [name, setting] of attributes) {
+      input.setAttribute(name, setting);
+    }
+    return () => {
+      for (const name of attributes.keys()) {
+        input.removeAttribute(name);
+      }
+    };
+  }, [Assist, hasList, listId, option]);
 
   return (
-    <div className="formulabar-wrap">
+    <div className="formulabar-wrap" inert={inert}>
       <div
         className="formulabar"
         data-disabled={disabled ? "" : undefined}
         data-inspected={inspected ? "" : undefined}
       >
-        <output
-          className="name-box"
-          data-testid="name-box"
-          aria-label={t("Selected cell or range")}
-        >
-          {nameBoxText}
-        </output>
+        {nameBox}
         {isSpillShadow && (
           <span
             className="spill-badge"
@@ -335,99 +361,29 @@ export function FormulaBar({
           <span
             className="formula-diag-pill"
             data-testid="formula-diagnostic"
-            title={translateEngineText(firstDiagnostic.message)}
+            title={engineText(firstDiagnostic.message)}
           >
-            {translateEngineText(firstDiagnostic.message)}
+            {engineText(firstDiagnostic.message)}
           </span>
         )}
       </div>
 
-      {(signature || completions.length > 0) && (
-        <div className="formula-assist" data-testid="formula-assist">
-          {signature && (
-            <div className="formula-signature" data-testid="formula-signature">
-              <span className="sig-fn">{signature.name}</span>
-              <span className="sig-punct">(</span>
-              {signature.params.map((param, idx) => {
-                const isLastFixed = idx === signature.params.length - 1;
-                const isActive =
-                  idx === signature.activeParam ||
-                  (isLastFixed &&
-                    signature.activeParam >= signature.params.length &&
-                    param.includes("..."));
-                return (
-                  <span key={`${signature.name}-${param}`}>
-                    {idx > 0 && <span className="sig-punct">, </span>}
-                    <span className={isActive ? "sig-param active" : "sig-param"}>
-                      {functionParameters(param)}
-                    </span>
-                  </span>
-                );
-              })}
-              <span className="sig-punct">)</span>
-              <span className="sig-summary">
-                {functionSummary(signature.name, signature.summary)}
-              </span>
-            </div>
-          )}
-
-          {completions.length > 0 && (
-            <div
-              className="formula-completions"
-              role="listbox"
-              aria-label={t("Formula completions")}
-              data-testid="formula-completions"
-            >
-              {completions.map((item, idx) => {
-                const active = idx === clampedIndex;
-                return (
-                  <div
-                    key={`${item.kind}-${item.label}`}
-                    role="option"
-                    tabIndex={-1}
-                    aria-selected={active}
-                    className={active ? "completion-item active" : "completion-item"}
-                    data-testid={`completion-${item.label}`}
-                    onMouseEnter={() =>
-                      setAssistState((prev) => ({
-                        forValue: value,
-                        selectedIndex: idx,
-                        navigated: prev.forValue === value ? prev.navigated : false,
-                        dismissed: false,
-                      }))
-                    }
-                    onMouseDown={(e) => {
-                      e.preventDefault();
-                      onAcceptCompletion(value, item, focused);
-                    }}
-                  >
-                    <span
-                      className={
-                        item.kind === "function"
-                          ? "completion-kind kind-fn"
-                          : "completion-kind kind-sheet"
-                      }
-                    >
-                      {item.kind === "function" ? "fx" : "⊞"}
-                    </span>
-                    <span className="completion-label">{item.label}</span>
-                    <span className="completion-sig">
-                      {item.kind === "function"
-                        ? functionParameters(item.signature)
-                        : ownText(item, item.signature)}
-                    </span>
-                    <span className="completion-summary">
-                      {item.kind === "function"
-                        ? functionSummary(item.label, item.summary)
-                        : ownText(item, item.summary)}
-                    </span>
-                    {active && <kbd className="completion-kbd">Tab</kbd>}
-                  </div>
-                );
-              })}
-            </div>
-          )}
-        </div>
+      {Assist && (signature || hasList) && (
+        <Assist
+          id={listId}
+          signature={signature}
+          completions={completions}
+          selected={clampedIndex}
+          onSelect={(index) =>
+            setAssistState((prev) => ({
+              forValue: value,
+              selectedIndex: index,
+              navigated: prev.forValue === value ? prev.navigated : false,
+              dismissed: false,
+            }))
+          }
+          onAccept={(item) => onAcceptCompletion(value, item, focused)}
+        />
       )}
     </div>
   );

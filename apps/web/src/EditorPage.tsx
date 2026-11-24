@@ -1,9 +1,11 @@
 import {
   CellEditor,
+  columnName,
   Grid,
   type GridStats,
   type RemotePresenceOverlay,
   type Selection,
+  type Span,
 } from "@reticula/grid";
 import type {
   CollabEvent,
@@ -17,36 +19,31 @@ import type {
 } from "@reticula/protocol";
 import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
 import type { CollabWorkbookTarget } from "./collab/CollabShell.tsx";
-import { withPersonTexts } from "./collab/labels.ts";
+import type {
+  CopiedSnapshot,
+  EditorHandle,
+  EditorState,
+  MutateOptions,
+} from "./commands/handle.ts";
+import { runCommand } from "./commands/run.ts";
 import type { Activity, SheetAction } from "./editor/activity.ts";
-import {
-  AiDraftBanner,
-  DemoTip,
-  FrozenRecalcBanner,
-  HistoryPreviewBanner,
-  QuotaBanner,
-  RejectedBanner,
-  UpdateBanner,
-} from "./editor/Banners.tsx";
-import { ContextMenu } from "./editor/ContextMenu.tsx";
-import { type FormatPatch, FormatToolbar } from "./editor/FormatToolbar.tsx";
-import { passGridStrings } from "./editor/grid-strings.ts";
-import { LockOverlay } from "./editor/LockOverlay.tsx";
+import type { CellInspection } from "./editor/cell-announcer.ts";
+import { DemoTip } from "./editor/DemoTip.tsx";
+import { FormatToolbar } from "./editor/FormatToolbar.tsx";
+import { useGridStrings } from "./editor/grid-strings.ts";
+import { type CellIds, HeldCommits } from "./editor/held-commits.ts";
+import { engineText, laterNow, lazyPart, loadLaterWhenIdle } from "./editor/load-later.ts";
+import { NameBox } from "./editor/NameBox.tsx";
 import { SheetTabs } from "./editor/SheetTabs.tsx";
 import { StatusBar } from "./editor/StatusBar.tsx";
 import { TitleBar } from "./editor/TitleBar.tsx";
-import type {
-  ClipboardAction,
-  EngineState,
-  FreezeChoice,
-  LockOverlayState,
-  SheetRename,
-} from "./editor/types.ts";
-import { useOverlays } from "./editor/use-overlays.ts";
+import { isTouchMode, useTouchMode } from "./editor/touch-mode.ts";
+import type { EditorDialog, EditorMenu, EngineState, LockOverlayState } from "./editor/types.ts";
 import { ViewMemory } from "./editor/view-state.ts";
 import { ZoomSignal } from "./editor/ZoomControl.tsx";
 import {
   type EngineClient,
+  type EngineMessage,
   type HostCommand,
   type SafeModeInfo,
   startEngine,
@@ -58,32 +55,36 @@ import {
   type CollabHookStatus,
   type HookDocStatus,
   hooksRequested,
-  installHooks,
-  type SnapshotSaveResult,
+  touchOverride,
 } from "./hooks.ts";
-import { translateEngineText } from "./i18n/engine-text.ts";
+import type { HookHost } from "./hooks-install.ts";
 import { t } from "./i18n/index.ts";
+import { commandFor, focusScope, swallowContextMenu } from "./keymap.ts";
 import type { LocalModalMode } from "./LocalModals.tsx";
 import type { M3aModalEvent, M3aToolMode } from "./M3aToolsModal.tsx";
 import { rendererPreference } from "./renderer.ts";
 import type { SwClientHandle } from "./sw-client.ts";
+import { announce } from "./ui/announcer.ts";
+import { useMedia } from "./ui/media.ts";
 import { useOpener } from "./ui/opener.ts";
+import { loadPopup } from "./ui/Popover.tsx";
 
 const LazyMobileFallback = lazy(() => import("./editor/MobileFallback.tsx"));
+const LazyTouchBar = lazy(() => import("./editor/TouchBar.tsx"));
 const LazyLocalModals = lazy(() => import("./LocalModals.tsx"));
-const LazyCollabShell = lazy(() => import("./collab/CollabShell.tsx"));
+const LazyCollabHost = lazy(() => import("./collab/CollabHost.tsx"));
 const LazyM3aToolsModal = lazy(() => import("./M3aToolsModal.tsx"));
-const LazyAiPanel = lazy(() => import("./ai/AiPanel.tsx"));
+const LazyAiHost = lazy(() => import("./ai/AiHost.tsx"));
+const LazyBanners = lazyPart(({ Banners }) => Banners);
+const LazyLockOverlay = lazyPart(({ LockOverlay }) => LockOverlay);
+const LazyMenus = lazyPart(({ EditorMenus }) => EditorMenus);
+const LazyDialogs = lazyPart(({ EditorDialogs }) => EditorDialogs);
+const LazyAnnouncements = lazyPart(({ CellAnnouncements }) => CellAnnouncements);
 
-interface InspectedState {
+interface InspectedState extends CellInspection {
   readonly sheet: number;
   readonly rowId: string;
   readonly colId: string;
-  readonly address: string;
-  readonly raw: string;
-  readonly display: string;
-  readonly isFormula: boolean;
-  readonly error: string | null;
   readonly formatCode: string;
   readonly style: WireCellStyle;
   readonly isSpillShadow: boolean;
@@ -102,17 +103,6 @@ interface ActiveEditSession {
   activeRefSpan: [number, number] | null;
   pointPickedSpan: [number, number] | null;
   editRev: number;
-}
-
-interface CopiedSnapshot {
-  readonly sheet: number;
-  readonly firstRow: number;
-  readonly rowCount: number;
-  readonly firstCol: number;
-  readonly colCount: number;
-  readonly cut: boolean;
-  readonly tsv: string;
-  readonly html: string;
 }
 
 const DEFAULT_DOC_ID = "sample-1m";
@@ -214,19 +204,6 @@ function syncUrlForDoc(docId: string): void {
   }
 }
 
-function downloadArrayBuffer(filename: string, bytes: ArrayBuffer): void {
-  const blob = new Blob([bytes], { type: "application/octet-stream" });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = filename;
-  a.style.display = "none";
-  document.body.append(a);
-  a.click();
-  a.remove();
-  setTimeout(() => URL.revokeObjectURL(url), 2_000);
-}
-
 function makeFreshDocId(): string {
   return `wb-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
 }
@@ -236,19 +213,19 @@ export interface EditorPageProps {
 }
 
 export function EditorPage({ onNavigate }: EditorPageProps) {
-  const [isNarrow, setIsNarrow] = useState<boolean>(() =>
-    typeof window !== "undefined" ? window.matchMedia("(max-width: 767px)").matches : false,
-  );
+  const isNarrow = useMedia("(max-width: 767px)");
   const [forceEditor, setForceEditor] = useState(false);
+  const isOpen = useRef(false);
 
-  useEffect(() => {
-    const mq = window.matchMedia("(max-width: 767px)");
-    const listener = (e: MediaQueryListEvent) => setIsNarrow(e.matches);
-    mq.addEventListener("change", listener);
-    return () => mq.removeEventListener("change", listener);
-  }, []);
-
-  if (isNarrow && !forceEditor && !hooksRequested()) {
+  if (
+    isNarrow &&
+    !forceEditor &&
+    // A phone that is turned keeps what it shows.
+    !isOpen.current &&
+    (!hooksRequested() || touchOverride()) &&
+    // Who follows a link to a workbook wants to see that.
+    !(isTouchMode() && readInitialUrlDoc().joinToken)
+  ) {
     return (
       <Suspense fallback={null}>
         <LazyMobileFallback onNavigate={onNavigate} onOpenAnyway={() => setForceEditor(true)} />
@@ -256,6 +233,7 @@ export function EditorPage({ onNavigate }: EditorPageProps) {
     );
   }
 
+  isOpen.current ||= isTouchMode();
   return <DesktopSpreadsheet onNavigate={onNavigate} />;
 }
 
@@ -301,12 +279,21 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
   const persistRequestedRef = useRef<boolean>(false);
 
   const activeSheetRef = useRef<number>(0);
+  /** The sheet that has been asked for, until it is in view. */
+  const askedSheetRef = useRef<number | null>(null);
   const inspectedRef = useRef<InspectedState | null>(null);
   const editSessionRef = useRef<ActiveEditSession | null>(null);
   const analysisRef = useRef<WireFormulaAnalysis | null>(null);
   const lastCopiedRef = useRef<CopiedSnapshot | null>(null);
   const pendingActionRef = useRef<SheetAction>("updated");
-  const pendingJumpRef = useRef<{ sheet: number; row: number; col: number } | null>(null);
+  /** What to do once a sheet is in view. */
+  const pendingJumpRef = useRef<{
+    sheet: number;
+    then: (grid: Grid, arrived: SheetInfo) => void;
+  } | null>(null);
+  const heldRef = useRef<HeldCommits | null>(null);
+  const interceptorsRef = useRef(new Set<(message: EngineMessage) => boolean>());
+  const internalsRef = useRef<HookHost["internals"]["current"]>(null);
 
   const [engine, setEngine] = useState<EngineState>({ status: "starting" });
   const [docId, setDocId] = useState<string>(initialRoute.current.docId);
@@ -335,8 +322,12 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
   } | null>(null);
   const [activity, setActivity] = useState<Activity | null>(null);
   const [rejectedReason, setRejectedReason] = useState<string | null>(null);
-  const { contextMenu, setContextMenu, colorPopover, setColorPopover } = useOverlays();
-  const [renamingSheet, setRenamingSheet] = useState<SheetRename | null>(null);
+  const [menu, setMenu] = useState<EditorMenu | null>(null);
+  const [dialog, setDialog] = useState<EditorDialog | null>(null);
+  const [nameBoxEditing, setNameBoxEditing] = useState(false);
+  /** Whether what the first screen does without has been loaded. */
+  const [isLaterReady, setIsLaterReady] = useState(false);
+  const [renamingSheet, setRenamingSheet] = useState<number | null>(null);
   const [collabMenuOpen, setCollabMenuOpen] = useState(false);
   const [collabTarget, setCollabTarget] = useState<CollabWorkbookTarget | null>(null);
   const [collabConn, setCollabConn] = useState<CollabHookStatus["connection"]>("offline");
@@ -348,8 +339,16 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
   const [historySeekMs, setHistorySeekMs] = useState<number | null>(null);
   const [aiOpen, setAiOpen] = useState(false);
   const [draftPreview, setDraftPreview] = useState(false);
+  const touchMode = useTouchMode(() => {
+    actionsRef.current.commitPending();
+    editorRef.current?.refreshAttributes();
+  });
   const effectiveReadOnly =
-    collabTarget?.role === "viewer" || historyPreviewSeq !== null || draftPreview;
+    touchMode ||
+    collabTarget?.role === "viewer" ||
+    historyPreviewSeq !== null ||
+    draftPreview ||
+    lockOverlay !== null;
   const effectiveReadOnlyRef = useRef(effectiveReadOnly);
   effectiveReadOnlyRef.current = effectiveReadOnly;
   const [unsyncedRescue, setUnsyncedRescue] = useState<{
@@ -417,18 +416,57 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
     refreshStorageEstimate();
   }, [refreshStorageEstimate]);
 
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if ((e.ctrlKey || e.metaKey) && !e.altKey) {
-        const k = e.key.toLowerCase();
-        if (k === "f" || k === "h") {
-          e.preventDefault();
-          setM3aTool({ kind: "find", replace: k === "h" });
-        }
+  const send = useCallback((command: EngineCommand): boolean => {
+    if (!clientRef.current || workerTerminatedRef.current) {
+      return false;
+    }
+    clientRef.current.send(command);
+    return true;
+  }, []);
+
+  /** Sends a change, if anything may be changed. */
+  const mutate = useCallback(
+    (command: EngineCommand, { action, computes = false }: MutateOptions = {}): boolean => {
+      const client = clientRef.current;
+      if (!client || workerTerminatedRef.current || effectiveReadOnlyRef.current) {
+        return false;
       }
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
+      notePersistenceMutation();
+      if (action) {
+        pendingActionRef.current = action;
+      }
+      if (computes) {
+        sendEvalEnv(client);
+      }
+      client.send(command);
+      return true;
+    },
+    [notePersistenceMutation],
+  );
+
+  const openWith = useCallback((docId: string, command: HostCommand, isFresh = false) => {
+    heldRef.current?.clear();
+    if (isFresh || workerTerminatedRef.current || !clientRef.current) {
+      startWorkerFnRef.current?.(docId, command);
+    } else {
+      clientRef.current.sendHost(command);
+    }
+  }, []);
+
+  const openCollab = useCallback((target: CollabWorkbookTarget) => {
+    const { userId, docId, branchId, title, role } = target;
+    const online = !collabManualOfflineRef.current && navigator.onLine !== false;
+    startWorkerFnRef.current?.(
+      docId,
+      { kind: "openCollab", userId, docId, branchId, title, online, readOnly: role === "viewer" },
+      target,
+    );
+  }, []);
+
+  /** Says why something was not done, whatever dialog is open. */
+  const reject = useCallback((reason: string) => {
+    setRejectedReason(reason);
+    announce(engineText(reason), { politeness: "assertive" });
   }, []);
 
   const handleM3aSend = useCallback((cmd: EngineCommand) => {
@@ -437,7 +475,14 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
 
   const handleCloseM3aTool = useCallback(() => setM3aTool(null), []);
 
-  const focusGrid = useCallback(() => editorRef.current?.focus(), []);
+  /** Where the focus goes that has no other place: the grid, or what is in front of it. */
+  const focusGrid = useCallback(
+    () =>
+      (document.querySelector<HTMLElement>(".lock-overlay button") ?? editorRef.current)?.focus(),
+    [],
+  );
+  const dialogOpener = useOpener(dialog !== null);
+  const renameOpener = useOpener(renamingSheet !== null);
   const modalOpener = useOpener(modalMode !== null);
   const toolOpener = useOpener(m3aTool !== null);
   const cloudOpener = useOpener(collabMenuOpen);
@@ -447,18 +492,78 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
   const aiShown = useRef(false);
   aiShown.current ||= aiOpen;
 
-  const handleJumpMatch = useCallback((m: WireSearchMatch) => {
+  const onSheet = useCallback<EditorHandle["onSheet"]>((sheet, then) => {
     const grid = gridRef.current;
-    if (!grid) {
-      return;
-    }
-    if (m.sheet === activeSheetRef.current) {
-      grid.jumpTo(m.row, m.col, false);
+    if (grid && sheet === activeSheetRef.current) {
+      then(grid);
     } else {
-      pendingJumpRef.current = { sheet: m.sheet, row: m.row, col: m.col };
-      clientRef.current?.send({ kind: "switchSheet", sheet: m.sheet });
+      pendingJumpRef.current = { sheet, then };
+      clientRef.current?.send({ kind: "switchSheet", sheet });
     }
   }, []);
+
+  const handleJumpMatch = useCallback(
+    ({ sheet, row, col }: Pick<WireSearchMatch, "sheet" | "row" | "col">) =>
+      onSheet(sheet, (grid) => grid.jumpTo(row, col, false)),
+    [onSheet],
+  );
+
+  /** Does what was to be done once this sheet is in view. */
+  const arriveAt = useCallback((sheet: SheetInfo) => {
+    if (askedSheetRef.current === sheet.sheet) {
+      askedSheetRef.current = null;
+    }
+    const pending = pendingJumpRef.current;
+    if (pending?.sheet === sheet.sheet && gridRef.current) {
+      pendingJumpRef.current = null;
+      pending.then(gridRef.current, sheet);
+    }
+  }, []);
+
+  /** Continues what is in a part of some cells over the rest of them. */
+  const fill = useCallback(
+    (src: Span, dst: Span): boolean => {
+      const filled = mutate(
+        {
+          kind: "fillRange",
+          sheet: activeSheetRef.current,
+          srcFirstRow: src.firstRow,
+          srcRowCount: src.endRow - src.firstRow,
+          srcFirstCol: src.firstCol,
+          srcColCount: src.endCol - src.firstCol,
+          dstFirstRow: dst.firstRow,
+          dstRowCount: dst.endRow - dst.firstRow,
+          dstFirstCol: dst.firstCol,
+          dstColCount: dst.endCol - dst.firstCol,
+        },
+        { action: "filledRange", computes: true },
+      );
+      if (filled) {
+        gridRef.current?.selectRange(
+          { row: dst.firstRow, col: dst.firstCol },
+          { row: dst.endRow - 1, col: dst.endCol - 1 },
+        );
+      }
+      return filled;
+    },
+    [mutate],
+  );
+
+  const autoFillDown = useCallback(
+    (src: Span): boolean =>
+      mutate(
+        {
+          kind: "autoFillDown",
+          sheet: activeSheetRef.current,
+          srcFirstRow: src.firstRow,
+          srcRowCount: src.endRow - src.firstRow,
+          srcFirstCol: src.firstCol,
+          srcColCount: src.endCol - src.firstCol,
+        },
+        { action: "autoFilledColumn", computes: true },
+      ),
+    [mutate],
+  );
 
   const syncGridFormulaRefs = useCallback(
     (grid: Grid, analysis: WireFormulaAnalysis | null, sheetId: number) => {
@@ -501,8 +606,8 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
         return null;
       }
       const rowId = sel.rowId ?? grid.rowIdAt(sel.row);
-      const colId = sel.colId ?? grid.colIdAt(sel.col) ?? String(sel.col);
-      if (rowId === null) {
+      const colId = sel.colId ?? grid.colIdAt(sel.col);
+      if (rowId === null || colId === null) {
         return null;
       }
       const session: ActiveEditSession = {
@@ -555,9 +660,6 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
     if (!element) {
       return;
     }
-    const selfChecks: ((digest: string) => void)[] = [];
-    const stateDigests: ((digest: string) => void)[] = [];
-    const compactWaiters: ((res: SnapshotSaveResult) => void)[] = [];
     const closeWaiters: (() => void)[] = [];
     let lastInspectKey = "";
     let yieldWatchdog = 0;
@@ -604,6 +706,34 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
       );
     };
 
+    /** A cell's name, with the row's number in the sheet itself. */
+    const nameOfCell = ({ row, col }: { readonly row: number; readonly col: number }) =>
+      `${columnName(col)}${grid.displayRowToPhysicalRow(row) + 1}`;
+
+    const idsOf = (row: number, col: number): CellIds | null => {
+      const rowId = grid.rowIdAt(row);
+      const colId = grid.colIdAt(col);
+      return rowId !== null && colId !== null ? { rowId, colId } : null;
+    };
+
+    const editCell = (sheet: number, { rowId, colId }: CellIds, raw: string) =>
+      mutate({ kind: "editCell", sheet, rowId, colId, raw }, { computes: true });
+
+    const held = new HeldCommits({
+      idsOf,
+      sheetId: () => activeSheetRef.current,
+      commit: ({ sheet, raw }, ids) => editCell(sheet, ids, raw),
+      fail: ({ row, col, raw: text }) =>
+        reject(
+          t("The text for {cell} could not be entered: {text}", {
+            cell: nameOfCell({ row, col }),
+            text,
+          }),
+        ),
+    });
+
+    heldRef.current = held;
+
     const grid = new Grid(element, {
       subscribe: (subscription) => {
         if (!workerTerminatedRef.current) {
@@ -617,7 +747,6 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
       onSelectionChange: (sel) => {
         lastSelectionRef.current = sel;
         setSelection(sel);
-        setContextMenu(null);
         requestInspect(sel);
         schedulePresenceSend();
       },
@@ -626,102 +755,36 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
           editor.startEdit("doubleClick");
         }
       },
-      onResizeRows: (sizes) => {
-        const client = clientRef.current;
-        if (!client || workerTerminatedRef.current || effectiveReadOnlyRef.current) {
-          return;
-        }
-        notePersistenceMutation();
-        pendingActionRef.current = "resizedRows";
-        client.send({
-          kind: "resizeRows",
-          sheet: activeSheetRef.current,
-          sizes: sizes.map((s) => ({ run: s.run, sizePx: s.sizePx ?? undefined })),
-        });
-      },
-      onResizeCols: (sizes) => {
-        const client = clientRef.current;
-        if (!client || workerTerminatedRef.current || effectiveReadOnlyRef.current) {
-          return;
-        }
-        notePersistenceMutation();
-        pendingActionRef.current = "resizedColumns";
-        client.send({
-          kind: "resizeCols",
-          sheet: activeSheetRef.current,
-          sizes: sizes.map((s) => ({ run: s.run, sizePx: s.sizePx ?? undefined })),
-        });
-      },
-      onMoveRows: (rows, afterRowId) => {
-        const client = clientRef.current;
-        if (!client || workerTerminatedRef.current || effectiveReadOnlyRef.current) {
-          return;
-        }
-        notePersistenceMutation();
-        pendingActionRef.current = "movedRows";
-        client.send({
-          kind: "moveRows",
-          sheet: activeSheetRef.current,
-          rows: [...rows],
-          afterRowId,
-        });
-      },
-      onMoveCols: (cols, afterColId) => {
-        const client = clientRef.current;
-        if (!client || workerTerminatedRef.current || effectiveReadOnlyRef.current) {
-          return;
-        }
-        notePersistenceMutation();
-        pendingActionRef.current = "movedColumns";
-        client.send({
-          kind: "moveCols",
-          sheet: activeSheetRef.current,
-          cols: [...cols],
-          afterColId,
-        });
-      },
-      onFillRange: (src, dst) => {
-        const client = clientRef.current;
-        if (!client || workerTerminatedRef.current || effectiveReadOnlyRef.current) {
-          return;
-        }
-        notePersistenceMutation();
-        pendingActionRef.current = "filledRange";
-        sendEvalEnv(client);
-        client.send({
-          kind: "fillRange",
-          sheet: activeSheetRef.current,
-          srcFirstRow: src.firstRow,
-          srcRowCount: src.endRow - src.firstRow,
-          srcFirstCol: src.firstCol,
-          srcColCount: src.endCol - src.firstCol,
-          dstFirstRow: dst.firstRow,
-          dstRowCount: dst.endRow - dst.firstRow,
-          dstFirstCol: dst.firstCol,
-          dstColCount: dst.endCol - dst.firstCol,
-        });
-        grid.selectRange(
-          { row: dst.firstRow, col: dst.firstCol },
-          { row: dst.endRow - 1, col: dst.endCol - 1 },
-        );
-      },
-      onAutoFillDown: (src) => {
-        const client = clientRef.current;
-        if (!client || workerTerminatedRef.current || effectiveReadOnlyRef.current) {
-          return;
-        }
-        notePersistenceMutation();
-        pendingActionRef.current = "autoFilledColumn";
-        sendEvalEnv(client);
-        client.send({
-          kind: "autoFillDown",
-          sheet: activeSheetRef.current,
-          srcFirstRow: src.firstRow,
-          srcRowCount: src.endRow - src.firstRow,
-          srcFirstCol: src.firstCol,
-          srcColCount: src.endCol - src.firstCol,
-        });
-      },
+      onResizeRows: (sizes) =>
+        mutate(
+          {
+            kind: "resizeRows",
+            sheet: activeSheetRef.current,
+            sizes: sizes.map((s) => ({ run: s.run, sizePx: s.sizePx ?? undefined })),
+          },
+          { action: "resizedRows" },
+        ),
+      onResizeCols: (sizes) =>
+        mutate(
+          {
+            kind: "resizeCols",
+            sheet: activeSheetRef.current,
+            sizes: sizes.map((s) => ({ run: s.run, sizePx: s.sizePx ?? undefined })),
+          },
+          { action: "resizedColumns" },
+        ),
+      onMoveRows: (rows, afterRowId) =>
+        mutate(
+          { kind: "moveRows", sheet: activeSheetRef.current, rows: [...rows], afterRowId },
+          { action: "movedRows" },
+        ),
+      onMoveCols: (cols, afterColId) =>
+        mutate(
+          { kind: "moveCols", sheet: activeSheetRef.current, cols: [...cols], afterColId },
+          { action: "movedColumns" },
+        ),
+      onFillRange: fill,
+      onAutoFillDown: autoFillDown,
       onPointAndClickRange: (range) => {
         const client = clientRef.current;
         if (!client || workerTerminatedRef.current || !isPointAndClickActive()) {
@@ -750,13 +813,14 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
         });
         return true;
       },
-      onFilterButtonClick: (col) => setM3aTool({ kind: "filter", col }),
+      onFilterButtonClick: (col) => {
+        if (!isTouchMode()) {
+          setM3aTool({ kind: "filter", col });
+        }
+      },
       zoom: true,
       onZoomChange: zoomSignal.set,
-      onContextMenu: (target) => {
-        setColorPopover(null);
-        setContextMenu({ kind: "grid", target });
-      },
+      onContextMenu: (target) => setMenu({ kind: "grid", target }),
     });
     gridRef.current = grid;
 
@@ -771,6 +835,7 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
 
     const editor = new CellEditor(grid, element, {
       isReadOnly: () => effectiveReadOnlyRef.current,
+      isTouchOnly: isTouchMode,
       textOf: (cell) => {
         const cur = grid.selectionDetails();
         if (
@@ -787,47 +852,32 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
         return grid.textAt(cell.row, cell.col) ?? "";
       },
       onCommit: (cell, raw) => {
-        const client = clientRef.current;
         const session = editSessionRef.current;
         clearEditState(grid, editor);
-        if (!client || workerTerminatedRef.current || effectiveReadOnlyRef.current) {
+        if (effectiveReadOnlyRef.current) {
           return;
         }
-        const sheet = session ? session.hostSheet : activeSheetRef.current;
-        const rowId = session ? session.rowId : grid.rowIdAt(cell.row);
-        const sel = grid.selectionDetails();
-        const colId = session
-          ? session.colId
-          : sel && sel.col === cell.col && sel.colId !== null
-            ? sel.colId
-            : (grid.colIdAt(cell.col) ?? String(cell.col));
-        if (rowId !== null) {
-          notePersistenceMutation();
-          sendEvalEnv(client);
-          client.send({
-            kind: "editCell",
-            sheet,
-            rowId,
-            colId,
-            raw,
-          });
+        if (raw !== inspectedRef.current?.raw) {
+          laterNow()?.announceCommit(nameOfCell(cell), raw);
+        }
+        const sheet = session?.hostSheet ?? activeSheetRef.current;
+        const ids = session ?? idsOf(cell.row, cell.col);
+        if (ids) {
+          editCell(sheet, ids, raw);
+        } else {
+          held.hold({ sheet, row: cell.row, col: cell.col, raw });
         }
         if (session && activeSheetRef.current !== session.hostSheet) {
-          client.send({ kind: "switchSheet", sheet: session.hostSheet });
+          send({ kind: "switchSheet", sheet: session.hostSheet });
         }
       },
       onClear: () => {
-        const client = clientRef.current;
         const runs = grid.selectedCellRuns();
-        if (client && !workerTerminatedRef.current && !effectiveReadOnlyRef.current && runs) {
-          notePersistenceMutation();
-          pendingActionRef.current = "clearedCells";
-          client.send({
-            kind: "clearCells",
-            sheet: activeSheetRef.current,
-            rows: runs.rows,
-            cols: runs.cols,
-          });
+        if (runs) {
+          mutate(
+            { kind: "clearCells", sheet: activeSheetRef.current, ...runs },
+            { action: "clearedCells" },
+          );
         }
       },
       onTextChange: (text, editingCell, cursorUtf16) => {
@@ -868,9 +918,9 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
       },
       isPointAndClickActive,
       onJumpEdge: (dir, select) => {
-        const cur = grid.selection;
-        if (cur && !workerTerminatedRef.current) {
-          clientRef.current?.send({
+        const cur = select ? grid.selectionFocus : grid.selection;
+        if (cur) {
+          send({
             kind: "jumpEdge",
             sheet: activeSheetRef.current,
             row: cur.row,
@@ -880,29 +930,10 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
           });
         }
       },
-      onJumpUsedEnd: (select) => {
-        if (!workerTerminatedRef.current) {
-          clientRef.current?.send({
-            kind: "jumpUsedEnd",
-            sheet: activeSheetRef.current,
-            select,
-          });
-        }
-      },
-      onUndo: () => {
-        if (!workerTerminatedRef.current && !effectiveReadOnlyRef.current) {
-          notePersistenceMutation();
-          pendingActionRef.current = "undidAction";
-          clientRef.current?.send({ kind: "undo" });
-        }
-      },
-      onRedo: () => {
-        if (!workerTerminatedRef.current && !effectiveReadOnlyRef.current) {
-          notePersistenceMutation();
-          pendingActionRef.current = "redidAction";
-          clientRef.current?.send({ kind: "redo" });
-        }
-      },
+      onJumpUsedEnd: (select) =>
+        send({ kind: "jumpUsedEnd", sheet: activeSheetRef.current, select }),
+      onUndo: () => mutate({ kind: "undo" }, { action: "undidAction" }),
+      onRedo: () => mutate({ kind: "redo" }, { action: "redidAction" }),
       onCopy: (cut, clipboardData) => {
         const range = grid.selectionRange;
         if (!range || workerTerminatedRef.current) {
@@ -921,7 +952,7 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
             clipboardData.setData("text/plain", single);
           }
         }
-        clientRef.current?.send({
+        send({
           kind: "copyRange",
           sheet: activeSheetRef.current,
           firstRow: range.firstRow,
@@ -932,9 +963,8 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
         });
       },
       onPaste: (tsv, html) => {
-        const client = clientRef.current;
         const range = grid.selectionRange;
-        if (!client || workerTerminatedRef.current || effectiveReadOnlyRef.current || !range) {
+        if (!range) {
           return;
         }
         let effTsv = tsv;
@@ -946,21 +976,39 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
         if (effTsv.length === 0 && !effHtml) {
           return;
         }
-        notePersistenceMutation();
-        sendEvalEnv(client);
-        client.send({
-          kind: "pasteClipboard",
-          sheet: activeSheetRef.current,
-          destRow: range.firstRow,
-          destRowCount: range.endRow - range.firstRow,
-          destCol: range.firstCol,
-          destColCount: range.endCol - range.firstCol,
-          tsv: effTsv,
-          html: effHtml,
-        });
+        mutate(
+          {
+            kind: "pasteClipboard",
+            sheet: activeSheetRef.current,
+            destRow: range.firstRow,
+            destRowCount: range.endRow - range.firstRow,
+            destCol: range.firstCol,
+            destColCount: range.endCol - range.firstCol,
+            tsv: effTsv,
+            html: effHtml,
+          },
+          { computes: true },
+        );
       },
     });
     editorRef.current = editor;
+
+    /** Leaves the workbook to another tab, with what cannot be saved any more kept in view. */
+    const yieldDoc = (id: string, evicted: boolean) => {
+      const session = editSessionRef.current;
+      const { editing } = editor;
+      const lost = session
+        ? { cell: session.address, text: session.source }
+        : editing && { cell: nameOfCell(editing), text: editor.text };
+      clearEditState(grid, editor);
+      setLockOverlay({
+        kind: "yielded",
+        docId: id,
+        title: activeDocTitleRef.current,
+        evicted,
+        lost: lost && lost.text !== inspectedRef.current?.raw ? lost : null,
+      });
+    };
 
     const mountWorkerClient = (
       targetDocId: string,
@@ -972,6 +1020,7 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
       collabTransportRef.current?.dispose();
       collabTransportRef.current = null;
       clientRef.current?.stop();
+      held.clear();
       workerTerminatedRef.current = false;
       activeDocIdRef.current = targetDocId;
       docLifecycleRef.current = initialCmd.kind === "takeOverDoc" ? "takingOver" : "starting";
@@ -999,8 +1048,7 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
       }
 
       const earlyCollabEvents: CollabEvent[] = [];
-      let transportReady = false;
-      let transportQueue = Promise.resolve();
+      let session: ((event: CollabEvent) => void) | null = null;
       let cancelled = false;
 
       const client = startEngine({
@@ -1008,84 +1056,18 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
         initialDocId: targetDocId,
         initialCommand: initialCmd,
         onCollab(event) {
-          switch (event.kind) {
-            case "state": {
-              const prevConn = collabConnRef.current;
-              collabConnRef.current = event.connection;
-              collabReplicaRef.current = event.replica ?? null;
-              collabPendingRef.current = event.pending;
-              setCollabConn(event.connection);
-              setCollabPending(event.pending);
-              if (event.connection === "online" && prevConn !== "online") {
-                sendPresenceNow();
-              }
-              break;
-            }
-            case "presence": {
-              if (event.sheet === activeSheetRef.current) {
-                collabPresencesRef.current = event.overlays;
-                setCollabPresences(event.overlays);
-                grid.setRemotePresences(withPersonTexts(event.overlays));
-              }
-              break;
-            }
-            case "localSelectionMoved": {
-              // Someone else inserted, deleted or moved rows or columns under
-              // the cursor: keep it on the same cells, as long as the user has
-              // not moved it since and is not typing into a cell.
-              const sel = lastSelectionRef.current;
-              const { from, to } = event;
-              if (
-                event.sheet !== activeSheetRef.current ||
-                editor.editing ||
-                !sel ||
-                sel.scope === "all" ||
-                sel.ranges.length !== 1 ||
-                sel.row !== from.row ||
-                sel.col !== from.col
-              ) {
-                break;
-              }
-              const was = from.selection;
-              const now = to.selection;
-              if (!was || !now) {
-                if (!was && !now) {
-                  grid.select({ row: to.row, col: to.col });
-                }
-                break;
-              }
-              if (
-                sel.range.firstRow !== was.firstRow ||
-                sel.range.endRow !== was.endRow ||
-                sel.range.firstCol !== was.firstCol ||
-                sel.range.endCol !== was.endCol
-              ) {
-                break;
-              }
-              grid.selectRange(
-                { row: to.row, col: to.col },
-                {
-                  row: from.row === was.firstRow ? now.endRow - 1 : now.firstRow,
-                  col: from.col === was.firstCol ? now.endCol - 1 : now.firstCol,
-                },
-                sel.scope,
-              );
-              break;
-            }
-            default: {
-              if (!transportReady) {
-                earlyCollabEvents.push(event);
-              } else {
-                const handle = collabTransportRef.current;
-                if (handle) {
-                  transportQueue = transportQueue.then(() => handle.handleEvent(event));
-                }
-              }
-              break;
-            }
+          if (session) {
+            session(event);
+          } else {
+            earlyCollabEvents.push(event);
           }
         },
         onMessage(message) {
+          for (const intercept of interceptorsRef.current) {
+            if (intercept(message)) {
+              return;
+            }
+          }
           switch (message.kind) {
             case "collabOpened": {
               window.clearTimeout(yieldWatchdog);
@@ -1154,13 +1136,7 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
               window.clearTimeout(yieldWatchdog);
               docLifecycleRef.current = "yielded";
               waitingForFileRef.current = false;
-              clearEditState(grid, editor);
-              setLockOverlay({
-                kind: "yielded",
-                docId: message.docId,
-                title: activeDocTitleRef.current,
-                evicted: message.evicted,
-              });
+              yieldDoc(message.docId, message.evicted);
               break;
             }
             case "safeMode": {
@@ -1187,14 +1163,6 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
             case "docSaved": {
               activeSlotRef.current = message.slot;
               refreshStorageEstimate();
-              for (const resolve of compactWaiters.splice(0)) {
-                resolve({
-                  docId: message.docId,
-                  slot: message.slot,
-                  byteLen: message.byteLen,
-                  elapsedMs: message.elapsedMs,
-                });
-              }
               break;
             }
             case "quotaExceeded": {
@@ -1206,16 +1174,17 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
               break;
             }
             case "fileExported": {
-              if (message.format === "xlsxSnapshot") {
-                void import("./xlsx/xlsxBridge.ts")
-                  .then((m) => m.exportSnapshotBytesToXlsx(new Uint8Array(message.bytes)))
-                  .then((res) => downloadArrayBuffer(message.filename, res.bytes))
-                  .catch((err) =>
-                    setRejectedReason(err instanceof Error ? err.message : String(err)),
-                  );
-              } else {
-                downloadArrayBuffer(message.filename, message.bytes);
-              }
+              const { format, filename, bytes } = message;
+              Promise.all([
+                import("./download.ts"),
+                format === "xlsxSnapshot"
+                  ? import("./xlsx/xlsxBridge.ts")
+                      .then((m) => m.exportSnapshotBytesToXlsx(new Uint8Array(bytes)))
+                      .then((res) => res.bytes)
+                  : bytes,
+              ])
+                .then(([{ download }, file]) => download(filename, file))
+                .catch((err) => reject(err instanceof Error ? err.message : String(err)));
               break;
             }
             case "closedForUpdate": {
@@ -1236,11 +1205,7 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
               );
               setHistoryPreviewSeq(message.seq);
               setHistorySeekMs(message.elapsedMs);
-              if (pendingJumpRef.current?.sheet === message.sheet.sheet) {
-                const { row, col } = pendingJumpRef.current;
-                pendingJumpRef.current = null;
-                grid.jumpTo(row, col, false);
-              }
+              arriveAt(message.sheet);
               requestInspect(grid.selectionDetails(), true);
               break;
             }
@@ -1264,7 +1229,6 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
                 setDraftPreview(message.kind === "draftReady");
                 if (message.kind === "draftExited") {
                   grid.setDiffHighlights(null);
-                  grid.setRemotePresences(withPersonTexts(collabPresencesRef.current));
                 }
               }
               requestInspect(grid.selectionDetails(), true);
@@ -1272,6 +1236,10 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
             }
             case "ready":
               performance.mark(MARKS.engineReady);
+              askedSheetRef.current = null;
+              pendingJumpRef.current = null;
+              // What has not been entered by now is not for this workbook.
+              held.clear();
               docLifecycleRef.current = "ready";
               kernelVersionRef.current = message.info.kernelVersion;
               activeSheetRef.current = message.sheet.sheet;
@@ -1314,11 +1282,7 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
                 grid.updateSheet(message.sheet);
               }
               grid.setFilterState(message.sheet.filter ?? null, message.sheet.totalRows);
-              const pendingJump = pendingJumpRef.current;
-              if (pendingJump && pendingJump.sheet === message.sheet.sheet) {
-                pendingJumpRef.current = null;
-                grid.jumpTo(pendingJump.row, pendingJump.col, false);
-              }
+              arriveAt(message.sheet);
               syncGridFormulaRefs(grid, analysisRef.current, message.sheet.sheet);
               setEngine((prev) =>
                 prev.status === "ready" ? { ...prev, sheet: message.sheet } : prev,
@@ -1363,6 +1327,8 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
                 formatCode: message.formatCode,
                 style: message.style,
                 isSpillShadow: message.isSpillShadow,
+                spillAnchor: message.spillAnchor ?? null,
+                valueKind: message.valueKind,
               };
               inspectedRef.current = info;
               setInspected(info);
@@ -1512,6 +1478,13 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
               setActivity({ kind: "recalculating", done: message.done, total: message.total });
               break;
             case "recalcDone":
+              if (pendingActionRef.current === "clearedCells") {
+                pendingActionRef.current = "updated";
+                laterNow()?.announceCleared(
+                  grid.selectionDetails(),
+                  (row) => grid.displayRowToPhysicalRow(row) + 1,
+                );
+              }
               setRejectedReason(null);
               walSeqRef.current = message.sheet.walSeq;
               grid.updateSheet(message.sheet);
@@ -1534,13 +1507,7 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
             case "searchNavigated":
               setM3aEvent(message);
               if (message.found) {
-                const m = message.found;
-                if (m.sheet === activeSheetRef.current) {
-                  grid.jumpTo(m.row, m.col, false);
-                } else {
-                  pendingJumpRef.current = { sheet: m.sheet, row: m.row, col: m.col };
-                  client.send({ kind: "switchSheet", sheet: m.sheet });
-                }
+                handleJumpMatch(message.found);
               }
               break;
             case "replaceCompleted":
@@ -1556,63 +1523,60 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
               refreshStorageEstimate();
               break;
             case "rejected":
+              // What is said of the next change, perhaps by others, is not what was asked for here.
+              pendingActionRef.current = "updated";
               setCsvProgress(null);
-              setRejectedReason(message.reason);
+              askedSheetRef.current = null;
+              reject(message.reason);
               if (collabTargetRef.current) {
                 setCollabNotice(message.reason);
-              }
-              break;
-            case "selfChecked":
-              for (const resolve of selfChecks.splice(0)) {
-                resolve(message.digest);
-              }
-              break;
-            case "stateDigested":
-              for (const resolve of stateDigests.splice(0)) {
-                resolve(message.digest);
               }
               break;
             case "failed":
               docLifecycleRef.current = "failed";
               setEngine({ status: "failed", message: message.message });
+              announce(t("The engine has stopped. Reload the page to start again."), {
+                politeness: "assertive",
+              });
               break;
           }
         },
-        onPage: (page) => grid.acceptPage(page),
+        onPage: (page) => {
+          grid.acceptPage(page);
+          held.retry();
+        },
       });
 
       clientRef.current = client;
 
       if (nextCollab) {
-        void import("./engine/collab-transport.ts").then(({ createCollabTransport }) => {
+        void import("./collab/session.ts").then(({ startCollabSession }) => {
           if (cancelled || clientRef.current !== client) {
             return;
           }
-          const handle = createCollabTransport({
-            docId: nextCollab.docId,
-            shareToken: nextCollab.shareToken,
+          const started = startCollabSession({
+            target: nextCollab,
             client,
-            kernelVersion: () => kernelVersionRef.current,
-            onCheckSwUpdate: () => {
-              void swClientRef.current?.checkForUpdate();
-            },
-            onConnectionEvent: (info) => {
-              if (info.notice) {
-                setCollabNotice(info.notice);
-              } else if (info.authError) {
-                setCollabNotice(info.authError);
-              }
-            },
+            grid,
+            editor,
+            activeSheet: activeSheetRef,
+            selection: lastSelectionRef,
+            kernelVersion: kernelVersionRef,
+            connection: collabConnRef,
+            replica: collabReplicaRef,
+            pending: collabPendingRef,
+            presences: collabPresencesRef,
+            transport: collabTransportRef,
+            manualOffline: collabManualOfflineRef,
+            onConnection: setCollabConn,
+            onPending: setCollabPending,
+            onPresences: setCollabPresences,
+            onNotice: setCollabNotice,
+            onCheckUpdate: () => void swClientRef.current?.checkForUpdate(),
+            sendPresence: sendPresenceNow,
           });
-          if (collabManualOfflineRef.current) {
-            handle.setOffline(true);
-          }
-          collabTransportRef.current = handle;
-          transportReady = true;
-          const queued = earlyCollabEvents.splice(0);
-          for (const ev of queued) {
-            transportQueue = transportQueue.then(() => handle.handleEvent(ev));
-          }
+          session = started;
+          earlyCollabEvents.splice(0).forEach(started);
         });
       }
 
@@ -1656,13 +1620,7 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
             clientRef.current?.stop();
             workerTerminatedRef.current = true;
             docLifecycleRef.current = "yielded";
-            clearEditState(grid, editor);
-            setLockOverlay({
-              kind: "yielded",
-              docId: activeDocIdRef.current,
-              title: activeDocTitleRef.current,
-              evicted: true,
-            });
+            yieldDoc(activeDocIdRef.current, true);
           }, YIELD_WATCHDOG_MS);
         }
       };
@@ -1723,6 +1681,9 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
             // Without it the app works as it does in a browser that has no
             // Service Workers.
             ensureSwClient().catch(() => {});
+            loadLaterWhenIdle(() => setIsLaterReady(true));
+            grid.prepareTouch();
+            loadPopup().catch(() => {});
           }, 0);
         }
         if (firstScreenMarked) {
@@ -1731,51 +1692,7 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
       }
     });
 
-    const removeHooks = hooksRequested()
-      ? installHooks(grid, {
-          selfCheck: () => {
-            clientRef.current?.send({ kind: "selfCheck" });
-            return new Promise<string>((resolve) => selfChecks.push(resolve));
-          },
-          stateDigest: () => {
-            clientRef.current?.send({ kind: "stateDigest" });
-            return new Promise<string>((resolve) => stateDigests.push(resolve));
-          },
-          docStatus: () => ({
-            docId: activeDocIdRef.current,
-            title: activeDocTitleRef.current,
-            engineStatus: docLifecycleRef.current,
-            storageBackend: storageBackendRef.current,
-            activeSlot: activeSlotRef.current,
-            walSeq: walSeqRef.current,
-            waitingForFile: waitingForFileRef.current,
-            safeMode: safeModeRef.current,
-          }),
-          compactSnapshot: () => {
-            clientRef.current?.sendHost({ kind: "forceCompactSnapshot" });
-            return new Promise<SnapshotSaveResult>((resolve) => compactWaiters.push(resolve));
-          },
-          flushAndClose: flushAndCloseDoc,
-          spinWorker: (ms) => {
-            clientRef.current?.sendHost({ kind: "debugSpinWorker", ms });
-          },
-          swStatus: async () => (await ensureSwClient()).status(),
-          checkSwUpdate: async () => (await ensureSwClient()).checkForUpdate(),
-          collabStatus: () => ({
-            active: collabTargetRef.current !== null,
-            docId: collabTargetRef.current?.docId ?? null,
-            connection: collabConnRef.current,
-            replica: collabReplicaRef.current,
-            pending: collabPendingRef.current,
-            slot: collabSlotRef.current,
-            remotePresences: collabPresencesRef.current,
-          }),
-          setCollabOffline: (offline) => {
-            collabManualOfflineRef.current = offline;
-            collabTransportRef.current?.setOffline(offline);
-          },
-        })
-      : undefined;
+    internalsRef.current = { flushAndClose: flushAndCloseDoc, swClient: ensureSwClient };
     const timer = window.setInterval(() => setStats(grid.stats()), STATUS_INTERVAL_MS);
 
     // Release the dedicated worker (and thus its Web Lock and OPFS
@@ -1795,21 +1712,7 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
       if (event.persisted && workerTerminatedRef.current) {
         const currentCollab = collabTargetRef.current;
         if (currentCollab) {
-          mountWorkerClient(
-            currentCollab.docId,
-            {
-              kind: "openCollab",
-              userId: currentCollab.userId,
-              docId: currentCollab.docId,
-              branchId: currentCollab.branchId,
-              title: currentCollab.title,
-              online:
-                !collabManualOfflineRef.current &&
-                (typeof navigator === "undefined" ? true : navigator.onLine !== false),
-              readOnly: currentCollab.role === "viewer",
-            },
-            currentCollab,
-          );
+          openCollab(currentCollab);
         } else {
           mountWorkerClient(activeDocIdRef.current, {
             kind: "openDoc",
@@ -1836,7 +1739,6 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
       swClientRef.current?.dispose();
       swClientRef.current = null;
       stopMarking();
-      removeHooks?.();
       editor.destroy();
       grid.destroy();
       clientRef.current?.stop();
@@ -1846,32 +1748,30 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
       startWorkerFnRef.current = null;
     };
   }, [
+    arriveAt,
+    autoFillDown,
     clearEditState,
     ensureEditSession,
-    notePersistenceMutation,
+    fill,
+    handleJumpMatch,
+    mutate,
+    openCollab,
     refreshStorageEstimate,
+    reject,
     requestAnalyze,
     schedulePresenceSend,
+    send,
     sendPresenceNow,
-    setColorPopover,
-    setContextMenu,
     syncGridFormulaRefs,
     zoomSignal,
   ]);
 
-  const cellEditorName = t("Cell editor");
-  const formulaBarName = t("Formula bar");
-  useEffect(() => {
-    if (gridRef.current && hostRef.current) {
-      passGridStrings(gridRef.current, hostRef.current, {
-        cellEditor: cellEditorName,
-        formulaBar: formulaBarName,
-      });
-    }
-  }, [cellEditorName, formulaBarName]);
+  useGridStrings(gridRef);
 
+  const wasReadOnly = useRef(effectiveReadOnly);
   useEffect(() => {
-    if (effectiveReadOnly) {
+    editorRef.current?.refreshAttributes();
+    if (effectiveReadOnly && !wasReadOnly.current) {
       const grid = gridRef.current;
       const editor = editorRef.current;
       if (grid && editor) {
@@ -1882,10 +1782,19 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
       editor?.cancelExternal(
         focused === document.body || focused.closest(".formulabar, .reticula-grid") !== null,
       );
-      setColorPopover(null);
       setRenamingSheet(null);
     }
-  }, [effectiveReadOnly, clearEditState, setColorPopover]);
+    wasReadOnly.current = effectiveReadOnly;
+  }, [effectiveReadOnly, clearEditState]);
+
+  // What had the focus is gone with the lock.
+  const wasLocked = useRef(false);
+  useEffect(() => {
+    if (wasLocked.current && !lockOverlay && document.activeElement === document.body) {
+      editorRef.current?.focus();
+    }
+    wasLocked.current = lockOverlay !== null;
+  }, [lockOverlay]);
 
   const activeSheetId = engine.status === "ready" ? engine.sheet.sheet : 0;
   const matchingInspected =
@@ -1960,10 +1869,8 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
     if (session && activeSheetRef.current !== session.hostSheet) {
       const { hostSheet, rowId, colId, source } = session;
       clearEditState(grid, editor);
-      notePersistenceMutation();
-      sendEvalEnv(client);
-      client.send({ kind: "editCell", sheet: hostSheet, rowId, colId, raw: source });
-      client.send({ kind: "switchSheet", sheet: hostSheet });
+      mutate({ kind: "editCell", sheet: hostSheet, rowId, colId, raw: source }, { computes: true });
+      send({ kind: "switchSheet", sheet: hostSheet });
       editor.focus();
       return;
     }
@@ -2029,156 +1936,17 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
     requestAnalyze(client, grid, editor);
   };
 
-  const handleInsertRow = (below: boolean) => {
-    const grid = gridRef.current;
-    const client = clientRef.current;
-    if (!grid || !client || workerTerminatedRef.current || effectiveReadOnlyRef.current) {
-      return;
-    }
-    const baseRow = selection ? (below ? selection.range.endRow - 1 : selection.range.firstRow) : 0;
-    const afterPos = below ? baseRow : baseRow - 1;
-    const afterRowId = afterPos < 0 ? null : grid.rowIdAt(afterPos);
-    if (afterPos >= 0 && afterRowId === null) {
-      return;
-    }
-    notePersistenceMutation();
-    pendingActionRef.current = "insertedRows";
-    client.send({
-      kind: "insertRows",
-      sheet: activeSheetRef.current,
-      afterRowId,
-      count: 1,
-    });
-    editorRef.current?.focus();
-  };
-
-  const handleDeleteSelectedRows = () => {
-    const grid = gridRef.current;
-    const client = clientRef.current;
-    if (!grid || !client || workerTerminatedRef.current || effectiveReadOnlyRef.current) {
-      return;
-    }
-    const rows = grid.selectedRowRuns();
-    if (!rows || rows.length === 0) {
-      return;
-    }
-    notePersistenceMutation();
-    pendingActionRef.current = "deletedRows";
-    client.send({
-      kind: "deleteRows",
-      sheet: activeSheetRef.current,
-      rows,
-    });
-    editorRef.current?.focus();
-  };
-
-  const handleInsertCol = (right: boolean) => {
-    const grid = gridRef.current;
-    const client = clientRef.current;
-    if (!grid || !client || workerTerminatedRef.current || effectiveReadOnlyRef.current) {
-      return;
-    }
-    const baseCol = selection ? (right ? selection.range.endCol - 1 : selection.range.firstCol) : 0;
-    const afterPos = right ? baseCol : baseCol - 1;
-    const afterColId = afterPos < 0 ? null : grid.colIdAt(afterPos);
-    if (afterPos >= 0 && afterColId === null) {
-      return;
-    }
-    notePersistenceMutation();
-    pendingActionRef.current = "insertedColumns";
-    client.send({
-      kind: "insertCols",
-      sheet: activeSheetRef.current,
-      afterColId,
-      count: 1,
-    });
-    editorRef.current?.focus();
-  };
-
-  const handleDeleteSelectedCols = () => {
-    const grid = gridRef.current;
-    const client = clientRef.current;
-    if (!grid || !client || workerTerminatedRef.current || effectiveReadOnlyRef.current) {
-      return;
-    }
-    const cols = grid.selectedColRuns();
-    if (!cols || cols.length === 0) {
-      return;
-    }
-    notePersistenceMutation();
-    pendingActionRef.current = "deletedColumns";
-    client.send({
-      kind: "deleteCols",
-      sheet: activeSheetRef.current,
-      cols,
-    });
-    editorRef.current?.focus();
-  };
-
-  const applyFormat = (patch: FormatPatch) => {
-    const grid = gridRef.current;
-    const client = clientRef.current;
-    if (!grid || !client || workerTerminatedRef.current || effectiveReadOnlyRef.current) {
-      return;
-    }
-    const target = grid.selectedFormatTarget();
-    if (!target) {
-      return;
-    }
-    notePersistenceMutation();
-    pendingActionRef.current = "formattedCells";
-    client.send({
-      kind: "setFormat",
-      sheet: activeSheetRef.current,
-      target,
-      ...patch,
-    });
-    editorRef.current?.focus();
-  };
-
-  const handleFreezeChange = (value: FreezeChoice) => {
-    const client = clientRef.current;
-    if (!client || workerTerminatedRef.current || effectiveReadOnlyRef.current) {
-      return;
-    }
-    let frozenRows = 0;
-    let frozenCols = 0;
-    if (value === "row1") {
-      frozenRows = 1;
-    } else if (value === "col1") {
-      frozenCols = 1;
-    } else if (value === "row1col1") {
-      frozenRows = 1;
-      frozenCols = 1;
-    } else if (value === "active" && selection) {
-      frozenRows = Math.min(32, selection.row);
-      frozenCols = Math.min(32, selection.col);
-      if (frozenRows === 0 && frozenCols === 0) {
-        frozenRows = 1;
-      }
-    }
-    notePersistenceMutation();
-    pendingActionRef.current = "updatedFreezePanes";
-    client.send({
-      kind: "setFreeze",
-      sheet: activeSheetRef.current,
-      frozenRows,
-      frozenCols,
-    });
-    editorRef.current?.focus();
-  };
-
-  const handleSwitchSheet = (targetId: number) => {
-    const grid = gridRef.current;
+  /** Shows another sheet. Unless the keys have the focus on its tab, the grid has it then. */
+  const handleSwitchSheet = (targetId: number, keepsFocus: boolean) => {
     const editor = editorRef.current;
     const client = clientRef.current;
-    if (
-      !grid ||
-      !editor ||
-      !client ||
-      workerTerminatedRef.current ||
-      targetId === activeSheetRef.current
-    ) {
+    if (!editor || !client || workerTerminatedRef.current) {
+      return;
+    }
+    if (targetId === (askedSheetRef.current ?? activeSheetRef.current)) {
+      if (!keepsFocus) {
+        editor.focus();
+      }
       return;
     }
     const session = editSessionRef.current;
@@ -2191,98 +1959,42 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
       formulaBarRef.current?.focus();
       return;
     }
-    if (editor.editing) {
-      editor.commitExternal(false);
-    }
-    clearEditState(grid, editor);
+    commitPending();
     pendingActionRef.current = "switchedSheet";
+    askedSheetRef.current = targetId;
     client.send({ kind: "switchSheet", sheet: targetId });
-    editor.focus();
+    if (!keepsFocus) {
+      editor.focus();
+    }
   };
 
-  const handleContextClipboard = async (mode: ClipboardAction) => {
-    const grid = gridRef.current;
-    const client = clientRef.current;
-    setContextMenu(null);
-    if (!grid || !client || workerTerminatedRef.current) {
-      return;
-    }
-    const range = grid.selectionRange;
-    if (!range) {
-      return;
-    }
-    if (mode !== "copy" && effectiveReadOnlyRef.current) {
-      return;
-    }
-    if (mode === "cut" || mode === "copy") {
-      client.send({
-        kind: "copyRange",
-        sheet: activeSheetRef.current,
-        firstRow: range.firstRow,
-        rowCount: range.endRow - range.firstRow,
-        firstCol: range.firstCol,
-        colCount: range.endCol - range.firstCol,
-        cut: mode === "cut",
-      });
-      editorRef.current?.focus();
-      return;
-    }
-    let tsv = "";
-    let html: string | undefined;
-    try {
-      if (typeof navigator !== "undefined" && navigator.clipboard?.readText) {
-        tsv = await navigator.clipboard.readText();
+  /** Accepts what is being typed, and leaves the focus where it is. */
+  const commitPending = () => {
+    if (editorRef.current?.editing || editSessionRef.current) {
+      const { activeElement } = document;
+      handleFormulaBarCommit(false);
+      if (activeElement instanceof HTMLElement) {
+        activeElement.focus({ preventScroll: true });
       }
-    } catch {
-      // Fall back to internal clipboard when browser blocks async clipboard read.
     }
-    if (tsv.length === 0 && lastCopiedRef.current) {
-      tsv = lastCopiedRef.current.tsv;
-      html = lastCopiedRef.current.html;
-    }
-    if (tsv.length > 0 || html) {
-      notePersistenceMutation();
-      sendEvalEnv(client);
-      client.send({
-        kind: "pasteClipboard",
-        sheet: activeSheetRef.current,
-        destRow: range.firstRow,
-        destRowCount: range.endRow - range.firstRow,
-        destCol: range.firstCol,
-        destColCount: range.endCol - range.firstCol,
-        tsv,
-        html,
-      });
-    }
-    editorRef.current?.focus();
   };
 
-  const handleTakeOver = (targetDocId: string) => {
-    if (workerTerminatedRef.current || !clientRef.current) {
-      startWorkerFnRef.current?.(targetDocId, { kind: "takeOverDoc", docId: targetDocId });
-    } else {
-      clientRef.current.sendHost({ kind: "takeOverDoc", docId: targetDocId });
-    }
-  };
+  const handleTakeOver = (docId: string) => openWith(docId, { kind: "takeOverDoc", docId });
 
   const handleCreateNewWorkbook = (title: string, template: "empty" | "sample") => {
-    const newId = makeFreshDocId();
+    const docId = makeFreshDocId();
     notePersistenceMutation();
     setModalMode(null);
     setLockOverlay(null);
-    if (workerTerminatedRef.current || !clientRef.current) {
-      startWorkerFnRef.current?.(newId, { kind: "createDoc", docId: newId, title, template });
-    } else {
-      clientRef.current.sendHost({ kind: "createDoc", docId: newId, title, template });
-    }
+    openWith(docId, { kind: "createDoc", docId, title, template });
   };
 
-  const handleOpenWorkbooksDrawer = () => {
+  const handleOpenWorkbooksDrawer = (importing = false) => {
     if (!workerTerminatedRef.current) {
       clientRef.current?.sendHost({ kind: "listDocs" });
     }
     refreshStorageEstimate();
-    setModalMode({ kind: "workbooks" });
+    setModalMode({ kind: "workbooks", importing });
   };
 
   const handleJumpToV1 = () => {
@@ -2295,119 +2007,181 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
     editorRef.current?.focus();
   };
 
-  const handleExportRtcl = () => clientRef.current?.sendHost({ kind: "exportRtcl" });
-
-  const handleUndoRedo = (kind: "undo" | "redo") => {
-    if (effectiveReadOnlyRef.current) {
-      return;
+  const handleRenameSheet = (tab: SheetTabInfo, name: string | null, byKey: boolean) => {
+    setRenamingSheet(null);
+    if (name !== null) {
+      mutate({ kind: "renameSheet", sheet: tab.id, name }, { action: "renamedSheet" });
     }
-    notePersistenceMutation();
-    pendingActionRef.current = kind === "undo" ? "undidAction" : "redidAction";
-    clientRef.current?.send({ kind });
-    editorRef.current?.focus();
+    if (byKey) {
+      const opener = renameOpener.current;
+      if (opener instanceof HTMLElement && opener.closest(".sheetbar")) {
+        opener.focus();
+      } else {
+        focusGrid();
+      }
+    }
   };
 
-  const handleClearContents = () => {
-    const runs = gridRef.current?.selectedCellRuns();
-    if (runs && !effectiveReadOnlyRef.current) {
-      notePersistenceMutation();
-      pendingActionRef.current = "clearedCells";
-      clientRef.current?.send({
-        kind: "clearCells",
-        sheet: activeSheetRef.current,
-        rows: runs.rows,
-        cols: runs.cols,
-      });
-    }
-    editorRef.current?.focus();
-  };
-
-  const handleToggleFilter = () => {
-    if (!readySheet) {
-      return;
-    }
-    if (readySheet.filter) {
-      clientRef.current?.send({ kind: "clearFilter", sheet: readySheet.sheet });
-      return;
-    }
-    const r = selection?.range;
-    const headerRow = r ? r.firstRow : 0;
-    const lastRow =
-      r && r.endRow - r.firstRow > 1
-        ? r.endRow - 1
-        : Math.min(readySheet.rows - 1, headerRow + 10_000);
-    const firstCol = r ? r.firstCol : 0;
-    const lastCol =
-      r && r.endCol - r.firstCol > 1
-        ? r.endCol - 1
-        : Math.min(readySheet.cols - 1, Math.max(firstCol, 25));
-    clientRef.current?.send({
-      kind: "setFilterTable",
-      sheet: readySheet.sheet,
-      headerRow,
-      lastRow,
-      firstCol,
-      lastCol,
-    });
-  };
-
-  const handleRenameSheet = (tab: SheetTabInfo, name: string) => {
-    notePersistenceMutation();
-    pendingActionRef.current = "renamedSheet";
-    clientRef.current?.send({ kind: "renameSheet", sheet: tab.id, name });
-  };
-
-  const handleAddSheet = (afterSheet: number) => {
-    if (effectiveReadOnlyRef.current) {
-      return;
-    }
-    notePersistenceMutation();
-    pendingActionRef.current = "addedSheet";
-    clientRef.current?.send({ kind: "addSheet", afterSheet });
-    editorRef.current?.focus();
-  };
-
-  const handleMoveSheet = (tab: SheetTabInfo, afterSheet: number | undefined) => {
-    if (effectiveReadOnlyRef.current) {
-      return;
-    }
-    notePersistenceMutation();
-    pendingActionRef.current = "reorderedSheets";
-    clientRef.current?.send({ kind: "moveSheet", sheet: tab.id, afterSheet });
-  };
-
-  const handleDeleteSheet = (tab: SheetTabInfo) => {
-    if (effectiveReadOnlyRef.current) {
-      return;
-    }
-    notePersistenceMutation();
-    pendingActionRef.current = "deletedSheet";
-    clientRef.current?.send({ kind: "deleteSheet", sheet: tab.id });
+  /** Does what a banner is for, which takes the banner away, and the focus with it. */
+  const leaveBanner = (act: () => void) => {
+    act();
+    focusGrid();
   };
 
   const readySheet = engine.status === "ready" && lockOverlay === null ? engine.sheet : null;
+  const state: EditorState = {
+    sheet: readySheet,
+    readOnly: effectiveReadOnly,
+    selection,
+    style: matchingInspected?.style,
+    formatCode: matchingInspected?.formatCode ?? "General",
+    isCloud: collabTarget !== null,
+  };
+  const stateRef = useRef(state);
+  stateRef.current = state;
+  const actions = {
+    commitPending,
+    handleSwitchSheet,
+    handleCreateNewWorkbook,
+    handleOpenWorkbooksDrawer,
+  };
+  const actionsRef = useRef(actions);
+  actionsRef.current = actions;
+  const [handle] = useState(
+    (): EditorHandle => ({
+      state: () => stateRef.current,
+      sheetId: () => activeSheetRef.current,
+      askedSheetId: () => askedSheetRef.current ?? activeSheetRef.current,
+      grid: () => gridRef.current,
+      cellEditor: () => editorRef.current,
+      mutate,
+      send,
+      sendHost: (command, transfer) => clientRef.current?.sendHost(command, transfer),
+      openWith,
+      openCollab,
+      collab: () => collabTargetRef.current,
+      updateCollab(change) {
+        setCollabTarget((prev) => {
+          const next = prev && { ...prev, ...change };
+          collabTargetRef.current = next;
+          return next;
+        });
+      },
+      presences: () => collabPresencesRef.current,
+      noteChange: notePersistenceMutation,
+      createWorkbook: (title, template) =>
+        actionsRef.current.handleCreateNewWorkbook(title, template),
+      freshDocId: makeFreshDocId,
+      fill,
+      autoFillDown,
+      intercept(listener) {
+        interceptorsRef.current.add(listener);
+        return () => interceptorsRef.current.delete(listener);
+      },
+      commitPending: () => actionsRef.current.commitPending(),
+      copied: () => lastCopiedRef.current,
+      switchSheet: (sheet) => actionsRef.current.handleSwitchSheet(sheet, true),
+      onSheet,
+      newWorkbook: () => actionsRef.current.handleCreateNewWorkbook("Untitled workbook", "empty"),
+      openTool: setM3aTool,
+      openWorkbooks: (importing) => actionsRef.current.handleOpenWorkbooksDrawer(importing),
+      openCloud: () => setCollabMenuOpen(true),
+      toggleHistory: () => setHistoryOpen((open) => !open),
+      toggleAi: () => setAiOpen((open) => !open),
+      openDialog: setDialog,
+      openMenu: setMenu,
+      renameSheet: (tab) => setRenamingSheet(tab.id),
+      editNameBox: () => setNameBoxEditing(true),
+    }),
+  );
+  // For tests and measurements, which ask for them in the page's address.
+  useEffect(() => {
+    if (!hooksRequested()) {
+      return;
+    }
+    let remove = () => {};
+    let isGone = false;
+    void import("./hooks-install.ts").then(({ installHooks }) => {
+      if (!isGone) {
+        remove = installHooks(handle, {
+          internals: internalsRef,
+          docId: activeDocIdRef,
+          title: activeDocTitleRef,
+          engineStatus: docLifecycleRef,
+          storageBackend: storageBackendRef,
+          activeSlot: activeSlotRef,
+          walSeq: walSeqRef,
+          waitingForFile: waitingForFileRef,
+          safeMode: safeModeRef,
+          connection: collabConnRef,
+          replica: collabReplicaRef,
+          pending: collabPendingRef,
+          slot: collabSlotRef,
+          manualOffline: collabManualOfflineRef,
+          transport: collabTransportRef,
+        });
+      }
+    });
+    return () => {
+      isGone = true;
+      remove();
+    };
+  }, [handle]);
+
+  const onCommand = useCallback(
+    (id: string, sheet?: number) => runCommand(handle, id, sheet),
+    [handle],
+  );
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      const isEditing = editorRef.current?.editing != null;
+      const id = commandFor(event, focusScope(event.target, hostRef.current, isEditing));
+      if (id !== null) {
+        event.preventDefault();
+        if (id === "contextMenu") {
+          swallowContextMenu();
+        }
+        runCommand(handle, id);
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [handle]);
+
   const canDeleteRows = !effectiveReadOnly && selection !== null && selection.rowId !== null;
   const canDeleteCols = !effectiveReadOnly && selection !== null && selection.colId !== null;
 
+  const nameBox = (
+    <NameBox
+      handle={handle}
+      text={nameBoxText}
+      isEditing={nameBoxEditing && readySheet !== null}
+      inactive={readySheet === null}
+      onEdit={() => onCommand("goTo")}
+      onDone={(byKey) => {
+        setNameBoxEditing(false);
+        if (byKey) {
+          focusGrid();
+        }
+      }}
+    />
+  );
+
   return (
-    <div className="app">
+    <div className="app" data-touch={touchMode || undefined}>
       <TitleBar
+        handle={handle}
         title={docTitle}
         sheet={readySheet}
         collabRole={collabTarget?.role ?? null}
         readOnly={effectiveReadOnly}
         canDeleteRows={canDeleteRows}
         storageUsedMb={storageUsedMb}
+        aiOpen={aiOpen}
+        historyOpen={historyOpen}
         onNavigate={onNavigate}
-        onOpenWorkbooks={handleOpenWorkbooksDrawer}
-        onOpenCloud={() => setCollabMenuOpen(true)}
-        onToggleAi={() => setAiOpen((open) => !open)}
-        onToggleHistory={() => setHistoryOpen((open) => !open)}
-        onExportRtcl={handleExportRtcl}
-        onUndo={() => handleUndoRedo("undo")}
-        onRedo={() => handleUndoRedo("redo")}
-        onInsertRowAbove={() => handleInsertRow(false)}
-        onDeleteRows={handleDeleteSelectedRows}
+        onCommand={onCommand}
       />
 
       {(collabMenuOpen ||
@@ -2418,7 +2192,9 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
         unsyncedRescue !== null ||
         collabNotice !== null) && (
         <Suspense fallback={null}>
-          <LazyCollabShell
+          <LazyCollabHost
+            handle={handle}
+            localDocId={DEFAULT_DOC_ID}
             open={collabMenuOpen}
             initialCollabId={initialRoute.current.collabId}
             initialJoinToken={initialRoute.current.joinToken}
@@ -2436,63 +2212,10 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
             remotePresences={collabPresences}
             notice={collabNotice}
             unsyncedRescue={unsyncedRescue}
+            onRescued={() => setUnsyncedRescue(null)}
             onCloseModal={() => setCollabMenuOpen(false)}
             onRequestOpenModal={() => setCollabMenuOpen(true)}
-            onOpenCollab={(target) => {
-              startWorkerFnRef.current?.(
-                target.docId,
-                {
-                  kind: "openCollab",
-                  userId: target.userId,
-                  docId: target.docId,
-                  branchId: target.branchId,
-                  title: target.title,
-                  online:
-                    !collabManualOfflineRef.current &&
-                    (typeof navigator === "undefined" ? true : navigator.onLine !== false),
-                  readOnly: target.role === "viewer",
-                },
-                target,
-              );
-            }}
-            onUpdateVisibility={(visibility) => {
-              setCollabTarget((prev) => {
-                const next = prev ? { ...prev, visibility } : null;
-                collabTargetRef.current = next;
-                return next;
-              });
-            }}
-            onOpenLocalRescue={(localDocId, title) => {
-              setUnsyncedRescue(null);
-              startWorkerFnRef.current?.(localDocId, {
-                kind: "openDoc",
-                docId: localDocId,
-                title,
-              });
-            }}
-            onSwitchToLocal={() => {
-              startWorkerFnRef.current?.(DEFAULT_DOC_ID, {
-                kind: "openDoc",
-                docId: DEFAULT_DOC_ID,
-              });
-            }}
             onCloseHistory={() => setHistoryOpen(false)}
-            onHistorySeek={(targetSeq, snapshotSeq) => {
-              const cur = collabTargetRef.current;
-              if (!cur) {
-                return;
-              }
-              clientRef.current?.sendHost({
-                kind: "historySeek",
-                docId: cur.docId,
-                targetSeq,
-                snapshotSeq,
-                shareToken: cur.shareToken,
-              });
-            }}
-            onHistoryExit={() => {
-              clientRef.current?.sendHost({ kind: "historyExit" });
-            }}
             onNavigate={onNavigate}
           />
         </Suspense>
@@ -2503,163 +2226,140 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
         readOnly={effectiveReadOnly}
         canFormat={readySheet !== null && selection !== null && !effectiveReadOnly}
         canDeleteCols={canDeleteCols}
-        style={matchingInspected?.style}
-        formatCode={matchingInspected?.formatCode ?? "General"}
-        colorPopover={colorPopover}
-        onColorPopover={setColorPopover}
-        onFormat={applyFormat}
-        onFreeze={handleFreezeChange}
-        onInsertColLeft={() => handleInsertCol(false)}
-        onDeleteCols={handleDeleteSelectedCols}
-        onSort={() => setM3aTool({ kind: "sort" })}
-        onToggleFilter={handleToggleFilter}
-        onFind={() => setM3aTool({ kind: "find", replace: false })}
-        onNames={() => setM3aTool({ kind: "names" })}
+        style={state.style}
+        formatCode={state.formatCode}
+        onCommand={onCommand}
       />
 
-      <QuotaBanner
-        message={quotaBanner}
-        onExportRtcl={handleExportRtcl}
-        onOpenWorkbooks={handleOpenWorkbooksDrawer}
-        onDismiss={() => setQuotaBanner(null)}
-      />
-      <UpdateBanner
-        ready={swUpdateReady}
-        onApply={() => swClientRef.current?.applyUpdate()}
-        onDismiss={() => setSwUpdateReady(false)}
-      />
-      <FrozenRecalcBanner
-        sheet={readySheet}
-        onResume={() => clientRef.current?.send({ kind: "resumeRecalc" })}
-      />
-      <DemoTip sheet={readySheet} onJump={handleJumpToV1} />
+      <div className="banners">
+        {(quotaBanner !== null ||
+          swUpdateReady ||
+          readySheet?.recalcFrozen === true ||
+          draftPreview ||
+          historyPreviewSeq !== null ||
+          rejectedReason !== null) && (
+          <Suspense fallback={null}>
+            <LazyBanners
+              sheet={readySheet}
+              rejected={rejectedReason}
+              onDismissRejected={() => leaveBanner(() => setRejectedReason(null))}
+              storage={quotaBanner}
+              onDismissStorage={() => leaveBanner(() => setQuotaBanner(null))}
+              onExportRtcl={() => onCommand("exportRtcl")}
+              onOpenWorkbooks={() => onCommand("workbooks")}
+              updateReady={swUpdateReady}
+              onUpdate={() => swClientRef.current?.applyUpdate()}
+              onDismissUpdate={() => leaveBanner(() => setSwUpdateReady(false))}
+              onResumeRecalc={() => leaveBanner(() => onCommand("resumeRecalc"))}
+              isDraft={draftPreview}
+              onExitDraft={() =>
+                leaveBanner(() => clientRef.current?.sendHost({ kind: "draftExit" }))
+              }
+              historySeq={historyPreviewSeq}
+              onReturnLive={() =>
+                leaveBanner(() => clientRef.current?.sendHost({ kind: "historyExit" }))
+              }
+            />
+          </Suspense>
+        )}
+        <DemoTip sheet={readySheet} onJump={handleJumpToV1} />
+      </div>
 
-      <FormulaBar
-        ref={formulaBarRef}
-        nameBoxText={nameBoxText}
-        value={formulaBarValue}
-        placeholder={
-          effectiveReadOnly
-            ? t("Read-only mode")
-            : selection || editSessionRef.current
-              ? t("Enter a value or =formula (Tab to autocomplete, F4 to toggle $)")
-              : t("Select a cell to edit")
-        }
-        disabled={
-          effectiveReadOnly ||
-          readySheet === null ||
-          ((selection === null || selection.rowId === null) && !editSessionRef.current)
-        }
-        isEditing={editingText !== null}
-        inspected={matchingInspected !== null}
-        isSpillShadow={matchingInspected?.isSpillShadow === true}
-        analysis={formulaAnalysis?.analysis ?? null}
-        analysisSource={formulaAnalysis?.source ?? null}
-        getEditSource={getEditSource}
-        onChange={handleFormulaBarChange}
-        onCommit={handleFormulaBarCommit}
-        onCancel={handleFormulaBarCancel}
-        onToggleDollar={(text, cursorUtf16) => {
-          if (effectiveReadOnlyRef.current) {
-            return;
+      {!touchMode && (
+        <FormulaBar
+          ref={formulaBarRef}
+          nameBox={nameBox}
+          inert={lockOverlay !== null}
+          value={formulaBarValue}
+          placeholder={
+            effectiveReadOnly
+              ? t("Read-only mode")
+              : selection || editSessionRef.current
+                ? t("Enter a value or =formula (Tab to autocomplete, F4 to toggle $)")
+                : t("Select a cell to edit")
           }
-          if (editSessionRef.current) {
-            editSessionRef.current.editRev += 1;
+          disabled={
+            effectiveReadOnly ||
+            readySheet === null ||
+            ((selection === null || selection.rowId === null) && !editSessionRef.current)
           }
-          clientRef.current?.send({ kind: "toggleFormulaDollar", source: text, cursorUtf16 });
-        }}
-        onAcceptCompletion={handleAcceptCompletion}
-      />
-
-      <AiDraftBanner
-        active={draftPreview}
-        onExit={() => clientRef.current?.sendHost({ kind: "draftExit" })}
-      />
+          isEditing={editingText !== null}
+          inspected={matchingInspected !== null}
+          isSpillShadow={matchingInspected?.isSpillShadow === true}
+          analysis={formulaAnalysis?.analysis ?? null}
+          analysisSource={formulaAnalysis?.source ?? null}
+          getEditSource={getEditSource}
+          onChange={handleFormulaBarChange}
+          onCommit={handleFormulaBarCommit}
+          onCancel={handleFormulaBarCancel}
+          onToggleDollar={(text, cursorUtf16) => {
+            if (effectiveReadOnlyRef.current) {
+              return;
+            }
+            if (editSessionRef.current) {
+              editSessionRef.current.editRev += 1;
+            }
+            clientRef.current?.send({ kind: "toggleFormulaDollar", source: text, cursorUtf16 });
+          }}
+          onAcceptCompletion={handleAcceptCompletion}
+        />
+      )}
 
       {aiShown.current && (
         <Suspense fallback={null}>
-          <LazyAiPanel
+          <LazyAiHost
+            handle={handle}
             open={aiOpen}
             opener={aiOpener}
             onFocusGrid={focusGrid}
-            collabDocId={collabTarget?.docId ?? null}
-            canWriteCloud={collabTarget !== null && collabTarget.role !== "viewer"}
             activeSheetId={engine.status === "ready" ? engine.sheet.sheet : 0}
             draftActive={draftPreview}
             onClose={() => setAiOpen(false)}
-            onOpenCloudDraft={(docId, branchId) =>
-              clientRef.current?.sendHost({ kind: "draftOpenCloud", docId, branchId })
-            }
-            onOpenReplayDraft={(baseSnapshot) =>
-              clientRef.current?.sendHost({ kind: "draftOpenReplay", baseSnapshot }, [baseSnapshot])
-            }
-            onApplyReplayTxn={(txn) =>
-              clientRef.current?.sendHost({ kind: "draftApplyTxn", txn }, [txn])
-            }
-            onCommitLocalMerge={(baseSnapshot, txns) =>
-              clientRef.current?.sendHost({ kind: "draftCommitLocalMerge", baseSnapshot, txns }, [
-                baseSnapshot,
-                ...txns,
-              ])
-            }
-            onExitDraft={() => clientRef.current?.sendHost({ kind: "draftExit" })}
-            onSetAiPresence={(p) =>
-              gridRef.current?.setRemotePresences(
-                withPersonTexts([...collabPresencesRef.current, ...(p ? [p] : [])]),
-              )
-            }
-            onSetDiffHighlights={(m) => gridRef.current?.setDiffHighlights(m)}
-            onJumpToCell={(sheet, row, col) => {
-              if (activeSheetRef.current === sheet) {
-                gridRef.current?.jumpTo(row, col, false);
-              } else {
-                pendingJumpRef.current = { sheet, row, col };
-                clientRef.current?.send({ kind: "switchSheet", sheet });
-              }
-            }}
           />
         </Suspense>
       )}
 
-      <HistoryPreviewBanner
-        seq={historyPreviewSeq}
-        onReturn={() => clientRef.current?.sendHost({ kind: "historyExit" })}
-      />
-      <RejectedBanner reason={rejectedReason} onDismiss={() => setRejectedReason(null)} />
-
       <main className="sheet">
-        <div ref={hostRef} className="grid" data-testid="grid" />
+        <div ref={hostRef} className="grid" data-testid="grid" inert={lockOverlay !== null} />
         {lockOverlay && (
-          <LockOverlay
-            lock={lockOverlay}
-            onTakeOver={handleTakeOver}
-            onNewWorkbook={() => handleCreateNewWorkbook("Untitled workbook", "empty")}
-          />
+          <Suspense fallback={null}>
+            <LazyLockOverlay
+              lock={lockOverlay}
+              onTakeOver={handleTakeOver}
+              onNewWorkbook={handle.newWorkbook}
+            />
+          </Suspense>
         )}
         {engine.status === "failed" && (
-          <div className="failure" role="alert">
+          <div className="failure">
             <p>{t("The engine has stopped. Reload the page to start again.")}</p>
             <p className="detail" data-testid="engine-error">
-              {translateEngineText(engine.message)}
+              {engineText(engine.message)}
             </p>
           </div>
         )}
       </main>
+
+      {touchMode && (
+        <Suspense fallback={null}>
+          <LazyTouchBar
+            nameBox={nameBox}
+            inspection={matchingInspected}
+            text={selection?.text ?? ""}
+            inert={lockOverlay !== null}
+          />
+        </Suspense>
+      )}
 
       {readySheet && (
         <SheetTabs
           sheet={readySheet}
           readOnly={effectiveReadOnly}
           renaming={renamingSheet}
-          onRenaming={setRenamingSheet}
           onRename={handleRenameSheet}
-          onLeave={() => editorRef.current?.focus()}
           onSwitch={handleSwitchSheet}
-          onMenu={(tab, clientX, clientY) => {
-            setColorPopover(null);
-            setContextMenu({ kind: "tab", clientX, clientY, tab });
-          }}
-          onAdd={() => handleAddSheet(readySheet.sheet)}
+          onMenu={(tab, clientX, clientY) => setMenu({ kind: "tab", clientX, clientY, tab })}
+          onCommand={onCommand}
         />
       )}
 
@@ -2674,44 +2374,52 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
         opening={engine.status === "starting" && !lockOverlay && !modalMode}
         sheet={readySheet}
         selection={selection}
-        activity={activity}
+        activity={(activity && laterNow()?.activityText(activity)) ?? null}
         stats={stats}
         kernelVersion={engine.status === "ready" ? engine.info.kernelVersion : ""}
         zoom={{
           zoom: zoomSignal,
+          handle,
           onStep: (direction) =>
             direction > 0 ? gridRef.current?.zoomIn() : gridRef.current?.zoomOut(),
-          onZoom: (zoom) => gridRef.current?.setZoom(zoom),
         }}
       />
 
-      {contextMenu && (
-        <ContextMenu
-          menu={contextMenu}
-          sheet={readySheet}
-          readOnly={effectiveReadOnly}
-          canDeleteRows={canDeleteRows}
-          canDeleteCols={canDeleteCols}
-          onClose={() => setContextMenu(null)}
-          onClipboard={(action) => void handleContextClipboard(action)}
-          onClearContents={handleClearContents}
-          onInsertRow={handleInsertRow}
-          onDeleteRows={handleDeleteSelectedRows}
-          onInsertCol={handleInsertCol}
-          onDeleteCols={handleDeleteSelectedCols}
-          onRenameSheet={(tab) => {
-            if (!effectiveReadOnlyRef.current) {
-              setRenamingSheet({ id: tab.id, draft: tab.name });
-            }
-          }}
-          onMoveSheet={handleMoveSheet}
-          onDeleteSheet={handleDeleteSheet}
-        />
+      {isLaterReady && (
+        <Suspense fallback={null}>
+          <LazyAnnouncements
+            host={hostRef}
+            documentId={docId}
+            sheet={readySheet}
+            selection={selection}
+            inspection={matchingInspected}
+            activity={activity}
+            rowNumber={(row) => (gridRef.current?.displayRowToPhysicalRow(row) ?? row) + 1}
+          />
+        </Suspense>
+      )}
+      {menu && (
+        <Suspense fallback={null}>
+          <LazyMenus handle={handle} menu={menu} onClose={() => setMenu(null)} />
+        </Suspense>
+      )}
+
+      {dialog && (
+        <Suspense fallback={null}>
+          <LazyDialogs
+            handle={handle}
+            dialog={dialog}
+            opener={dialogOpener}
+            onFocusGrid={focusGrid}
+            onClose={() => setDialog(null)}
+          />
+        </Suspense>
       )}
 
       {modalMode && (
         <Suspense fallback={null}>
           <LazyLocalModals
+            handle={handle}
             mode={modalMode}
             opener={modalOpener}
             onFocusGrid={focusGrid}
@@ -2720,69 +2428,8 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
             storageUsedMb={storageUsedMb}
             csvProgress={csvProgress}
             onClose={() => setModalMode(null)}
-            onOpenDoc={(nextId, nextTitle) => {
-              setModalMode(null);
-              if (collabTargetRef.current || workerTerminatedRef.current || !clientRef.current) {
-                startWorkerFnRef.current?.(nextId, {
-                  kind: "openDoc",
-                  docId: nextId,
-                  title: nextTitle,
-                });
-              } else {
-                clientRef.current.sendHost({ kind: "openDoc", docId: nextId, title: nextTitle });
-              }
-            }}
-            onCreateDoc={handleCreateNewWorkbook}
-            onRenameDoc={(id, title) => {
-              notePersistenceMutation();
-              clientRef.current?.sendHost({ kind: "renameDoc", docId: id, title });
-            }}
-            onDeleteDoc={(id) => {
-              notePersistenceMutation();
-              clientRef.current?.sendHost({ kind: "deleteDoc", docId: id });
-            }}
-            onExportRtcl={() => clientRef.current?.sendHost({ kind: "exportRtcl" })}
-            onExportCsv={() =>
-              clientRef.current?.sendHost({ kind: "exportCsv", sheet: activeSheetRef.current })
-            }
-            onExportXlsx={() => clientRef.current?.sendHost({ kind: "exportXlsxSnapshot" })}
-            onImportNotice={(msg) => setQuotaBanner(msg)}
-            onImportRtcl={(title, bytes) => {
-              const newId = makeFreshDocId();
-              notePersistenceMutation();
-              setModalMode(null);
-              clientRef.current?.sendHost({ kind: "importRtcl", docId: newId, title, bytes }, [
-                bytes,
-              ]);
-            }}
-            onImportCsv={(title, sheetName, bytes) => {
-              const newId = makeFreshDocId();
-              notePersistenceMutation();
-              clientRef.current?.sendHost(
-                { kind: "importCsv", docId: newId, title, sheetName, bytes },
-                [bytes],
-              );
-            }}
-            onImportRejected={(reason) => {
-              setModalMode(null);
-              setRejectedReason(reason);
-            }}
-            onSafeModeOpenFrozen={(targetId) => {
-              setModalMode(null);
-              clientRef.current?.sendHost({
-                kind: "safeModeRecover",
-                docId: targetId,
-                mode: { type: "openFrozen" },
-              });
-            }}
-            onSafeModeSkipTail={(targetId, skipCount, salvageMid) => {
-              setModalMode(null);
-              clientRef.current?.sendHost({
-                kind: "safeModeRecover",
-                docId: targetId,
-                mode: { type: "skipTail", skipCount, salvageMid },
-              });
-            }}
+            onNotice={setQuotaBanner}
+            onRejected={reject}
           />
         </Suspense>
       )}

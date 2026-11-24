@@ -48,6 +48,8 @@ export interface AiPanelProps {
   readonly onFocusGrid: () => void;
   readonly collabDocId: string | null;
   readonly canWriteCloud: boolean;
+  /** Whether nothing that is reviewed may be merged. */
+  readonly readOnly: boolean;
   readonly activeSheetId: number;
   readonly draftActive: boolean;
   readonly onClose: () => void;
@@ -95,6 +97,7 @@ export default function AiPanel({
   onFocusGrid,
   collabDocId,
   canWriteCloud,
+  readOnly,
   activeSheetId,
   draftActive,
   onClose,
@@ -540,14 +543,18 @@ export default function AiPanel({
     if (!bundle) return;
     onSetDiffHighlights(null);
     onSetAiPresence(null);
-    if (collabDocId !== null) {
+    if (collabDocId !== null || readOnly) {
       onExitDraft();
       setReplayReview(false);
       setReplayMsg(
-        t(
-          'Previewed "{title}" merge selection; returned to your cloud workbook without overwriting it.',
-          { title: bundle.title },
-        ),
+        readOnly
+          ? t('Previewed "{title}". Nothing was merged: the workbook is read-only here.', {
+              title: bundle.title,
+            })
+          : t(
+              'Previewed "{title}" merge selection; returned to your cloud workbook without overwriting it.',
+              { title: bundle.title },
+            ),
       );
       return;
     }

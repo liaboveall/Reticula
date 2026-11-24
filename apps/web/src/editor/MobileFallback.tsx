@@ -1,5 +1,6 @@
 import { BENCHMARKS } from "../generated/benchmarks.ts";
 import { t } from "../i18n/index.ts";
+import { useTouchMode } from "./touch-mode.ts";
 
 export interface MobileFallbackProps {
   readonly onNavigate: (path: string) => void;
@@ -8,6 +9,7 @@ export interface MobileFallbackProps {
 
 /** What a narrow screen shows in place of the editor. */
 export default function MobileFallback({ onNavigate, onOpenAnyway }: MobileFallbackProps) {
+  const touchMode = useTouchMode();
   return (
     <div className="mobile-fallback" data-testid="mobile-fallback">
       <header className="mobile-header">
@@ -24,11 +26,30 @@ export default function MobileFallback({ onNavigate, onOpenAnyway }: MobileFallb
       </header>
       <main className="mobile-body">
         <h1>{t("Desktop Canvas Editor")}</h1>
-        <p className="mobile-notice">
-          {t(
-            "Reticula's desktop canvas editor requires a keyboard and pointer — please open this link on desktop.",
-          )}
-        </p>
+        {touchMode ? (
+          <div className="mobile-open">
+            <button
+              type="button"
+              className="primary-btn"
+              data-testid="open-read-only"
+              aria-describedby="open-read-only-note"
+              onClick={onOpenAnyway}
+            >
+              {t("Open read-only")}
+            </button>
+            <p id="open-read-only-note" className="mobile-notice">
+              {t(
+                "On a touch screen you can scroll, zoom and look into cells. Connect a mouse or a trackpad to edit them.",
+              )}
+            </p>
+          </div>
+        ) : (
+          <p className="mobile-notice">
+            {t(
+              "Reticula's desktop canvas editor requires a keyboard and pointer — please open this link on desktop.",
+            )}
+          </p>
+        )}
 
         <svg
           viewBox="0 0 360 176"
@@ -81,14 +102,16 @@ export default function MobileFallback({ onNavigate, onOpenAnyway }: MobileFallb
           </div>
         </div>
 
-        <button
-          type="button"
-          className="mobile-anyway"
-          data-testid="open-anyway"
-          onClick={onOpenAnyway}
-        >
-          {t("Open editor anyway")}
-        </button>
+        {!touchMode && (
+          <button
+            type="button"
+            className="mobile-anyway"
+            data-testid="open-anyway"
+            onClick={onOpenAnyway}
+          >
+            {t("Open editor anyway")}
+          </button>
+        )}
       </main>
     </div>
   );

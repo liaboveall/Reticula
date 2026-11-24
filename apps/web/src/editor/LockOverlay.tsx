@@ -1,4 +1,6 @@
+import { useLayoutEffect, useRef } from "react";
 import { t } from "../i18n/index.ts";
+import { tx } from "../i18n/react.ts";
 import type { LockOverlayState } from "./types.ts";
 
 export interface LockOverlayProps {
@@ -38,18 +40,52 @@ function explanation(lock: LockOverlayState): string {
   }
 }
 
-/** Covers the grid while another tab has the workbook. */
-export function LockOverlay({ lock, onTakeOver, onNewWorkbook }: LockOverlayProps) {
+/**
+ * Covers the grid while another tab has the workbook. It is no dialog: the rest
+ * of the page goes on, and only what belongs to the workbook is out of use.
+ */
+export default function LockOverlay({ lock, onTakeOver, onNewWorkbook }: LockOverlayProps) {
+  const headingRef = useRef<HTMLHeadingElement>(null);
+  const takeOverRef = useRef<HTMLButtonElement>(null);
+  const lost = lock.kind === "yielded" ? lock.lost : null;
+
+  useLayoutEffect(() => {
+    const target = lock.kind === "takingOver" ? headingRef : takeOverRef;
+    if (!document.querySelector("dialog:modal")) {
+      target.current?.focus();
+    }
+  }, [lock.kind]);
+
   return (
-    <div className="lock-overlay" role="dialog" aria-modal="true" data-testid="lock-overlay">
+    <section
+      className="lock-overlay"
+      aria-labelledby="lock-heading"
+      aria-describedby="lock-message"
+      data-testid="lock-overlay"
+    >
       <div className="lock-card">
-        <h2>{heading(lock)}</h2>
-        <p data-testid="lock-overlay-message">{explanation(lock)}</p>
+        <h2 ref={headingRef} id="lock-heading" tabIndex={-1}>
+          {heading(lock)}
+        </h2>
+        <p id="lock-message" data-testid="lock-overlay-message">
+          {explanation(lock)}
+        </p>
+        {lost && (
+          <p id="lock-lost" data-testid="lock-lost-edit">
+            {tx(
+              "What was being typed into {cell} has not been saved: <0>{text}</0>",
+              { 0: <code /> },
+              { cell: lost.cell, text: lost.text },
+            )}
+          </p>
+        )}
         {lock.kind !== "takingOver" && (
           <div className="lock-actions">
             <button
+              ref={takeOverRef}
               type="button"
               className="toolbar-btn primary-btn"
+              aria-describedby="lock-heading lock-message lock-lost"
               data-testid="take-over-btn"
               onClick={() => onTakeOver(lock.docId)}
             >
@@ -66,6 +102,6 @@ export function LockOverlay({ lock, onTakeOver, onNewWorkbook }: LockOverlayProp
           </div>
         )}
       </div>
-    </div>
+    </section>
   );
 }

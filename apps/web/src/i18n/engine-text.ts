@@ -4,25 +4,36 @@
  * is recognized here, by the messages that `zh-engine.ts` translates.
  */
 
-import { type Catalogue, catalogueOf, fill } from "./index.ts";
+import {
+  type Catalogue,
+  catalogueOf,
+  fill,
+  type LoadedCatalogue,
+  type Lookup,
+  textsOf,
+} from "./index.ts";
+import { type PackedMessages, type Patterns, patternsOf } from "./messages.ts";
 
 /** A message with values in it. */
 interface Template {
   readonly pattern: RegExp;
-  readonly names: readonly string[];
+  readonly kinds: readonly string[];
   readonly translation: string;
+  /** How much of it is words. */
+  readonly words: number;
 }
 
-/** The placeholders that stand for a number. The others may stand for anything. */
-export const NUMBER =
-  /^(?:MAX_\w+|n|p|pos|got|found|expected|offset|cursor|bytes|replica|ids|cluster|format_items|sheets|sheet_id|charts|drawings|pivots|comments|external_links|txns|retries|\w*(?:count|seq|epoch|rows?|cols?|idx|args|runs|tokens|steps|issues|conflicts|Seq|Epoch|Count))$/;
-
-/** The placeholders that may stand for another message, or for a word of the engine's. */
-export const MESSAGE =
-  /^(?:0|axis_err|corr|e|err|error|field|label|lex|msg|pos_hint|reason|status)$/;
-
-/** Where rows are inserted. Nothing but a space is between it and the name of a worksheet. */
-const PLACE = "at row \\d+|after anchor row|at top";
+/** What a value may be, by its kind: a number, the name of a column, or where rows are inserted. */
+const VALUES: Readonly<Record<string, string>> = {
+  "#": "(\\d+)",
+  "^": "([A-Z]+)",
+  // Nothing but a space is between it and the name of a worksheet.
+  "~": "(at row \\d+|after anchor row|at top)",
+};
+/** Any other value. What others have written, such as the body of an answer, may be empty. */
+const ANYTHING = "([\\s\\S]*?)";
+/** The kinds of values that may be messages themselves, or words of the engine's. */
+const NESTED = "@~";
 
 /** Which of several transactions a change is in. The server puts it after the label. */
 const PART = / \(\d+\/\d+\)$/;
@@ -32,61 +43,61 @@ const MAX_LENGTH = 2_000;
 const MAX_NESTING = 4;
 const MAX_REMEMBERED = 500;
 
-interface Messages {
-  readonly catalogue: Catalogue;
+interface Translations {
+  readonly catalogue: LoadedCatalogue;
+  readonly plain: Lookup;
   /** The more of a message is words, the sooner its template is tried. */
   readonly templates: readonly Template[];
 }
 
-let messages: Messages | undefined;
+interface Functions {
+  readonly catalogue: LoadedCatalogue;
+  readonly lookUp: Lookup;
+}
+
+let messages: Translations | undefined;
+let functions: Functions | undefined;
 /** What has been translated lately. */
 const remembered = new Map<string, string>();
 
-function patternOf(name: string): string {
-  if (name === "pos_hint") {
-    return `(${PLACE})`;
-  }
-  if (name === "letters") {
-    return "([A-Z]+)";
-  }
-  // What others have written, such as the body of an answer, may be empty.
-  return NUMBER.test(name) ? "(\\d+)" : "([\\s\\S]*?)";
-}
-
 const escaped = (text: string) => text.replace(/[\\^$.*+?()[\]{}|]/g, "\\$&");
 
-function compile(catalogue: Catalogue): Messages {
-  const found: (Template & { readonly words: number })[] = [];
-  for (const [message, translation] of Object.entries(catalogue)) {
-    // Words at even places, the names of placeholders between them.
-    const parts = message.split(/\{(\w+)\}/);
-    if (parts.length > 1) {
-      const pattern = parts.map((part, at) => (at % 2 === 0 ? escaped(part) : patternOf(part)));
-      found.push({
-        pattern: new RegExp(`^${pattern.join("")}$`),
-        names: parts.filter((_, at) => at % 2 === 1),
-        translation,
-        words: parts.reduce((length, part, at) => length + (at % 2 === 0 ? part.length : 0), 0),
-      });
-    }
-  }
-  return { catalogue, templates: found.sort((a, b) => b.words - a.words) };
+function read(catalogue: LoadedCatalogue): Translations {
+  const [patterns, translations]: Patterns = import.meta.env.PROD
+    ? [(catalogue as PackedMessages)[3], (catalogue as PackedMessages)[4]]
+    : patternsOf(catalogue as Catalogue);
+  const lines = translations.split("\n");
+  const templates = patterns.split("\n").map((pattern, line): Template => {
+    // Words at even places, the kinds of values between them.
+    const parts = pattern.split(/\{([#^~@]?)\}/);
+    const source = parts.map((part, at) =>
+      at % 2 === 0 ? escaped(part) : (VALUES[part] ?? ANYTHING),
+    );
+    const kinds = parts.filter((_, at) => at % 2 === 1);
+    return {
+      pattern: new RegExp(`^${source.join("")}$`),
+      kinds,
+      translation: lines[line] ?? "",
+      words: parts.join("").length - kinds.join("").length,
+    };
+  });
+  templates.sort((a, b) => b.words - a.words);
+  return { catalogue, plain: textsOf(catalogue), templates };
 }
 
-function translate(from: Messages, text: string, nesting: number): string {
-  const known = lookUp(from.catalogue, text);
+function translate(from: Translations, text: string, nesting: number): string {
+  const known = from.plain(text);
   if (known !== undefined || nesting > MAX_NESTING) {
     return known ?? text;
   }
-  for (const { pattern, names, translation } of from.templates) {
+  for (const { pattern, kinds, translation } of from.templates) {
     const [, ...values] = pattern.exec(text) ?? [];
     if (values.length > 0) {
-      const params: Record<string, string> = {};
-      for (const [at, name] of names.entries()) {
+      const params = kinds.map((kind, at) => {
         const value = values[at] ?? "";
-        params[name] = MESSAGE.test(name) ? translate(from, value, nesting + 1) : value;
-      }
-      return fill(translation, params);
+        return kind && NESTED.includes(kind) ? translate(from, value, nesting + 1) : value;
+      });
+      return fill(translation, Object.fromEntries(params.entries()));
     }
   }
   const [part] = PART.exec(text) ?? [];
@@ -100,7 +111,7 @@ export function translateEngineText(text: string): string {
     return text;
   }
   if (messages?.catalogue !== catalogue) {
-    messages = compile(catalogue);
+    messages = read(catalogue);
     remembered.clear();
   }
   let translation = remembered.get(text);
@@ -114,23 +125,28 @@ export function translateEngineText(text: string): string {
   return translation;
 }
 
+/** What is known about functions and their parameters, by their names. */
+function functionTexts(): Lookup | undefined {
+  const catalogue = catalogueOf("zh-functions");
+  if (catalogue && functions?.catalogue !== catalogue) {
+    functions = { catalogue, lookUp: textsOf(catalogue) };
+  }
+  return catalogue && functions?.lookUp;
+}
+
 /** What a function of formulas does. */
 export function functionSummary(name: string, english: string): string {
-  return lookUp(catalogueOf("zh-functions"), name) ?? english;
+  return functionTexts()?.(name) ?? english;
 }
 
 /** A list of parameters, or one of them, with their names in the language shown. */
 export function functionParameters(english: string): string {
-  const catalogue = catalogueOf("zh-functions");
-  return catalogue
+  const lookUp = functionTexts();
+  return lookUp
     ? english.replace(/[a-z]\w*/g, (name) => {
         const [, word = name, number = ""] = /^(.*?)(\d*)$/.exec(name) ?? [];
-        const known = lookUp(catalogue, word);
-        return lookUp(catalogue, name) ?? (known === undefined ? name : known + number);
+        const known = lookUp(word);
+        return lookUp(name) ?? (known === undefined ? name : known + number);
       })
     : english;
-}
-
-function lookUp(catalogue: Catalogue | undefined, key: string): string | undefined {
-  return catalogue && Object.hasOwn(catalogue, key) ? catalogue[key] : undefined;
 }

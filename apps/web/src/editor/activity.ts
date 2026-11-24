@@ -38,7 +38,7 @@ export type Activity =
   | { readonly kind: "recalculated"; readonly cells: number; readonly ms: number }
   | { readonly kind: "replaced"; readonly cells: number };
 
-function actionText(action: SheetAction): string {
+export function actionText(action: SheetAction): string {
   switch (action) {
     case "updated":
       return t("updated");

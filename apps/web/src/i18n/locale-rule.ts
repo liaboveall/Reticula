@@ -6,14 +6,20 @@ export type Locale = "en" | "zh-CN";
 export const LOCALE_KEY = "reticula:locale";
 
 /** The files with Chinese texts, by the names of their modules. */
-export type CatalogueName = "zh-core" | "zh-pages" | "zh-labs" | "zh-engine" | "zh-functions";
+export type CatalogueName =
+  | "zh-core"
+  | "zh-pages"
+  | "zh-landing"
+  | "zh-labs"
+  | "zh-engine"
+  | "zh-functions";
 
 /**
  * The texts each page waits for before it is rendered in Chinese. The build
  * preloads the same ones (`crates/xtask/src/web/bundle.rs` reads this table).
  */
 export const CATALOGUES: Readonly<Record<AppRoute, readonly CatalogueName[]>> = {
-  landing: ["zh-core", "zh-pages"],
+  landing: ["zh-core", "zh-pages", "zh-landing"],
   app: ["zh-core"],
   workbooks: ["zh-core", "zh-pages"],
   account: ["zh-core", "zh-pages"],

@@ -5,6 +5,7 @@ import type { AppRoute } from "../routes.ts";
 export function pageTitle(route: AppRoute): string {
   switch (route) {
     case "landing":
+      return t("Reticula: a local-first spreadsheet");
     case "app":
       return t("Reticula|title");
     case "workbooks":

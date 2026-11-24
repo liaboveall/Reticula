@@ -1,4 +1,4 @@
-import { Grid, type Subscription } from "@reticula/grid";
+import { Grid, type Selection, type Subscription } from "@reticula/grid";
 import {
   type AutoSimProgress,
   AutoSimRunner,
@@ -9,6 +9,7 @@ import {
 } from "@reticula/protocol/sim";
 import simWasmUrl from "@reticula/protocol/sim-wasm?url";
 import { type FormEvent, useCallback, useEffect, useRef, useState } from "react";
+import { plainSelectionText } from "../editor/cell-announcer.ts";
 import { translateEngineText } from "../i18n/engine-text.ts";
 import { t } from "../i18n/index.ts";
 import { tx } from "../i18n/react.ts";
@@ -17,6 +18,7 @@ import { roleName } from "../pages/labels.ts";
 import { PageNav } from "../pages/PageNav.tsx";
 import { rendererPreference } from "../renderer.ts";
 import { ActionButton } from "../ui/ActionButton.tsx";
+import { announce } from "../ui/announcer.ts";
 import { useKeptFocus } from "../ui/focus.ts";
 import { Tabs } from "../ui/Tabs.tsx";
 import {
@@ -24,7 +26,6 @@ import {
   type InvariantStatus,
   invariantStatusName,
   invariants,
-  labText,
   parseSeed,
 } from "./labels.ts";
 import "../collab/collab.css";
@@ -92,6 +93,19 @@ function pushPagesForReplica(
   }
 }
 
+/**
+ * The grids here are without an editor: their own element has the keyboard.
+ * Reads where the selection is, unless that is what was read last.
+ */
+function announceSelection(host: HTMLElement, selection: Selection, last: string): string {
+  const text = plainSelectionText(selection);
+  if (host !== document.activeElement || text === last) {
+    return last;
+  }
+  announce(text, { isPlace: true });
+  return text;
+}
+
 export default function SimLabPage({ onNavigate }: SimLabPageProps) {
   const [wasmReady, setWasmReady] = useState(false);
   const [mode, setMode] = useState<SimMode>("interactive");
@@ -110,6 +124,7 @@ export default function SimLabPage({ onNavigate }: SimLabPageProps) {
   const hostRefs = useRef<(HTMLDivElement | null)[]>([]);
   const gridRefs = useRef<(Grid | null)[]>([]);
   const subRefs = useRef<Subscription[]>([]);
+  const lastReadRef = useRef("");
   const runnerRef = useRef<AutoSimRunner | null>(null);
   const rafRef = useRef<number>(0);
 
@@ -165,6 +180,7 @@ export default function SimLabPage({ onNavigate }: SimLabPageProps) {
             if (!sel) {
               return;
             }
+            lastReadRef.current = announceSelection(host, sel, lastReadRef.current);
             setDrafts((prev) => ({
               ...prev,
               [i]: {
@@ -226,6 +242,20 @@ export default function SimLabPage({ onNavigate }: SimLabPageProps) {
     };
   }, [wasmReady, mode, replicaCount, resetLab]);
 
+  const replicaName = (idx: number) =>
+    labState?.replicas[idx]?.name ?? t("Replica {n}", { n: idx + 1 });
+  const gridNames = [0, 1, 2].map((idx) => t("Worksheet of {name}", { name: replicaName(idx) }));
+  const gridTexts = useRef({ names: gridNames, selectedCell: "" });
+  gridTexts.current = { names: gridNames, selectedCell: t("Selected cell") };
+  const allGridTexts = JSON.stringify(gridTexts.current);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: the grids are other ones with every lab
+  useEffect(() => {
+    const { names, selectedCell } = gridTexts.current;
+    for (const [idx, grid] of gridRefs.current.entries()) {
+      grid?.setStrings({ grid: names[idx] ?? "", cellEditor: "", selectedCell });
+    }
+  }, [allGridTexts, labState]);
+
   const runInteractiveOp = (fn: (lab: InteractiveSimLab) => SimLabState) => {
     const lab = labRef.current;
     if (!lab) {
@@ -237,7 +267,7 @@ export default function SimLabPage({ onNavigate }: SimLabPageProps) {
       setLabState(nextState);
       syncAllReplicas(lab, false);
     } catch (err) {
-      setLabError(labText(err instanceof Error ? err.message : String(err)));
+      setLabError(err instanceof Error ? err.message : String(err));
     }
   };
 
@@ -358,7 +388,7 @@ export default function SimLabPage({ onNavigate }: SimLabPageProps) {
             <div className="page-card">
               {labError ? (
                 <div className="page-error" role="alert" data-testid="sim-lab-error">
-                  {labError}
+                  {translateEngineText(labError)}
                 </div>
               ) : (
                 <p role="status">{t("Loading simulator WebAssembly module…")}</p>
@@ -368,7 +398,7 @@ export default function SimLabPage({ onNavigate }: SimLabPageProps) {
             <>
               {labError && (
                 <div className="page-error" role="alert" data-testid="sim-lab-error">
-                  {labError}
+                  {translateEngineText(labError)}
                 </div>
               )}
 
@@ -577,7 +607,9 @@ export default function SimLabPage({ onNavigate }: SimLabPageProps) {
                           {t("Crash & Restart")}
                         </button>
                       </div>
-                      {rep?.lastNotice && <p className="page-muted">{labText(rep.lastNotice)}</p>}
+                      {rep?.lastNotice && (
+                        <p className="page-muted">{translateEngineText(rep.lastNotice)}</p>
+                      )}
                     </section>
                   );
                 })}

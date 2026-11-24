@@ -114,6 +114,7 @@ test("the pointer is listened to above the picture, which assistive technology p
     "reticula-scrollbar",
     "reticula-scrollbar",
     "reticula-scrollbar-corner",
+    "reticula-mirror",
     "reticula-editor",
   ]);
   expect(layers.hidden).toEqual([
@@ -122,6 +123,91 @@ test("the pointer is listened to above the picture, which assistive technology p
     "reticula-scrollbar",
     "reticula-scrollbar-corner",
   ]);
+});
+
+test("a scrollbar that is dragged is not zoomed away from under the pointer", async ({ page }) => {
+  await open(page);
+  const thumb = page.locator('.reticula-scrollbar[data-orientation="vertical"] > *');
+  const box = await thumb.boundingBox();
+  if (!box) {
+    throw new Error("there is nothing to scroll");
+  }
+  const turnWheel = async () => {
+    await page.keyboard.down("Control");
+    await page.mouse.wheel(0, -100);
+    await page.keyboard.up("Control");
+    await nextFrames(page);
+    await nextFrames(page);
+  };
+  const at = { x: box.x + box.width / 2, y: box.y + box.height / 2 };
+  await page.mouse.move(at.x, at.y);
+  await page.mouse.down();
+  await page.mouse.move(at.x, at.y + 40, { steps: 4 });
+  const before = await stats(page);
+  expect(before.scroll.top).toBeGreaterThan(0);
+  await turnWheel();
+  const during = await stats(page);
+  expect(during.zoom).toBe(1);
+  expect(during.scroll).toEqual(before.scroll);
+  await page.mouse.up();
+  await turnWheel();
+  expect((await stats(page)).zoom).toBe(1.1);
+});
+
+test("the fill handle can be grabbed on both sides of the freeze line", async ({ page }) => {
+  const { at, colWidth, rowHeight } = await open(page);
+  await page.evaluate(() => window.__reticula?.select(1, 1));
+  await page.evaluate(() => window.__reticula?.scrollTo({ top: 0, left: 0 }));
+  await page.getByTestId("freeze-select").click();
+  await page.getByTestId("freeze-row1col1").click();
+  await settled(page);
+  await page.evaluate(() => window.__reticula?.scrollTo({ top: 1000, left: 300 }));
+  await nextFrames(page);
+  await settled(page);
+  await page.evaluate(() => window.__reticula?.select(0, 0));
+  const corner = at(colWidth, rowHeight);
+  const cursor = async (dx: number, dy: number) => {
+    await page.mouse.move(corner.x + dx, corner.y + dy);
+    return page.locator(".reticula-input").evaluate((input: HTMLElement) => input.style.cursor);
+  };
+  for (const dx of [-3, 3]) {
+    for (const dy of [-3, 3]) {
+      expect(await cursor(dx, dy), `${dx}, ${dy}`).toBe("crosshair");
+    }
+  }
+  expect(await cursor(20, 12)).toBe("cell");
+  // Half of it is past the line, and is there to see.
+  const ink = await page.evaluate(({ x, y }) => {
+    const canvas = document.querySelector<HTMLCanvasElement>('[data-testid="grid"] canvas');
+    const host = canvas?.getBoundingClientRect();
+    const scale = window.devicePixelRatio;
+    const pixel = (dx: number, dy: number) =>
+      canvas
+        ?.getContext("2d")
+        ?.getImageData((x - (host?.x ?? 0) + dx) * scale, (y - (host?.y ?? 0) + dy) * scale, 1, 1)
+        .data.join();
+    return [pixel(-2, -2), pixel(2, -2), pixel(-2, 2), pixel(2, 2)];
+  }, corner);
+  expect(new Set(ink).size).toBe(1);
+});
+
+test("in another language the picture is drawn anew, on a canvas that begins in it", async ({
+  page,
+}) => {
+  await open(page);
+  const change = (lang: string) =>
+    page.evaluate(async (lang) => {
+      const first = document.querySelector('[data-testid="grid"] canvas');
+      document.documentElement.lang = lang;
+      for (let frame = 0; frame < 4; frame++) {
+        await new Promise(requestAnimationFrame);
+      }
+      const canvases = [...document.querySelectorAll('[data-testid="grid"] canvas')];
+      return { count: canvases.length, isSame: canvases[0] === first };
+    }, lang);
+  expect(await change("zh-CN")).toEqual({ count: 1, isSame: false });
+  expect(await change("zh-CN")).toEqual({ count: 1, isSame: true });
+  expect((await stats(page)).renderer).toMatchObject({ kind: "canvas2d", reason: "preference" });
 });
 
 test("an edge that is pressed and let go without moving resizes nothing", async ({ page }) => {

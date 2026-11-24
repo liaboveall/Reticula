@@ -1,7 +1,6 @@
-import type { Grid, GridStats, RemotePresenceOverlay } from "@reticula/grid";
+import type { GridStats, RemotePresenceOverlay } from "@reticula/grid";
 import type { SafeModeInfo } from "./engine/client.ts";
 import type { StorageBackendKind } from "./engine/storage.ts";
-import { setRendererPreference } from "./renderer.ts";
 
 export interface SwStatus {
   readonly supported: boolean;
@@ -94,46 +93,18 @@ declare global {
   }
 }
 
+/**
+ * What `?touch=1` or `?touch=0` in the page's address says: whether to take the
+ * device for one with nothing but a touch screen, whatever it is. The hooks
+ * keep the editor from giving way to a card on a narrow screen; `?touch=1` has
+ * it do so all the same.
+ */
+export function touchOverride(): boolean | null {
+  const touch = new URLSearchParams(window.location.search).get("touch");
+  return touch === null ? null : touch === "1";
+}
+
+/** Whether the page was opened by something that tests or measures it. */
 export function hooksRequested(): boolean {
   return new URLSearchParams(window.location.search).has("hooks");
-}
-
-export interface HookExtras {
-  readonly selfCheck: () => Promise<string>;
-  readonly stateDigest: () => Promise<string>;
-  readonly docStatus: () => HookDocStatus;
-  readonly compactSnapshot: () => Promise<SnapshotSaveResult>;
-  readonly flushAndClose: () => Promise<void>;
-  readonly spinWorker: (ms: number) => void;
-  readonly swStatus: () => Promise<SwStatus>;
-  readonly checkSwUpdate: () => Promise<void>;
-  readonly collabStatus: () => CollabHookStatus;
-  readonly setCollabOffline: (offline: boolean) => void;
-}
-
-export function installHooks(grid: Grid, extras: HookExtras): () => void {
-  const hooks: Hooks = {
-    stats: () => grid.stats(),
-    scrollTo: (position) => grid.scrollTo(position),
-    select: (row, col) => grid.select({ row, col }),
-    selectRange: (anchor, focus) => grid.selectRange(anchor, focus),
-    textAt: (row, col) => grid.textAt(row, col),
-    selfCheck: extras.selfCheck,
-    stateDigest: extras.stateDigest,
-    docStatus: extras.docStatus,
-    compactSnapshot: extras.compactSnapshot,
-    flushAndClose: extras.flushAndClose,
-    spinWorker: extras.spinWorker,
-    swStatus: extras.swStatus,
-    checkSwUpdate: extras.checkSwUpdate,
-    collabStatus: extras.collabStatus,
-    setCollabOffline: extras.setCollabOffline,
-    setRenderer: (preference) => setRendererPreference(grid, preference),
-  };
-  window.__reticula = hooks;
-  return () => {
-    if (window.__reticula === hooks) {
-      delete window.__reticula;
-    }
-  };
 }

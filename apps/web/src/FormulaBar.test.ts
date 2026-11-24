@@ -10,6 +10,13 @@ import zhFunctions from "./i18n/zh-functions.ts";
 // The editor of the formula is made when the bar is mounted, which it is not here.
 vi.mock("@reticula/grid", () => ({ FormulaBarEditor: class {} }));
 
+// As if it had been loaded.
+vi.mock("./editor/load-later.ts", async () => {
+  const { default: FormulaAssist } = await import("./editor/FormulaAssist.tsx");
+  const { translateEngineText } = await import("./i18n/engine-text.ts");
+  return { laterNow: () => ({ FormulaAssist }), engineText: translateEngineText };
+});
+
 let shown: Readonly<Record<string, Catalogue>> = {};
 
 vi.mock("./i18n/index.ts", async (original) => ({
@@ -68,7 +75,7 @@ const analysis: WireFormulaAnalysis = {
 function shownText(): string {
   const markup = renderToStaticMarkup(
     createElement(FormulaBar, {
-      nameBoxText: "A1",
+      nameBox: "A1",
       value: "=SUMS",
       placeholder: "",
       disabled: false,
