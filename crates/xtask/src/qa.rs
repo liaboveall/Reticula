@@ -188,7 +188,7 @@ pub fn bench(flags: &Flags) -> Result {
     // `engine` is B1-B8, B11 and B12; `b9` is the collaborative slow path.
     let suite = flags.get("suite").unwrap_or("engine");
     let (native_command, suite_label, archive_kind) = match suite {
-        "engine" => ("native-bench", "m3a-engine", "engine"),
+        "engine" => ("native-bench", "m3b-engine", "engine"),
         "b9" => ("sync-bench", "m3a-sync", "sync"),
         other => return Err(format!("unknown benchmark suite `{other}` (engine or b9)")),
     };

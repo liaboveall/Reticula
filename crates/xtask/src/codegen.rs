@@ -294,6 +294,7 @@ fn quoted(text: &str) -> String {
 
 fn suite_rank(val: &serde_json::Value) -> u8 {
     match val["suite"].as_str().unwrap_or("") {
+        "m3b-engine" | "m3b-sync" | "m3b-diff" | "m3b-startup" | "m3b-render" => 6,
         "m3a-engine" | "m3a-sync" | "m3a-diff" | "m3a-startup" | "m3a-render" => 5,
         "m2b-load" | "m2b-sync" => 4,
         "m2a-sync" => 3,
