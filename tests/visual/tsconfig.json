@@ -1,0 +1,8 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "types": ["node"]
+  },
+  // The page's hooks file declares what the tests call on `window`.
+  "include": ["*.ts", "../../playwright.visual.config.ts", "../../apps/web/src/visual/hooks.ts"]
+}

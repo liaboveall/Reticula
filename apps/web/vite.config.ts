@@ -28,7 +28,10 @@ export default defineConfig(({ mode }) => ({
   // `dist/sw.js` without clearing the app build output (`14-m1b.md` 7.4).
   build:
     mode === "spikes"
-      ? { outDir: "dist-spikes", rolldownOptions: { input: ["bench.html", "ime.html"] } }
+      ? {
+          outDir: "dist-spikes",
+          rolldownOptions: { input: ["bench.html", "ime.html", "visual.html"] },
+        }
       : mode === "sw"
         ? {
             outDir: "dist",

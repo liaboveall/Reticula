@@ -80,6 +80,10 @@ Commands:
                           End-to-end tests in chromium, firefox and webkit. The
                           collaborative ones use RETICULA_TEST_DATABASE_URL, or else
                           the development database, which they start.
+  visual [--update] [--skip-build]
+                          Visual regression: pictures of the grid, compared between the
+                          renderers and, on the CI runner only, with the golden images.
+                          --update (there only) writes the golden images.
   ci                      Everything CI runs on a push. Run it before pushing.
   spike <name> [options]  Run one of the experiments under spikes/ and print its report.
                           `s1` and `s2` measure the grid in a browser and pass their
@@ -177,6 +181,7 @@ fn run(args: &[String]) -> Result {
         "loadtest" => stack::loadtest(&Flags::parse(rest, &["skip-image"], &["out"])?),
         "build" => build(&Flags::parse(rest, &["skip-wasm", "check-budget"], &[])?),
         "e2e" => e2e(&Flags::parse(rest, &["skip-build"], &["browser"])?),
+        "visual" => visual(&Flags::parse(rest, &["update", "skip-build"], &[])?),
         "ci" => {
             Flags::parse(rest, &[], &[])?;
             ci()
@@ -272,6 +277,24 @@ fn e2e(flags: &Flags) -> Result {
     web::e2e(flags.get("browser"))
 }
 
+fn visual(flags: &Flags) -> Result {
+    if flags.has("update") && !web::is_golden_environment() {
+        return Err(
+            "golden images are made by the `visual` CI job only: take them from its artifact"
+                .to_owned(),
+        );
+    }
+    if !flags.has("skip-build") {
+        // Nothing the page draws comes from the engine, but the other pages
+        // that are built with it do not build without the module.
+        if !util::root().join("packages/protocol/pkg").is_dir() {
+            wasm::build(Profile::Release)?;
+        }
+        web::build_spikes()?;
+    }
+    web::visual(flags.has("update"))
+}
+
 fn ci() -> Result {
     rust::check()?;
     compat::check()?;
@@ -288,5 +311,6 @@ fn ci() -> Result {
     web::test()?;
     web::build()?;
     web::build_spikes()?;
+    web::visual(false)?;
     web::e2e(None)
 }

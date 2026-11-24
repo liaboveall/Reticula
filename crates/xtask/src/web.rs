@@ -4,6 +4,7 @@ mod bundle;
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use crate::compat::sha256_hex;
 use crate::util::{self, Result, cargo, node, pnpm};
@@ -13,12 +14,13 @@ const APP: &str = "@reticula/web";
 const DIST: &str = "apps/web/dist";
 
 /// TypeScript projects, each with its own `tsconfig.json`.
-const TS_PROJECTS: [&str; 5] = [
+const TS_PROJECTS: [&str; 6] = [
     "packages/protocol",
     "packages/grid",
     "apps/web",
     "tests/e2e",
     "tests/stack",
+    "tests/visual",
 ];
 
 pub fn check() -> Result {
@@ -33,6 +35,9 @@ pub fn check() -> Result {
     }
     Ok(())
 }
+
+/// What the visual regression tests may take: they run before every push.
+const VISUAL_BUDGET_SECONDS: f64 = 120.0;
 
 /// The front-end unit tests. They need neither a browser nor the engine.
 pub fn test() -> Result {
@@ -199,4 +204,38 @@ pub fn e2e(browser: Option<&str>) -> Result {
         test = test.arg(format!("--project={browser}"));
     }
     test.run()
+}
+
+/// Golden images belong to one environment, the runner of the `visual` CI job,
+/// which sets this: elsewhere the same text is drawn a little differently.
+pub fn is_golden_environment() -> bool {
+    std::env::var_os("RETICULA_GOLDEN").is_some_and(|value| value == "1")
+}
+
+/// The visual regression tests, on the pages `build_spikes` makes.
+pub fn visual(update: bool) -> Result {
+    util::step("playwright (visual regression)");
+    if !is_golden_environment() {
+        println!("  golden images: skipped, they are compared by the `visual` CI job only");
+    }
+    let mut test = pnpm().args([
+        "exec",
+        "playwright",
+        "test",
+        "-c",
+        "playwright.visual.config.ts",
+    ]);
+    if update {
+        test = test.env("RETICULA_GOLDEN_UPDATE", "1");
+    }
+    let started = Instant::now();
+    test.run()?;
+    let seconds = started.elapsed().as_secs_f64();
+    println!("  visual regression: {seconds:.1} s (budget {VISUAL_BUDGET_SECONDS:.0} s)");
+    if seconds > VISUAL_BUDGET_SECONDS {
+        return Err(format!(
+            "the visual regression tests took {seconds:.1} s, more than {VISUAL_BUDGET_SECONDS:.0} s"
+        ));
+    }
+    Ok(())
 }
