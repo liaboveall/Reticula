@@ -44,6 +44,7 @@ pub mod filter;
 pub mod functions;
 pub mod lang_service;
 pub mod lexer;
+pub mod lookup_index;
 pub mod parser;
 pub mod search;
 pub mod sort;

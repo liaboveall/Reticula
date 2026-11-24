@@ -28,6 +28,7 @@ use reticula_core::store::{BLOCK_ROWS, Block};
 use reticula_core::value::{CalcError, Value};
 
 use crate::binder::{BoundFormula, live_span_positions};
+use crate::lookup_index::LookupIndexCache;
 use crate::spill::SpillRegistry;
 use crate::value_eval::{
     Array2D, CallerContext, EvalScalar, EvalValue, MAX_ARRAY_CELLS, ResolvedRef, ScalarOrArray,
@@ -74,7 +75,11 @@ impl EvalEnv {
 /// Evaluates an eager (non-short-circuiting) built-in function `name` on
 /// already-evaluated `args`. (`IF`, `IFERROR`, `IFNA`, `IFS`, `SWITCH`, `CHOOSE`,
 /// `OFFSET`, and `INDIRECT` are handled directly in `FormulaEngine`.)
-#[expect(clippy::too_many_lines, reason = "central 192-arm built-in dispatcher")]
+#[expect(
+    clippy::too_many_lines,
+    clippy::too_many_arguments,
+    reason = "central 192-arm built-in dispatcher"
+)]
 pub fn eval_eager_function(
     name: &str,
     args: Vec<EvalValue>,
@@ -83,6 +88,7 @@ pub fn eval_eager_function(
     caller: CallerContext,
     env: &mut EvalEnv,
     is_row_hidden: Option<&dyn Fn(SheetId, RowId) -> bool>,
+    lookup_cache: &mut LookupIndexCache,
 ) -> EvalValue {
     match name {
         // --- Layer 0: Aggregations ---
@@ -299,12 +305,16 @@ pub fn eval_eager_function(
         "ROWS" => lookup::eval_rows_or_columns(&args, workbook, true),
         "COLUMNS" => lookup::eval_rows_or_columns(&args, workbook, false),
         "INDEX" => lookup::eval_index(args, workbook, spills, caller),
-        "MATCH" => lookup::eval_match(args, workbook, spills, caller),
-        "VLOOKUP" => lookup::eval_vlookup_or_hlookup(args, workbook, spills, caller, true),
-        "HLOOKUP" => lookup::eval_vlookup_or_hlookup(args, workbook, spills, caller, false),
-        "XLOOKUP" => lookup::eval_xlookup(args, workbook, spills, caller),
-        "XMATCH" => lookup::eval_xmatch(args, workbook, spills, caller),
-        "LOOKUP" => lookup::eval_lookup(args, workbook, spills, caller),
+        "MATCH" => lookup::eval_match(args, workbook, spills, caller, lookup_cache),
+        "VLOOKUP" => {
+            lookup::eval_vlookup_or_hlookup(args, workbook, spills, caller, true, lookup_cache)
+        }
+        "HLOOKUP" => {
+            lookup::eval_vlookup_or_hlookup(args, workbook, spills, caller, false, lookup_cache)
+        }
+        "XLOOKUP" => lookup::eval_xlookup(args, workbook, spills, caller, lookup_cache),
+        "XMATCH" => lookup::eval_xmatch(args, workbook, spills, caller, lookup_cache),
+        "LOOKUP" => lookup::eval_lookup(args, workbook, spills, caller, lookup_cache),
         "ADDRESS" => lookup::eval_address(args, workbook, spills, caller),
         "AREAS" => lookup::eval_areas(&args),
         "TRANSPOSE" => dynamic_array::eval_transpose(args, workbook, spills),

@@ -13,14 +13,18 @@ use reticula_core::decimal15::{cmp_excel_f64, snap_cancelled_zero};
 use reticula_core::id::{ColId, RowId, SheetId};
 use reticula_core::ops::Workbook;
 use reticula_core::sheet::Sheet;
+use reticula_core::store::Column;
 use reticula_core::value::{CalcError, Value};
+use smallvec::SmallVec;
 
 use crate::ast::{BinaryOp, UnaryOp};
 use crate::binder::BoundFormula;
 use crate::bytecode::{CHUNK_LEN, CompiledStripProgram, FixedAreaSpec, Instr, UnaryByteOp};
+use crate::functions::criteria::ref_live_origin_and_size;
 use crate::functions::{
     eval_average, eval_count, eval_counta, eval_min_max, eval_round_scalar, eval_sum, lookup,
 };
+use crate::lookup_index::{LookupIndexCache, has_wildcard_tokens};
 use crate::spill::SpillRegistry;
 use crate::value_eval::{
     EvalScalar, EvalValue, ResolvedRef, apply_binary_scalar, apply_unary_scalar,
@@ -269,6 +273,64 @@ impl RegVec {
     }
 
     #[inline]
+    fn write_error(&mut self, lane: usize, err: CalcError) {
+        self.all_num = false;
+        if let Some(t) = self.tags.get_mut(lane) {
+            *t = TAG_ERROR;
+        }
+        if let Some(p) = self.payloads.get_mut(lane) {
+            *p = err_to_u32(err);
+        }
+    }
+
+    #[inline]
+    fn write_number_lane(&mut self, lane: usize, n: f64) {
+        if !n.is_finite() {
+            self.write_error(lane, CalcError::Num);
+            return;
+        }
+        if let Some(t) = self.tags.get_mut(lane) {
+            *t = TAG_NUM;
+        }
+        if let Some(dst) = self.nums.get_mut(lane) {
+            *dst = if n == 0.0 { 0.0 } else { n };
+        }
+    }
+
+    #[inline]
+    fn write_lookup_packed_cell(
+        &mut self,
+        lane: usize,
+        sheet: &Sheet,
+        bits: u64,
+        text_pool: &mut Vec<String>,
+    ) {
+        if bits == Value::EMPTY_BITS {
+            self.write_number_lane(lane, 0.0);
+            return;
+        }
+        match Value::unpack(bits) {
+            Value::Empty => self.write_number_lane(lane, 0.0),
+            Value::Number(n) => self.write_number_lane(lane, n),
+            Value::Bool(b) => {
+                if let (Some(t), Some(p)) = (self.tags.get_mut(lane), self.payloads.get_mut(lane)) {
+                    *t = TAG_BOOL;
+                    *p = u32::from(b);
+                }
+            }
+            Value::Error(e) => self.write_error(lane, e),
+            Value::Text(id) => {
+                let idx = intern_pool_string(text_pool, sheet.strings().get(id));
+                if let (Some(t), Some(p)) = (self.tags.get_mut(lane), self.payloads.get_mut(lane)) {
+                    *t = TAG_TEXT;
+                    *p = idx;
+                }
+            }
+            Value::Array(_) => self.write_error(lane, CalcError::Spill),
+        }
+    }
+
+    #[inline]
     fn refresh_all_num(&mut self, len: usize) {
         self.all_num = self
             .tags
@@ -356,6 +418,8 @@ impl BatchScratch {
         &mut self,
         program: &CompiledStripProgram,
         workbook: &Workbook<BoundFormula>,
+        spills: &SpillRegistry,
+        lookup_cache: &mut LookupIndexCache,
         host_sheet: SheetId,
         host_base_pos: u32,
         strip_col: ColId,
@@ -368,6 +432,8 @@ impl BatchScratch {
             self.eval_recurrence_chunk(
                 program,
                 workbook,
+                spills,
+                lookup_cache,
                 host_sheet,
                 host_base_pos,
                 strip_col,
@@ -395,16 +461,21 @@ impl BatchScratch {
             }
         }
 
-        let spills = SpillRegistry::new();
-        let ctx = VecEvalCtx {
+        let mut ctx = VecEvalCtx {
             program,
             workbook,
-            spills: &spills,
+            spills,
+            lookup_cache,
             stride_words: &self.stride_words,
             host_base_pos,
             chunk_len: len,
         };
-        exec_vec_instrs(&program.instrs, &ctx, &mut self.regs, &mut self.text_pool);
+        exec_vec_instrs(
+            &program.instrs,
+            &mut ctx,
+            &mut self.regs,
+            &mut self.text_pool,
+        );
 
         let Some(root_reg) = self.regs.get(program.result_reg as usize) else {
             self.out_words.fill(Value::Error(CalcError::Calc).pack());
@@ -427,6 +498,8 @@ impl BatchScratch {
         &mut self,
         program: &CompiledStripProgram,
         workbook: &Workbook<BoundFormula>,
+        spills: &SpillRegistry,
+        lookup_cache: &mut LookupIndexCache,
         host_sheet_id: SheetId,
         host_base_pos: u32,
         strip_col: ColId,
@@ -466,14 +539,13 @@ impl BatchScratch {
             host_sheet.read_row_id_span_packed(RowId(seed_start_u64), strip_col, seed_dst);
         }
 
-        let spills = SpillRegistry::new();
-
         for lane in 0..len {
             let mut ctx = LaneEvalCtx {
                 program,
                 workbook,
                 host_sheet_id,
-                spills: &spills,
+                spills,
+                lookup_cache,
                 stride_words: &self.stride_words,
                 host_base_pos,
                 lane,
@@ -553,6 +625,7 @@ struct VecEvalCtx<'a> {
     program: &'a CompiledStripProgram,
     workbook: &'a Workbook<BoundFormula>,
     spills: &'a SpillRegistry,
+    lookup_cache: &'a mut LookupIndexCache,
     stride_words: &'a [Vec<u64>],
     host_base_pos: u32,
     chunk_len: usize,
@@ -560,7 +633,7 @@ struct VecEvalCtx<'a> {
 
 fn exec_vec_instrs(
     instrs: &[Instr],
-    ctx: &VecEvalCtx<'_>,
+    ctx: &mut VecEvalCtx<'_>,
     regs: &mut [RegVec],
     text_pool: &mut Vec<String>,
 ) {
@@ -956,59 +1029,238 @@ fn exec_vec_instrs(
                 area_idx,
                 col_index,
             } => {
-                let Some(area) = ctx.program.fixed_areas.get(*area_idx) else {
+                let Some(area) = ctx.program.fixed_areas.get(*area_idx).copied() else {
                     continue;
                 };
-                let area_ref = fixed_area_resolved(*area);
-                let dst_idx = *dst as usize;
-                let (before, after) = regs.split_at_mut(dst_idx);
-                let (Some(n_reg), Some(dst_reg)) =
-                    (before.get(*needle as usize), after.first_mut())
-                else {
-                    continue;
-                };
-                for lane in 0..len {
-                    let needle_s = n_reg.read_scalar(lane, text_pool);
-                    let res = lookup::vlookup_exact_on_ref(
-                        &needle_s,
-                        area_ref.clone(),
-                        *col_index,
-                        ctx.workbook,
-                        ctx.spills,
-                    );
-                    dst_reg.write_scalar(lane, res, text_pool);
-                }
-                dst_reg.refresh_all_num(len);
+                exec_vec_lookup_exact(
+                    ctx,
+                    regs,
+                    text_pool,
+                    *dst as usize,
+                    *needle as usize,
+                    area,
+                    Some(*col_index),
+                );
             }
             Instr::MatchExact {
                 dst,
                 needle,
                 area_idx,
             } => {
-                let Some(area) = ctx.program.fixed_areas.get(*area_idx) else {
+                let Some(area) = ctx.program.fixed_areas.get(*area_idx).copied() else {
                     continue;
                 };
-                let area_ref = fixed_area_resolved(*area);
-                let dst_idx = *dst as usize;
-                let (before, after) = regs.split_at_mut(dst_idx);
-                let (Some(n_reg), Some(dst_reg)) =
-                    (before.get(*needle as usize), after.first_mut())
-                else {
-                    continue;
-                };
-                for lane in 0..len {
-                    let needle_s = n_reg.read_scalar(lane, text_pool);
-                    let res = lookup::match_exact_on_ref(
-                        &needle_s,
-                        area_ref.clone(),
-                        ctx.workbook,
-                        ctx.spills,
-                    );
-                    dst_reg.write_scalar(lane, res, text_pool);
-                }
-                dst_reg.refresh_all_num(len);
+                exec_vec_lookup_exact(
+                    ctx,
+                    regs,
+                    text_pool,
+                    *dst as usize,
+                    *needle as usize,
+                    area,
+                    None,
+                );
             }
         }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct VlookupTargetCols<'a> {
+    t_cid: ColId,
+    target_col: Option<&'a Column>,
+    r0: u32,
+    contiguous_base_rid: Option<u64>,
+    contiguous_base_slot: Option<u32>,
+}
+
+#[inline]
+fn write_lookup_hit_to_lane(
+    dst_reg: &mut RegVec,
+    lane: usize,
+    hit: Option<u32>,
+    sheet: &Sheet,
+    target: Option<VlookupTargetCols<'_>>,
+    text_pool: &mut Vec<String>,
+) {
+    let Some(off) = hit else {
+        dst_reg.write_error(lane, CalcError::Na);
+        return;
+    };
+    let Some(tgt) = target else {
+        dst_reg.write_number_lane(lane, f64::from(off.saturating_add(1)));
+        return;
+    };
+    let bits = if let Some(base_slot) = tgt.contiguous_base_slot {
+        tgt.target_col.map_or(Value::EMPTY_BITS, |c| {
+            c.get_packed(base_slot.saturating_add(off))
+        })
+    } else if let Some(rid) = tgt
+        .contiguous_base_rid
+        .map(|b| b.saturating_add(u64::from(off)))
+        .or_else(|| sheet.row_axis().pos_to_id(tgt.r0.saturating_add(off)))
+    {
+        sheet.value_by_id(RowId(rid), tgt.t_cid).pack()
+    } else {
+        dst_reg.write_error(lane, CalcError::Ref);
+        return;
+    };
+    dst_reg.write_lookup_packed_cell(lane, sheet, bits, text_pool);
+}
+
+fn exec_vec_lookup_exact(
+    ctx: &mut VecEvalCtx<'_>,
+    regs: &mut [RegVec],
+    text_pool: &mut Vec<String>,
+    dst_idx: usize,
+    needle_idx: usize,
+    area: FixedAreaSpec,
+    vlookup_col_index: Option<u32>,
+) {
+    let len = ctx.chunk_len;
+    let area_ref = fixed_area_resolved(area);
+    let mut wildcard_lanes: SmallVec<[usize; 8]> = SmallVec::new();
+    let mut used_fast_path = false;
+
+    let geom = ref_live_origin_and_size(&area_ref, ctx.workbook)
+        .ok()
+        .and_then(|(sheet_id, r0, rows, c0, cols)| {
+            let sheet = ctx.workbook.sheet(sheet_id)?;
+            if vlookup_col_index.is_none() && cols != 1 {
+                return None;
+            }
+            if let Some(ci) = vlookup_col_index
+                && (ci < 1 || ci > cols)
+            {
+                return None;
+            }
+            let lookup_cid = ColId(sheet.col_axis().pos_to_id(c0)?);
+            if ctx.spills.has_shadows_in_col(sheet_id, lookup_cid) {
+                return None;
+            }
+            let target = if let Some(ci) = vlookup_col_index {
+                let t_cid = ColId(
+                    sheet
+                        .col_axis()
+                        .pos_to_id(c0.saturating_add(ci.saturating_sub(1)))?,
+                );
+                if ctx.spills.has_shadows_in_col(sheet_id, t_cid) {
+                    return None;
+                }
+                let t_col = sheet
+                    .col_slots()
+                    .get(t_cid.0)
+                    .and_then(|cs| sheet.raw_columns().get(cs as usize));
+                let contiguous_base_rid = sheet.row_axis().pos_to_id(r0).filter(|&first_rid| {
+                    sheet.row_axis().live_run_covers(first_rid, rows).is_some()
+                });
+                let contiguous_base_slot = contiguous_base_rid
+                    .filter(|&b| {
+                        b.saturating_add(u64::from(rows)) <= u64::from(sheet.row_slots().base_len())
+                    })
+                    .and_then(|b| u32::try_from(b).ok());
+                Some(VlookupTargetCols {
+                    t_cid,
+                    target_col: t_col,
+                    r0,
+                    contiguous_base_rid,
+                    contiguous_base_slot,
+                })
+            } else {
+                None
+            };
+            Some((sheet, lookup_cid, r0, rows, target))
+        });
+
+    if let Some((sheet, lookup_cid, r0, rows, target)) = geom {
+        let touch = u32::try_from(len).unwrap_or(u32::MAX);
+        if let Some(hash_idx) = ctx
+            .lookup_cache
+            .get_or_build(sheet, lookup_cid, r0, rows, touch)
+        {
+            used_fast_path = true;
+            let (before, after) = regs.split_at_mut(dst_idx);
+            let (Some(n_reg), Some(dst_reg)) = (before.get(needle_idx), after.first_mut()) else {
+                return;
+            };
+            dst_reg.all_num = false;
+            if n_reg.all_num {
+                for lane in 0..len {
+                    let n = n_reg.nums.get(lane).copied().unwrap_or(0.0);
+                    let hit = hash_idx.probe_number(n);
+                    write_lookup_hit_to_lane(dst_reg, lane, hit, sheet, target, text_pool);
+                }
+            } else {
+                for lane in 0..len {
+                    let tag = n_reg.tags.get(lane).copied().unwrap_or(TAG_EMPTY);
+                    let hit = match tag {
+                        TAG_ERROR => {
+                            let code = n_reg.payloads.get(lane).copied().unwrap_or(0);
+                            dst_reg.write_error(lane, err_from_u32(code));
+                            continue;
+                        }
+                        TAG_EMPTY => hash_idx.probe_number(0.0),
+                        TAG_NUM => {
+                            let n = n_reg.nums.get(lane).copied().unwrap_or(0.0);
+                            hash_idx.probe_number(n)
+                        }
+                        TAG_BOOL => {
+                            let b = n_reg.payloads.get(lane).copied().unwrap_or(0) != 0;
+                            hash_idx.probe_bool(b)
+                        }
+                        TAG_TEXT => {
+                            let idx = n_reg.payloads.get(lane).copied().unwrap_or(0) as usize;
+                            let s = text_pool.get(idx).map_or("", String::as_str);
+                            if has_wildcard_tokens(s) {
+                                wildcard_lanes.push(lane);
+                                continue;
+                            }
+                            hash_idx.probe_text(sheet, s)
+                        }
+                        _ => hash_idx.probe_number(0.0),
+                    };
+                    write_lookup_hit_to_lane(dst_reg, lane, hit, sheet, target, text_pool);
+                }
+            }
+            dst_reg.refresh_all_num(len);
+        }
+    }
+
+    if !used_fast_path || !wildcard_lanes.is_empty() {
+        let (before, after) = regs.split_at_mut(dst_idx);
+        let (Some(n_reg), Some(dst_reg)) = (before.get(needle_idx), after.first_mut()) else {
+            return;
+        };
+        let mut eval_slow_lane = |lane: usize| {
+            let needle_s = n_reg.read_scalar(lane, text_pool);
+            let res = match vlookup_col_index {
+                Some(col_index) => lookup::vlookup_exact_on_ref(
+                    &needle_s,
+                    area_ref.clone(),
+                    col_index,
+                    ctx.workbook,
+                    ctx.spills,
+                    ctx.lookup_cache,
+                ),
+                None => lookup::match_exact_on_ref(
+                    &needle_s,
+                    area_ref.clone(),
+                    ctx.workbook,
+                    ctx.spills,
+                    ctx.lookup_cache,
+                ),
+            };
+            dst_reg.write_scalar(lane, res, text_pool);
+        };
+        if !used_fast_path {
+            for lane in 0..len {
+                eval_slow_lane(lane);
+            }
+        } else {
+            for lane in wildcard_lanes {
+                eval_slow_lane(lane);
+            }
+        }
+        dst_reg.refresh_all_num(len);
     }
 }
 
@@ -1017,6 +1269,7 @@ struct LaneEvalCtx<'a> {
     workbook: &'a Workbook<BoundFormula>,
     host_sheet_id: SheetId,
     spills: &'a SpillRegistry,
+    lookup_cache: &'a mut LookupIndexCache,
     stride_words: &'a [Vec<u64>],
     host_base_pos: u32,
     lane: usize,
@@ -1379,6 +1632,7 @@ impl LaneEvalCtx<'_> {
                         *col_index,
                         self.workbook,
                         self.spills,
+                        self.lookup_cache,
                     );
                     self.set_scalar(*dst as usize, res);
                 }
@@ -1396,6 +1650,7 @@ impl LaneEvalCtx<'_> {
                         fixed_area_resolved(*area),
                         self.workbook,
                         self.spills,
+                        self.lookup_cache,
                     );
                     self.set_scalar(*dst as usize, res);
                 }

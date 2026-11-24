@@ -59,6 +59,7 @@ use crate::filter::{
     distinct_column_values, evaluate_filter_table,
 };
 use crate::functions::{EvalEnv, combine_choose, combine_if, combine_iferror, eval_eager_function};
+use crate::lookup_index::LookupIndexCache;
 use crate::parser::ParseError;
 use crate::spill::{CommitSpillOutcome, SpillCollisionOrder, SpillRegistry};
 use crate::value_eval::{
@@ -431,6 +432,7 @@ pub struct FormulaEngine {
     filters: BTreeMap<SheetId, (FilterTable, VisibleRowProjection)>,
     env: EvalEnv,
     batch_scratch: BatchScratch,
+    lookup_cache: LookupIndexCache,
 }
 
 impl Default for FormulaEngine {
@@ -613,6 +615,7 @@ impl FormulaEngine {
             filters: BTreeMap::new(),
             env: EvalEnv::default(),
             batch_scratch: BatchScratch::default(),
+            lookup_cache: LookupIndexCache::new(),
         }
     }
 
@@ -3210,6 +3213,7 @@ impl FormulaEngine {
 
     fn on_sheet_visibility_changed(&mut self, sheet: SheetId) {
         self.changes.structural = true;
+        self.lookup_cache.invalidate_sheet(sheet);
         let is_deleted = self.workbook.live_sheet(sheet).is_none();
         if is_deleted {
             self.clear_filter(sheet);
@@ -4384,6 +4388,8 @@ impl FormulaEngine {
                             self.batch_scratch.eval_strip_chunk(
                                 program,
                                 &self.workbook,
+                                &self.spills,
+                                &mut self.lookup_cache,
                                 sheet,
                                 host_base_pos,
                                 col,
@@ -6889,6 +6895,7 @@ impl FormulaEngine {
             caller,
             &mut self.env,
             is_row_hidden,
+            &mut self.lookup_cache,
         ))
     }
 
@@ -10427,6 +10434,92 @@ mod tests {
                 .unwrap()
                 .value_by_id(RowId(0), ColId(3)),
             Value::Number(10.0)
+        );
+    }
+
+    #[test]
+    fn b6_value_edit_keeps_key_index_warm_and_handles_wildcards() {
+        let mut eng = FormulaEngine::new();
+        let s = SheetId(0);
+        for r in 0_u32..100 {
+            let row = RowId(u64::from(r));
+            if r == 10 {
+                eng.edit_cell_raw(s, row, ColId(0), "alphaXstar").unwrap();
+            } else if r == 20 {
+                eng.edit_cell_raw(s, row, ColId(0), "alpha*star").unwrap();
+            } else {
+                eng.edit_cell_raw(s, row, ColId(0), &format!("{}", r + 1))
+                    .unwrap();
+            }
+            eng.edit_cell_raw(s, row, ColId(1), &format!("{}", (r + 1) * 10))
+                .unwrap();
+        }
+        for r in 0_u32..100 {
+            let row = RowId(u64::from(r));
+            eng.edit_cell_raw(s, row, ColId(3), "1").unwrap();
+            eng.edit_cell_raw(s, row, ColId(4), "=VLOOKUP(D1, $A$1:$B$100, 2, FALSE)")
+                .unwrap();
+        }
+        eng.edit_cell_raw(s, RowId(0), ColId(5), "alpha*star")
+            .unwrap();
+        // Wildcard VLOOKUP matches `alphaXstar` at row 10 (`110`), whereas
+        // XLOOKUP match_mode=0 treats `alpha*star` literally -> row 20 (`210`).
+        eng.edit_cell_raw(s, RowId(1), ColId(5), "=VLOOKUP(F1, $A$1:$B$100, 2, FALSE)")
+            .unwrap();
+        eng.edit_cell_raw(
+            s,
+            RowId(2),
+            ColId(5),
+            "=XLOOKUP(F1, $A$1:$A$100, $B$1:$B$100, -1, 0)",
+        )
+        .unwrap();
+        eng.edit_cell_raw(
+            s,
+            RowId(3),
+            ColId(5),
+            "=XLOOKUP(\"alpha?star\", $A$1:$A$100, $B$1:$B$100, -1, 0)",
+        )
+        .unwrap();
+        eng.recalc_all();
+        assert_eq!(eng.lookup_cache.hot_entry_count(), 1);
+        let key_col_gen_before = eng.workbook().sheet(s).unwrap().col_generation(ColId(0));
+
+        {
+            let sh = eng.workbook().sheet(s).unwrap();
+            assert_eq!(sh.value_by_id(RowId(0), ColId(4)), Value::Number(10.0));
+            assert_eq!(sh.value_by_id(RowId(1), ColId(5)), Value::Number(110.0));
+            assert_eq!(sh.value_by_id(RowId(2), ColId(5)), Value::Number(210.0));
+            assert_eq!(sh.value_by_id(RowId(3), ColId(5)), Value::Number(-1.0));
+        }
+
+        // Editing value column B leaves lookup column A's generation unchanged and
+        // updates all 100 VLOOKUP rows plus the 3 column-F lookup cells (`103`)
+        // using the warm cached hash index.
+        eng.edit_cell_raw(s, RowId(0), ColId(1), "999").unwrap();
+        assert_eq!(eng.recalc_all(), 103);
+        let key_col_gen_after_val = eng.workbook().sheet(s).unwrap().col_generation(ColId(0));
+        assert_eq!(key_col_gen_before, key_col_gen_after_val);
+        assert_eq!(
+            eng.workbook()
+                .sheet(s)
+                .unwrap()
+                .value_by_id(RowId(0), ColId(4)),
+            Value::Number(999.0)
+        );
+
+        // Editing lookup key column A bumps key column generation and rebuilds accurately.
+        eng.edit_cell_raw(s, RowId(0), ColId(0), "9999").unwrap();
+        eng.recalc_all();
+        assert_ne!(
+            eng.workbook().sheet(s).unwrap().col_generation(ColId(0)),
+            key_col_gen_after_val
+        );
+        assert_eq!(
+            eng.workbook()
+                .sheet(s)
+                .unwrap()
+                .value_by_id(RowId(0), ColId(4)),
+            Value::Error(CalcError::Na)
         );
     }
 }

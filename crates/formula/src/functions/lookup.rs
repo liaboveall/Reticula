@@ -25,6 +25,7 @@ use super::wildcard::{WildToken, compile_wildcard, wildcard_matches_full};
 use super::{empty_to_zero, get_sa, shape_of, trunc_to_isize};
 use crate::address::{write_col_letters, write_sheet_prefix};
 use crate::binder::{BoundExpr, BoundFormula, bind_expr};
+use crate::lookup_index::{LookupIndexCache, LookupProbeResult, has_wildcard_tokens};
 use crate::parser::parse_formula;
 use crate::spill::SpillRegistry;
 use crate::value_eval::{
@@ -329,6 +330,7 @@ pub fn eval_match(
     workbook: &Workbook<BoundFormula>,
     spills: &SpillRegistry,
     caller: CallerContext,
+    lookup_cache: &mut LookupIndexCache,
 ) -> EvalValue {
     if !(2..=3).contains(&args.len()) {
         return EvalValue::Scalar(EvalScalar::Error(CalcError::Value));
@@ -368,15 +370,26 @@ pub fn eval_match(
         Err(e) => return EvalValue::Scalar(EvalScalar::Error(e)),
     };
     match lookup_sa {
-        ScalarOrArray::Scalar(needle) => {
-            EvalValue::Scalar(match_one(&needle, &array_arg, match_type, workbook, spills))
-        }
+        ScalarOrArray::Scalar(needle) => EvalValue::Scalar(match_one(
+            &needle,
+            &array_arg,
+            match_type,
+            workbook,
+            spills,
+            lookup_cache,
+        )),
         ScalarOrArray::Array(arr) => {
-            let values = arr
-                .values
-                .iter()
-                .map(|needle| match_one(needle, &array_arg, match_type, workbook, spills))
-                .collect();
+            let mut values = Vec::with_capacity(arr.values.len());
+            for needle in &arr.values {
+                values.push(match_one(
+                    needle,
+                    &array_arg,
+                    match_type,
+                    workbook,
+                    spills,
+                    lookup_cache,
+                ));
+            }
             EvalValue::Array(Array2D {
                 rows: arr.rows,
                 cols: arr.cols,
@@ -392,6 +405,7 @@ pub(crate) fn match_exact_on_ref(
     reference: ResolvedRef,
     workbook: &Workbook<BoundFormula>,
     spills: &SpillRegistry,
+    lookup_cache: &mut LookupIndexCache,
 ) -> EvalScalar {
     match_one(
         needle,
@@ -399,6 +413,7 @@ pub(crate) fn match_exact_on_ref(
         0,
         workbook,
         spills,
+        lookup_cache,
     )
 }
 
@@ -410,6 +425,7 @@ pub(crate) fn vlookup_exact_on_ref(
     col_index: u32,
     workbook: &Workbook<BoundFormula>,
     spills: &SpillRegistry,
+    lookup_cache: &mut LookupIndexCache,
 ) -> EvalScalar {
     if col_index < 1 {
         return EvalScalar::Error(CalcError::Value);
@@ -422,6 +438,7 @@ pub(crate) fn vlookup_exact_on_ref(
         true,
         workbook,
         spills,
+        lookup_cache,
     )
 }
 
@@ -431,6 +448,7 @@ fn match_one(
     match_type: i32,
     workbook: &Workbook<BoundFormula>,
     spills: &SpillRegistry,
+    lookup_cache: &mut LookupIndexCache,
 ) -> EvalScalar {
     if let EvalScalar::Error(e) = needle {
         return EvalScalar::Error(*e);
@@ -454,7 +472,16 @@ fn match_one(
                 return EvalScalar::Error(CalcError::Ref);
             };
             let found = if cols == 1 {
-                search_sheet_column(sheet, c0, r0, rows, &norm_needle, match_type, spills)
+                search_sheet_column(
+                    sheet,
+                    c0,
+                    r0,
+                    rows,
+                    &norm_needle,
+                    match_type,
+                    spills,
+                    lookup_cache,
+                )
             } else {
                 search_sheet_row(sheet, r0, c0, cols, &norm_needle, match_type, spills)
             };
@@ -488,6 +515,7 @@ pub fn eval_vlookup_or_hlookup(
     spills: &SpillRegistry,
     caller: CallerContext,
     is_vertical: bool,
+    lookup_cache: &mut LookupIndexCache,
 ) -> EvalValue {
     if !(3..=4).contains(&args.len()) {
         return EvalValue::Scalar(EvalScalar::Error(CalcError::Value));
@@ -546,23 +574,22 @@ pub fn eval_vlookup_or_hlookup(
             is_vertical,
             workbook,
             spills,
+            lookup_cache,
         )),
         ScalarOrArray::Array(arr) => {
-            let values = arr
-                .values
-                .iter()
-                .map(|needle| {
-                    vh_lookup_one(
-                        needle,
-                        &table_arg,
-                        index_u32,
-                        match_type,
-                        is_vertical,
-                        workbook,
-                        spills,
-                    )
-                })
-                .collect();
+            let mut values = Vec::with_capacity(arr.values.len());
+            for needle in &arr.values {
+                values.push(vh_lookup_one(
+                    needle,
+                    &table_arg,
+                    index_u32,
+                    match_type,
+                    is_vertical,
+                    workbook,
+                    spills,
+                    lookup_cache,
+                ));
+            }
             EvalValue::Array(Array2D {
                 rows: arr.rows,
                 cols: arr.cols,
@@ -572,6 +599,10 @@ pub fn eval_vlookup_or_hlookup(
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "central VLOOKUP/HLOOKUP evaluator"
+)]
 fn vh_lookup_one(
     needle: &EvalScalar,
     table_arg: &EvalValue,
@@ -580,6 +611,7 @@ fn vh_lookup_one(
     is_vertical: bool,
     workbook: &Workbook<BoundFormula>,
     spills: &SpillRegistry,
+    lookup_cache: &mut LookupIndexCache,
 ) -> EvalScalar {
     if let EvalScalar::Error(e) = needle {
         return EvalScalar::Error(*e);
@@ -602,9 +634,16 @@ fn vh_lookup_one(
                 return EvalScalar::Error(CalcError::Ref);
             };
             if is_vertical {
-                let Some(row_offset) =
-                    search_sheet_column(sheet, c0, r0, rows, &norm_needle, match_type, spills)
-                else {
+                let Some(row_offset) = search_sheet_column(
+                    sheet,
+                    c0,
+                    r0,
+                    rows,
+                    &norm_needle,
+                    match_type,
+                    spills,
+                    lookup_cache,
+                ) else {
                     return EvalScalar::Error(CalcError::Na);
                 };
                 let target_r_pos = r0.saturating_add(row_offset);
@@ -768,6 +807,10 @@ impl ExactMatcher {
 ///
 /// For `match_type == 0` (exact match, including **B6** `100k × VLOOKUP(..., FALSE)`),
 /// scans contiguous `Dense` 64-bit word slices directly without allocating!
+#[expect(
+    clippy::too_many_arguments,
+    reason = "vertical column search integrates cache, spill shadows, and match modes"
+)]
 fn search_sheet_column(
     sheet: &Sheet,
     col_pos: u32,
@@ -776,9 +819,18 @@ fn search_sheet_column(
     needle: &EvalScalar,
     match_type: i32,
     spills: &SpillRegistry,
+    lookup_cache: &mut LookupIndexCache,
 ) -> Option<u32> {
     let col_id = sheet.col_axis().pos_to_id(col_pos)?;
     if match_type == 0 {
+        if !spills.has_shadows_in_col(sheet.id(), ColId(col_id))
+            && !matches!(needle, EvalScalar::Text(s) if has_wildcard_tokens(s))
+            && let Some(idx) =
+                lookup_cache.get_or_build(sheet, ColId(col_id), first_row_pos, row_count, 1)
+            && let LookupProbeResult::Hit(hit) = idx.probe_scalar(sheet, needle, true)
+        {
+            return hit;
+        }
         let matcher = ExactMatcher::from_needle(needle)?;
         if spills.has_shadows_in_col(sheet.id(), ColId(col_id)) {
             let mut offset_idx: u32 = 0;
@@ -1190,6 +1242,7 @@ fn x_search_index(
     match_mode: isize,
     search_mode: isize,
     spills: &SpillRegistry,
+    lookup_cache: &mut LookupIndexCache,
 ) -> Option<u32> {
     if len == 0 {
         return None;
@@ -1267,6 +1320,24 @@ fn x_search_index(
     }
 
     let reverse = search_mode == -1;
+    if !reverse
+        && (match_mode == 0 || match_mode == 2)
+        && let VectorSource::RefCol {
+            sheet,
+            col_id,
+            r0,
+            len: col_len,
+        } = src
+        && !spills.has_shadows_in_col(sheet.id(), ColId(*col_id))
+    {
+        let allow_wild = match_mode == 2;
+        if !(allow_wild && matches!(&norm_needle, EvalScalar::Text(s) if has_wildcard_tokens(s)))
+            && let Some(idx) = lookup_cache.get_or_build(sheet, ColId(*col_id), *r0, *col_len, 1)
+            && let LookupProbeResult::Hit(hit) = idx.probe_scalar(sheet, &norm_needle, allow_wild)
+        {
+            return hit;
+        }
+    }
     if match_mode == 0 {
         for step in 0..len {
             let idx = if reverse {
@@ -1481,6 +1552,7 @@ pub fn eval_xlookup(
     workbook: &Workbook<BoundFormula>,
     spills: &SpillRegistry,
     caller: CallerContext,
+    lookup_cache: &mut LookupIndexCache,
 ) -> EvalValue {
     if !(3..=6).contains(&args.len()) {
         return EvalValue::Scalar(EvalScalar::Error(CalcError::Value));
@@ -1526,7 +1598,15 @@ pub fn eval_xlookup(
             if let EvalScalar::Error(e) = needle {
                 return EvalValue::Scalar(EvalScalar::Error(e));
             }
-            if let Some(hit) = x_search_index(&src, len, &needle, match_mode, search_mode, spills) {
+            if let Some(hit) = x_search_index(
+                &src,
+                len,
+                &needle,
+                match_mode,
+                search_mode,
+                spills,
+                lookup_cache,
+            ) {
                 match slice_return_at_offset(&ret_arr_arg, hit, is_col, len, workbook) {
                     Ok(v) => v,
                     Err(e) => EvalValue::Scalar(EvalScalar::Error(e)),
@@ -1554,9 +1634,15 @@ pub fn eval_xlookup(
                     out.push(EvalScalar::Error(*e));
                     continue;
                 }
-                let cell = if let Some(hit) =
-                    x_search_index(&src, len, needle, match_mode, search_mode, spills)
-                {
+                let cell = if let Some(hit) = x_search_index(
+                    &src,
+                    len,
+                    needle,
+                    match_mode,
+                    search_mode,
+                    spills,
+                    lookup_cache,
+                ) {
                     match slice_return_at_offset(&ret_arr_arg, hit, is_col, len, workbook) {
                         Ok(v) => match coerce_for_scalar_op(v, workbook, spills, caller) {
                             Ok(ScalarOrArray::Scalar(s)) => empty_to_zero(s),
@@ -1588,6 +1674,7 @@ pub fn eval_xmatch(
     workbook: &Workbook<BoundFormula>,
     spills: &SpillRegistry,
     caller: CallerContext,
+    lookup_cache: &mut LookupIndexCache,
 ) -> EvalValue {
     if !(2..=4).contains(&args.len()) {
         return EvalValue::Scalar(EvalScalar::Error(CalcError::Value));
@@ -1618,19 +1705,28 @@ pub fn eval_xmatch(
         Ok(v) => v,
         Err(e) => return EvalValue::Scalar(EvalScalar::Error(e)),
     };
-    let find_one = |needle: &EvalScalar| -> EvalScalar {
-        if let EvalScalar::Error(e) = needle {
-            return EvalScalar::Error(*e);
-        }
-        x_search_index(&src, len, needle, match_mode, search_mode, spills)
-            .map_or(EvalScalar::Error(CalcError::Na), |idx0| {
-                EvalScalar::Number(f64::from(idx0.saturating_add(1)))
-            })
-    };
     match lu_sa {
-        ScalarOrArray::Scalar(needle) => EvalValue::Scalar(find_one(&needle)),
+        ScalarOrArray::Scalar(needle) => EvalValue::Scalar(match needle {
+            EvalScalar::Error(e) => EvalScalar::Error(e),
+            ref s => x_search_index(&src, len, s, match_mode, search_mode, spills, lookup_cache)
+                .map_or(EvalScalar::Error(CalcError::Na), |idx0| {
+                    EvalScalar::Number(f64::from(idx0.saturating_add(1)))
+                }),
+        }),
         ScalarOrArray::Array(arr) => {
-            let vals = arr.values.iter().map(find_one).collect();
+            let mut vals = Vec::with_capacity(arr.values.len());
+            for needle in &arr.values {
+                let res = match needle {
+                    EvalScalar::Error(e) => EvalScalar::Error(*e),
+                    s => {
+                        x_search_index(&src, len, s, match_mode, search_mode, spills, lookup_cache)
+                            .map_or(EvalScalar::Error(CalcError::Na), |idx0| {
+                                EvalScalar::Number(f64::from(idx0.saturating_add(1)))
+                            })
+                    }
+                };
+                vals.push(res);
+            }
             EvalValue::Array(Array2D {
                 rows: arr.rows,
                 cols: arr.cols,
@@ -1646,6 +1742,7 @@ pub fn eval_lookup(
     workbook: &Workbook<BoundFormula>,
     spills: &SpillRegistry,
     caller: CallerContext,
+    lookup_cache: &mut LookupIndexCache,
 ) -> EvalValue {
     if !(2..=3).contains(&args.len()) {
         return EvalValue::Scalar(EvalScalar::Error(CalcError::Value));
@@ -1660,9 +1757,9 @@ pub fn eval_lookup(
         Ok(v) => v,
         Err(e) => return EvalValue::Scalar(EvalScalar::Error(e)),
     };
-    let lookup_scalar = |needle: &EvalScalar,
-                         vec_a: &EvalValue,
-                         res_a: Option<&EvalValue>|
+    let mut lookup_scalar = |needle: &EvalScalar,
+                             vec_a: &EvalValue,
+                             res_a: Option<&EvalValue>|
      -> EvalScalar {
         if let EvalScalar::Error(e) = needle {
             return EvalScalar::Error(*e);
@@ -1683,7 +1780,9 @@ pub fn eval_lookup(
             if l_len != r_len {
                 return EvalScalar::Error(CalcError::Na);
             }
-            let Some(hit) = x_search_index(&l_src, l_len, &norm_needle, -1, 2, spills) else {
+            let Some(hit) =
+                x_search_index(&l_src, l_len, &norm_needle, -1, 2, spills, lookup_cache)
+            else {
                 return EvalScalar::Error(CalcError::Na);
             };
             r_src
