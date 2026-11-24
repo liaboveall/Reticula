@@ -106,6 +106,8 @@ export async function startCollabServer(): Promise<CollabServerHandle> {
       RETICULA_PUBLIC_ORIGIN: baseUrl,
       RETICULA_AUTH_MODE: "dev-mock",
       RETICULA_LLM_MODE: "mock",
+      // The development database keeps the count of every run made today.
+      RETICULA_AGENT_DAILY_RUN_LIMIT: "100000",
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
