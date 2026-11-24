@@ -5,6 +5,7 @@
 //!   (default `apps/web/dist`);
 //! - sets `Cache-Control: public, max-age=31536000, immutable` on `/assets/*` and
 //!   `Cache-Control: no-cache` on HTML / SPA routes (`/`, `/app`);
+//! - answers 404 for a missing `/assets/*`, which is never an SPA route;
 //! - ensures `.wasm` responses carry `Content-Type: application/wasm` for
 //!   streaming WebAssembly compilation.
 
@@ -52,6 +53,12 @@ pub fn build_app_with_coi(static_dir: &Path, api: Option<ApiState>, coi_enabled:
         .precompressed_br()
         .precompressed_gzip()
         .fallback(index_fallback);
+    // The names under `/assets/` are hashed. One that is not there belongs to
+    // another build, and the document in its place would be taken for it.
+    let asset_service = ServeDir::new(static_dir.join("assets"))
+        .append_index_html_on_directories(false)
+        .precompressed_br()
+        .precompressed_gzip();
 
     let store = api.as_ref().map(|api| api.store().clone());
     let metrics_router = http::metrics_route(api.clone());
@@ -75,6 +82,7 @@ pub fn build_app_with_coi(static_dir: &Path, api: Option<ApiState>, coi_enabled:
                 }
             }),
         )
+        .nest_service("/assets", asset_service)
         .fallback_service(static_service)
         .layer(middleware::from_fn(apply_asset_headers));
     if coi_enabled {
@@ -136,7 +144,10 @@ async fn apply_asset_headers(req: Request, next: Next) -> Response {
         return response;
     }
 
-    if uri_path.starts_with("/assets/") {
+    let status = response.status();
+    if uri_path.starts_with("/assets/")
+        && (status.is_success() || status == StatusCode::NOT_MODIFIED)
+    {
         response
             .headers_mut()
             .insert(CACHE_CONTROL, IMMUTABLE_CACHE);
@@ -500,6 +511,85 @@ mod tests {
         assert!(sw_resp.ends_with("\r\n\r\nBR_SW_PAYLOAD"));
 
         handle.abort();
+        let _ = fs::remove_dir_all(&site);
+    }
+
+    #[tokio::test]
+    async fn missing_assets_are_not_found_and_not_cached_as_immutable() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        let site = make_temp_site();
+        let app = build_app(&site, None);
+        for path in [
+            "/assets/app-999.js",
+            "/assets/kern-999.wasm",
+            "/assets/style-999.css",
+            "/assets/nested/app.js",
+            "/assets/",
+        ] {
+            for encoding in ["identity", "br", "gzip"] {
+                let response = app
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .uri(path)
+                            .header("accept-encoding", encoding)
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+                let headers = response.headers();
+                assert_eq!(headers.get(CACHE_CONTROL), Some(&NO_CACHE), "{path}");
+                assert!(!headers.contains_key(CONTENT_TYPE), "{path}");
+            }
+        }
+
+        // What is there is still served and kept, also when revalidated.
+        let served = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/assets/app-123.js")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(served.status(), StatusCode::OK);
+        assert_eq!(served.headers().get(CACHE_CONTROL), Some(&IMMUTABLE_CACHE));
+        let modified = served.headers().get("last-modified").unwrap().clone();
+        let unchanged = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/assets/app-123.js")
+                    .header("if-modified-since", modified)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unchanged.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(
+            unchanged.headers().get(CACHE_CONTROL),
+            Some(&IMMUTABLE_CACHE)
+        );
+
+        // Other paths are still routes of the app.
+        let route = app
+            .oneshot(
+                Request::builder()
+                    .uri("/join/some-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(route.status(), StatusCode::OK);
+
         let _ = fs::remove_dir_all(&site);
     }
 

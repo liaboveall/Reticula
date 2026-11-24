@@ -1,36 +1,5 @@
 import { ApiError } from "@reticula/protocol/collab-api";
 
-export type AppRoute =
-  | "landing"
-  | "app"
-  | "workbooks"
-  | "account"
-  | "privacy"
-  | "sim"
-  | "benchmarks";
-
-export function normalizeAppRoute(pathname: string): AppRoute {
-  if (pathname === "/app" || pathname.startsWith("/app/") || pathname.startsWith("/join/")) {
-    return "app";
-  }
-  if (pathname === "/workbooks" || pathname.startsWith("/workbooks/")) {
-    return "workbooks";
-  }
-  if (pathname === "/account" || pathname.startsWith("/account/")) {
-    return "account";
-  }
-  if (pathname === "/privacy" || pathname.startsWith("/privacy/")) {
-    return "privacy";
-  }
-  if (pathname === "/sim" || pathname.startsWith("/sim/")) {
-    return "sim";
-  }
-  if (pathname === "/benchmarks" || pathname.startsWith("/benchmarks/")) {
-    return "benchmarks";
-  }
-  return "landing";
-}
-
 export function pickNearestSnapshotSeq(
   snapshotSeqs: readonly string[],
   targetSeq: string,

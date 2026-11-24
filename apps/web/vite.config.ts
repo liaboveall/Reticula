@@ -3,6 +3,12 @@ import { defineConfig } from "vite";
 
 const apiTarget = process.env.RETICULA_SERVER_URL ?? "http://127.0.0.1:3200";
 
+// The grid's WebGPU renderer is a chunk of its own with a size budget, which
+// finds it by this name (`crates/xtask/src/web/bundle.rs`). Any chunk with a
+// part of it gets the name: a static import of one then fails the build, and
+// code the renderer alone uses does not hide it from its budget.
+const WEBGPU_MODULE = /\/grid\/src\/render\/webgpu\//;
+
 export default defineConfig(({ mode }) => ({
   plugins: [react()],
   server: {
@@ -35,5 +41,17 @@ export default defineConfig(({ mode }) => ({
               },
             },
           }
-        : {},
+        : {
+            // `cargo xtask build` reads the manifest for the pages' static
+            // closures and deletes it.
+            manifest: true,
+            rolldownOptions: {
+              output: {
+                chunkFileNames: ({ moduleIds }) =>
+                  moduleIds.some((id) => WEBGPU_MODULE.test(id))
+                    ? "assets/webgpu-[hash].js"
+                    : "assets/[name]-[hash].js",
+              },
+            },
+          },
 }));

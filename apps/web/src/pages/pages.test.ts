@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { formatBytes, normalizeAppRoute, pickNearestSnapshotSeq } from "./helpers.ts";
+import { normalizeAppRoute } from "../routes.ts";
+import { formatBytes, pickNearestSnapshotSeq } from "./helpers.ts";
 
 describe("M2b shell helpers", () => {
   it("normalizes routes accurately", () => {

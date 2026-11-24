@@ -7,6 +7,7 @@ import type {
   SyncCommand,
   WireWalTxnSummary,
 } from "@reticula/protocol";
+import { reportLoadFailure } from "../load-failure.ts";
 import type { StorageBackendKind, WorkbookCatalogEntry } from "./storage.ts";
 
 export type SafeModeReason = "explicit" | "crashLoop" | "corruptWal" | "corruptSnapshot";
@@ -247,6 +248,11 @@ export function startEngine(handlers: EngineHandlers): EngineClient {
     }
   };
   worker.onerror = (event) => {
+    // An error in the script has a message. A plain event means that the script
+    // could not be loaded: the page is older than the build on the server.
+    if (!stopped && !(event instanceof ErrorEvent)) {
+      reportLoadFailure();
+    }
     const message = event.message || "The engine worker failed.";
     checkpointRequest?.reject(new Error(message));
     checkpointRequest = undefined;

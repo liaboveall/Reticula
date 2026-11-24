@@ -45,7 +45,7 @@ import {
 } from "./hooks.ts";
 import type { LocalModalMode } from "./LocalModals.tsx";
 import type { M3aModalEvent, M3aToolMode } from "./M3aToolsModal.tsx";
-import { createSwClient, type SwClientHandle } from "./sw-client.ts";
+import type { SwClientHandle } from "./sw-client.ts";
 
 const LazyLocalModals = lazy(() => import("./LocalModals.tsx"));
 const LazyCollabShell = lazy(() => import("./collab/CollabShell.tsx"));
@@ -1361,6 +1361,11 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
               );
               setHistoryPreviewSeq(message.seq);
               setHistorySeekMs(message.elapsedMs);
+              if (pendingJumpRef.current?.sheet === message.sheet.sheet) {
+                const { row, col } = pendingJumpRef.current;
+                pendingJumpRef.current = null;
+                grid.jumpTo(row, col, false);
+              }
               requestInspect(grid.selectionDetails(), true);
               break;
             }
@@ -1801,15 +1806,23 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
     };
 
     let swStartTimer = 0;
-    const ensureSwClient = (): SwClientHandle => {
-      if (!swClientRef.current) {
-        swClientRef.current = createSwClient({
+    let swClient: Promise<SwClientHandle> | null = null;
+    let disposed = false;
+    const ensureSwClient = (): Promise<SwClientHandle> => {
+      swClient ??= import("./sw-client.ts").then(({ createSwClient }) => {
+        const handle = createSwClient({
           tabId: tabIdRef.current,
           onUpdateReady: (ready) => setSwUpdateReady(ready),
           onDrainForUpdate: flushAndCloseDoc,
         });
-      }
-      return swClientRef.current;
+        if (disposed) {
+          handle.dispose();
+        } else {
+          swClientRef.current = handle;
+        }
+        return handle;
+      });
+      return swClient;
     };
 
     let shellMarked = false;
@@ -1824,12 +1837,14 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
         performance.mark(MARKS.firstScreen);
       }
       if (frame.missing === 0 && (frame.cells > 0 || grid.stats().pagesHeld > 0)) {
-        if (!swClientRef.current && swStartTimer === 0) {
+        if (!swClient && swStartTimer === 0) {
           // Defer Service Worker registration until after first-screen paint so
           // cold-start B10 latency is completely unaffected (`14-m1b.md` 7.4).
           swStartTimer = window.setTimeout(() => {
             swStartTimer = 0;
-            ensureSwClient();
+            // Without it the app works as it does in a browser that has no
+            // Service Workers.
+            ensureSwClient().catch(() => {});
           }, 0);
         }
         if (firstScreenMarked) {
@@ -1866,8 +1881,8 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
           spinWorker: (ms) => {
             clientRef.current?.sendHost({ kind: "debugSpinWorker", ms });
           },
-          swStatus: () => ensureSwClient().status(),
-          checkSwUpdate: () => ensureSwClient().checkForUpdate(),
+          swStatus: async () => (await ensureSwClient()).status(),
+          checkSwUpdate: async () => (await ensureSwClient()).checkForUpdate(),
           collabStatus: () => ({
             active: collabTargetRef.current !== null,
             docId: collabTargetRef.current?.docId ?? null,
@@ -1937,6 +1952,7 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
       locksWatch?.close();
       collabTransportRef.current?.dispose();
       collabTransportRef.current = null;
+      disposed = true;
       swClientRef.current?.dispose();
       swClientRef.current = null;
       stopMarking();

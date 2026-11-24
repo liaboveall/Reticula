@@ -7,9 +7,12 @@
 /// - New versions install into their own `reticula-shell-<BUILD_ID>` cache and
 ///   stay in `waiting` until a client coordinates OPFS drain across all open
 ///   tabs and posts `{ kind: "SKIP_WAITING" }`.
-/// - Hashed `/assets/*` are served cache-first.
+/// - Hashed `/assets/*` are served cache-first; only a response of the kind the
+///   name asks for is kept.
 /// - Navigation / HTML requests are served network-first with instant fallback
 ///   to the precached `/index.html` shell when offline.
+
+import { isAssetResponse } from "./sw-assets.ts";
 
 interface ExtendableEventLike extends Event {
   waitUntil(promise: Promise<unknown>): void;
@@ -52,6 +55,13 @@ const CACHE_PREFIX = "reticula-shell-";
 const CACHE_NAME = `${CACHE_PREFIX}${BUILD_ID}`;
 const NAV_TIMEOUT_MS = 3_000;
 
+function isUsable(pathname: string, response: Response): boolean {
+  return (
+    !pathname.startsWith("/assets/") ||
+    isAssetResponse(pathname, response.headers.get("content-type"))
+  );
+}
+
 async function precacheShell(): Promise<void> {
   const urls = PRECACHE_URLS.filter((u) => u.startsWith("/"));
   if (urls.length === 0) {
@@ -62,8 +72,9 @@ async function precacheShell(): Promise<void> {
     urls.map(async (url) => {
       const request = new Request(url, { cache: "reload" });
       const response = await fetch(request);
-      if (!response.ok) {
-        throw new Error(`Precache fetch failed for ${url}: HTTP ${response.status}`);
+      if (!response.ok || !isUsable(url, response)) {
+        const type = response.headers.get("content-type");
+        throw new Error(`Precache fetch failed for ${url}: HTTP ${response.status}, ${type}`);
       }
       await cache.put(url, response);
     }),
@@ -81,13 +92,15 @@ async function cleanupOldCaches(): Promise<void> {
 }
 
 async function cacheFirstAsset(request: Request): Promise<Response> {
+  const { pathname } = new URL(request.url);
   const cache = await caches.open(CACHE_NAME);
   const hit = (await cache.match(request)) ?? (await caches.match(request));
-  if (hit) {
+  // An older version of this worker may have kept a response it should not have.
+  if (hit && isUsable(pathname, hit)) {
     return hit;
   }
   const response = await fetch(request);
-  if (response.ok && response.status === 200) {
+  if (response.status === 200 && isUsable(pathname, response)) {
     await cache.put(request, response.clone());
   }
   return response;

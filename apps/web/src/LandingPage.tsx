@@ -1,4 +1,5 @@
 import { BENCHMARKS } from "./generated/benchmarks.ts";
+import { PRELOAD_EDITOR_ON_INTENT } from "./preload.ts";
 
 export interface LandingPageProps {
   readonly onNavigate: (path: string) => void;
@@ -66,6 +67,7 @@ export function LandingPage({ onNavigate }: LandingPageProps) {
           <a
             href="/app"
             className="landing-cta-small"
+            {...PRELOAD_EDITOR_ON_INTENT}
             onClick={(event) => {
               event.preventDefault();
               onNavigate("/app");
@@ -95,6 +97,7 @@ export function LandingPage({ onNavigate }: LandingPageProps) {
               href="/app"
               className="landing-cta"
               data-testid="open-demo"
+              {...PRELOAD_EDITOR_ON_INTENT}
               onClick={(event) => {
                 event.preventDefault();
                 onNavigate("/app");

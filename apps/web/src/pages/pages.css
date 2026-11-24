@@ -122,12 +122,6 @@
   border-color: var(--shell-danger, #dc2626);
 }
 
-.page-loading {
-  padding: 32px;
-  text-align: center;
-  color: var(--shell-muted, #64748b);
-}
-
 .bench-kpi-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(175px, 1fr));

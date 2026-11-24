@@ -1,0 +1,62 @@
+.load-problem {
+  display: grid;
+  justify-items: start;
+  gap: 10px;
+  box-sizing: border-box;
+  width: min(460px, calc(100% - 40px));
+  margin: 18vh auto 0;
+  padding: 18px 20px;
+  border: 1px solid var(--shell-accent);
+  border-radius: 10px;
+  background: var(--shell-surface);
+  color: var(--shell-text);
+  line-height: 1.5;
+}
+
+.load-problem strong {
+  font-size: 15px;
+}
+
+.load-problem p {
+  margin: 0;
+  color: var(--shell-muted);
+}
+
+.load-problem button {
+  padding: 5px 14px;
+  border: 1px solid var(--shell-accent);
+  border-radius: 5px;
+  background: var(--shell-surface);
+  color: var(--shell-text);
+  font: inherit;
+  cursor: pointer;
+}
+
+.load-problem-banner {
+  position: fixed;
+  right: 16px;
+  bottom: 38px;
+  z-index: 90;
+  margin: 0;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.14);
+}
+
+/* Navigating to a page whose code is still on its way. Most pages are there
+   at once, so the sign only appears after a moment. */
+.route-pending {
+  position: fixed;
+  inset: 0 0 auto;
+  z-index: 90;
+  height: 2px;
+  background: var(--shell-accent);
+  animation: route-pending 0s 200ms both;
+}
+
+@keyframes route-pending {
+  from {
+    visibility: hidden;
+  }
+  to {
+    visibility: visible;
+  }
+}

@@ -1,5 +1,6 @@
-//! The front-end half: checks, the production build, preload injection, size
-//! budget verification, and end-to-end tests.
+//! The front-end half: checks, the production build, and end-to-end tests.
+
+mod bundle;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -10,17 +11,6 @@ use crate::wasm::report_sizes;
 
 const APP: &str = "@reticula/web";
 const DIST: &str = "apps/web/dist";
-
-/// Hard upper bound on brotli-compressed core `.wasm` module (`1.2 MB`, `14-m1b.md` 8.3).
-const MAX_CORE_WASM_BROTLI_BYTES: u64 = 1_200_000;
-/// Hard upper bound on brotli-compressed on-demand simulator `.wasm` module (`800 KB`, `16-m2b.md`).
-const MAX_SIM_WASM_BROTLI_BYTES: u64 = 800_000;
-/// Hard upper bound on brotli-compressed on-demand XLSX `.wasm` module (`900 KB`, `17-m3a.md` 8.2).
-const MAX_XLSX_WASM_BROTLI_BYTES: u64 = 900_000;
-/// Upper bound on brotli-compressed first-screen critical-path JS (`165 KB`, `14-m1b.md` 8.3).
-const MAX_FIRST_SCREEN_JS_BROTLI_BYTES: u64 = 165_000;
-/// Upper bound on brotli-compressed total JS including lazy chunks & service worker (`220 KB`, `14-m1b.md` 8.3).
-const MAX_TOTAL_JS_BROTLI_BYTES: u64 = 220_000;
 
 /// TypeScript projects, each with its own `tsconfig.json`.
 const TS_PROJECTS: [&str; 5] = [
@@ -62,7 +52,9 @@ pub fn build() -> Result {
         .run()?;
 
     let dist_dir = util::root().join(DIST);
-    inject_preloads(&dist_dir)?;
+    // Before the build of the service worker, which writes to the same directory.
+    let closures = bundle::Closures::take(&dist_dir)?;
+    bundle::inject_boot_script(&dist_dir, &closures)?;
 
     util::step("vite build (service worker)");
     pnpm()
@@ -92,63 +84,7 @@ for (const file of walk(process.argv[1])) {
     let files: Vec<PathBuf> = files.lines().map(PathBuf::from).collect();
     let refs: Vec<&Path> = files.iter().map(PathBuf::as_path).collect();
     report_sizes(&refs)?;
-    check_budgets(&dist_dir)
-}
-
-/// Injects `<link rel="modulepreload">` for the engine worker script and
-/// `<link rel="preload" as="fetch" type="application/wasm" crossorigin>` for the
-/// hashed `.wasm` binary into `dist/index.html` (`13-m1a.md` 6.4).
-fn inject_preloads(dist_dir: &Path) -> Result {
-    let assets_dir = dist_dir.join("assets");
-    let mut worker_js: Option<String> = None;
-    let mut wasm_bin: Option<String> = None;
-
-    for entry in fs::read_dir(&assets_dir)
-        .map_err(|e| format!("cannot read {}: {e}", assets_dir.display()))?
-    {
-        let entry = entry.map_err(|e| format!("read_dir entry: {e}"))?;
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else {
-            continue;
-        };
-        if name.starts_with("worker-")
-            && Path::new(name)
-                .extension()
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("js"))
-        {
-            worker_js = Some(name.to_owned());
-        } else if name.starts_with("reticula_wasm_bg")
-            && Path::new(name)
-                .extension()
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("wasm"))
-        {
-            wasm_bin = Some(name.to_owned());
-        }
-    }
-
-    let worker_js =
-        worker_js.ok_or_else(|| String::from("no `worker-*.js` found in dist/assets/"))?;
-    let wasm_bin = wasm_bin.ok_or_else(|| String::from("no `*.wasm` found in dist/assets/"))?;
-
-    let index_path = dist_dir.join("index.html");
-    let html = fs::read_to_string(&index_path)
-        .map_err(|e| format!("cannot read {}: {e}", index_path.display()))?;
-    if html.contains("type=\"application/wasm\"") {
-        return Ok(());
-    }
-    let preload_tags = format!(
-        "    <link rel=\"modulepreload\" crossorigin href=\"/assets/{worker_js}\">\n\
-         \x20   <link rel=\"preload\" as=\"fetch\" type=\"application/wasm\" crossorigin href=\"/assets/{wasm_bin}\">\n  </head>"
-    );
-    let updated = html.replacen("  </head>", &preload_tags, 1);
-    if updated == html {
-        return Err(format!(
-            "failed to locate `</head>` in {} for preload injection",
-            index_path.display()
-        ));
-    }
-    fs::write(&index_path, updated)
-        .map_err(|e| format!("cannot write {}: {e}", index_path.display()))
+    bundle::check_budgets(&dist_dir, &closures)
 }
 
 /// Computes a deterministic `BUILD_ID` and precache URL manifest from the built
@@ -233,113 +169,6 @@ fn inject_sw_manifest(dist_dir: &Path) -> Result {
         "  injected SW manifest: build_id={build_id}, {} precached file(s)",
         urls.len()
     );
-    Ok(())
-}
-
-fn check_budgets(dist_dir: &Path) -> Result {
-    util::step("bundle size budgets (brotli)");
-    let index_path = dist_dir.join("index.html");
-    let index_html = fs::read_to_string(&index_path)
-        .map_err(|e| format!("cannot read {}: {e}", index_path.display()))?;
-
-    let assets_dir = dist_dir.join("assets");
-    let mut core_wasm_br: u64 = 0;
-    let mut sim_wasm_br: u64 = 0;
-    let mut xlsx_wasm_br: u64 = 0;
-    let mut first_screen_js_br: u64 = 0;
-    let mut total_js_br: u64 = 0;
-
-    for entry in fs::read_dir(&assets_dir)
-        .map_err(|e| format!("cannot read {}: {e}", assets_dir.display()))?
-    {
-        let entry = entry.map_err(|e| format!("read_dir entry: {e}"))?;
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else {
-            continue;
-        };
-        let len = entry
-            .metadata()
-            .map_err(|e| format!("stat {name}: {e}"))?
-            .len();
-        if name.ends_with(".wasm.br") {
-            if name.starts_with("reticula_sim_wasm") {
-                sim_wasm_br = sim_wasm_br.saturating_add(len);
-            } else if name.starts_with("reticula_xlsx_wasm") {
-                xlsx_wasm_br = xlsx_wasm_br.saturating_add(len);
-            } else {
-                core_wasm_br = core_wasm_br.saturating_add(len);
-            }
-        } else if let Some(js_name) = name.strip_suffix(".br")
-            && js_name.ends_with(".js")
-        {
-            total_js_br = total_js_br.saturating_add(len);
-            if index_html.contains(js_name) {
-                first_screen_js_br = first_screen_js_br.saturating_add(len);
-            }
-        }
-    }
-
-    let sw_br_path = dist_dir.join("sw.js.br");
-    if let Ok(meta) = fs::metadata(&sw_br_path) {
-        total_js_br = total_js_br.saturating_add(meta.len());
-    }
-
-    println!(
-        "  core WASM (brotli):        {:>8} / {:>8} bytes ({:.1}%)",
-        core_wasm_br,
-        MAX_CORE_WASM_BROTLI_BYTES,
-        (core_wasm_br as f64 / MAX_CORE_WASM_BROTLI_BYTES as f64) * 100.0
-    );
-    println!(
-        "  sim WASM (brotli):         {:>8} / {:>8} bytes ({:.1}%)",
-        sim_wasm_br,
-        MAX_SIM_WASM_BROTLI_BYTES,
-        (sim_wasm_br as f64 / MAX_SIM_WASM_BROTLI_BYTES as f64) * 100.0
-    );
-    println!(
-        "  xlsx WASM (brotli):        {:>8} / {:>8} bytes ({:.1}%)",
-        xlsx_wasm_br,
-        MAX_XLSX_WASM_BROTLI_BYTES,
-        (xlsx_wasm_br as f64 / MAX_XLSX_WASM_BROTLI_BYTES as f64) * 100.0
-    );
-    println!(
-        "  first-screen JS (brotli):  {:>8} / {:>8} bytes ({:.1}%)",
-        first_screen_js_br,
-        MAX_FIRST_SCREEN_JS_BROTLI_BYTES,
-        (first_screen_js_br as f64 / MAX_FIRST_SCREEN_JS_BROTLI_BYTES as f64) * 100.0
-    );
-    println!(
-        "  total JS (brotli):         {:>8} / {:>8} bytes ({:.1}%)",
-        total_js_br,
-        MAX_TOTAL_JS_BROTLI_BYTES,
-        (total_js_br as f64 / MAX_TOTAL_JS_BROTLI_BYTES as f64) * 100.0
-    );
-
-    if core_wasm_br == 0 || core_wasm_br > MAX_CORE_WASM_BROTLI_BYTES {
-        return Err(format!(
-            "core WASM brotli size ({core_wasm_br} B) out of budget (1..={MAX_CORE_WASM_BROTLI_BYTES} B)"
-        ));
-    }
-    if sim_wasm_br == 0 || sim_wasm_br > MAX_SIM_WASM_BROTLI_BYTES {
-        return Err(format!(
-            "sim WASM brotli size ({sim_wasm_br} B) out of budget (1..={MAX_SIM_WASM_BROTLI_BYTES} B)"
-        ));
-    }
-    if xlsx_wasm_br == 0 || xlsx_wasm_br > MAX_XLSX_WASM_BROTLI_BYTES {
-        return Err(format!(
-            "xlsx WASM brotli size ({xlsx_wasm_br} B) out of budget (1..={MAX_XLSX_WASM_BROTLI_BYTES} B)"
-        ));
-    }
-    if first_screen_js_br > MAX_FIRST_SCREEN_JS_BROTLI_BYTES {
-        return Err(format!(
-            "first-screen JS brotli size ({first_screen_js_br} B) exceeds budget ({MAX_FIRST_SCREEN_JS_BROTLI_BYTES} B)"
-        ));
-    }
-    if total_js_br > MAX_TOTAL_JS_BROTLI_BYTES {
-        return Err(format!(
-            "total JS brotli size ({total_js_br} B) exceeds budget ({MAX_TOTAL_JS_BROTLI_BYTES} B)"
-        ));
-    }
     Ok(())
 }
 

@@ -16,7 +16,9 @@ export default defineConfig({
   // Firefox. CI runners have two processors.
   ...(onCi ? {} : { workers: "25%" }),
   reporter: onCi ? [["github"], ["list"]] : "list",
-  use: { baseURL: `http://localhost:${port}` },
+  // The app's language and its numbers follow the browser's locale, which would
+  // otherwise be the machine's.
+  use: { baseURL: `http://localhost:${port}`, locale: "en-US" },
   webServer: [
     {
       command: "pnpm --filter @reticula/web exec vite preview",

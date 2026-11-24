@@ -9,6 +9,9 @@ export default defineConfig({
   forbidOnly: Boolean(process.env.CI),
   reporter: "list",
   timeout: 180_000,
-  use: { baseURL: process.env.RETICULA_STACK_URL ?? "http://127.0.0.1:3200" },
+  use: {
+    baseURL: process.env.RETICULA_STACK_URL ?? "http://127.0.0.1:3200",
+    locale: "en-US",
+  },
   projects: [{ name: "chromium", use: { ...devices["Desktop Chrome"] } }],
 });
