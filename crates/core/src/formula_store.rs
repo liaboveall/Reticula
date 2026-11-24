@@ -99,11 +99,324 @@ impl<F: FormulaPayload> PartialEq for FormulaStore<F> {
 
 impl<F: FormulaPayload> From<BTreeMap<WorkbookCellKey, F>> for FormulaStore<F> {
     fn from(map: BTreeMap<WorkbookCellKey, F>) -> Self {
-        let mut store = Self::new();
+        let mut builder = FormulaStoreBuilder::new();
         for (k, f) in map {
-            let _ = store.insert(k, f);
+            let _ = builder.insert_unique(k, f);
         }
-        store
+        builder.finish()
+    }
+}
+
+enum OpenColTail<F: FormulaPayload> {
+    Single {
+        row: RowId,
+        formula: F,
+        bytes: usize,
+    },
+    Strip {
+        start_row: RowId,
+        len: u32,
+        template: F::StripTemplate,
+        bytes: usize,
+    },
+}
+
+/// Incremental builder for [`FormulaStore`] optimised for strictly ascending
+/// `(SheetId, RowId, ColId)` streams such as snapshot decoding.
+///
+/// Tracks an open vertical tail per active column (`(SheetId, ColId)`) plus a
+/// single-entry hot column cache so contiguous affine formulas coalesce into
+/// [`TemplateStrip`]s with minimal map lookups, falling back transparently to
+/// general insertion if an out-of-order key arrives.
+pub struct FormulaStoreBuilder<F: FormulaPayload> {
+    store: FormulaStore<F>,
+    last_key: Option<WorkbookCellKey>,
+    monotonic: bool,
+    hot_col: Option<((SheetId, ColId), OpenColTail<F>)>,
+    open_cols: BTreeMap<(SheetId, ColId), OpenColTail<F>>,
+    open_bytes: usize,
+    open_len: usize,
+    r_eps: Vec<(SheetId, RowId)>,
+    c_eps: Vec<(SheetId, ColId)>,
+}
+
+impl<F: FormulaPayload> Default for FormulaStoreBuilder<F> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<F: FormulaPayload> FormulaStoreBuilder<F> {
+    /// Creates an empty [`FormulaStoreBuilder`].
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            store: FormulaStore::new(),
+            last_key: None,
+            monotonic: true,
+            hot_col: None,
+            open_cols: BTreeMap::new(),
+            open_bytes: 0,
+            open_len: 0,
+            r_eps: Vec::new(),
+            c_eps: Vec::new(),
+        }
+    }
+
+    /// Total logical formula cell count buffered and committed so far.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.store.len().saturating_add(self.open_len)
+    }
+
+    /// Returns `true` when zero formulas have been inserted.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Approximate heap bytes of committed and open formulas combined.
+    #[must_use]
+    pub const fn estimated_bytes(&self) -> usize {
+        self.store.estimated_bytes().saturating_add(self.open_bytes)
+    }
+
+    /// Attempts to extend an already-open vertical strip for `(key.0, key.2)`
+    /// in place when `key` advances strictly in sorted order and matches the
+    /// open strip's validated template at the next contiguous row identity.
+    pub fn try_match_open_strip(&mut self, key: WorkbookCellKey, formula: &F) -> bool {
+        if !self.monotonic {
+            return false;
+        }
+        if let Some(prev) = self.last_key
+            && key <= prev
+        {
+            return false;
+        }
+        let col_key = (key.0, key.2);
+        let is_hot = self.hot_col.as_ref().is_some_and(|&(hk, _)| hk == col_key);
+        if !is_hot {
+            let Some(tail) = self.open_cols.remove(&col_key) else {
+                return false;
+            };
+            if let Some((prev_k, prev_tail)) = self.hot_col.replace((col_key, tail)) {
+                self.open_cols.insert(prev_k, prev_tail);
+            }
+        }
+        let Some((
+            _,
+            OpenColTail::Strip {
+                start_row,
+                len,
+                template,
+                ..
+            },
+        )) = self.hot_col.as_mut()
+        else {
+            return false;
+        };
+        let Some(next_len) = len.checked_add(1) else {
+            return false;
+        };
+        if start_row.0.checked_add(u64::from(*len)) != Some(key.1.0)
+            || IdRun::new(start_row.0, next_len).is_none()
+            || !formula.matches_strip_template(template, *len)
+        {
+            return false;
+        }
+        *len = next_len;
+        self.open_len = self.open_len.saturating_add(1);
+        self.last_key = Some(key);
+        true
+    }
+
+    /// Inserts a formula whose key must be unique across the stream, coalescing
+    /// contiguous vertical strips along the monotonic fast path.
+    #[expect(
+        clippy::result_unit_err,
+        reason = "unit error acts as a lightweight duplicate-key sentinel"
+    )]
+    pub fn insert_unique(&mut self, key: WorkbookCellKey, formula: F) -> Result<(), ()> {
+        if !self.monotonic {
+            return if self.store.insert(key, formula).is_some() {
+                Err(())
+            } else {
+                Ok(())
+            };
+        }
+
+        if let Some(prev) = self.last_key {
+            if key == prev {
+                return Err(());
+            }
+            if key < prev {
+                self.flush_open_tails();
+                self.monotonic = false;
+                return if self.store.insert(key, formula).is_some() {
+                    Err(())
+                } else {
+                    Ok(())
+                };
+            }
+        }
+
+        let col_key = (key.0, key.2);
+        let prev_tail = if self.hot_col.as_ref().is_some_and(|&(hk, _)| hk == col_key) {
+            self.hot_col.take().map(|(_, tail)| tail)
+        } else {
+            if let Some((prev_k, prev_tail)) = self.hot_col.take() {
+                self.open_cols.insert(prev_k, prev_tail);
+            }
+            self.open_cols.remove(&col_key)
+        };
+
+        let new_tail = match prev_tail {
+            None => {
+                let bytes = single_entry_bytes(&formula);
+                self.open_bytes = self.open_bytes.saturating_add(bytes);
+                self.open_len = self.open_len.saturating_add(1);
+                OpenColTail::Single {
+                    row: key.1,
+                    formula,
+                    bytes,
+                }
+            }
+            Some(OpenColTail::Single {
+                row: prev_row,
+                formula: prev_f,
+                bytes: prev_bytes,
+            }) => {
+                let contiguous = prev_row.0.checked_add(1) == Some(key.1.0)
+                    && IdRun::new(prev_row.0, 2).is_some();
+                if contiguous && let Some(template) = F::try_pair_strip_template(&prev_f, &formula)
+                {
+                    let strip_bytes = strip_template_entry_bytes::<F>(&template);
+                    self.open_bytes = self
+                        .open_bytes
+                        .saturating_sub(prev_bytes)
+                        .saturating_add(strip_bytes);
+                    self.open_len = self.open_len.saturating_add(1);
+                    OpenColTail::Strip {
+                        start_row: prev_row,
+                        len: 2,
+                        template,
+                        bytes: strip_bytes,
+                    }
+                } else {
+                    self.open_bytes = self.open_bytes.saturating_sub(prev_bytes);
+                    self.open_len = self.open_len.saturating_sub(1);
+                    self.store.insert_single_fresh(
+                        (key.0, prev_row, key.2),
+                        prev_f,
+                        &mut self.r_eps,
+                        &mut self.c_eps,
+                    );
+                    let bytes = single_entry_bytes(&formula);
+                    self.open_bytes = self.open_bytes.saturating_add(bytes);
+                    self.open_len = self.open_len.saturating_add(1);
+                    OpenColTail::Single {
+                        row: key.1,
+                        formula,
+                        bytes,
+                    }
+                }
+            }
+            Some(OpenColTail::Strip {
+                start_row,
+                len,
+                template,
+                bytes: strip_bytes,
+            }) => {
+                let next_len = len.checked_add(1);
+                let extends = next_len.is_some_and(|nl| {
+                    start_row.0.checked_add(u64::from(len)) == Some(key.1.0)
+                        && IdRun::new(start_row.0, nl).is_some()
+                        && formula.matches_strip_template(&template, len)
+                });
+                if extends && let Some(nl) = next_len {
+                    self.open_len = self.open_len.saturating_add(1);
+                    OpenColTail::Strip {
+                        start_row,
+                        len: nl,
+                        template,
+                        bytes: strip_bytes,
+                    }
+                } else {
+                    self.open_bytes = self.open_bytes.saturating_sub(strip_bytes);
+                    self.open_len = self.open_len.saturating_sub(len as usize);
+                    self.store.insert_strip_raw(TemplateStrip {
+                        sheet: key.0,
+                        col: key.2,
+                        start_row,
+                        len,
+                        template,
+                    });
+                    let bytes = single_entry_bytes(&formula);
+                    self.open_bytes = self.open_bytes.saturating_add(bytes);
+                    self.open_len = self.open_len.saturating_add(1);
+                    OpenColTail::Single {
+                        row: key.1,
+                        formula,
+                        bytes,
+                    }
+                }
+            }
+        };
+
+        self.hot_col = Some((col_key, new_tail));
+        self.last_key = Some(key);
+        Ok(())
+    }
+
+    /// Flushes all remaining buffered column tails and returns the completed [`FormulaStore`].
+    #[must_use]
+    pub fn finish(mut self) -> FormulaStore<F> {
+        self.flush_open_tails();
+        self.store
+    }
+
+    fn flush_open_tails(&mut self) {
+        if let Some(((sheet, col), tail)) = self.hot_col.take() {
+            self.flush_tail(sheet, col, tail);
+        }
+        while let Some(((sheet, col), tail)) = self.open_cols.pop_first() {
+            self.flush_tail(sheet, col, tail);
+        }
+    }
+
+    fn flush_tail(&mut self, sheet: SheetId, col: ColId, tail: OpenColTail<F>) {
+        match tail {
+            OpenColTail::Single {
+                row,
+                formula,
+                bytes,
+            } => {
+                self.open_bytes = self.open_bytes.saturating_sub(bytes);
+                self.open_len = self.open_len.saturating_sub(1);
+                self.store.insert_single_fresh(
+                    (sheet, row, col),
+                    formula,
+                    &mut self.r_eps,
+                    &mut self.c_eps,
+                );
+            }
+            OpenColTail::Strip {
+                start_row,
+                len,
+                template,
+                bytes,
+            } => {
+                self.open_bytes = self.open_bytes.saturating_sub(bytes);
+                self.open_len = self.open_len.saturating_sub(len as usize);
+                self.store.insert_strip_raw(TemplateStrip {
+                    sheet,
+                    col,
+                    start_row,
+                    len,
+                    template,
+                });
+            }
+        }
     }
 }
 
@@ -774,11 +1087,23 @@ impl<F: FormulaPayload> FormulaStore<F> {
         let _ = self.remove_single_raw(&key);
         let mut r_eps = Vec::new();
         let mut c_eps = Vec::new();
-        formula.collect_range_endpoints(key.0, &mut r_eps, &mut c_eps);
-        for ep in r_eps {
+        self.insert_single_fresh(key, formula, &mut r_eps, &mut c_eps);
+    }
+
+    fn insert_single_fresh(
+        &mut self,
+        key: WorkbookCellKey,
+        formula: F,
+        r_eps: &mut Vec<(SheetId, RowId)>,
+        c_eps: &mut Vec<(SheetId, ColId)>,
+    ) {
+        r_eps.clear();
+        c_eps.clear();
+        formula.collect_range_endpoints(key.0, r_eps, c_eps);
+        for &ep in r_eps.iter() {
             self.single_row_endpoints.entry(ep).or_default().insert(key);
         }
-        for ep in c_eps {
+        for &ep in c_eps.iter() {
             self.single_col_endpoints.entry(ep).or_default().insert(key);
         }
         let added = single_entry_bytes(&formula);
@@ -975,11 +1300,15 @@ fn single_entry_bytes<F: FormulaPayload>(formula: &F) -> usize {
         .saturating_add(size_of::<WorkbookCellKey>().saturating_mul(2))
 }
 
-fn strip_entry_bytes<F: FormulaPayload>(strip: &TemplateStrip<F::StripTemplate>) -> usize {
+fn strip_template_entry_bytes<F: FormulaPayload>(template: &F::StripTemplate) -> usize {
     size_of::<(SheetId, ColId, RowId)>()
         .saturating_add(size_of::<TemplateStrip<F::StripTemplate>>())
-        .saturating_add(F::strip_template_bytes(&strip.template))
+        .saturating_add(F::strip_template_bytes(template))
         .saturating_add(size_of::<u64>().saturating_mul(2))
+}
+
+fn strip_entry_bytes<F: FormulaPayload>(strip: &TemplateStrip<F::StripTemplate>) -> usize {
+    strip_template_entry_bytes::<F>(&strip.template)
 }
 
 const fn cloned_bound(bound: Bound<&WorkbookCellKey>) -> Bound<WorkbookCellKey> {
@@ -1066,7 +1395,7 @@ mod tests {
     use crate::ops::{FormulaMode, FormulaPayload, OpError};
     use crate::rng::Rng;
 
-    use super::FormulaStore;
+    use super::{FormulaStore, FormulaStoreBuilder};
 
     #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
     struct TestFormula {
@@ -1293,5 +1622,91 @@ mod tests {
             })
         );
         let _ = (format!("{:?}", String::new()), pack_id(0, 1, 0));
+    }
+
+    #[test]
+    fn builder_matches_sequential_insert_across_strips_interleaving_fallback_and_dups() {
+        let s0 = SheetId(0);
+
+        // 1. 1,000-row single-column strip via try_match_open_strip + insert_unique.
+        let mut b1 = FormulaStoreBuilder::new();
+        let mut ref1 = FormulaStore::new();
+        for r in 0_u64..1_000 {
+            let key = (s0, RowId(r), ColId(3));
+            let f = TestFormula {
+                base_row: r,
+                fixed_row: 7,
+                tag: 1,
+                mode: FormulaMode::Dynamic,
+            };
+            if !b1.try_match_open_strip(key, &f) {
+                b1.insert_unique(key, f.clone()).unwrap();
+            }
+            ref1.insert(key, f);
+            assert_eq!(b1.len(), ref1.len());
+            assert_eq!(b1.estimated_bytes(), ref1.estimated_bytes());
+        }
+        let built1 = b1.finish();
+        assert_eq!(built1.strip_count(), 1);
+        assert_eq!(built1.single_count(), 0);
+        assert_eq!(built1, ref1);
+        assert_eq!(built1.estimated_bytes(), ref1.estimated_bytes());
+
+        // 2. Row-major interleaved multi-column strips + singletons + strip breaks.
+        let mut b2 = FormulaStoreBuilder::new();
+        let mut ref2 = FormulaStore::new();
+        for r in 0_u64..40 {
+            for c in [1_u64, 4_u64, 9_u64] {
+                if c == 4 && r == 17 {
+                    continue; // row gap splits column 4 strip
+                }
+                let tag = u32::from(c == 9 && (20..25).contains(&r));
+                let key = (s0, RowId(r), ColId(c));
+                let f = TestFormula {
+                    base_row: r.saturating_add(c),
+                    fixed_row: 99,
+                    tag,
+                    mode: FormulaMode::Dynamic,
+                };
+                if !b2.try_match_open_strip(key, &f) {
+                    b2.insert_unique(key, f.clone()).unwrap();
+                }
+                ref2.insert(key, f);
+                assert_eq!(b2.len(), ref2.len());
+                assert_eq!(b2.estimated_bytes(), ref2.estimated_bytes());
+            }
+        }
+        let built2 = b2.finish();
+        assert_eq!(built2, ref2);
+        assert_eq!(built2.single_count(), ref2.single_count());
+        assert_eq!(built2.strip_count(), ref2.strip_count());
+
+        // 3. Duplicate key rejection.
+        let mut b3 = FormulaStoreBuilder::new();
+        let k_dup = (s0, RowId(5), ColId(2));
+        let f_dup = TestFormula {
+            base_row: 5,
+            fixed_row: 1,
+            tag: 0,
+            mode: FormulaMode::Dynamic,
+        };
+        assert!(b3.insert_unique(k_dup, f_dup.clone()).is_ok());
+        assert_eq!(b3.insert_unique(k_dup, f_dup.clone()), Err(()));
+
+        // 4. Out-of-order key fallback + duplicate rejection in fallback mode.
+        let k_after = (s0, RowId(6), ColId(2));
+        let k_earlier = (s0, RowId(2), ColId(0));
+        assert!(!b3.try_match_open_strip(k_after, &f_dup));
+        assert!(b3.insert_unique(k_after, f_dup.clone()).is_ok());
+        assert!(b3.insert_unique(k_earlier, f_dup.clone()).is_ok());
+        assert!(!b3.try_match_open_strip((s0, RowId(7), ColId(2)), &f_dup));
+        assert_eq!(b3.insert_unique(k_earlier, f_dup.clone()), Err(()));
+        let mut ref3 = FormulaStore::new();
+        ref3.insert(k_dup, f_dup.clone());
+        ref3.insert(k_after, f_dup.clone());
+        ref3.insert(k_earlier, f_dup);
+        let built3 = b3.finish();
+        assert_eq!(built3, ref3);
+        assert_eq!(built3.len(), 3);
     }
 }

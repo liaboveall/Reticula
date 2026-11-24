@@ -21,10 +21,11 @@ use serde::{Deserialize, Serialize};
 use crate::KERNEL_VERSION;
 use crate::axis::AxisRun;
 use crate::format::NumberFormat;
+use crate::formula_store::FormulaStoreBuilder;
 use crate::id::{ColId, IdAllocator, RowId, SheetId};
 use crate::ops::{
     FormulaPayload, MAX_CELL_TEXT_UTF16, MAX_SHEETS, MAX_WORKBOOK_BYTES, OpError, SeedOrigin,
-    Workbook, WorkbookCellKey,
+    Workbook,
 };
 use crate::sheet::Sheet;
 use crate::store::{Block, Column, SlotMap};
@@ -410,16 +411,16 @@ where
         sheets.push(sheet);
     }
 
-    let mut formulas: BTreeMap<WorkbookCellKey, F> = BTreeMap::new();
+    let mut formulas: FormulaStoreBuilder<F> = FormulaStoreBuilder::new();
     for (s, r, c, f) in formulas_sec.entries {
-        if formulas.insert((s, r, c), f).is_some() {
+        if formulas.insert_unique((s, r, c), f).is_err() {
             return Err(SnapshotError::Validation);
         }
     }
 
     let workbook = Workbook::from_parts(
         sheets,
-        formulas,
+        formulas.finish(),
         allocator,
         axes_sec.next_sheet_id,
         seed_origin,

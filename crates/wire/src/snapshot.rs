@@ -13,7 +13,7 @@ use core::ops::Bound::{Excluded, Unbounded};
 use reticula_core::KERNEL_VERSION;
 use reticula_core::axis::AxisRun;
 use reticula_core::format::NumberFormat;
-use reticula_core::formula_store::FormulaStore;
+use reticula_core::formula_store::{FormulaStore, FormulaStoreBuilder};
 use reticula_core::id::{ColId, IdAllocator, RowId, SheetId};
 use reticula_core::ops::{
     MAX_CELL_TEXT_UTF16, MAX_NAMED_RANGE_COMMENT_CHARS, MAX_NAMED_RANGES, MAX_SHEETS,
@@ -974,7 +974,9 @@ fn decode_snapshot_raw_with_limits(
             return Err(SnapshotError::Validation);
         }
         let (wb, kernel_version): (Workbook<BoundFormula>, String) = decode_snapshot_v0(bytes)?;
-        if wb.populated_cell_count() > max_cells as u64 || wb.estimated_bytes() > max_bytes {
+        if (max_cells < usize::MAX && wb.populated_cell_count() > max_cells as u64)
+            || wb.estimated_bytes() > max_bytes
+        {
             return Err(SnapshotError::Validation);
         }
         return Ok((
@@ -1117,7 +1119,7 @@ fn decode_snapshot_raw_with_limits(
     let reserve_hint = cols_slice
         .len()
         .saturating_mul(5)
-        .saturating_add(formula_count_hint.saturating_mul(600))
+        .saturating_add(formulas_slice.len().saturating_mul(4))
         .min(max_bytes)
         .min(768 * 1024 * 1024);
     if reserve_hint >= 4 * 1024 * 1024 {
@@ -1366,7 +1368,12 @@ fn decode_snapshot_raw_with_limits(
     )
     .map_err(|_: OpError| SnapshotError::Validation)?;
 
-    if workbook.populated_cell_count() > max_cells as u64 || workbook.estimated_bytes() > max_bytes
+    let max_cells_u64 = max_cells as u64;
+    let upper_bound_cells = (running_cells as u64).saturating_add(workbook.formulas().len() as u64);
+    if (max_cells < usize::MAX
+        && upper_bound_cells > max_cells_u64
+        && workbook.populated_cell_count() > max_cells_u64)
+        || workbook.estimated_bytes() > max_bytes
     {
         return Err(SnapshotError::Validation);
     }
@@ -1830,7 +1837,7 @@ fn decode_formulas_section(
         return Err(SnapshotError::Validation);
     }
 
-    let mut formulas: FormulaStore<BoundFormula> = FormulaStore::new();
+    let mut formulas = FormulaStoreBuilder::new();
     for _ in 0..chunk_count {
         let raw_len =
             usize::try_from(read_u32_le(bytes, cursor)?).map_err(|_| SnapshotError::Validation)?;
@@ -1852,15 +1859,17 @@ fn decode_formulas_section(
             return Err(SnapshotError::Validation);
         }
         for mut entry in entries {
-            validate_and_normalize_direct_expr(&mut entry.formula.root, 0, allow_v3)?;
-            use reticula_core::ops::FormulaPayload as _;
-            entry
-                .formula
-                .validate()
-                .map_err(|_| SnapshotError::Validation)?;
             let key = (SheetId(entry.sheet), RowId(entry.row), ColId(entry.col));
-            if formulas.insert(key, entry.formula).is_some() {
-                return Err(SnapshotError::Validation);
+            if !formulas.try_match_open_strip(key, &entry.formula) {
+                validate_and_normalize_direct_expr(&mut entry.formula.root, 0, allow_v3)?;
+                use reticula_core::ops::FormulaPayload as _;
+                entry
+                    .formula
+                    .validate()
+                    .map_err(|_| SnapshotError::Validation)?;
+                formulas
+                    .insert_unique(key, entry.formula)
+                    .map_err(|()| SnapshotError::Validation)?;
             }
             if running_bytes.saturating_add(formulas.estimated_bytes()) > max_bytes {
                 return Err(SnapshotError::Validation);
@@ -1868,6 +1877,7 @@ fn decode_formulas_section(
         }
     }
 
+    let formulas = formulas.finish();
     if cursor != bytes.len() || formulas.len() != total_formulas {
         return Err(SnapshotError::Validation);
     }
@@ -2427,5 +2437,113 @@ mod tests {
             Some(SnapshotError::Validation)
         );
         assert!(decode_snapshot_for_collab(&v1_bytes, 2_000_000, 64 * 1024 * 1024).is_ok());
+    }
+
+    #[test]
+    fn streaming_strip_decode_normalizes_and_coalesces_multicolumn_strips() {
+        use reticula_core::id::{ColId, RowId, SheetId};
+        use reticula_core::ops::{FormulaMode, Workbook};
+        use reticula_core::sheet::Sheet;
+        use reticula_core::value::Value;
+        use reticula_formula::ast::Literal;
+        use reticula_formula::binder::{BoundExpr, BoundFormula, BoundRef};
+
+        let make_formula = |row: u64, call_name: &str, num: f64| BoundFormula {
+            mode: FormulaMode::Dynamic,
+            root: BoundExpr::Call {
+                name: String::from(call_name),
+                args: vec![
+                    BoundExpr::Reference(BoundRef::Cell {
+                        sheet: None,
+                        missing_sheet: None,
+                        row: RowId(row),
+                        col: ColId(0),
+                        abs_col: false,
+                        abs_row: false,
+                    }),
+                    BoundExpr::Literal(Literal::Number(num)),
+                ],
+            },
+        };
+
+        let s0 = SheetId(0);
+        let mut wb_raw =
+            Workbook::from_sheet(Sheet::with_axes(s0, String::from("Sheet1"), 16, 4), None);
+        let mut wb_clean =
+            Workbook::from_sheet(Sheet::with_axes(s0, String::from("Sheet1"), 16, 4), None);
+
+        for r in 0_u64..8 {
+            let f_norm = make_formula(r, "SUM", 0.0);
+            wb_raw.insert_seeded_formula(s0, RowId(r), ColId(1), f_norm.clone(), Value::Empty);
+            wb_clean.insert_seeded_formula(s0, RowId(r), ColId(1), f_norm.clone(), Value::Empty);
+
+            let f_col2_raw = if r == 2 {
+                make_formula(r, "sum", -0.0)
+            } else {
+                f_norm.clone()
+            };
+            wb_raw.insert_seeded_formula(s0, RowId(r), ColId(2), f_col2_raw, Value::Empty);
+            wb_clean.insert_seeded_formula(s0, RowId(r), ColId(2), f_norm, Value::Empty);
+        }
+
+        let bytes = encode_snapshot_v1(&wb_raw, &[]).unwrap();
+        let decoded = decode_snapshot_any(&bytes).unwrap();
+        let wb = decoded.engine.workbook();
+        assert_eq!(wb.formulas().strip_count(), 2);
+        assert_eq!(wb.formulas().single_count(), 0);
+        assert_eq!(wb.state_digest(), wb_clean.state_digest());
+
+        let f22 = wb.formula(s0, RowId(2), ColId(2)).unwrap();
+        assert!(matches!(
+            &f22.root,
+            BoundExpr::Call { name, args }
+                if name == "SUM"
+                    && matches!(
+                        args.get(1),
+                        Some(BoundExpr::Literal(Literal::Number(n))) if n.to_bits() == 0.0_f64.to_bits()
+                    )
+        ));
+    }
+
+    #[test]
+    fn collab_quota_checks_exact_population_when_upper_bound_exceeds_limit() {
+        use reticula_core::id::{ColId, RowId, SheetId};
+        use reticula_core::ops::{CellEdit, CellInput, FormatPatch, FormulaMode, Op, Workbook};
+        use reticula_core::sheet::Sheet;
+        use reticula_core::value::Value;
+        use reticula_formula::ast::Literal;
+        use reticula_formula::binder::{BoundExpr, BoundFormula};
+
+        use super::{SnapshotError, decode_snapshot_for_collab};
+
+        let s0 = SheetId(0);
+        let mut wb = Workbook::from_sheet(Sheet::with_axes(s0, String::from("Sheet1"), 4, 2), None);
+        wb.apply(Op::SetCells {
+            sheet: s0,
+            edits: vec![CellEdit {
+                row: RowId(0),
+                col: ColId(0),
+                input: CellInput::Scalar(reticula_core::ops::ScalarValue::Number(1.0)),
+                format: FormatPatch::Keep,
+            }],
+        })
+        .unwrap();
+        let f = BoundFormula {
+            mode: FormulaMode::Dynamic,
+            root: BoundExpr::Literal(Literal::Number(2.0)),
+        };
+        // Non-empty cached value (running_cells = 2) + empty cached value formula (formulas.len = 2).
+        wb.insert_seeded_formula(s0, RowId(1), ColId(0), f.clone(), Value::Number(2.0));
+        wb.insert_seeded_formula(s0, RowId(2), ColId(0), f, Value::Empty);
+        assert_eq!(wb.populated_cell_count(), 3);
+
+        let bytes = encode_snapshot_v1(&wb, &[]).unwrap();
+        // upper_bound_cells = 2 + 2 = 4 > max_cells(3), exact populated_cell_count = 3 <= 3 -> ok.
+        assert!(decode_snapshot_for_collab(&bytes, 3, 64 * 1024 * 1024).is_ok());
+        // running_cells(2) <= 2 and formulas.len()(2) <= 2, exact populated_cell_count = 3 > 2 -> err.
+        assert_eq!(
+            decode_snapshot_for_collab(&bytes, 2, 64 * 1024 * 1024).err(),
+            Some(SnapshotError::Validation)
+        );
     }
 }
