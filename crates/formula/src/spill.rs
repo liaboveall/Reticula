@@ -1,10 +1,10 @@
 //! Dynamic array spill materialization, conflict detection, and viewport
-//! overlay tracking (`04-engine.md` E22, `17-m3a.md`).
+//! overlay tracking (E22).
 //!
-//! Uses order-independent symmetric `#SPILL!` conflict resolution: when two
-//! dynamic array formulas' footprints overlap with no static obstacle, both
-//! anchors transition to `#SPILL!` and watch the overlapping coordinates so
-//! clearing either blocker pops the remaining spill open automatically.
+//! The registry records which cells each spill owns and which anchors show
+//! `#SPILL!`; it does not decide between spills that want the same cells.
+//! That decision depends on every spill involved, so the engine makes it for
+//! all of them at once (`engine/settle.rs`).
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
@@ -12,7 +12,7 @@ use alloc::vec::Vec;
 use reticula_core::id::{ColId, RowId, SheetId};
 use reticula_core::ops::{Workbook, WorkbookCellKey};
 use reticula_core::sheet::Sheet;
-use reticula_core::value::{CalcError, Value};
+use reticula_core::value::Value;
 use reticula_core::viewport::{FLAG_SPILL, OverlayValue};
 
 use crate::binder::BoundFormula;
@@ -29,76 +29,62 @@ pub struct SpillEntry {
     pub array: Array2D,
 }
 
-/// Blocked spill state tracked so clearing any static or dynamic obstacle can
-/// immediately wake waiting formulas.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct BlockedSpill {
-    /// Watched shadow coordinates (empty when overflowed sheet bounds).
-    pub footprint: Vec<WorkbookCellKey>,
-    /// `true` when blocked by a static non-empty cell, formula cell, or grid
-    /// bounds; `false` when blocked solely by dynamic spill collision(s).
-    pub blocked_by_static: bool,
+impl SpillEntry {
+    /// The value at `(row, col)` of the array, provided it lands on `cell`.
+    fn value_at(&self, row: usize, col: usize, cell: WorkbookCellKey) -> Option<&EvalScalar> {
+        if self.rows.get(row) != Some(&cell.1) || self.cols.get(col) != Some(&cell.2) {
+            return None;
+        }
+        array_value(&self.array, row, col)
+    }
 }
 
-/// Outcome of clearing an anchor's active or blocked spill state.
+/// Outcome of releasing an anchor's active or blocked spill state.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct ClearSpillOutcome {
-    /// Shadow cells (`!= anchor`) previously materialized by `anchor` that are now empty.
+pub struct ReleasedSpill {
+    /// Shadow cells (`!= anchor`) previously owned by the anchor.
     pub cleared_shadows: Vec<WorkbookCellKey>,
-    /// Blocked anchors waiting on any cell vacated by `anchor`.
-    pub unblocked_watchers: Vec<WorkbookCellKey>,
-    /// Whether `anchor` previously held an active spill or blocked registration.
+    /// Whether the anchor previously held an active spill or blocked registration.
     pub had_state: bool,
 }
 
-/// Relative dependency ordering between two colliding dynamic spill anchors.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SpillCollisionOrder {
-    /// Colliding anchor is strictly upstream of the committing anchor (`other ->* anchor`),
-    /// so `anchor` yields cleanly (`#SPILL!`) without revoking `other`.
-    OtherUpstream,
-    /// Committing anchor is strictly upstream of the colliding anchor (`anchor ->* other`),
-    /// so `anchor` evicts/wakes `other`.
-    AnchorUpstream,
-    /// Independent or mutually dependent anchors; symmetric `#SPILL!` applies.
-    Symmetric,
-}
-
-/// Outcome of committing an [`Array2D`] at `anchor`.
-#[derive(Clone, Debug, PartialEq)]
-pub enum CommitSpillOutcome {
-    /// Array fit without obstacles (including `1×1` dynamic array outputs).
-    Materialized {
-        /// Scalar value at `(0, 0)` written to the anchor cell on `Sheet`.
-        anchor_scalar: EvalScalar,
-        /// Shadow coordinates (`!= anchor`) whose materialized value changed or
-        /// was removed compared to the previous spill of `anchor`.
-        changed_shadows: Vec<WorkbookCellKey>,
-        /// Previously blocked anchors watching any shadow cell vacated by shrinkage.
-        unblocked_watchers: Vec<WorkbookCellKey>,
-        /// Strictly downstream active anchors evicted so `anchor` could materialize.
-        displaced_anchors: Vec<WorkbookCellKey>,
+/// Where an array of a given shape would land on the sheet.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SpillFit {
+    /// Every covered cell besides the anchor is free of static content.
+    Free {
+        /// Ordered live row IDs covered by the array.
+        rows: Vec<RowId>,
+        /// Ordered live column IDs covered by the array.
+        cols: Vec<ColId>,
     },
-    /// Array failed (`#SPILL!`) due to bounds overflow, static obstacle, or
-    /// symmetric dynamic spill collision.
-    Blocked {
-        /// Active anchors revoked to `#SPILL!` due to symmetric collision.
-        revoked_anchors: Vec<WorkbookCellKey>,
-        /// Shadow cells vacated across `anchor` and any revoked colliding anchors.
-        freed_shadows: Vec<WorkbookCellKey>,
-        /// Blocked anchors watching vacated cells that may now pop open.
-        unblocked_watchers: Vec<WorkbookCellKey>,
+    /// A value, a formula or the edge of the sheet is in the way.
+    Obstructed {
+        /// Cells whose clearing may free the spill (empty when the array does
+        /// not fit on the sheet).
+        footprint: Vec<WorkbookCellKey>,
     },
 }
 
-/// Registry tracking active dynamic-array spills, symmetric blockers, and
+impl SpillFit {
+    /// The covered cells without the anchor, or those that may free the spill.
+    #[must_use]
+    pub fn footprint(&self, anchor: WorkbookCellKey) -> Vec<WorkbookCellKey> {
+        match self {
+            Self::Free { rows, cols } => footprint_cells(anchor, rows, cols),
+            Self::Obstructed { footprint } => footprint.clone(),
+        }
+    }
+}
+
+/// Registry tracking active dynamic-array spills, blocked anchors, and
 /// per-column shadow values for fast viewport and formula lookups.
 #[derive(Clone, Debug, Default)]
 pub struct SpillRegistry {
     anchors: BTreeMap<WorkbookCellKey, SpillEntry>,
     cell_to_anchor: BTreeMap<WorkbookCellKey, WorkbookCellKey>,
     sheet_col_shadows: BTreeMap<(SheetId, ColId, RowId), EvalScalar>,
-    blocked_anchors: BTreeMap<WorkbookCellKey, BlockedSpill>,
+    blocked_anchors: BTreeMap<WorkbookCellKey, Vec<WorkbookCellKey>>,
     blocked_watch: BTreeMap<WorkbookCellKey, BTreeSet<WorkbookCellKey>>,
     sheet_spill_counts: BTreeMap<SheetId, u32>,
 }
@@ -150,16 +136,6 @@ impl SpillRegistry {
         self.blocked_anchors.contains_key(&anchor)
     }
 
-    /// Returns the watched shadow footprint of `anchor` when blocked solely
-    /// by dynamic spill collisions (`blocked_by_static == false`).
-    #[must_use]
-    pub fn dynamic_blocked_footprint(&self, anchor: WorkbookCellKey) -> Option<&[WorkbookCellKey]> {
-        self.blocked_anchors
-            .get(&anchor)
-            .filter(|b| !b.blocked_by_static)
-            .map(|b| b.footprint.as_slice())
-    }
-
     /// Returns the `(rows, cols)` dimensions of an active spill anchored at `anchor`.
     #[must_use]
     pub fn spill_shape(&self, anchor: WorkbookCellKey) -> Option<(u32, u32)> {
@@ -185,11 +161,22 @@ impl SpillRegistry {
     }
 
     /// Returns all blocked anchors currently watching `key`.
+    #[must_use]
     pub fn watchers_of_cell(&self, key: WorkbookCellKey) -> Vec<WorkbookCellKey> {
         self.blocked_watch
             .get(&key)
             .map(|set| set.iter().copied().collect())
             .unwrap_or_default()
+    }
+
+    /// Lists every active and blocked anchor in key order.
+    #[must_use]
+    pub fn all_anchors(&self) -> BTreeSet<WorkbookCellKey> {
+        self.anchors
+            .keys()
+            .chain(self.blocked_anchors.keys())
+            .copied()
+            .collect()
     }
 
     /// Lists all active and blocked spill anchors residing on `sheet_id`.
@@ -205,6 +192,23 @@ impl SpillRegistry {
             out.insert(k);
         }
         out.into_iter().collect()
+    }
+
+    /// Whether any active or blocked anchor sits in `col` between `first` and
+    /// `last` (inclusive, in row ID order).
+    #[must_use]
+    pub fn has_anchor_in_col_run(
+        &self,
+        sheet_id: SheetId,
+        col: ColId,
+        first: RowId,
+        last: RowId,
+    ) -> bool {
+        let lo = (sheet_id, first, ColId(0));
+        let hi = (sheet_id, last, ColId(u64::MAX));
+        lo <= hi
+            && (self.anchors.range(lo..=hi).any(|(k, _)| k.2 == col)
+                || self.blocked_anchors.range(lo..=hi).any(|(k, _)| k.2 == col))
     }
 
     /// Visits every spilled shadow cell in column `col` of `sheet` whose live row
@@ -233,353 +237,179 @@ impl SpillRegistry {
         }
     }
 
-    /// Removes any active or blocked spill owned by `anchor`, returning freed
-    /// shadow cells and any blocked anchors watching them.
-    pub fn clear_anchor(&mut self, anchor: WorkbookCellKey) -> ClearSpillOutcome {
-        let mut outcome = ClearSpillOutcome::default();
-        if let Some(old_blocked) = self.remove_blocked_only(anchor) {
-            outcome.had_state = true;
-            if !old_blocked.blocked_by_static {
-                for cell in old_blocked.footprint {
-                    self.collect_watchers_into(cell, &mut outcome.unblocked_watchers, Some(anchor));
-                }
+    /// Resolves where a `height × width` array anchored at `anchor` would land and
+    /// whether static content (a value, a formula, the sheet edge) is in the way.
+    #[must_use]
+    pub fn fit(
+        workbook: &Workbook<BoundFormula>,
+        anchor: WorkbookCellKey,
+        height: u32,
+        width: u32,
+    ) -> SpillFit {
+        let (sheet_id, anchor_row, anchor_col) = anchor;
+        let Some((rows, cols)) =
+            resolve_spill_axes(workbook, sheet_id, anchor_row, anchor_col, height, width)
+        else {
+            return SpillFit::Obstructed {
+                footprint: Vec::new(),
+            };
+        };
+        let Some(sheet) = workbook.sheet(sheet_id) else {
+            return SpillFit::Obstructed {
+                footprint: Vec::new(),
+            };
+        };
+        let obstructed = rows.iter().any(|&row| {
+            cols.iter().any(|&col| {
+                (sheet_id, row, col) != anchor
+                    && (sheet.value_by_id(row, col) != Value::Empty
+                        || workbook.has_formula(sheet_id, row, col))
+            })
+        });
+        if obstructed {
+            SpillFit::Obstructed {
+                footprint: footprint_cells(anchor, &rows, &cols),
             }
+        } else {
+            SpillFit::Free { rows, cols }
         }
-        if let Some(old_shadows) = self.remove_active_only(anchor) {
-            outcome.had_state = true;
-            for cell in old_shadows {
-                self.collect_watchers_into(cell, &mut outcome.unblocked_watchers, Some(anchor));
-                outcome.cleared_shadows.push(cell);
-            }
-        }
-        outcome
     }
 
-    /// Commits a dynamic-array formula result at `anchor`, applying symmetric
-    /// E22 `#SPILL!` conflict detection.
-    pub fn commit_array(
-        &mut self,
-        anchor: WorkbookCellKey,
-        arr: Array2D,
-        workbook: &Workbook<BoundFormula>,
-    ) -> CommitSpillOutcome {
-        self.commit_array_with_order(anchor, arr, workbook, |_, _, _, _| {
-            SpillCollisionOrder::Symmetric
+    /// Whether another spill owns any of the cells `anchor` would cover.
+    #[must_use]
+    pub fn is_contested(&self, anchor: WorkbookCellKey, rows: &[RowId], cols: &[ColId]) -> bool {
+        if self.cell_to_anchor.is_empty() {
+            return false;
+        }
+        rows.iter().any(|&row| {
+            cols.iter().any(|&col| {
+                self.cell_to_anchor
+                    .get(&(anchor.0, row, col))
+                    .is_some_and(|&owner| owner != anchor)
+            })
         })
     }
 
-    /// Commits a dynamic-array formula result at `anchor`, classifying each
-    /// colliding spill anchor via `classify(registry, anchor, footprint, other)`
-    /// so strictly downstream spills yield cleanly to upstream spills while
-    /// independent or mutually dependent spills collide symmetrically.
-    pub fn commit_array_with_order<F>(
+    /// Removes any active or blocked spill state owned by `anchor`.
+    pub fn release(&mut self, anchor: WorkbookCellKey) -> ReleasedSpill {
+        let was_blocked = self.remove_blocked(anchor);
+        let active = self.remove_active(anchor);
+        ReleasedSpill {
+            had_state: was_blocked || active.is_some(),
+            cleared_shadows: active.unwrap_or_default(),
+        }
+    }
+
+    /// Records that `anchor` shows `#SPILL!` and watches `footprint`, returning
+    /// the shadow cells it gave up.
+    pub fn block(
         &mut self,
         anchor: WorkbookCellKey,
-        arr: Array2D,
-        workbook: &Workbook<BoundFormula>,
-        mut classify: F,
-    ) -> CommitSpillOutcome
-    where
-        F: FnMut(
-            &Self,
-            WorkbookCellKey,
-            &[WorkbookCellKey],
-            WorkbookCellKey,
-        ) -> SpillCollisionOrder,
-    {
-        let (sheet_id, anchor_row, anchor_col) = anchor;
-        let old_blocked = self.remove_blocked_only(anchor);
-
-        let anchor_scalar = arr
-            .values
-            .first()
-            .cloned()
-            .unwrap_or(EvalScalar::Error(CalcError::Calc));
-
-        let Some((rows, cols)) = resolve_spill_axes(
-            workbook, sheet_id, anchor_row, anchor_col, arr.rows, arr.cols,
-        ) else {
-            // Exceeded worksheet bounds -> static `#SPILL!`, vacate any prior active spill.
-            let freed_shadows = self.remove_active_only(anchor).unwrap_or_default();
-            let mut unblocked_watchers = Vec::new();
-            for &cell in &freed_shadows {
-                self.collect_watchers_into(cell, &mut unblocked_watchers, Some(anchor));
-            }
-            if let Some(ref b) = old_blocked
-                && !b.blocked_by_static
-            {
-                for &cell in &b.footprint {
-                    self.collect_watchers_into(cell, &mut unblocked_watchers, Some(anchor));
-                }
-            }
-            self.record_blocked(anchor, Vec::new(), true);
-            return CommitSpillOutcome::Blocked {
-                revoked_anchors: Vec::new(),
-                freed_shadows,
-                unblocked_watchers,
-            };
-        };
-
-        let mut footprint =
-            Vec::with_capacity(rows.len().saturating_mul(cols.len()).saturating_sub(1));
-        for &r in &rows {
-            for &c in &cols {
-                if (sheet_id, r, c) != anchor {
-                    footprint.push((sheet_id, r, c));
-                }
-            }
-        }
-
-        // Check static obstacles first (non-empty Sheet value or formula cell).
-        let Some(sheet) = workbook.sheet(sheet_id) else {
-            let freed_shadows = self.remove_active_only(anchor).unwrap_or_default();
-            let mut unblocked_watchers = Vec::new();
-            if let Some(ref b) = old_blocked
-                && !b.blocked_by_static
-            {
-                for &cell in &b.footprint {
-                    self.collect_watchers_into(cell, &mut unblocked_watchers, Some(anchor));
-                }
-            }
-            self.record_blocked(anchor, Vec::new(), true);
-            return CommitSpillOutcome::Blocked {
-                revoked_anchors: Vec::new(),
-                freed_shadows,
-                unblocked_watchers,
-            };
-        };
-
-        let mut has_static_blocker = false;
-        let mut active_collisions = BTreeSet::new();
-        let mut dynamic_blocked_collisions = BTreeSet::new();
-
+        footprint: Vec<WorkbookCellKey>,
+    ) -> Vec<WorkbookCellKey> {
+        let released = self.release(anchor);
         for &cell in &footprint {
-            if sheet.value_by_id(cell.1, cell.2) != Value::Empty
-                || workbook.formula(cell.0, cell.1, cell.2).is_some()
-            {
-                has_static_blocker = true;
-                break;
-            }
-            if let Some(&owner) = self.cell_to_anchor.get(&cell)
-                && owner != anchor
-            {
-                active_collisions.insert(owner);
-            }
-            if let Some(watchers) = self.blocked_watch.get(&cell) {
-                for &watcher in watchers {
-                    if watcher != anchor
-                        && self
-                            .blocked_anchors
-                            .get(&watcher)
-                            .is_some_and(|b| !b.blocked_by_static)
-                    {
-                        dynamic_blocked_collisions.insert(watcher);
-                    }
-                }
-            }
+            self.blocked_watch.entry(cell).or_default().insert(anchor);
         }
+        self.blocked_anchors.insert(anchor, footprint);
+        released.cleared_shadows
+    }
 
-        let mut has_upstream_blocker = false;
-        let mut symmetric_active = Vec::new();
-        let mut downstream_active = Vec::new();
-        let mut symmetric_blocked = Vec::new();
-        let mut downstream_blocked = Vec::new();
-
-        if !has_static_blocker
-            && (!active_collisions.is_empty() || !dynamic_blocked_collisions.is_empty())
-        {
-            for &other in &active_collisions {
-                match classify(self, anchor, &footprint, other) {
-                    SpillCollisionOrder::OtherUpstream => {
-                        has_upstream_blocker = true;
-                        break;
-                    }
-                    SpillCollisionOrder::AnchorUpstream => {
-                        downstream_active.push(other);
-                    }
-                    SpillCollisionOrder::Symmetric => {
-                        symmetric_active.push(other);
-                    }
-                }
-            }
-            if !has_upstream_blocker {
-                for &other in &dynamic_blocked_collisions {
-                    match classify(self, anchor, &footprint, other) {
-                        SpillCollisionOrder::OtherUpstream => {
-                            has_upstream_blocker = true;
-                            break;
-                        }
-                        SpillCollisionOrder::AnchorUpstream => {
-                            downstream_blocked.push(other);
-                        }
-                        SpillCollisionOrder::Symmetric => {
-                            symmetric_blocked.push(other);
-                        }
-                    }
-                }
-            }
-        }
-
-        if has_static_blocker || has_upstream_blocker {
-            let freed_shadows = self.remove_active_only(anchor).unwrap_or_default();
-            let mut unblocked_watchers = Vec::new();
-            for &cell in &freed_shadows {
-                self.collect_watchers_into(cell, &mut unblocked_watchers, Some(anchor));
-            }
-            if let Some(ref b) = old_blocked
-                && !b.blocked_by_static
-            {
-                for &cell in &b.footprint {
-                    self.collect_watchers_into(cell, &mut unblocked_watchers, Some(anchor));
-                }
-            }
-            self.record_blocked(anchor, footprint, true);
-            return CommitSpillOutcome::Blocked {
-                revoked_anchors: Vec::new(),
-                freed_shadows,
-                unblocked_watchers,
-            };
-        }
-
-        if !symmetric_active.is_empty() || !symmetric_blocked.is_empty() {
-            let mut freed_shadows = self.remove_active_only(anchor).unwrap_or_default();
-            let mut revoked_anchors = Vec::with_capacity(
-                symmetric_active
-                    .len()
-                    .saturating_add(downstream_active.len()),
-            );
-            for &other in &symmetric_active {
-                let other_footprint = self.remove_active_only(other).unwrap_or_default();
-                freed_shadows.extend(other_footprint.iter().copied());
-                self.record_blocked(other, other_footprint, false);
-                revoked_anchors.push(other);
-            }
-            for &other in &downstream_active {
-                let other_footprint = self.remove_active_only(other).unwrap_or_default();
-                freed_shadows.extend(other_footprint.iter().copied());
-                self.record_blocked(other, other_footprint, true);
-                revoked_anchors.push(other);
-            }
-            let mut unblocked_watchers = Vec::new();
-            for &cell in &freed_shadows {
-                self.collect_watchers_into(cell, &mut unblocked_watchers, Some(anchor));
-            }
-            if let Some(ref b) = old_blocked
-                && !b.blocked_by_static
-            {
-                for &cell in &b.footprint {
-                    if !footprint.contains(&cell) {
-                        self.collect_watchers_into(cell, &mut unblocked_watchers, Some(anchor));
-                    }
-                }
-            }
-            // Note: do not wake symmetric blockers we just revoked into blocked state,
-            // while waking strictly downstream anchors so they re-evaluate cleanly.
-            unblocked_watchers.retain(|w| !symmetric_active.contains(w));
-            for &other in downstream_active.iter().chain(downstream_blocked.iter()) {
-                if !unblocked_watchers.contains(&other) {
-                    unblocked_watchers.push(other);
-                }
-            }
-            self.record_blocked(anchor, footprint, false);
-            return CommitSpillOutcome::Blocked {
-                revoked_anchors,
-                freed_shadows,
-                unblocked_watchers,
-            };
-        }
-
-        // Clean fit: first evict any strictly downstream active/blocked anchors cleanly.
-        let mut displaced_shadows = Vec::new();
-        let mut displaced_anchors = Vec::new();
-        let mut unblocked_watchers = Vec::new();
-        for &other in &downstream_active {
-            let other_shadows = self.remove_active_only(other).unwrap_or_default();
-            for &cell in &other_shadows {
-                self.collect_watchers_into(cell, &mut unblocked_watchers, Some(anchor));
-            }
-            displaced_shadows.extend(other_shadows);
-            displaced_anchors.push(other);
-            if !unblocked_watchers.contains(&other) {
-                unblocked_watchers.push(other);
-            }
-        }
-        for &other in &downstream_blocked {
-            if !unblocked_watchers.contains(&other) {
-                unblocked_watchers.push(other);
-            }
-        }
-
-        // Compare against `anchor`'s prior active spill (if any) to track exact diffs.
-        let mut old_shadow_vals = BTreeMap::new();
-        let old_shadows = self.remove_active_only_with_values(anchor, &mut old_shadow_vals);
-
-        let mut new_shadows_map = BTreeMap::new();
-        let mut changed_shadows = Vec::new();
-        let col_count = cols.len();
-        for (ri, &r) in rows.iter().enumerate() {
-            for (ci, &c) in cols.iter().enumerate() {
-                let cell = (sheet_id, r, c);
+    /// Materializes `arr` over `rows × cols`, which no other spill may own, and
+    /// returns the shadow cells whose value or owner changed.
+    pub fn materialize(
+        &mut self,
+        anchor: WorkbookCellKey,
+        rows: Vec<RowId>,
+        cols: Vec<ColId>,
+        arr: Array2D,
+    ) -> Vec<WorkbookCellKey> {
+        let sheet_id = anchor.0;
+        let _ = self.remove_blocked(anchor);
+        let old = self.anchors.remove(&anchor);
+        let mut changed = Vec::new();
+        let mut values = arr.values.iter();
+        for (ri, &row) in rows.iter().enumerate() {
+            for (ci, &col) in cols.iter().enumerate() {
+                let value = values.next();
+                let cell = (sheet_id, row, col);
                 if cell == anchor {
                     continue;
                 }
-                let val_idx = ri.saturating_mul(col_count).saturating_add(ci);
-                let scalar = arr
-                    .values
-                    .get(val_idx)
-                    .cloned()
-                    .unwrap_or(EvalScalar::Error(CalcError::Calc));
+                let before = old.as_ref().and_then(|entry| entry.value_at(ri, ci, cell));
+                if before.is_some() && before == value {
+                    continue;
+                }
+                changed.push(cell);
                 self.cell_to_anchor.insert(cell, anchor);
-                self.sheet_col_shadows
-                    .insert((sheet_id, c, r), scalar.clone());
-                if old_shadow_vals.get(&cell) != Some(&scalar) {
-                    changed_shadows.push(cell);
+                self.sheet_col_shadows.insert(
+                    (sheet_id, col, row),
+                    value.cloned().unwrap_or(EvalScalar::Empty),
+                );
+            }
+        }
+        let entry = SpillEntry {
+            rows,
+            cols,
+            array: arr,
+        };
+        match old {
+            Some(old) => {
+                for (ri, &row) in old.rows.iter().enumerate() {
+                    for (ci, &col) in old.cols.iter().enumerate() {
+                        let cell = (sheet_id, row, col);
+                        if cell != anchor && entry.value_at(ri, ci, cell).is_none() {
+                            self.cell_to_anchor.remove(&cell);
+                            self.sheet_col_shadows.remove(&(sheet_id, col, row));
+                            changed.push(cell);
+                        }
+                    }
                 }
-                new_shadows_map.insert(cell, ());
+            }
+            None => {
+                let count = self.sheet_spill_counts.entry(sheet_id).or_insert(0);
+                *count = count.saturating_add(1);
             }
         }
+        self.anchors.insert(anchor, entry);
+        changed
+    }
 
-        for old_cell in old_shadows {
-            if !new_shadows_map.contains_key(&old_cell) {
-                changed_shadows.push(old_cell);
-                self.collect_watchers_into(old_cell, &mut unblocked_watchers, Some(anchor));
-            }
-        }
-        if let Some(ref b) = old_blocked
-            && !b.blocked_by_static
-        {
-            for &old_cell in &b.footprint {
-                if !new_shadows_map.contains_key(&old_cell) {
-                    self.collect_watchers_into(old_cell, &mut unblocked_watchers, Some(anchor));
+    /// Replaces the values of an active spill without moving its footprint: cells
+    /// outside `arr` (all of them for `None`) become empty. Returns the shadow
+    /// cells whose value changed.
+    pub fn refill(
+        &mut self,
+        anchor: WorkbookCellKey,
+        arr: Option<&Array2D>,
+    ) -> Vec<WorkbookCellKey> {
+        let sheet_id = anchor.0;
+        let Some(entry) = self.anchors.get_mut(&anchor) else {
+            return Vec::new();
+        };
+        let mut changed = Vec::new();
+        let mut slots = entry.array.values.iter_mut();
+        for (ri, &row) in entry.rows.iter().enumerate() {
+            for (ci, &col) in entry.cols.iter().enumerate() {
+                let Some(slot) = slots.next() else {
+                    return changed;
+                };
+                let value = arr
+                    .and_then(|a| array_value(a, ri, ci))
+                    .cloned()
+                    .unwrap_or(EvalScalar::Empty);
+                if *slot == value {
+                    continue;
+                }
+                *slot = value.clone();
+                let cell = (sheet_id, row, col);
+                if cell != anchor {
+                    self.sheet_col_shadows.insert((sheet_id, col, row), value);
+                    changed.push(cell);
                 }
             }
         }
-        for cell in displaced_shadows {
-            if !new_shadows_map.contains_key(&cell) && !changed_shadows.contains(&cell) {
-                changed_shadows.push(cell);
-            }
-        }
-
-        if let Some(count) = self.sheet_spill_counts.get_mut(&sheet_id) {
-            *count = count.saturating_add(1);
-        } else {
-            self.sheet_spill_counts.insert(sheet_id, 1);
-        }
-        self.anchors.insert(
-            anchor,
-            SpillEntry {
-                rows,
-                cols,
-                array: arr,
-            },
-        );
-
-        CommitSpillOutcome::Materialized {
-            anchor_scalar,
-            changed_shadows,
-            unblocked_watchers,
-            displaced_anchors,
-        }
+        changed
     }
 
     /// Builds a viewport overlay descriptor for `(sheet_id, row, col)` when
@@ -602,120 +432,64 @@ impl SpillRegistry {
         Some((val, FLAG_SPILL))
     }
 
-    fn record_blocked(
-        &mut self,
-        anchor: WorkbookCellKey,
-        footprint: Vec<WorkbookCellKey>,
-        blocked_by_static: bool,
-    ) {
-        let _ = self.remove_blocked_only(anchor);
-        for &cell in &footprint {
-            self.blocked_watch.entry(cell).or_default().insert(anchor);
-        }
-        self.blocked_anchors.insert(
-            anchor,
-            BlockedSpill {
-                footprint,
-                blocked_by_static,
-            },
-        );
-    }
-
-    fn remove_blocked_only(&mut self, anchor: WorkbookCellKey) -> Option<BlockedSpill> {
-        let blocked = self.blocked_anchors.remove(&anchor)?;
-        for &cell in &blocked.footprint {
-            if let Some(set) = self.blocked_watch.get_mut(&cell) {
+    fn remove_blocked(&mut self, anchor: WorkbookCellKey) -> bool {
+        let Some(footprint) = self.blocked_anchors.remove(&anchor) else {
+            return false;
+        };
+        for cell in &footprint {
+            if let Some(set) = self.blocked_watch.get_mut(cell) {
                 set.remove(&anchor);
                 if set.is_empty() {
-                    self.blocked_watch.remove(&cell);
+                    self.blocked_watch.remove(cell);
                 }
             }
         }
-        Some(blocked)
+        true
     }
 
-    fn remove_active_only(&mut self, anchor: WorkbookCellKey) -> Option<Vec<WorkbookCellKey>> {
+    fn remove_active(&mut self, anchor: WorkbookCellKey) -> Option<Vec<WorkbookCellKey>> {
         let entry = self.anchors.remove(&anchor)?;
-        let sheet_id = anchor.0;
-        if let Some(count) = self.sheet_spill_counts.get_mut(&sheet_id) {
+        if let Some(count) = self.sheet_spill_counts.get_mut(&anchor.0) {
             *count = count.saturating_sub(1);
             if *count == 0 {
-                self.sheet_spill_counts.remove(&sheet_id);
+                self.sheet_spill_counts.remove(&anchor.0);
             }
         }
-        let mut shadows = Vec::with_capacity(
-            entry
-                .rows
-                .len()
-                .saturating_mul(entry.cols.len())
-                .saturating_sub(1),
-        );
-        for &r in &entry.rows {
-            for &c in &entry.cols {
-                let cell = (sheet_id, r, c);
-                if cell == anchor {
-                    continue;
-                }
-                self.cell_to_anchor.remove(&cell);
-                self.sheet_col_shadows.remove(&(sheet_id, c, r));
-                shadows.push(cell);
-            }
+        let shadows = footprint_cells(anchor, &entry.rows, &entry.cols);
+        for cell in &shadows {
+            self.cell_to_anchor.remove(cell);
+            self.sheet_col_shadows.remove(&(cell.0, cell.2, cell.1));
         }
         Some(shadows)
     }
+}
 
-    fn remove_active_only_with_values(
-        &mut self,
-        anchor: WorkbookCellKey,
-        out_vals: &mut BTreeMap<WorkbookCellKey, EvalScalar>,
-    ) -> Vec<WorkbookCellKey> {
-        let Some(entry) = self.anchors.remove(&anchor) else {
-            return Vec::new();
-        };
-        let sheet_id = anchor.0;
-        if let Some(count) = self.sheet_spill_counts.get_mut(&sheet_id) {
-            *count = count.saturating_sub(1);
-            if *count == 0 {
-                self.sheet_spill_counts.remove(&sheet_id);
-            }
-        }
-        let mut shadows = Vec::with_capacity(
-            entry
-                .rows
-                .len()
-                .saturating_mul(entry.cols.len())
-                .saturating_sub(1),
-        );
-        for &r in &entry.rows {
-            for &c in &entry.cols {
-                let cell = (sheet_id, r, c);
-                if cell == anchor {
-                    continue;
-                }
-                self.cell_to_anchor.remove(&cell);
-                if let Some(old_val) = self.sheet_col_shadows.remove(&(sheet_id, c, r)) {
-                    out_vals.insert(cell, old_val);
-                }
-                shadows.push(cell);
-            }
-        }
-        shadows
-    }
-
-    fn collect_watchers_into(
-        &self,
-        cell: WorkbookCellKey,
-        out: &mut Vec<WorkbookCellKey>,
-        exclude: Option<WorkbookCellKey>,
-    ) {
-        if let Some(set) = self.blocked_watch.get(&cell) {
-            for &watcher in set {
-                if Some(watcher) != exclude && !out.contains(&watcher) {
-                    out.push(watcher);
-                }
+/// Lists the cells `rows × cols` on the anchor's sheet, without the anchor.
+#[must_use]
+pub fn footprint_cells(
+    anchor: WorkbookCellKey,
+    rows: &[RowId],
+    cols: &[ColId],
+) -> Vec<WorkbookCellKey> {
+    let mut cells = Vec::with_capacity(rows.len().saturating_mul(cols.len()).saturating_sub(1));
+    for &row in rows {
+        for &col in cols {
+            let cell = (anchor.0, row, col);
+            if cell != anchor {
+                cells.push(cell);
             }
         }
     }
+    cells
+}
+
+fn array_value(arr: &Array2D, row: usize, col: usize) -> Option<&EvalScalar> {
+    let width = arr.cols as usize;
+    if row >= arr.rows as usize || col >= width {
+        return None;
+    }
+    arr.values
+        .get(row.saturating_mul(width).saturating_add(col))
 }
 
 fn resolve_spill_axes(

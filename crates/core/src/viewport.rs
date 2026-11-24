@@ -505,7 +505,7 @@ pub fn prepare_projected_page_styles<R>(
     sheet.prepare_viewport_styles(&row_ids, &col_ids);
 
     // Of the cells to the left only the one text overflows from is drawn: the
-    // first with a value, or one before it that a value is spilled into.
+    // first that shows anything, or one before it that a value is spilled into.
     let Some(&first_page_col) = col_ids.first() else {
         return;
     };
@@ -514,20 +514,32 @@ pub fn prepare_projected_page_styles<R>(
         .map(|c| ColId(sheet.col_id(c)))
         .filter(|&col| spilled || column_has_storage(sheet, col))
         .collect();
+    let mut scratch = String::new();
     for &row in &row_ids {
-        if sheet.value_by_id(row, first_page_col) != Value::Empty {
+        if shows_anything(sheet, row, first_page_col, &mut scratch) {
             continue;
         }
         for &col in &lookback {
-            let empty = sheet.value_by_id(row, col) == Value::Empty;
-            if spilled || !empty {
+            let shown = shows_anything(sheet, row, col, &mut scratch);
+            if spilled || shown {
                 sheet.prepare_viewport_styles(&[row], &[col]);
             }
-            if !empty {
+            if shown {
                 break;
             }
         }
     }
+}
+
+/// Whether a cell of the sheet itself has anything to draw as text.
+fn shows_anything(sheet: &Sheet, row: RowId, col: ColId, scratch: &mut String) -> bool {
+    let value = sheet.value_by_id(row, col);
+    if value == Value::Empty {
+        return false;
+    }
+    scratch.clear();
+    sheet.format_value(value, row, col, scratch);
+    !scratch.is_empty()
 }
 
 /// Borrowed value override for a single viewport cell (used so spilled values,
@@ -549,10 +561,6 @@ pub enum OverlayValue<'a> {
 impl OverlayValue<'_> {
     const fn is_empty(self) -> bool {
         matches!(self, Self::Empty)
-    }
-
-    const fn is_text(self) -> bool {
-        matches!(self, Self::Text(_))
     }
 }
 
@@ -601,15 +609,16 @@ where
     )
 }
 
+/// Writes what a cell shows. Returns its flags and whether it holds text.
 fn format_overlay_or_sheet_value(
     sheet: &Sheet,
     row_id: RowId,
     col_id: ColId,
     override_val: Option<OverlayValue<'_>>,
     text: &mut String,
-) -> (u16, bool, bool) {
+) -> (u16, bool) {
     match override_val {
-        Some(OverlayValue::Empty) => (0, true, false),
+        Some(OverlayValue::Empty) => (0, false),
         Some(OverlayValue::Number(n)) => {
             let v = Value::number(n);
             sheet.format_value(v, row_id, col_id, text);
@@ -618,19 +627,19 @@ fn format_overlay_or_sheet_value(
             } else {
                 FLAG_ERROR
             };
-            (f, false, false)
+            (f, false)
         }
         Some(OverlayValue::Bool(b)) => {
             sheet.format_value(Value::Bool(b), row_id, col_id, text);
-            (FLAG_BOOL, false, false)
+            (FLAG_BOOL, false)
         }
         Some(OverlayValue::Error(e)) => {
             text.push_str(e.as_str());
-            (FLAG_ERROR, false, false)
+            (FLAG_ERROR, false)
         }
         Some(OverlayValue::Text(s)) => {
             text.push_str(s);
-            (0, false, true)
+            (0, true)
         }
         None => {
             let val = sheet.value_by_id(row_id, col_id);
@@ -641,7 +650,7 @@ fn format_overlay_or_sheet_value(
                 Value::Error(_) | Value::Array(_) => FLAG_ERROR,
                 Value::Empty | Value::Text(_) => 0,
             };
-            (flags, val == Value::Empty, matches!(val, Value::Text(_)))
+            (flags, matches!(val, Value::Text(_)))
         }
     }
 }
@@ -773,13 +782,19 @@ where
 
     text.clear();
     let mut position: u32 = 0;
+    // A cell may hold a value that shows nothing, such as an empty string. Text
+    // runs on over it like over any other cell with nothing to draw.
+    let mut first_cell_blank: SmallVec<[bool; 64]> = SmallVec::new();
     for &row_id in &row_ids {
-        for &col_id in &col_ids {
+        for (index, &col_id) in col_ids.iter().enumerate() {
             let start = text.len();
             let cell_overlay = overlay(row_id, col_id);
-            let (mut flags, _, _) =
+            let (mut flags, _) =
                 format_overlay_or_sheet_value(sheet, row_id, col_id, cell_overlay.value, text);
             let (units, truncated) = clip_to_record(text, start);
+            if index == 0 {
+                first_cell_blank.push(units == 0);
+            }
             flags |= cell_overlay.extra_flags;
             if truncated {
                 flags |= FLAG_TRUNCATED;
@@ -796,9 +811,7 @@ where
 
     // Left-overflow candidate scan (`first_col > 0`).
     let mut overflow_count: u16 = 0;
-    if first_col > 0
-        && let Some(&first_page_col_id) = col_ids.first()
-    {
+    if first_col > 0 {
         let min_scan_col = first_col.saturating_sub(MAX_LEFT_OVERFLOW_LOOKBACK);
         let mut lookback_col_ids: SmallVec<[(u32, ColId); 64]> = SmallVec::new();
         let mut c = first_col;
@@ -810,12 +823,8 @@ where
             }
         }
 
-        for (r_idx, &row_id) in row_ids.iter().enumerate() {
-            let first_is_empty = overlay(row_id, first_page_col_id).value.map_or_else(
-                || sheet.value_by_id(row_id, first_page_col_id) == Value::Empty,
-                OverlayValue::is_empty,
-            );
-            if !first_is_empty {
+        for (r_idx, (&row_id, &blank)) in row_ids.iter().zip(&first_cell_blank).enumerate() {
+            if !blank {
                 continue;
             }
             for &(origin_col_pos, origin_col_id) in &lookback_col_ids {
@@ -824,14 +833,17 @@ where
                 } else {
                     None
                 };
-                let (is_empty, is_text) = match ov_val {
-                    Some(ov) => (ov.is_empty(), ov.is_text()),
-                    None => {
-                        let v = sheet.value_by_id(row_id, origin_col_id);
-                        (v == Value::Empty, matches!(v, Value::Text(_)))
-                    }
-                };
+                let is_empty = ov_val.map_or_else(
+                    || sheet.value_by_id(row_id, origin_col_id) == Value::Empty,
+                    OverlayValue::is_empty,
+                );
                 if is_empty {
+                    continue;
+                }
+                let start = text.len();
+                let (_, is_text) =
+                    format_overlay_or_sheet_value(sheet, row_id, origin_col_id, ov_val, text);
+                if text.len() == start {
                     continue;
                 }
                 let eff_style = sheet.effective_style_by_id(row_id, origin_col_id);
@@ -843,24 +855,21 @@ where
                 } else {
                     eff_style.align == HorizontalAlign::Left
                 };
-                if is_left_text {
-                    let start = text.len();
-                    let _ =
-                        format_overlay_or_sheet_value(sheet, row_id, origin_col_id, ov_val, text);
+                if is_left_text
+                    && let (Ok(r_off), Ok(orig_c)) =
+                        (u16::try_from(r_idx), u16::try_from(origin_col_pos))
+                {
                     let (units, _) = clip_to_record(text, start);
-                    if units > 0
-                        && let (Ok(r_off), Ok(orig_c)) =
-                            (u16::try_from(r_idx), u16::try_from(origin_col_pos))
-                    {
-                        let style_id = sheet.effective_style_id(row_id, origin_col_id).0;
-                        out.extend_from_slice(&position.to_le_bytes());
-                        out.extend_from_slice(&units.to_le_bytes());
-                        out.extend_from_slice(&r_off.to_le_bytes());
-                        out.extend_from_slice(&orig_c.to_le_bytes());
-                        out.extend_from_slice(&style_id.to_le_bytes());
-                        position = position.saturating_add(u32::from(units));
-                        overflow_count = overflow_count.saturating_add(1);
-                    }
+                    let style_id = sheet.effective_style_id(row_id, origin_col_id).0;
+                    out.extend_from_slice(&position.to_le_bytes());
+                    out.extend_from_slice(&units.to_le_bytes());
+                    out.extend_from_slice(&r_off.to_le_bytes());
+                    out.extend_from_slice(&orig_c.to_le_bytes());
+                    out.extend_from_slice(&style_id.to_le_bytes());
+                    position = position.saturating_add(u32::from(units));
+                    overflow_count = overflow_count.saturating_add(1);
+                } else {
+                    text.truncate(start);
                 }
                 break;
             }
@@ -1465,6 +1474,53 @@ mod tests {
         // Column 70 is in page column 4, so it reaches page column 8.
         assert_eq!(origins(8), [(2, 70)]);
         assert_eq!(origins(9), []);
+    }
+
+    #[test]
+    fn text_runs_on_over_cells_that_show_nothing() {
+        let italic = StylePatch {
+            italic: Some(true),
+            ..StylePatch::default()
+        };
+        let mut sheet = Sheet::with_axes(SheetId(0), String::from("S1"), 4, 60);
+        let text = sheet.add_string("A heading that runs on and on").unwrap();
+        let nothing = sheet.add_string("").unwrap();
+        for row in 0..4 {
+            assert!(sheet.set_value_by_id(RowId(row), ColId(12), Value::Text(text)));
+        }
+        // Before the page, at its start, and both; in the last row something is in the way.
+        assert!(sheet.set_value_by_id(RowId(0), ColId(14), Value::Text(nothing)));
+        assert!(sheet.set_value_by_id(RowId(1), ColId(16), Value::Text(nothing)));
+        assert!(sheet.set_value_by_id(RowId(2), ColId(15), Value::Text(nothing)));
+        assert!(sheet.set_value_by_id(RowId(2), ColId(16), Value::Text(nothing)));
+        assert!(sheet.set_value_by_id(RowId(3), ColId(14), Value::Text(nothing)));
+        assert!(sheet.set_value_by_id(RowId(3), ColId(15), Value::Number(5.0)));
+        sheet.set_col_style_patch(ColId(12), italic);
+        sheet.set_row_style_patch(
+            RowId(2),
+            StylePatch {
+                bold: Some(true),
+                ..StylePatch::default()
+            },
+        );
+
+        let page = Page { row: 0, col: 1 };
+        let interned = sheet.styles().entries().len();
+        prepare_page_styles(&mut sheet, page);
+        assert_eq!(sheet.styles().entries().len(), interned + 1, "bold italic");
+        let decoded = decode(&encode_page(&sheet, page, 1, &mut String::new()));
+        let origins: Vec<(u16, u16)> = decoded
+            .overflows
+            .iter()
+            .map(|overflow| (overflow.0, overflow.1))
+            .collect();
+        assert_eq!(origins, [(0, 12), (1, 12), (2, 12)]);
+        assert!(
+            decoded
+                .overflows
+                .iter()
+                .all(|overflow| overflow.3 == "A heading that runs on and on")
+        );
     }
 
     #[test]

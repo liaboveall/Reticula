@@ -1979,163 +1979,171 @@ fn a1_ref(r: u32, c: u32) -> String {
     s
 }
 
-fn assert_spill_steps_match_full_recalc(steps: &[SpillStep]) -> Result<(), TestCaseError> {
-    let mut eng = FormulaEngine::new();
+fn apply_spill_step(eng: &mut FormulaEngine, step: &SpillStep) {
     let s0 = SheetId(0);
-
-    for step in steps {
-        match *step {
-            SpillStep::SetScalar { r, c, val } => {
-                let sheet = eng.workbook().sheet(s0).unwrap();
-                if let (Some(rid), Some(cid)) =
-                    (sheet.row_axis().pos_to_id(r), sheet.col_axis().pos_to_id(c))
-                {
-                    let raw = val.map_or_else(String::new, |v| v.to_string());
-                    let _ = eng.edit_cell_raw(s0, RowId(rid), ColId(cid), &raw);
-                }
-            }
-            SpillStep::SetArray {
-                r,
-                c,
-                rows,
-                cols,
-                base,
-            } => {
-                let sheet = eng.workbook().sheet(s0).unwrap();
-                if let (Some(rid), Some(cid)) =
-                    (sheet.row_axis().pos_to_id(r), sheet.col_axis().pos_to_id(c))
-                {
-                    let mut f = String::from("={");
-                    let mut cur = u32::from(base);
-                    for ri in 0..rows {
-                        if ri > 0 {
-                            f.push(';');
-                        }
-                        for ci in 0..cols {
-                            if ci > 0 {
-                                f.push(',');
-                            }
-                            f.push_str(&cur.to_string());
-                            cur += 1;
-                        }
-                    }
-                    f.push('}');
-                    let _ = eng.edit_cell_raw(s0, RowId(rid), ColId(cid), &f);
-                }
-            }
-            SpillStep::SetRangeSpill {
-                r,
-                c,
-                sr,
-                sc,
-                er,
-                ec,
-            } => {
-                let sheet = eng.workbook().sheet(s0).unwrap();
-                if let (Some(rid), Some(cid)) =
-                    (sheet.row_axis().pos_to_id(r), sheet.col_axis().pos_to_id(c))
-                {
-                    let f = if sr == er && sc == ec {
-                        format!("={}", a1_ref(sr, sc))
-                    } else {
-                        format!("={}:{}", a1_ref(sr, sc), a1_ref(er, ec))
-                    };
-                    let _ = eng.edit_cell_raw(s0, RowId(rid), ColId(cid), &f);
-                }
-            }
-            SpillStep::SetConsumer { r, c, ar, ac, kind } => {
-                let sheet = eng.workbook().sheet(s0).unwrap();
-                if let (Some(rid), Some(cid)) =
-                    (sheet.row_axis().pos_to_id(r), sheet.col_axis().pos_to_id(c))
-                {
-                    let anchor_s = a1_ref(ar, ac);
-                    let rng_s = format!("{anchor_s}:{}", a1_ref(ar + 2, ac + 2));
-                    let f = match kind {
-                        0 => format!("={anchor_s}#"),
-                        1 => format!("=SUM({anchor_s}#)"),
-                        2 => format!("=COUNTIF({rng_s}, \">1\")"),
-                        3 => format!("=COUNTBLANK({rng_s})"),
-                        _ => format!("=IFERROR(VLOOKUP(2, {rng_s}, 1, FALSE), 0)"),
-                    };
-                    let _ = eng.edit_cell_raw(s0, RowId(rid), ColId(cid), &f);
-                }
-            }
-            SpillStep::InsertRowAfter { after } => {
-                let after_id = after
-                    .and_then(|p| eng.workbook().sheet(s0).unwrap().row_axis().pos_to_id(p))
-                    .map(RowId);
-                let run = eng.allocator_mut().alloc_run(1).unwrap();
-                let _ = eng.apply_op(Op::InsertRows {
-                    sheet: s0,
-                    after: after_id,
-                    ids: run,
-                });
-            }
-            SpillStep::DeleteRow { pos } => {
-                let sheet = eng.workbook().sheet(s0).unwrap();
-                if sheet.row_axis().live_len() > 2
-                    && let Some(rid) = sheet.row_axis().pos_to_id(pos)
-                {
-                    let _ = eng.apply_op(Op::DeleteRows {
-                        sheet: s0,
-                        ids: vec![IdRun::new(rid, 1).unwrap()],
-                    });
-                }
-            }
-            SpillStep::InsertColAfter { after } => {
-                let after_id = after
-                    .and_then(|p| eng.workbook().sheet(s0).unwrap().col_axis().pos_to_id(p))
-                    .map(ColId);
-                let run = eng.allocator_mut().alloc_run(1).unwrap();
-                let _ = eng.apply_op(Op::InsertCols {
-                    sheet: s0,
-                    after: after_id,
-                    ids: run,
-                });
-            }
-            SpillStep::DeleteCol { pos } => {
-                let sheet = eng.workbook().sheet(s0).unwrap();
-                if sheet.col_axis().live_len() > 2
-                    && let Some(cid) = sheet.col_axis().pos_to_id(pos)
-                {
-                    let _ = eng.apply_op(Op::DeleteCols {
-                        sheet: s0,
-                        ids: vec![IdRun::new(cid, 1).unwrap()],
-                    });
-                }
+    match *step {
+        SpillStep::SetScalar { r, c, val } => {
+            let sheet = eng.workbook().sheet(s0).unwrap();
+            if let (Some(rid), Some(cid)) =
+                (sheet.row_axis().pos_to_id(r), sheet.col_axis().pos_to_id(c))
+            {
+                let raw = val.map_or_else(String::new, |v| v.to_string());
+                let _ = eng.edit_cell_raw(s0, RowId(rid), ColId(cid), &raw);
             }
         }
-
-        eng.recalc_all();
-        let fresh = FormulaEngine::from_workbook_recalc_all(eng.workbook().clone());
-
-        let s_inc = eng.workbook().sheet(s0).unwrap();
-        let s_ref = fresh.workbook().sheet(s0).unwrap();
-        prop_assert_eq!(s_inc.row_axis().live_len(), s_ref.row_axis().live_len());
-        prop_assert_eq!(s_inc.col_axis().live_len(), s_ref.col_axis().live_len());
-
-        for r in 0..s_inc.row_axis().live_len().min(12) {
-            for c in 0..s_inc.col_axis().live_len().min(10) {
-                let rid = RowId(s_inc.row_axis().pos_to_id(r).unwrap());
-                let cid = ColId(s_inc.col_axis().pos_to_id(c).unwrap());
-                prop_assert_eq!(
-                    s_inc.value_by_id(rid, cid),
-                    s_ref.value_by_id(rid, cid),
-                    "sheet value mismatch at pos ({}, {})",
-                    r,
-                    c
-                );
-                prop_assert_eq!(
-                    eng.spills().shadow_value(s0, rid, cid),
-                    fresh.spills().shadow_value(s0, rid, cid),
-                    "spill shadow mismatch at pos ({}, {})",
-                    r,
-                    c
-                );
+        SpillStep::SetArray {
+            r,
+            c,
+            rows,
+            cols,
+            base,
+        } => {
+            let sheet = eng.workbook().sheet(s0).unwrap();
+            if let (Some(rid), Some(cid)) =
+                (sheet.row_axis().pos_to_id(r), sheet.col_axis().pos_to_id(c))
+            {
+                let mut f = String::from("={");
+                let mut cur = u32::from(base);
+                for ri in 0..rows {
+                    if ri > 0 {
+                        f.push(';');
+                    }
+                    for ci in 0..cols {
+                        if ci > 0 {
+                            f.push(',');
+                        }
+                        f.push_str(&cur.to_string());
+                        cur += 1;
+                    }
+                }
+                f.push('}');
+                let _ = eng.edit_cell_raw(s0, RowId(rid), ColId(cid), &f);
+            }
+        }
+        SpillStep::SetRangeSpill {
+            r,
+            c,
+            sr,
+            sc,
+            er,
+            ec,
+        } => {
+            let sheet = eng.workbook().sheet(s0).unwrap();
+            if let (Some(rid), Some(cid)) =
+                (sheet.row_axis().pos_to_id(r), sheet.col_axis().pos_to_id(c))
+            {
+                let f = if sr == er && sc == ec {
+                    format!("={}", a1_ref(sr, sc))
+                } else {
+                    format!("={}:{}", a1_ref(sr, sc), a1_ref(er, ec))
+                };
+                let _ = eng.edit_cell_raw(s0, RowId(rid), ColId(cid), &f);
+            }
+        }
+        SpillStep::SetConsumer { r, c, ar, ac, kind } => {
+            let sheet = eng.workbook().sheet(s0).unwrap();
+            if let (Some(rid), Some(cid)) =
+                (sheet.row_axis().pos_to_id(r), sheet.col_axis().pos_to_id(c))
+            {
+                let anchor_s = a1_ref(ar, ac);
+                let rng_s = format!("{anchor_s}:{}", a1_ref(ar + 2, ac + 2));
+                let f = match kind {
+                    0 => format!("={anchor_s}#"),
+                    1 => format!("=SUM({anchor_s}#)"),
+                    2 => format!("=COUNTIF({rng_s}, \">1\")"),
+                    3 => format!("=COUNTBLANK({rng_s})"),
+                    _ => format!("=IFERROR(VLOOKUP(2, {rng_s}, 1, FALSE), 0)"),
+                };
+                let _ = eng.edit_cell_raw(s0, RowId(rid), ColId(cid), &f);
+            }
+        }
+        SpillStep::InsertRowAfter { after } => {
+            let after_id = after
+                .and_then(|p| eng.workbook().sheet(s0).unwrap().row_axis().pos_to_id(p))
+                .map(RowId);
+            let run = eng.allocator_mut().alloc_run(1).unwrap();
+            let _ = eng.apply_op(Op::InsertRows {
+                sheet: s0,
+                after: after_id,
+                ids: run,
+            });
+        }
+        SpillStep::DeleteRow { pos } => {
+            let sheet = eng.workbook().sheet(s0).unwrap();
+            if sheet.row_axis().live_len() > 2
+                && let Some(rid) = sheet.row_axis().pos_to_id(pos)
+            {
+                let _ = eng.apply_op(Op::DeleteRows {
+                    sheet: s0,
+                    ids: vec![IdRun::new(rid, 1).unwrap()],
+                });
+            }
+        }
+        SpillStep::InsertColAfter { after } => {
+            let after_id = after
+                .and_then(|p| eng.workbook().sheet(s0).unwrap().col_axis().pos_to_id(p))
+                .map(ColId);
+            let run = eng.allocator_mut().alloc_run(1).unwrap();
+            let _ = eng.apply_op(Op::InsertCols {
+                sheet: s0,
+                after: after_id,
+                ids: run,
+            });
+        }
+        SpillStep::DeleteCol { pos } => {
+            let sheet = eng.workbook().sheet(s0).unwrap();
+            if sheet.col_axis().live_len() > 2
+                && let Some(cid) = sheet.col_axis().pos_to_id(pos)
+            {
+                let _ = eng.apply_op(Op::DeleteCols {
+                    sheet: s0,
+                    ids: vec![IdRun::new(cid, 1).unwrap()],
+                });
             }
         }
     }
+}
 
+fn assert_spills_match_full_recalc(eng: &FormulaEngine) -> Result<(), TestCaseError> {
+    let s0 = SheetId(0);
+    let fresh = FormulaEngine::from_workbook_recalc_all(eng.workbook().clone());
+
+    let s_inc = eng.workbook().sheet(s0).unwrap();
+    let s_ref = fresh.workbook().sheet(s0).unwrap();
+    prop_assert_eq!(s_inc.row_axis().live_len(), s_ref.row_axis().live_len());
+    prop_assert_eq!(s_inc.col_axis().live_len(), s_ref.col_axis().live_len());
+
+    for r in 0..s_inc.row_axis().live_len().min(12) {
+        for c in 0..s_inc.col_axis().live_len().min(10) {
+            let rid = RowId(s_inc.row_axis().pos_to_id(r).unwrap());
+            let cid = ColId(s_inc.col_axis().pos_to_id(c).unwrap());
+            prop_assert_eq!(
+                s_inc.value_by_id(rid, cid),
+                s_ref.value_by_id(rid, cid),
+                "sheet value mismatch at pos ({}, {})",
+                r,
+                c
+            );
+            prop_assert_eq!(
+                eng.spills().shadow_value(s0, rid, cid),
+                fresh.spills().shadow_value(s0, rid, cid),
+                "spill shadow mismatch at pos ({}, {})",
+                r,
+                c
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn assert_spill_steps_match_full_recalc(steps: &[SpillStep]) -> Result<(), TestCaseError> {
+    let mut eng = FormulaEngine::new();
+    for step in steps {
+        apply_spill_step(&mut eng, step);
+        eng.recalc_all();
+        assert_spills_match_full_recalc(&eng)?;
+    }
     Ok(())
 }
 
@@ -2178,6 +2186,132 @@ fn regression_multi_spill_cycle_matches_full_recalc() {
     assert_spill_steps_match_full_recalc(&steps).unwrap();
 }
 
+fn range_spill((r, c): (u32, u32), (sr, sc): (u32, u32), (er, ec): (u32, u32)) -> SpillStep {
+    SpillStep::SetRangeSpill {
+        r,
+        c,
+        sr,
+        sc,
+        er,
+        ec,
+    }
+}
+
+fn consumer((r, c): (u32, u32), (ar, ac): (u32, u32), kind: u8) -> SpillStep {
+    SpillStep::SetConsumer { r, c, ar, ac, kind }
+}
+
+fn array((r, c): (u32, u32), rows: u32, cols: u32) -> SpillStep {
+    SpillStep::SetArray {
+        r,
+        c,
+        rows,
+        cols,
+        base: 1,
+    }
+}
+
+const fn clear((r, c): (u32, u32)) -> SpillStep {
+    SpillStep::SetScalar { r, c, val: None }
+}
+
+/// What remains of a loop whose other half was in a deleted row is `#REF!`, also
+/// after an edit that makes the engine look at the deleted half again.
+#[test]
+fn regression_deleted_half_of_a_loop_matches_full_recalc() {
+    assert_spill_steps_match_full_recalc(&[
+        range_spill((3, 2), (2, 2), (2, 2)),
+        SpillStep::DeleteRow { pos: 0 },
+        range_spill((1, 2), (2, 1), (3, 2)),
+        SpillStep::DeleteRow { pos: 1 },
+        clear((2, 1)),
+    ])
+    .unwrap();
+}
+
+/// Arrays that want the same cell while one reads the other's cells.
+#[test]
+fn regression_collision_of_mutual_readers_matches_full_recalc() {
+    assert_spill_steps_match_full_recalc(&[
+        range_spill((1, 2), (1, 3), (1, 4)),
+        range_spill((0, 3), (1, 1), (2, 2)),
+        clear((2, 1)),
+    ])
+    .unwrap();
+    assert_spill_steps_match_full_recalc(&[
+        consumer((1, 0), (4, 0), 0),
+        array((4, 0), 1, 2),
+        SpillStep::InsertRowAfter { after: None },
+        range_spill((4, 1), (1, 1), (2, 1)),
+    ])
+    .unwrap();
+}
+
+/// An array whose shadow the next formula below takes, with both formulas equal.
+#[test]
+fn regression_formula_below_an_equal_spill_matches_full_recalc() {
+    assert_spill_steps_match_full_recalc(&[
+        range_spill((4, 2), (0, 0), (1, 0)),
+        range_spill((5, 2), (0, 0), (1, 0)),
+    ])
+    .unwrap();
+}
+
+/// Readers of cells that a loop gives up.
+#[test]
+fn regression_reader_of_a_given_up_spill_matches_full_recalc() {
+    assert_spill_steps_match_full_recalc(&[
+        consumer((0, 0), (2, 4), 3),
+        range_spill((3, 3), (2, 1), (2, 2)),
+        consumer((2, 1), (1, 1), 2),
+    ])
+    .unwrap();
+    assert_spill_steps_match_full_recalc(&[
+        range_spill((0, 2), (0, 1), (0, 1)),
+        range_spill((0, 0), (3, 1), (3, 2)),
+        array((3, 2), 1, 1),
+        consumer((3, 1), (0, 0), 0),
+    ])
+    .unwrap();
+}
+
+/// A loop that only exists through the cells of a spill read by a strip.
+#[test]
+fn regression_loop_through_a_strip_matches_full_recalc() {
+    assert_spill_steps_match_full_recalc(&[
+        consumer((1, 2), (3, 3), 4),
+        range_spill((3, 2), (0, 1), (0, 2)),
+        consumer((0, 2), (2, 3), 4),
+    ])
+    .unwrap();
+}
+
+/// Loops that share formulas, entered from different sides.
+#[test]
+fn regression_entangled_loops_match_full_recalc() {
+    assert_spill_steps_match_full_recalc(&[
+        consumer((5, 1), (4, 1), 0),
+        consumer((0, 0), (1, 2), 2),
+        consumer((5, 0), (0, 2), 2),
+        consumer((0, 2), (1, 2), 2),
+        consumer((1, 2), (3, 0), 2),
+        consumer((3, 0), (3, 1), 2),
+    ])
+    .unwrap();
+    assert_spill_steps_match_full_recalc(&[
+        consumer((3, 4), (3, 1), 2),
+        range_spill((3, 3), (2, 3), (3, 4)),
+        SpillStep::InsertRowAfter { after: Some(2) },
+        range_spill((5, 1), (2, 1), (3, 1)),
+        consumer((3, 1), (0, 2), 0),
+        consumer((3, 2), (2, 2), 2),
+        SpillStep::DeleteRow { pos: 1 },
+        range_spill((0, 2), (3, 2), (3, 2)),
+        consumer((3, 2), (0, 2), 2),
+    ])
+    .unwrap();
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(64))]
 
@@ -2186,6 +2320,21 @@ proptest! {
         steps in prop::collection::vec(arb_spill_step(), 1..28),
     ) {
         assert_spill_steps_match_full_recalc(&steps)?;
+    }
+
+    #[test]
+    fn prop_sliced_dynamic_spills_match_full_recalc(
+        steps in prop::collection::vec((arb_spill_step(), 0_usize..6), 1..28),
+    ) {
+        let mut eng = FormulaEngine::new();
+        for (step, evaluations) in &steps {
+            apply_spill_step(&mut eng, step);
+            for _ in 0..*evaluations {
+                let _ = eng.recalc_step(1);
+            }
+        }
+        while matches!(eng.recalc_step(1), RecalcStatus::InProgress { .. }) {}
+        assert_spills_match_full_recalc(&eng)?;
     }
 
     #[test]

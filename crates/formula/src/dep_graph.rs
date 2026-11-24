@@ -1149,6 +1149,19 @@ impl DepGraph {
         &self,
         key: WorkbookCellKey,
         workbook: &Workbook<BoundFormula>,
+        emit_single: impl FnMut(u32),
+        emit_strip: impl FnMut(u32, u32, u32),
+    ) {
+        self.for_each_cell_dependent_rows(key, workbook, false, emit_single, emit_strip);
+    }
+
+    /// [`Self::for_each_cell_dependent_target`]; with `exact`, strip rows that do not
+    /// read the cell are left out even where the rows they read moved apart.
+    pub fn for_each_cell_dependent_rows(
+        &self,
+        key: WorkbookCellKey,
+        workbook: &Workbook<BoundFormula>,
+        exact: bool,
         mut emit_single: impl FnMut(u32),
         mut emit_strip: impl FnMut(u32, u32, u32),
     ) {
@@ -1175,7 +1188,9 @@ impl DepGraph {
                     {
                         continue;
                     }
-                    if let Some((lo, hi)) =
+                    if exact && let Some(run) = IdRun::new(row.0, 1) {
+                        for_each_strip_area_row_run(sub, row_axis, run, &mut emit_strip);
+                    } else if let Some((lo, hi)) =
                         narrow_strip_area_for_ord_span(sub, row_axis, r_ord, r_ord)
                     {
                         emit_strip(sub.sid, lo, hi);
@@ -1196,6 +1211,32 @@ impl DepGraph {
         row_run: IdRun,
         exclude_sid: Option<u32>,
         workbook: &Workbook<BoundFormula>,
+        emit_single: impl FnMut(u32),
+        emit_strip: impl FnMut(u32, u32, u32),
+    ) {
+        self.for_each_col_run_dependent_rows(
+            sheet_id,
+            col,
+            row_run,
+            exclude_sid,
+            workbook,
+            false,
+            emit_single,
+            emit_strip,
+        );
+    }
+
+    /// [`Self::for_each_col_run_dependent_target`]; with `exact`, strip rows that read
+    /// none of the cells are left out even where the rows they read moved apart.
+    #[allow(clippy::too_many_arguments)]
+    pub fn for_each_col_run_dependent_rows(
+        &self,
+        sheet_id: SheetId,
+        col: ColId,
+        row_run: IdRun,
+        exclude_sid: Option<u32>,
+        workbook: &Workbook<BoundFormula>,
+        exact: bool,
         mut emit_single: impl FnMut(u32),
         mut emit_strip: impl FnMut(u32, u32, u32),
     ) {
@@ -1284,7 +1325,9 @@ impl DepGraph {
                         {
                             continue;
                         }
-                        if let Some((lo, hi)) =
+                        if exact {
+                            for_each_strip_area_row_run(sub, row_axis, row_run, &mut emit_strip);
+                        } else if let Some((lo, hi)) =
                             narrow_strip_area_for_runs(sub, row_axis, runs_slice)
                         {
                             emit_strip(sub.sid, lo, hi);
@@ -1685,8 +1728,13 @@ fn collect_affine_refs(
 }
 
 fn narrow_strip_area_endpoints(sub: &StripAreaSub, row_axis: &Axis) -> Option<(bool, u32, u32)> {
-    let o1 = row_axis.axis_order_of(sub.first_row.base)?;
-    let o2 = row_axis.axis_order_of(sub.last_row.base)?;
+    // A first row that no longer exists says nothing about the rows after it.
+    let (Some(o1), Some(o2)) = (
+        row_axis.axis_order_of(sub.first_row.base),
+        row_axis.axis_order_of(sub.last_row.base),
+    ) else {
+        return Some((false, 0, 0));
+    };
     let c1 =
         sub.first_row.stride == 0 || row_axis.single_run_covers(sub.first_row.base, sub.strip_len);
     let c2 =
@@ -1812,6 +1860,42 @@ fn narrow_strip_area_for_runs(
     }
     let _ = (o1, o2);
     any.then_some((out_lo, out_hi))
+}
+
+/// Emits exactly the strip rows whose area overlaps `run`.
+fn for_each_strip_area_row_run(
+    sub: &StripAreaSub,
+    row_axis: &Axis,
+    run: IdRun,
+    emit_strip: &mut impl FnMut(u32, u32, u32),
+) {
+    let slides_in_one_piece = sub.first_row.stride == 1
+        && sub.last_row.stride == 1
+        && narrow_strip_area_endpoints(sub, row_axis).is_some_and(|(contiguous, _, _)| contiguous)
+        && row_axis.single_run_covers(run.first_id, run.len);
+    if slides_in_one_piece {
+        if let Some((lo, hi)) = narrow_strip_area_for_runs(sub, row_axis, &[run]) {
+            emit_strip(sub.sid, lo, hi);
+        }
+        return;
+    }
+    let mut first_hit = None;
+    for offset in 0..sub.strip_len {
+        let first = sub.first_row.resolve(offset).0;
+        let last = sub.last_row.resolve(offset).0;
+        let hit = span_overlaps_runs(row_axis, first, last, &[run]);
+        match (hit, first_hit) {
+            (true, None) => first_hit = Some(offset),
+            (false, Some(lo)) => {
+                emit_strip(sub.sid, lo, offset);
+                first_hit = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(lo) = first_hit {
+        emit_strip(sub.sid, lo, sub.strip_len);
+    }
 }
 
 fn narrow_strip_area_strictly_straddling(
@@ -2030,13 +2114,11 @@ fn span_overlaps_runs(axis: &Axis, a: u64, b: u64, runs: &[IdRun]) -> bool {
     let (lo, hi) = if oa <= ob { (oa, ob) } else { (ob, oa) };
     let span_len = hi.saturating_sub(lo).saturating_add(1);
     for run in runs {
-        if let (Some(o_first), Some(last_id)) = (
-            axis.axis_order_of(run.first_id),
-            run.id_at(run.len.saturating_sub(1)),
-        ) && let Some(o_last) = axis.axis_order_of(last_id)
-            && o_first <= o_last
-            && o_last.saturating_sub(o_first).saturating_add(1) == run.len
+        // Rows in between may have moved away, so the ends alone do not tell.
+        if axis.single_run_covers(run.first_id, run.len)
+            && let Some(o_first) = axis.axis_order_of(run.first_id)
         {
+            let o_last = o_first.saturating_add(run.len.saturating_sub(1));
             if lo <= o_last && o_first <= hi {
                 return true;
             }

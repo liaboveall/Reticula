@@ -48,7 +48,8 @@ use crate::address::CellAddr;
 use crate::ast::{BinaryOp, Literal, MAX_NESTING_DEPTH};
 use crate::batch_eval::BatchScratch;
 use crate::binder::{
-    AffineExpr, AffineFormula, AffineRef, BoundExpr, BoundFormula, BoundRef, live_span_positions,
+    AffineExpr, AffineFormula, AffineRef, AffineRow, BoundExpr, BoundFormula, BoundRef,
+    live_span_positions,
 };
 use crate::bytecode::{CHUNK_LEN, CHUNK_LEN_U32, CompiledStripProgram, compile_strip_program};
 use crate::dep_graph::{
@@ -61,12 +62,16 @@ use crate::filter::{
 use crate::functions::{EvalEnv, combine_choose, combine_if, combine_iferror, eval_eager_function};
 use crate::lookup_index::LookupIndexCache;
 use crate::parser::ParseError;
-use crate::spill::{CommitSpillOutcome, SpillCollisionOrder, SpillRegistry};
+use crate::spill::{SpillFit, SpillRegistry};
 use crate::value_eval::{
     Array2D, CallerContext, EvalScalar, EvalValue, ResolvedRef, ScalarOrArray,
     coerce_for_scalar_op, eval_binary, eval_unary, finalize_top_level, materialise_reference,
     resolve_bound_ref,
 };
+
+mod settle;
+
+use settle::{SpillSettlement, SpillTangle};
 
 type FxMap<K, V> = HashMap<K, V, BuildHasherDefault<FxHasher>>;
 type FxSet<T> = HashSet<T, BuildHasherDefault<FxHasher>>;
@@ -77,7 +82,9 @@ const STATE_EVALUATING: u8 = 2;
 const STATE_SCC_WAIT: u8 = 3;
 const STATE_MAYBE_DIRTY: u8 = 4;
 const STATE_EVALUATING_MAYBE: u8 = 5;
-const MAX_WAVE_SPILL_REQUEUES: u8 = 16;
+const MAX_WAVE_SPILL_REQUEUES: u16 = 16;
+const MAX_ROUND_SPILL_REQUEUES: u16 = 1_024;
+const MIN_CALL_STACK_LIMIT: usize = 4_096;
 
 /// Number of live formula rows populated in `M2..=M100001` of the default
 /// 1,000,000-row sample (`13-m1a.md` 5.8).
@@ -337,14 +344,14 @@ enum StripEvalControl {
     Done,
     Yielded,
     Blocked(SmallVec<[u32; 4]>),
-    Cycle(usize),
+    Cycle(u32),
     ExpandedToSingles,
 }
 
 enum BatchChunkPrep {
     Ready { host_base_pos: u32, chunk_len: u32 },
     Blocked(SmallVec<[u32; 4]>),
-    Cycle(usize),
+    Cycle(u32),
     FallbackToAst,
 }
 
@@ -354,27 +361,22 @@ struct DirtyRoots {
     strips: Vec<(u32, u32, u32)>,
 }
 
-#[derive(Clone, Debug, Default)]
-struct CycleSpillRecord {
-    peers: Vec<WorkbookCellKey>,
-    cleared_shadows: Vec<WorkbookCellKey>,
-}
-
 enum ExprOutcome {
     Ready(EvalValue),
     Blocked(SmallVec<[u32; 4]>),
-    Cycle(usize),
+    /// Depends on a formula being evaluated, the earliest of which was entered as
+    /// the given one.
+    Cycle(u32),
 }
 
-#[derive(Clone, Copy)]
-struct DepView<'a> {
-    dep_graph: &'a DepGraph,
-    name_dep_graph: &'a DepGraph,
-    name_slots: &'a [Option<(NamedRangeKey, FormulaRegistration)>],
-    cell_to_fid: &'a FxMap<WorkbookCellKey, u32>,
-    slots: &'a [Option<FormulaSlot>],
-    strip_slots: &'a [Option<StripSlot>],
-    workbook: &'a Workbook<BoundFormula>,
+/// Entry of the evaluation stack.
+#[derive(Clone, Copy, Debug)]
+struct Frame {
+    node: u32,
+    /// Position in the order in which evaluation entered the formulas, 0 until
+    /// then. Unlike a stack position it is never reused, so a formula parked on a
+    /// loop cannot be mistaken for waiting on whatever took over a frame below.
+    entered: u32,
 }
 
 /// Complete single-node spreadsheet engine (`Workbook` + `DepGraph` + time-sliced
@@ -391,13 +393,25 @@ pub struct FormulaEngine {
     volatile_names: BTreeSet<u32>,
     filter_sensitive_names: BTreeSet<u32>,
     name_eval_stack: Vec<NamedRangeKey>,
-    wave_spill_requeues: BTreeMap<u32, u8>,
-    wave_cycle_verified: BTreeSet<u32>,
-    scc_stack: Vec<u32>,
-    scc_low: BTreeMap<u32, usize>,
+    wave_spill_requeues: BTreeMap<u32, u16>,
+    wave_without_cutoff: bool,
+    /// Whether spilled cells changed since formulas with computed references were
+    /// last evaluated.
+    spilled_cells_changed: bool,
+    frames_entered: u32,
+    /// Entry order of the formulas below the top of the stack that were entered.
+    /// Entries of formulas that are no longer being evaluated are stale.
+    waiting_since: FxMap<u32, u32>,
+    /// Length of the stack at which repeated frames are dropped.
+    call_stack_limit: usize,
+    scc_stack: Vec<Frame>,
+    scc_low: BTreeMap<u32, u32>,
     wave_deferred_dirty: Vec<u32>,
-    cycle_spills: BTreeMap<WorkbookCellKey, CycleSpillRecord>,
-    cycle_shadow_watch: BTreeMap<WorkbookCellKey, Vec<WorkbookCellKey>>,
+    /// Cells whose formulas form loops. Their value may change although nothing they
+    /// read does, so they are never skipped and never grouped into strips.
+    loop_members: BTreeSet<WorkbookCellKey>,
+    tangle: SpillTangle,
+    settle: SpillSettlement,
     slots: Vec<Option<FormulaSlot>>,
     states: Vec<u8>,
     free_slots: Vec<u32>,
@@ -417,8 +431,11 @@ pub struct FormulaEngine {
     non_clean_singles_in_col: FxMap<(SheetId, ColId), u32>,
     dirty_queue: Vec<u32>,
     dirty_cursor: usize,
+    /// End of the sorted part of `dirty_queue`; formulas woken by a spill wait
+    /// behind it for the next pass.
+    dirty_pass_end: usize,
     dirty_needs_sort: bool,
-    call_stack: Vec<u32>,
+    call_stack: Vec<Frame>,
     wave_done: u32,
     changes: DirtyChanges,
     volatile_set: BTreeSet<u32>,
@@ -580,12 +597,17 @@ impl FormulaEngine {
             filter_sensitive_names,
             name_eval_stack: Vec::new(),
             wave_spill_requeues: BTreeMap::new(),
-            wave_cycle_verified: BTreeSet::new(),
+            wave_without_cutoff: false,
+            spilled_cells_changed: false,
+            frames_entered: 0,
+            waiting_since: FxMap::default(),
+            call_stack_limit: MIN_CALL_STACK_LIMIT,
             scc_stack: Vec::new(),
             scc_low: BTreeMap::new(),
             wave_deferred_dirty: Vec::new(),
-            cycle_spills: BTreeMap::new(),
-            cycle_shadow_watch: BTreeMap::new(),
+            loop_members: BTreeSet::new(),
+            tangle: SpillTangle::default(),
+            settle: SpillSettlement::default(),
             slots,
             states,
             free_slots: Vec::new(),
@@ -600,6 +622,7 @@ impl FormulaEngine {
             non_clean_singles_in_col: FxMap::default(),
             dirty_queue: Vec::new(),
             dirty_cursor: 0,
+            dirty_pass_end: 0,
             dirty_needs_sort: false,
             call_stack: Vec::new(),
             wave_done: 0,
@@ -1128,29 +1151,26 @@ impl FormulaEngine {
     /// graph cleanly over the compacted workbook.
     pub fn compact_local_garbage(&mut self) {
         self.recalc_all();
-        let mut spill_anchors = Vec::new();
+        let mut unsettled = Vec::new();
         if !self.spills.is_empty() {
             for sheet in self.workbook.live_sheets() {
-                spill_anchors.extend(self.spills.anchors_on_sheet(sheet.id()));
+                unsettled.extend(self.spills.anchors_on_sheet(sheet.id()));
             }
         }
-        for (anchor, rec) in &self.cycle_spills {
-            spill_anchors.push(*anchor);
-            spill_anchors.extend_from_slice(&rec.peers);
-        }
+        let tangled = core::mem::take(&mut self.tangle.members);
+        unsettled.extend(tangled.iter().copied());
+        unsettled.extend(core::mem::take(&mut self.loop_members));
         let mut wb = core::mem::take(&mut self.workbook);
         wb.compact_local_garbage();
         let mut rebuilt = Self::from_workbook_clean(wb);
-        if !spill_anchors.is_empty() {
+        if !unsettled.is_empty() {
             let mut roots = DirtyRoots::default();
-            for anchor in spill_anchors {
-                if let Some(&fid) = rebuilt.cell_to_fid.get(&anchor) {
-                    roots.singles.push(fid);
-                } else if let Some((sid, off)) = rebuilt.strip_covering_cell(anchor) {
-                    roots.strips.push((sid, off, off.saturating_add(1)));
-                }
+            for anchor in unsettled {
+                rebuilt.push_cell_root(anchor, &mut roots);
             }
             rebuilt.propagate_dirty_roots(roots);
+            rebuilt.tangle.pending = !tangled.is_empty();
+            rebuilt.tangle.members = tangled;
             rebuilt.recalc_all();
             rebuilt.changes = DirtyChanges::default();
         }
@@ -1169,6 +1189,8 @@ impl FormulaEngine {
         self.dirty_cursor < self.dirty_queue.len()
             || !self.call_stack.is_empty()
             || !self.scc_stack.is_empty()
+            || self.tangle.pending
+            || self.settle.active
     }
 
     /// O(1) check whether `(sheet_id, row, col)` holds a bound formula.
@@ -2089,22 +2111,31 @@ impl FormulaEngine {
         check_every: usize,
         mut should_yield: impl FnMut(u32) -> bool,
     ) -> RecalcStatus {
+        if self.tangle.has_new_formulas {
+            self.check_new_formulas();
+        }
         self.prepare_dirty_queue();
 
         let stride = check_every.max(1);
         let mut since_check = 0usize;
 
         loop {
+            if self.tangle.pending {
+                self.begin_settlement();
+            }
             if self.call_stack.is_empty() {
                 if !self.scc_stack.is_empty() {
                     self.release_all_scc_wait_to_dirty();
                 }
-                if self.dirty_needs_sort {
-                    self.prepare_dirty_queue();
-                }
+                self.prepare_dirty_queue();
                 // Advance `dirty_cursor` to the next still-DIRTY node.
                 let mut next_root: Option<u32> = None;
                 while let Some(&fid) = self.dirty_queue.get(self.dirty_cursor) {
+                    if self.dirty_cursor >= self.dirty_pass_end {
+                        self.dirty_needs_sort = true;
+                        self.prepare_dirty_queue();
+                        continue;
+                    }
                     self.dirty_cursor = self.dirty_cursor.saturating_add(1);
                     if matches!(self.node_state(fid), STATE_DIRTY | STATE_MAYBE_DIRTY)
                         && self.node_exists(fid)
@@ -2114,23 +2145,35 @@ impl FormulaEngine {
                     }
                 }
                 let Some(root_fid) = next_root else {
-                    let done = self.wave_done;
+                    if self.wake_dynamic_references() {
+                        continue;
+                    }
                     self.dirty_queue.clear();
                     self.dirty_cursor = 0;
+                    self.dirty_pass_end = 0;
                     self.dirty_needs_sort = false;
+                    if self.settle.active {
+                        self.close_settle_round();
+                        continue;
+                    }
+                    self.settle.end_wave();
+                    let done = self.wave_done;
                     self.wave_done = 0;
                     self.wave_spill_requeues.clear();
-                    self.wave_cycle_verified.clear();
+                    self.wave_without_cutoff = false;
+                    self.waiting_since = FxMap::default();
+                    self.call_stack_limit = MIN_CALL_STACK_LIMIT;
                     self.scc_stack.clear();
                     self.scc_low.clear();
                     self.wave_deferred_dirty.clear();
                     self.cur_strip_eval = None;
                     return RecalcStatus::Complete { recalculated: done };
                 };
-                self.call_stack.push(root_fid);
+                self.frames_entered = 0;
+                self.push_frame(root_fid);
             }
 
-            let Some(&cur_fid) = self.call_stack.last() else {
+            let Some(&Frame { node: cur_fid, .. }) = self.call_stack.last() else {
                 continue;
             };
             if matches!(self.node_state(cur_fid), STATE_CLEAN | STATE_SCC_WAIT)
@@ -2139,10 +2182,14 @@ impl FormulaEngine {
                 let _ = self.call_stack.pop();
                 continue;
             }
+            let entered = self.enter_top_frame();
 
             if is_strip_fid(cur_fid) {
+                if !self.settle.active && self.tangle.reaches(cur_fid) {
+                    self.tangle.pending = true;
+                    continue;
+                }
                 let sid = strip_index(cur_fid);
-                let my_pos = self.call_stack.len().saturating_sub(1);
                 let (has_dirty, has_maybe) = self.strip_slot_of(sid).map_or((false, false), |s| {
                     (
                         !s.dirty_intervals.is_empty(),
@@ -2171,22 +2218,13 @@ impl FormulaEngine {
                                 self.set_strip_state(sid, STATE_CLEAN);
                                 let _ = self.call_stack.pop();
                                 if !self.scc_stack.is_empty() {
-                                    self.release_scc_wait_at_or_above(my_pos);
+                                    self.release_scc_wait_since(entered);
                                 }
                                 continue;
                             }
                         }
                         Err(ExprOutcome::Blocked(deps)) => {
-                            let mut count = 0usize;
-                            for &dep_fid in deps.iter().rev() {
-                                if matches!(
-                                    self.node_state(dep_fid),
-                                    STATE_DIRTY | STATE_MAYBE_DIRTY
-                                ) {
-                                    count = count.saturating_add(self.node_remaining_work(dep_fid));
-                                    self.call_stack.push(dep_fid);
-                                }
-                            }
+                            let count = self.push_precedents(&deps);
                             since_check = since_check.saturating_add(count.min(stride).max(1));
                             if since_check >= stride {
                                 since_check = 0;
@@ -2196,11 +2234,10 @@ impl FormulaEngine {
                             }
                             continue;
                         }
-                        Err(ExprOutcome::Cycle(min_pos)) => {
-                            self.handle_cycle(cur_fid, min_pos);
+                        Err(ExprOutcome::Cycle(_) | ExprOutcome::Ready(_)) => {
+                            self.evaluate_rest_of_wave_fully();
                             continue;
                         }
-                        Err(ExprOutcome::Ready(_)) => {}
                     }
                 }
                 self.set_strip_state(sid, STATE_EVALUATING);
@@ -2209,7 +2246,7 @@ impl FormulaEngine {
                         self.set_strip_state(sid, STATE_CLEAN);
                         let _ = self.call_stack.pop();
                         if !self.scc_stack.is_empty() {
-                            self.release_scc_wait_at_or_above(my_pos);
+                            self.release_scc_wait_since(entered);
                         }
                         if since_check >= stride {
                             since_check = 0;
@@ -2222,13 +2259,7 @@ impl FormulaEngine {
                         return self.in_progress_status();
                     }
                     StripEvalControl::Blocked(deps) => {
-                        let mut count = 0usize;
-                        for &dep_fid in deps.iter().rev() {
-                            if matches!(self.node_state(dep_fid), STATE_DIRTY | STATE_MAYBE_DIRTY) {
-                                count = count.saturating_add(self.node_remaining_work(dep_fid));
-                                self.call_stack.push(dep_fid);
-                            }
-                        }
+                        let count = self.push_precedents(&deps);
                         since_check = since_check.saturating_add(count.min(stride).max(1));
                         if since_check >= stride {
                             since_check = 0;
@@ -2237,8 +2268,8 @@ impl FormulaEngine {
                             }
                         }
                     }
-                    StripEvalControl::Cycle(min_pos) => {
-                        self.handle_cycle(cur_fid, min_pos);
+                    StripEvalControl::Cycle(low) => {
+                        self.handle_cycle(cur_fid, low);
                     }
                     StripEvalControl::ExpandedToSingles => {
                         let _ = self.call_stack.pop();
@@ -2255,23 +2286,16 @@ impl FormulaEngine {
                 match self.check_single_static_precedents_ready(cur_fid) {
                     Ok(()) => {
                         if self.state_of(cur_fid) == STATE_EVALUATING_MAYBE {
-                            let my_pos = self.call_stack.len().saturating_sub(1);
                             self.set_state(cur_fid, STATE_CLEAN);
                             let _ = self.call_stack.pop();
                             if !self.scc_stack.is_empty() {
-                                self.release_scc_wait_at_or_above(my_pos);
+                                self.release_scc_wait_since(entered);
                             }
                             continue;
                         }
                     }
                     Err(ExprOutcome::Blocked(deps)) => {
-                        let mut count = 0usize;
-                        for &dep_fid in deps.iter().rev() {
-                            if matches!(self.node_state(dep_fid), STATE_DIRTY | STATE_MAYBE_DIRTY) {
-                                count = count.saturating_add(self.node_remaining_work(dep_fid));
-                                self.call_stack.push(dep_fid);
-                            }
-                        }
+                        let count = self.push_precedents(&deps);
                         since_check = since_check.saturating_add(count.min(stride).max(1));
                         if since_check >= stride {
                             since_check = 0;
@@ -2281,11 +2305,10 @@ impl FormulaEngine {
                         }
                         continue;
                     }
-                    Err(ExprOutcome::Cycle(min_pos)) => {
-                        self.handle_cycle(cur_fid, min_pos);
+                    Err(ExprOutcome::Cycle(_) | ExprOutcome::Ready(_)) => {
+                        self.evaluate_rest_of_wave_fully();
                         continue;
                     }
-                    Err(ExprOutcome::Ready(_)) => {}
                 }
             }
 
@@ -2294,6 +2317,20 @@ impl FormulaEngine {
                 let _ = self.call_stack.pop();
                 continue;
             };
+            if self.settle.active {
+                if self.settle.holds_at_cycle(key) {
+                    let cycle = EvalScalar::Error(CalcError::Cycle);
+                    self.commit_settling(cur_fid, key, cycle, None);
+                    if !self.scc_stack.is_empty() {
+                        self.release_scc_wait_since(entered);
+                    }
+                    self.wave_done = self.wave_done.saturating_add(1);
+                    continue;
+                }
+            } else if self.tangle.reaches(cur_fid) {
+                self.tangle.pending = true;
+                continue;
+            }
             let Some(formula) = self
                 .workbook
                 .formula(key.0, key.1, key.2)
@@ -2313,10 +2350,9 @@ impl FormulaEngine {
 
             match self.eval_root_formula(&formula.root, caller) {
                 ExprOutcome::Ready(val) => {
-                    let my_pos = self.call_stack.len().saturating_sub(1);
                     self.commit_evaluated_formula(cur_fid, key, caller, val);
                     if !self.scc_stack.is_empty() {
-                        self.release_scc_wait_at_or_above(my_pos);
+                        self.release_scc_wait_since(entered);
                     }
                     self.wave_done = self.wave_done.saturating_add(1);
                     since_check = since_check.saturating_add(1);
@@ -2328,15 +2364,7 @@ impl FormulaEngine {
                     }
                 }
                 ExprOutcome::Blocked(deps) => {
-                    let mut count = 0usize;
-                    // Push dirty precedents in reverse so the first precedent is
-                    // evaluated first on top of `call_stack`.
-                    for &dep_fid in deps.iter().rev() {
-                        if matches!(self.node_state(dep_fid), STATE_DIRTY | STATE_MAYBE_DIRTY) {
-                            count = count.saturating_add(self.node_remaining_work(dep_fid));
-                            self.call_stack.push(dep_fid);
-                        }
-                    }
+                    let count = self.push_precedents(&deps);
                     since_check = since_check.saturating_add(count.min(stride).max(1));
                     if since_check >= stride {
                         since_check = 0;
@@ -2345,8 +2373,8 @@ impl FormulaEngine {
                         }
                     }
                 }
-                ExprOutcome::Cycle(min_pos) => {
-                    self.handle_cycle(cur_fid, min_pos);
+                ExprOutcome::Cycle(low) => {
+                    self.handle_cycle(cur_fid, low);
                 }
             }
         }
@@ -2377,11 +2405,8 @@ impl FormulaEngine {
                 rem = rem.saturating_add(self.node_remaining_work(fid));
             }
         }
-        for &fid in &self.call_stack {
-            rem = rem.saturating_add(self.node_remaining_work(fid));
-        }
-        for &fid in &self.scc_stack {
-            rem = rem.saturating_add(self.node_remaining_work(fid));
+        for frame in self.call_stack.iter().chain(&self.scc_stack) {
+            rem = rem.saturating_add(self.node_remaining_work(frame.node));
         }
         let total = self
             .wave_done
@@ -2443,342 +2468,137 @@ impl FormulaEngine {
                 self.finish_scalar_formula(cur_fid, key, s);
             }
             TopLevelResult::Array(arr) => {
-                let old_bits = self
-                    .workbook
-                    .sheet(key.0)
-                    .map(|s| s.value_by_id(key.1, key.2).pack());
-                let old_shape = self.spills.spill_shape(key);
-                let was_active = old_shape.is_some();
-                let dep_view = DepView {
-                    dep_graph: &self.dep_graph,
-                    name_dep_graph: &self.name_dep_graph,
-                    name_slots: &self.name_slots,
-                    cell_to_fid: &self.cell_to_fid,
-                    slots: &self.slots,
-                    strip_slots: &self.strip_slots,
-                    workbook: &self.workbook,
-                };
-                match self.spills.commit_array_with_order(
-                    key,
-                    arr,
-                    dep_view.workbook,
-                    |spills, a, a_fp, b| {
-                        Self::classify_spill_collision_in(&dep_view, spills, a, a_fp, b)
-                    },
-                ) {
-                    CommitSpillOutcome::Materialized {
-                        anchor_scalar,
-                        changed_shadows,
-                        unblocked_watchers,
-                        displaced_anchors,
-                    } => {
-                        let new_shape = self.spills.spill_shape(key);
-                        let shape_changed = old_shape != new_shape;
-                        let anchor_stored_changed = self.store_eval_scalar(key, anchor_scalar);
-                        let new_bits = self
-                            .workbook
-                            .sheet(key.0)
-                            .map(|s| s.value_by_id(key.1, key.2).pack());
-                        let anchor_changed = anchor_stored_changed || old_bits != new_bits;
-                        self.record_changed_cells(&changed_shadows);
-                        self.set_state(cur_fid, STATE_CLEAN);
-                        let _ = self.call_stack.pop();
-
-                        if anchor_changed {
-                            self.upgrade_cell_dependents_to_dirty(key);
-                        }
-                        for &displaced in &displaced_anchors {
-                            self.upgrade_cell_dependents_to_dirty(displaced);
-                        }
-                        for &shadow_key in &changed_shadows {
-                            self.upgrade_cell_dependents_to_dirty(shadow_key);
-                        }
-
-                        let mut post_dirty = DirtyRoots::default();
-                        if anchor_changed {
-                            self.collect_direct_dependents(key, &mut post_dirty);
-                        }
-                        if shape_changed || anchor_changed || !changed_shadows.is_empty() {
-                            self.collect_spill_anchor_dependents(key, &mut post_dirty.singles);
-                        }
-                        for displaced in displaced_anchors {
-                            self.collect_direct_dependents(displaced, &mut post_dirty);
-                        }
-                        // Strip `cur_fid` for direct anchor / spill-anchor dependents before
-                        // collecting changed-shadow dependents so self-shadow cycles
-                        // (`A1 = =A2:A3`) re-evaluate once and report `#CYCLE!` consistently
-                        // on both fresh and incremental recalculation.
-                        post_dirty.singles.retain(|&fid| fid != cur_fid);
-                        for shadow_key in changed_shadows {
-                            self.collect_direct_dependents(shadow_key, &mut post_dirty);
-                            if self.spills.anchor_of_cell(shadow_key) == Some(key) {
-                                self.wake_cycle_shadow_watchers(
-                                    shadow_key,
-                                    Some(cur_fid),
-                                    Some(key),
-                                    &mut post_dirty.singles,
-                                );
-                            }
-                        }
-                        self.push_unblocked_watchers(
-                            &unblocked_watchers,
-                            cur_fid,
-                            &mut post_dirty.singles,
-                        );
-                        self.drain_cycle_spill_anchor(key, Some(cur_fid), &mut post_dirty.singles);
-                        self.propagate_dirty_in_wave_roots(post_dirty, &[]);
-                    }
-                    CommitSpillOutcome::Blocked {
-                        revoked_anchors,
-                        freed_shadows,
-                        unblocked_watchers,
-                    } => {
-                        let anchor_stored_changed =
-                            self.store_eval_scalar(key, EvalScalar::Error(CalcError::Spill));
-                        let new_bits = self
-                            .workbook
-                            .sheet(key.0)
-                            .map(|s| s.value_by_id(key.1, key.2).pack());
-                        let anchor_changed = anchor_stored_changed || old_bits != new_bits;
-                        self.set_state(cur_fid, STATE_CLEAN);
-                        let _ = self.call_stack.pop();
-
-                        if anchor_changed || was_active {
-                            self.upgrade_cell_dependents_to_dirty(key);
-                        }
-
-                        let mut post_dirty = DirtyRoots::default();
-                        if anchor_changed || was_active {
-                            self.collect_direct_dependents(key, &mut post_dirty);
-                        }
-                        for revoked in revoked_anchors {
-                            if self.store_eval_scalar(revoked, EvalScalar::Error(CalcError::Spill))
-                            {
-                                self.upgrade_cell_dependents_to_dirty(revoked);
-                            }
-                            self.collect_direct_dependents(revoked, &mut post_dirty);
-                        }
-                        self.record_changed_cells(&freed_shadows);
-                        for shadow_key in freed_shadows {
-                            self.upgrade_cell_dependents_to_dirty(shadow_key);
-                            self.collect_direct_dependents(shadow_key, &mut post_dirty);
-                        }
-                        self.push_unblocked_watchers(
-                            &unblocked_watchers,
-                            cur_fid,
-                            &mut post_dirty.singles,
-                        );
-                        post_dirty.singles.retain(|&fid| fid != cur_fid);
-                        if !self.cycle_shadow_watch.is_empty()
-                            && let Some(fp) = self
-                                .spills
-                                .dynamic_blocked_footprint(key)
-                                .map(<[WorkbookCellKey]>::to_vec)
-                        {
-                            for cell in fp {
-                                self.wake_cycle_shadow_watchers(
-                                    cell,
-                                    Some(cur_fid),
-                                    Some(key),
-                                    &mut post_dirty.singles,
-                                );
-                            }
-                        }
-                        self.drain_cycle_spill_anchor(key, Some(cur_fid), &mut post_dirty.singles);
-                        self.propagate_dirty_in_wave_roots(post_dirty, &[]);
-                    }
-                }
+                self.finish_array_formula(cur_fid, key, arr);
             }
+        }
+    }
+
+    fn finish_array_formula(&mut self, cur_fid: u32, key: WorkbookCellKey, arr: Array2D) {
+        let anchor_scalar = arr
+            .values
+            .first()
+            .cloned()
+            .unwrap_or(EvalScalar::Error(CalcError::Calc));
+        if self.settle.active {
+            self.commit_settling(cur_fid, key, anchor_scalar, Some(arr));
+            return;
+        }
+        let old_shape = self.spills.spill_shape(key);
+        let fit = SpillRegistry::fit(&self.workbook, key, arr.rows, arr.cols);
+        self.settle.note_wanted(key, &fit);
+        match fit {
+            SpillFit::Free { rows, cols } => {
+                if self.spills.is_contested(key, &rows, &cols)
+                    || self.footprint_change_is_disputed(key, &rows, &cols)
+                    || self.tangle.is_downstream(cur_fid)
+                {
+                    self.flag_spill_tangle();
+                    return;
+                }
+                self.leave_loop(key);
+                let changed_shadows = self.spills.materialize(key, rows, cols, arr);
+                let shape_changed = old_shape != self.spills.spill_shape(key);
+                let anchor_changed = self.store_eval_scalar(key, anchor_scalar);
+                self.record_changed_cells(&changed_shadows);
+                self.set_state(cur_fid, STATE_CLEAN);
+                let _ = self.call_stack.pop();
+
+                if anchor_changed {
+                    self.upgrade_cell_dependents_to_dirty(key);
+                }
+                for &shadow_key in &changed_shadows {
+                    self.upgrade_cell_dependents_to_dirty(shadow_key);
+                }
+
+                let mut post_dirty = DirtyRoots::default();
+                if anchor_changed {
+                    self.collect_direct_dependents(key, &mut post_dirty);
+                }
+                if shape_changed || anchor_changed || !changed_shadows.is_empty() {
+                    self.collect_spill_anchor_dependents(key, &mut post_dirty.singles);
+                }
+                // A formula that reads its own new shadows goes round once more, so
+                // the loop is found whichever way the spill came about.
+                post_dirty.singles.retain(|&fid| fid != cur_fid);
+                for &shadow_key in &changed_shadows {
+                    self.collect_direct_dependents(shadow_key, &mut post_dirty);
+                }
+                if shape_changed && self.settle.withdraws_stale_spills() {
+                    self.withdraw_spills_downstream_of(key, &changed_shadows, &mut post_dirty);
+                }
+                self.propagate_dirty_in_wave_roots(post_dirty, &[]);
+            }
+            SpillFit::Obstructed { footprint } => {
+                if self.footprint_change_is_disputed(key, &[], &[]) {
+                    self.flag_spill_tangle();
+                    return;
+                }
+                self.leave_loop(key);
+                let freed_shadows = self.spills.block(key, footprint);
+                let anchor_changed =
+                    self.store_eval_scalar(key, EvalScalar::Error(CalcError::Spill));
+                self.set_state(cur_fid, STATE_CLEAN);
+                let _ = self.call_stack.pop();
+
+                let mut post_dirty = DirtyRoots::default();
+                self.spilled_cells_changed |= anchor_changed;
+                if anchor_changed || old_shape.is_some() {
+                    self.upgrade_cell_dependents_to_dirty(key);
+                    self.collect_direct_dependents(key, &mut post_dirty);
+                }
+                self.record_changed_cells(&freed_shadows);
+                for shadow_key in freed_shadows {
+                    self.upgrade_cell_dependents_to_dirty(shadow_key);
+                    self.collect_direct_dependents(shadow_key, &mut post_dirty);
+                }
+                post_dirty.singles.retain(|&fid| fid != cur_fid);
+                self.propagate_dirty_in_wave_roots(post_dirty, &[]);
+            }
+        }
+    }
+
+    fn leave_loop(&mut self, key: WorkbookCellKey) {
+        if !self.loop_members.is_empty() {
+            self.loop_members.remove(&key);
         }
     }
 
     fn finish_scalar_formula(&mut self, cur_fid: u32, key: WorkbookCellKey, scalar: EvalScalar) {
-        let clear_out = self.spills.clear_anchor(key);
+        if self.settle.active {
+            self.commit_settling(cur_fid, key, scalar, None);
+            return;
+        }
+        if self.footprint_change_is_disputed(key, &[], &[]) {
+            self.flag_spill_tangle();
+            return;
+        }
+        self.leave_loop(key);
+        let released = self.spills.release(key);
         let bits_changed = self.store_eval_scalar(key, scalar);
         self.set_state(cur_fid, STATE_CLEAN);
         let _ = self.call_stack.pop();
-        if bits_changed || clear_out.had_state {
+        if bits_changed || released.had_state {
             self.upgrade_cell_dependents_to_dirty(key);
         }
-        let mut post_dirty = DirtyRoots::default();
-        if clear_out.had_state {
-            self.record_changed_cells(&clear_out.cleared_shadows);
-            for shadow_key in clear_out.cleared_shadows {
+        if released.had_state {
+            let mut post_dirty = DirtyRoots::default();
+            self.record_changed_cells(&released.cleared_shadows);
+            for shadow_key in released.cleared_shadows {
                 self.upgrade_cell_dependents_to_dirty(shadow_key);
                 self.collect_direct_dependents(shadow_key, &mut post_dirty);
             }
             self.collect_spill_anchor_dependents(key, &mut post_dirty.singles);
-            self.push_unblocked_watchers(
-                &clear_out.unblocked_watchers,
-                cur_fid,
-                &mut post_dirty.singles,
-            );
             post_dirty.singles.retain(|&fid| fid != cur_fid);
-        }
-        self.drain_cycle_spill_anchor(key, Some(cur_fid), &mut post_dirty.singles);
-        if !post_dirty.singles.is_empty() || !post_dirty.strips.is_empty() {
             self.propagate_dirty_in_wave_roots(post_dirty, &[]);
         }
     }
 
-    fn record_cycle_spill(
-        &mut self,
-        anchor: WorkbookCellKey,
-        unwound_keys: &[WorkbookCellKey],
-        cleared_shadows: &[WorkbookCellKey],
-    ) {
-        if let Some(prev) = self.cycle_spills.get(&anchor) {
-            for cell in &prev.cleared_shadows {
-                if let Some(anchors) = self.cycle_shadow_watch.get_mut(cell) {
-                    anchors.retain(|&a| a != anchor);
-                    if anchors.is_empty() {
-                        self.cycle_shadow_watch.remove(cell);
-                    }
-                }
-            }
-        }
-        let mut peers = self
-            .cycle_spills
-            .remove(&anchor)
-            .map(|r| r.peers)
-            .unwrap_or_default();
-        for &peer in unwound_keys {
-            if peer != anchor && !peers.contains(&peer) {
-                peers.push(peer);
-            }
-        }
-        let mut dedup_shadows = Vec::with_capacity(cleared_shadows.len());
-        for &cell in cleared_shadows {
-            if !dedup_shadows.contains(&cell) {
-                dedup_shadows.push(cell);
-            }
-        }
-        if peers.is_empty() && dedup_shadows.is_empty() {
-            return;
-        }
-        for &cell in &dedup_shadows {
-            let entry = self.cycle_shadow_watch.entry(cell).or_default();
-            if !entry.contains(&anchor) {
-                entry.push(anchor);
-            }
-        }
-        self.cycle_spills.insert(
-            anchor,
-            CycleSpillRecord {
-                peers,
-                cleared_shadows: dedup_shadows,
-            },
-        );
-    }
-
-    fn drain_cycle_spill_anchor(
-        &mut self,
-        anchor: WorkbookCellKey,
-        exclude_fid: Option<u32>,
-        out: &mut Vec<u32>,
-    ) {
-        let Some(rec) = self.cycle_spills.remove(&anchor) else {
-            return;
-        };
-        for cell in rec.cleared_shadows {
-            if let Some(anchors) = self.cycle_shadow_watch.get_mut(&cell) {
-                anchors.retain(|&a| a != anchor);
-                if anchors.is_empty() {
-                    self.cycle_shadow_watch.remove(&cell);
-                }
-            }
-        }
-        for peer in rec.peers {
-            if let Some(&pfid) = self.cell_to_fid.get(&peer)
-                && Some(pfid) != exclude_fid
-                && self.state_of(pfid) == STATE_CLEAN
-            {
-                out.push(pfid);
-            }
-        }
-    }
-
-    fn wake_cycle_shadow_watchers(
-        &mut self,
-        cell: WorkbookCellKey,
-        exclude_fid: Option<u32>,
-        claimer: Option<WorkbookCellKey>,
-        out: &mut Vec<u32>,
-    ) {
-        let mut matched: SmallVec<[(u32, bool); 4]> = SmallVec::new();
-        {
-            let Some(anchors) = self.cycle_shadow_watch.get(&cell) else {
-                return;
-            };
-            let dep_view = DepView {
-                dep_graph: &self.dep_graph,
-                name_dep_graph: &self.name_dep_graph,
-                name_slots: &self.name_slots,
-                cell_to_fid: &self.cell_to_fid,
-                slots: &self.slots,
-                strip_slots: &self.strip_slots,
-                workbook: &self.workbook,
-            };
-            for &anchor in anchors {
-                let Some(&afid) = self.cell_to_fid.get(&anchor) else {
-                    continue;
-                };
-                if Some(afid) == exclude_fid {
-                    continue;
-                }
-                if let Some(claimer_key) = claimer {
-                    let cleared = self
-                        .cycle_spills
-                        .get(&anchor)
-                        .map_or(&[][..], |r| r.cleared_shadows.as_slice());
-                    let anchor_reaches_claimer = Self::formula_reaches_in(
-                        &dep_view,
-                        &self.spills,
-                        anchor,
-                        claimer_key,
-                        anchor,
-                        cleared,
-                    );
-                    let claimer_reaches_anchor = Self::formula_reaches_in(
-                        &dep_view,
-                        &self.spills,
-                        claimer_key,
-                        anchor,
-                        anchor,
-                        cleared,
-                    );
-                    if anchor_reaches_claimer && !claimer_reaches_anchor {
-                        continue;
-                    }
-                }
-                matched.push((afid, self.state_of(afid) == STATE_CLEAN));
-            }
-        }
-        for (afid, is_clean) in matched {
-            self.wave_cycle_verified.remove(&afid);
-            if is_clean {
-                out.push(afid);
-            }
-        }
-    }
-
-    fn push_unblocked_watchers(
-        &self,
-        watchers: &[WorkbookCellKey],
-        self_fid: u32,
-        out: &mut Vec<u32>,
-    ) {
-        for w in watchers {
-            if let Some(&fid) = self.cell_to_fid.get(w)
-                && fid != self_fid
-            {
-                out.push(fid);
-            }
-        }
-    }
-
     fn record_changed_cells(&mut self, cells: &[WorkbookCellKey]) {
-        if cells.is_empty() || self.changes.structural {
+        if cells.is_empty() {
+            return;
+        }
+        self.spilled_cells_changed = true;
+        if self.changes.structural {
             return;
         }
         if self.changes.cells.len().saturating_add(cells.len()) > 256 {
@@ -2793,25 +2613,23 @@ impl FormulaEngine {
         key: WorkbookCellKey,
         root_dirty: &mut DirtyRoots,
     ) {
-        if self.spills.is_empty() && self.cycle_spills.is_empty() {
+        self.leave_loop(key);
+        if self.spills.is_empty() && self.tangle.is_empty() {
             return;
         }
-        self.drain_cycle_spill_anchor(key, None, &mut root_dirty.singles);
-        self.wake_cycle_shadow_watchers(key, None, None, &mut root_dirty.singles);
-        let clear_out = self.spills.clear_anchor(key);
-        if clear_out.had_state {
-            self.record_changed_cells(&clear_out.cleared_shadows);
-            for shadow_key in clear_out.cleared_shadows {
+        let released = self.spills.release(key);
+        if released.had_state {
+            self.record_changed_cells(&released.cleared_shadows);
+            for shadow_key in released.cleared_shadows {
+                if self.tangle.involves(shadow_key) {
+                    self.flag_spill_tangle();
+                }
                 self.collect_direct_dependents(shadow_key, root_dirty);
             }
             self.collect_spill_anchor_dependents(key, &mut root_dirty.singles);
-            for w in clear_out.unblocked_watchers {
-                if let Some(&wfid) = self.cell_to_fid.get(&w)
-                    && self.state_of(wfid) == STATE_CLEAN
-                {
-                    root_dirty.singles.push(wfid);
-                }
-            }
+        }
+        if self.tangle.involves(key) {
+            self.flag_spill_tangle();
         }
         if let Some(owner) = self.spills.anchor_of_cell(key)
             && let Some(&ofid) = self.cell_to_fid.get(&owner)
@@ -2834,8 +2652,12 @@ impl FormulaEngine {
         sheet_removed_or_deleted: bool,
         out: &mut DirtyRoots,
     ) {
-        if self.spills.is_empty() && self.cycle_spills.is_empty() {
+        if self.spills.is_empty() && self.tangle.is_empty() {
             return;
+        }
+        // Footprints follow axis positions, so a dispute has to be settled anew.
+        if self.tangle.members.iter().any(|key| key.0 == sheet_id) {
+            self.flag_spill_tangle();
         }
         let anchors = self.spills.anchors_on_sheet(sheet_id);
         for anchor in anchors {
@@ -2844,46 +2666,17 @@ impl FormulaEngine {
                     s.row_axis().id_to_pos(anchor.1.0).is_some()
                         && s.col_axis().id_to_pos(anchor.2.0).is_some()
                 });
-            let clear_out = self.spills.clear_anchor(anchor);
-            if clear_out.had_state {
-                self.record_changed_cells(&clear_out.cleared_shadows);
-                for shadow_key in clear_out.cleared_shadows {
-                    self.collect_direct_dependents(shadow_key, out);
-                }
-                self.collect_spill_anchor_dependents(anchor, &mut out.singles);
-                for w in clear_out.unblocked_watchers {
-                    if let Some(&wfid) = self.cell_to_fid.get(&w)
-                        && self.state_of(wfid) == STATE_CLEAN
-                    {
-                        out.singles.push(wfid);
-                    }
-                }
+            let released = self.spills.release(anchor);
+            self.record_changed_cells(&released.cleared_shadows);
+            for shadow_key in released.cleared_shadows {
+                self.collect_direct_dependents(shadow_key, out);
             }
+            self.collect_spill_anchor_dependents(anchor, &mut out.singles);
             if is_live
                 && let Some(&fid) = self.cell_to_fid.get(&anchor)
                 && self.state_of(fid) == STATE_CLEAN
             {
                 out.singles.push(fid);
-            }
-        }
-        if !self.cycle_spills.is_empty() {
-            let lo = (sheet_id, RowId(0), ColId(0));
-            let hi = (sheet_id, RowId(u64::MAX), ColId(u64::MAX));
-            let peer_anchors: Vec<WorkbookCellKey> =
-                self.cycle_spills.range(lo..=hi).map(|(k, _)| *k).collect();
-            for anchor in peer_anchors {
-                let is_live = !sheet_removed_or_deleted
-                    && self.workbook.live_sheet(sheet_id).is_some_and(|s| {
-                        s.row_axis().id_to_pos(anchor.1.0).is_some()
-                            && s.col_axis().id_to_pos(anchor.2.0).is_some()
-                    });
-                self.drain_cycle_spill_anchor(anchor, None, &mut out.singles);
-                if is_live
-                    && let Some(&fid) = self.cell_to_fid.get(&anchor)
-                    && self.state_of(fid) == STATE_CLEAN
-                {
-                    out.singles.push(fid);
-                }
             }
         }
     }
@@ -2899,7 +2692,7 @@ impl FormulaEngine {
         if total_cells > 256 {
             self.changes.structural = true;
         }
-        let check_spills = !self.spills.is_empty() || !self.cycle_spills.is_empty();
+        let check_spills = !self.spills.is_empty() || !self.tangle.is_empty();
         let mut roots = DirtyRoots::default();
         for c_run in cols {
             for raw_c in c_run.iter() {
@@ -2956,11 +2749,7 @@ impl FormulaEngine {
             rows,
             cols,
             &self.workbook,
-            |fid| {
-                if self.state_of(fid) == STATE_CLEAN {
-                    roots.singles.push(fid);
-                }
-            },
+            |fid| roots.singles.push(fid),
             |sid, lo, hi| roots.strips.push((sid, lo, hi)),
         );
         if !self.name_slots.is_empty() {
@@ -2989,7 +2778,7 @@ impl FormulaEngine {
         if total_cells > 256 {
             self.changes.structural = true;
         }
-        let check_spills = !self.spills.is_empty() || !self.cycle_spills.is_empty();
+        let check_spills = !self.spills.is_empty() || !self.tangle.is_empty();
         let mut roots = DirtyRoots::default();
         let mut strip_cols: FxMap<ColId, Vec<RowId>> = FxMap::default();
         for c_run in cols {
@@ -3045,11 +2834,7 @@ impl FormulaEngine {
             rows,
             cols,
             &self.workbook,
-            |fid| {
-                if self.state_of(fid) == STATE_CLEAN {
-                    roots.singles.push(fid);
-                }
-            },
+            |fid| roots.singles.push(fid),
             |sid, lo, hi| roots.strips.push((sid, lo, hi)),
         );
         if !self.name_slots.is_empty() {
@@ -3083,6 +2868,13 @@ impl FormulaEngine {
                 }
             }
         }
+        let start = (sheet, ColId(0), RowId(0));
+        let end = (sheet, ColId(u64::MAX), RowId(u64::MAX));
+        for (_, strip) in self.workbook.formulas().col_strips().range(start..=end) {
+            for &run in ids {
+                self.collect_strip_cells_with_slots(strip, run, &mut roots.singles);
+            }
+        }
         for (_, &sid) in self
             .strip_by_col
             .range((sheet, ColId(0), RowId(0))..=(sheet, ColId(u64::MAX), RowId(u64::MAX)))
@@ -3097,6 +2889,32 @@ impl FormulaEngine {
         }
         self.refresh_sheet_spills_on_structural_change(sheet, false, &mut roots);
         self.propagate_dirty_roots(roots);
+    }
+
+    /// Collects formulas in `rows` that the workbook stores as part of `strip` but
+    /// that have a slot of their own here.
+    fn collect_strip_cells_with_slots(
+        &self,
+        strip: &TemplateStrip<AffineFormula>,
+        rows: IdRun,
+        out: &mut Vec<u32>,
+    ) {
+        let in_col = self.slot_count_in_col.get(&(strip.sheet, strip.col));
+        if in_col.is_none_or(|&count| count == 0)
+            || id_stream(rows.first_id) != id_stream(strip.start_row.0)
+        {
+            return;
+        }
+        let first = rows.first_id.max(strip.start_row.0);
+        let end = rows
+            .first_id
+            .saturating_add(u64::from(rows.len))
+            .min(strip.end_row_exclusive_raw());
+        for row in first..end {
+            if let Some(&fid) = self.cell_to_fid.get(&(strip.sheet, RowId(row), strip.col)) {
+                out.push(fid);
+            }
+        }
     }
 
     fn on_cols_undeleted(&mut self, sheet: SheetId, ids: &[IdRun]) {
@@ -3122,12 +2940,16 @@ impl FormulaEngine {
         for run in ids {
             for raw_c in run.iter() {
                 let col = ColId(raw_c);
-                for (_, &sid) in self
-                    .strip_by_col
-                    .range((sheet, col, RowId(0))..=(sheet, col, RowId(u64::MAX)))
-                {
+                let start = (sheet, col, RowId(0));
+                let end = (sheet, col, RowId(u64::MAX));
+                for (_, &sid) in self.strip_by_col.range(start..=end) {
                     if let Some(strip) = self.strip_slot_of(sid) {
                         roots.strips.push((sid, 0, strip.len));
+                    }
+                }
+                for (_, strip) in self.workbook.formulas().col_strips().range(start..=end) {
+                    if let Some(run) = IdRun::new(strip.start_row.0, strip.len) {
+                        self.collect_strip_cells_with_slots(strip, run, &mut roots.singles);
                     }
                 }
             }
@@ -3144,12 +2966,13 @@ impl FormulaEngine {
     ) {
         self.changes.structural = true;
         let mut roots = DirtyRoots::default();
-        let mut strip_cols: FxMap<ColId, Vec<RowId>> = FxMap::default();
+        let mut strip_cols: BTreeMap<(SheetId, ColId), Vec<RowId>> = BTreeMap::new();
         for &(key, _) in rewritten {
-            if !strip_cols.contains_key(&key.2) && self.col_needs_strip_sync(key.0, key.2) {
-                strip_cols.insert(key.2, Vec::new());
+            let col = (key.0, key.2);
+            if !strip_cols.contains_key(&col) && self.col_needs_strip_sync(key.0, key.2) {
+                strip_cols.insert(col, Vec::new());
             }
-            if let Some(col_rows) = strip_cols.get_mut(&key.2) {
+            if let Some(col_rows) = strip_cols.get_mut(&col) {
                 col_rows.push(key.1);
             }
         }
@@ -3159,7 +2982,7 @@ impl FormulaEngine {
         {
             if let Some(s) = self.strip_slot_of(sid)
                 && s.sequential_self_dep
-                && !strip_cols.contains_key(&col)
+                && !strip_cols.contains_key(&(sheet, col))
             {
                 let ts = TemplateStrip {
                     sheet: s.sheet,
@@ -3169,15 +2992,15 @@ impl FormulaEngine {
                     template: s.template.clone(),
                 };
                 if Self::is_affine_strip_eligible(&ts, &self.workbook).is_none() {
-                    strip_cols.insert(col, Vec::new());
+                    strip_cols.insert((sheet, col), Vec::new());
                 }
             }
         }
-        for (col, col_rows) in &strip_cols {
-            self.sync_col_with_workbook(sheet, *col, &[], col_rows, col_rows, &mut roots);
+        for (&(s, col), col_rows) in &strip_cols {
+            self.sync_col_with_workbook(s, col, &[], col_rows, col_rows, &mut roots);
         }
         for &(key, _) in rewritten {
-            if strip_cols.contains_key(&key.2) {
+            if strip_cols.contains_key(&(key.0, key.2)) {
                 continue;
             }
             self.remove_slot_by_key(key);
@@ -3362,6 +3185,9 @@ impl FormulaEngine {
     }
 
     fn sync_named_range_slot(&mut self, key: &NamedRangeKey) {
+        if !self.tangle.is_empty() {
+            self.flag_spill_tangle();
+        }
         if let Some(old_nid) = self.name_to_nid.remove(key) {
             self.volatile_names.remove(&old_nid);
             self.filter_sensitive_names.remove(&old_nid);
@@ -3475,7 +3301,7 @@ impl FormulaEngine {
             &self.name_slots,
             seed_nids,
             |fid| {
-                if self.node_state(fid) == STATE_CLEAN {
+                if self.can_still_miss_change(fid) {
                     out.push(fid);
                 }
             },
@@ -3514,7 +3340,7 @@ impl FormulaEngine {
             &self.name_slots,
             seed_names,
             |fid| {
-                if self.node_state(fid) == STATE_CLEAN {
+                if self.can_still_miss_change(fid) {
                     out.push(fid);
                 }
             },
@@ -3555,7 +3381,7 @@ impl FormulaEngine {
 
     fn collect_spill_anchor_dependents(&self, anchor: WorkbookCellKey, out: &mut Vec<u32>) {
         self.dep_graph.for_each_spill_dependent(anchor, |fid| {
-            if self.node_state(fid) == STATE_CLEAN {
+            if self.can_still_miss_change(fid) {
                 out.push(fid);
             }
         });
@@ -3565,6 +3391,13 @@ impl FormulaEngine {
                 .for_each_spill_dependent(anchor, |nid| seed_nids.push(nid));
             self.collect_name_dependents_from_nids(&seed_nids, out);
         }
+    }
+
+    /// Whether `node` has to be told that something it reads changed. Dirty and
+    /// evaluating formulas read everything again anyway; a strip in those states
+    /// may only have some of its rows queued.
+    fn can_still_miss_change(&self, node: u32) -> bool {
+        is_strip_fid(node) || !matches!(self.state_of(node), STATE_DIRTY | STATE_EVALUATING)
     }
 
     fn slot_of(&self, fid: u32) -> Option<&FormulaSlot> {
@@ -3680,6 +3513,7 @@ impl FormulaEngine {
     }
 
     fn insert_slot(&mut self, key: WorkbookCellKey, formula: &BoundFormula, dirty: bool) -> u32 {
+        self.note_node_added();
         let fid = if let Some(reused) = self.free_slots.pop() {
             reused
         } else {
@@ -3715,6 +3549,7 @@ impl FormulaEngine {
         let Some(fid) = self.cell_to_fid.remove(&key) else {
             return;
         };
+        self.note_node_removed(fid);
         self.volatile_set.remove(&fid);
         self.filter_sensitive_set.remove(&fid);
         self.dynamic_ref_set.remove(&fid);
@@ -3774,6 +3609,7 @@ impl FormulaEngine {
         strip: &TemplateStrip<AffineFormula>,
         sequential_self_dep: bool,
     ) -> u32 {
+        self.note_node_added();
         let sid = if let Some(reused) = self.free_strip_slots.pop() {
             reused
         } else {
@@ -3820,6 +3656,7 @@ impl FormulaEngine {
     }
 
     fn remove_strip_slot(&mut self, sid: u32) {
+        self.note_node_removed(strip_fid(sid));
         self.volatile_strips.remove(&sid);
         self.filter_sensitive_strips.remove(&sid);
         self.levels_valid = false;
@@ -3875,7 +3712,6 @@ impl FormulaEngine {
         if was_deferred {
             self.wave_deferred_dirty.retain(|&x| x != raw_fid);
         }
-        self.wave_cycle_verified.remove(&raw_fid);
         self.wave_spill_requeues.remove(&raw_fid);
         self.remove_strip_slot(sid);
 
@@ -4107,7 +3943,12 @@ impl FormulaEngine {
                 let s_start = strip.start_row.0;
                 let s_end = strip.end_row_exclusive_raw();
                 covered_strips.push((s_start, s_end));
-                let Some(seq_self) = Self::is_affine_strip_eligible(strip, &self.workbook) else {
+                let seq_self = if self.strip_hosts_spill_or_loop(strip) {
+                    None
+                } else {
+                    Self::is_affine_strip_eligible(strip, &self.workbook)
+                };
+                let Some(seq_self) = seq_self else {
                     for off in 0..strip.len {
                         let row = RowId(s_start.saturating_add(u64::from(off)));
                         let key = (sheet, row, col);
@@ -4197,6 +4038,22 @@ impl FormulaEngine {
                 }
             }
         }
+    }
+
+    /// Whether any cell of `strip` anchors a spill or is part of a loop. Such cells
+    /// keep their own slots: they are woken and held back one by one.
+    fn strip_hosts_spill_or_loop(&self, strip: &TemplateStrip<AffineFormula>) -> bool {
+        if self.spills.is_empty() && self.loop_members.is_empty() {
+            return false;
+        }
+        let first = strip.start_row;
+        let last = RowId(strip.end_row_exclusive_raw().saturating_sub(1));
+        self.spills
+            .has_anchor_in_col_run(strip.sheet, strip.col, first, last)
+            || self
+                .loop_members
+                .range((strip.sheet, first, ColId(0))..=(strip.sheet, last, ColId(u64::MAX)))
+                .any(|key| key.2 == strip.col)
     }
 
     fn is_affine_strip_eligible(
@@ -4480,7 +4337,7 @@ impl FormulaEngine {
                         }
                     }
                     BatchChunkPrep::Blocked(deps) => return StripEvalControl::Blocked(deps),
-                    BatchChunkPrep::Cycle(min_pos) => return StripEvalControl::Cycle(min_pos),
+                    BatchChunkPrep::Cycle(low) => return StripEvalControl::Cycle(low),
                     BatchChunkPrep::FallbackToAst => {}
                 }
             }
@@ -4566,8 +4423,8 @@ impl FormulaEngine {
                 ExprOutcome::Blocked(deps) => {
                     return StripEvalControl::Blocked(deps);
                 }
-                ExprOutcome::Cycle(min_pos) => {
-                    return StripEvalControl::Cycle(min_pos);
+                ExprOutcome::Cycle(low) => {
+                    return StripEvalControl::Cycle(low);
                 }
             }
         }
@@ -4598,7 +4455,7 @@ impl FormulaEngine {
             key,
             &self.workbook,
             |fid| {
-                if matches!(self.state_of(fid), STATE_CLEAN | STATE_MAYBE_DIRTY) {
+                if self.can_still_miss_change(fid) {
                     out.singles.push(fid);
                 }
             },
@@ -4613,204 +4470,24 @@ impl FormulaEngine {
         }
     }
 
-    fn collect_cell_dependents_unfiltered(
-        view: &DepView<'_>,
-        key: WorkbookCellKey,
-        include_spill_anchor: bool,
-        out: &mut Vec<u32>,
-    ) {
-        let mut strip_sids: SmallVec<[u32; 4]> = SmallVec::new();
-        view.dep_graph.for_each_cell_dependent_target(
-            key,
-            view.workbook,
-            |fid| out.push(fid),
-            |sid, _, _| strip_sids.push(sid),
-        );
-        for sid in strip_sids {
-            out.push(strip_fid(sid));
-        }
-        if include_spill_anchor {
-            view.dep_graph
-                .for_each_spill_dependent(key, |fid| out.push(fid));
-        }
-        if !view.name_slots.is_empty() {
-            let mut seed_nids = Vec::new();
-            view.name_dep_graph
-                .for_each_cell_dependent(key, view.workbook, |nid| seed_nids.push(nid));
-            if include_spill_anchor {
-                view.name_dep_graph
-                    .for_each_spill_dependent(key, |nid| seed_nids.push(nid));
-            }
-            Self::collect_name_dependents_from_nids_with(
-                view.dep_graph,
-                view.name_dep_graph,
-                view.name_slots,
-                &seed_nids,
-                |fid| out.push(fid),
-            );
-        }
-    }
-
-    fn formula_reaches_in(
-        view: &DepView<'_>,
-        spills: &SpillRegistry,
-        start: WorkbookCellKey,
-        target: WorkbookCellKey,
-        override_anchor: WorkbookCellKey,
-        override_footprint: &[WorkbookCellKey],
-    ) -> bool {
-        let Some(&start_fid) = view.cell_to_fid.get(&start) else {
-            return false;
-        };
-        let Some(&target_fid) = view.cell_to_fid.get(&target) else {
-            return false;
-        };
-        if start_fid == target_fid {
-            return false;
-        }
-        let mut visited: BTreeSet<u32> = BTreeSet::new();
-        let mut queue: Vec<u32> = Vec::new();
-        visited.insert(start_fid);
-        queue.push(start_fid);
-
-        let mut head = 0usize;
-        let mut next_fids: Vec<u32> = Vec::new();
-        while let Some(&fid) = queue.get(head) {
-            head = head.saturating_add(1);
-            next_fids.clear();
-            if is_strip_fid(fid) {
-                let sid = strip_index(fid);
-                if let Some(s) = view.strip_slots.get(sid as usize).and_then(Option::as_ref)
-                    && let Some(row_run) = IdRun::new(s.start_row.0, s.len)
-                {
-                    let mut strip_sids: SmallVec<[u32; 4]> = SmallVec::new();
-                    view.dep_graph.for_each_col_run_dependent_target(
-                        s.sheet,
-                        s.col,
-                        row_run,
-                        None,
-                        view.workbook,
-                        |dep_fid| next_fids.push(dep_fid),
-                        |dep_sid, _, _| strip_sids.push(dep_sid),
-                    );
-                    for dep_sid in strip_sids {
-                        next_fids.push(strip_fid(dep_sid));
-                    }
-                    if !view.name_slots.is_empty() {
-                        let mut seed_nids = Vec::new();
-                        view.name_dep_graph.on_rect_written(
-                            s.sheet,
-                            core::slice::from_ref(&row_run),
-                            &[IdRun {
-                                first_id: s.col.0,
-                                len: 1,
-                            }],
-                            view.workbook,
-                            |nid| seed_nids.push(nid),
-                        );
-                        Self::collect_name_dependents_from_nids_with(
-                            view.dep_graph,
-                            view.name_dep_graph,
-                            view.name_slots,
-                            &seed_nids,
-                            |dep_fid| next_fids.push(dep_fid),
-                        );
-                    }
-                }
-            } else {
-                let Some(cell_key) = view
-                    .slots
-                    .get(fid as usize)
-                    .and_then(Option::as_ref)
-                    .map(|s| s.key)
-                else {
-                    continue;
-                };
-                Self::collect_cell_dependents_unfiltered(view, cell_key, true, &mut next_fids);
-                if cell_key == override_anchor {
-                    for &shadow_key in override_footprint {
-                        if shadow_key != cell_key {
-                            Self::collect_cell_dependents_unfiltered(
-                                view,
-                                shadow_key,
-                                false,
-                                &mut next_fids,
-                            );
-                        }
-                    }
-                } else if spills.has_spills_on_sheet(cell_key.0)
-                    && let Some(entry) = spills.active_spill(cell_key)
-                {
-                    for &row in &entry.rows {
-                        for &col in &entry.cols {
-                            let shadow_key = (cell_key.0, row, col);
-                            if shadow_key != cell_key {
-                                Self::collect_cell_dependents_unfiltered(
-                                    view,
-                                    shadow_key,
-                                    false,
-                                    &mut next_fids,
-                                );
-                            }
-                        }
-                    }
-                } else if let Some(fp) = spills.dynamic_blocked_footprint(cell_key) {
-                    for &shadow_key in fp {
-                        if shadow_key != cell_key {
-                            Self::collect_cell_dependents_unfiltered(
-                                view,
-                                shadow_key,
-                                false,
-                                &mut next_fids,
-                            );
-                        }
-                    }
-                }
-            }
-
-            for &dep_fid in &next_fids {
-                if dep_fid == target_fid {
-                    return true;
-                }
-                if visited.insert(dep_fid) {
-                    queue.push(dep_fid);
-                }
-            }
-        }
-        false
-    }
-
-    fn classify_spill_collision_in(
-        view: &DepView<'_>,
-        spills: &SpillRegistry,
-        anchor: WorkbookCellKey,
-        anchor_footprint: &[WorkbookCellKey],
-        other: WorkbookCellKey,
-    ) -> SpillCollisionOrder {
-        let a_reaches_b =
-            Self::formula_reaches_in(view, spills, anchor, other, anchor, anchor_footprint);
-        let b_reaches_a =
-            Self::formula_reaches_in(view, spills, other, anchor, anchor, anchor_footprint);
-        if b_reaches_a && !a_reaches_b {
-            SpillCollisionOrder::OtherUpstream
-        } else if a_reaches_b && !b_reaches_a {
-            SpillCollisionOrder::AnchorUpstream
-        } else {
-            SpillCollisionOrder::Symmetric
-        }
-    }
-
     fn propagate_dirty_roots(&mut self, roots: DirtyRoots) {
-        self.wave_cycle_verified.clear();
+        self.abandon_settlement();
         self.propagate_dirty_impl(roots.singles, roots.strips, &[], false);
     }
 
     fn propagate_dirty_full(&mut self, singles: Vec<u32>, strips: Vec<(u32, u32, u32)>) {
-        self.wave_cycle_verified.clear();
+        self.abandon_settlement();
         self.propagate_dirty_impl(singles, strips, &[], false);
     }
 
     fn propagate_dirty_in_wave_roots(&mut self, roots: DirtyRoots, exclude: &[u32]) {
+        if roots.singles.is_empty() && roots.strips.is_empty() {
+            return;
+        }
+        // Loops found so far were found with the cells that just changed.
+        if !self.settle.active && !self.scc_stack.is_empty() {
+            self.release_all_scc_wait_to_dirty();
+        }
         self.propagate_dirty_impl(roots.singles, roots.strips, exclude, true);
     }
 
@@ -4827,7 +4504,7 @@ impl FormulaEngine {
         let key = slot.key;
         if self.spills.active_spill(key).is_some()
             || self.spills.is_blocked_anchor(key)
-            || self.cycle_spills.contains_key(&key)
+            || self.tangle.members.contains(&key)
         {
             return false;
         }
@@ -4849,11 +4526,15 @@ impl FormulaEngine {
     }
 
     fn upgrade_strip_to_dirty(&mut self, sid: u32, lo: u32, hi: u32) {
-        let added = if let Some(Some(s)) = self.strip_slots.get_mut(sid as usize) {
-            s.insert_dirty_interval(lo, hi)
-        } else {
-            false
-        };
+        // Rows that are not maybe-dirty are left to the caller's propagation, which
+        // must still find them clean to reach what depends on them.
+        let mut added = false;
+        if let Some(Some(s)) = self.strip_slots.get_mut(sid as usize) {
+            let maybe = s.maybe_dirty_intervals.clone();
+            for (a, b) in maybe {
+                added |= s.insert_dirty_interval(lo.max(a), hi.min(b));
+            }
+        }
         if !added {
             return;
         }
@@ -4861,6 +4542,33 @@ impl FormulaEngine {
             STATE_MAYBE_DIRTY => self.set_strip_state(sid, STATE_DIRTY),
             STATE_EVALUATING_MAYBE => self.set_strip_state(sid, STATE_EVALUATING),
             _ => {}
+        }
+    }
+
+    /// Gives up the early cutoff for the rest of the wave. Checking whether a
+    /// formula may be skipped follows its static precedents, which include cells
+    /// it never reads (untaken branches, references whose rows were deleted). A
+    /// loop among those proves nothing; only full evaluation finds the real ones.
+    fn evaluate_rest_of_wave_fully(&mut self) {
+        self.wave_without_cutoff = true;
+        self.unwind_call_stack();
+        for idx in self.dirty_cursor..self.dirty_queue.len() {
+            let Some(&node) = self.dirty_queue.get(idx) else {
+                break;
+            };
+            if is_strip_fid(node) {
+                let sid = strip_index(node);
+                if let Some(Some(s)) = self.strip_slots.get_mut(sid as usize) {
+                    for (lo, hi) in core::mem::take(&mut s.maybe_dirty_intervals) {
+                        let _ = s.insert_dirty_interval(lo, hi);
+                    }
+                }
+                if self.strip_state_of(sid) == STATE_MAYBE_DIRTY {
+                    self.set_strip_state(sid, STATE_DIRTY);
+                }
+            } else if self.state_of(node) == STATE_MAYBE_DIRTY {
+                self.set_state(node, STATE_DIRTY);
+            }
         }
     }
 
@@ -4934,6 +4642,21 @@ impl FormulaEngine {
         }
     }
 
+    /// Counts a re-evaluation caused by a spill and returns whether there were too
+    /// many. Spills that depend on each other one way need a handful, and within a
+    /// settlement round hardly any formula needs a second one.
+    fn is_requeued_without_end(&mut self, node: u32) -> bool {
+        let limit = if self.settle.active {
+            MAX_ROUND_SPILL_REQUEUES
+        } else {
+            MAX_WAVE_SPILL_REQUEUES
+        };
+        let count = self.wave_spill_requeues.entry(node).or_insert(0);
+        let exhausted = *count >= limit;
+        *count = count.saturating_add(1);
+        exhausted
+    }
+
     fn try_mark_dirty_for_bfs(
         &mut self,
         fid: u32,
@@ -4952,7 +4675,7 @@ impl FormulaEngine {
             }
             return;
         }
-        let want_maybe = as_maybe && self.can_maybe_dirty_single(fid);
+        let want_maybe = as_maybe && !self.wave_without_cutoff && self.can_maybe_dirty_single(fid);
         if st == STATE_MAYBE_DIRTY {
             if !want_maybe {
                 self.set_state(fid, STATE_DIRTY);
@@ -4968,12 +4691,14 @@ impl FormulaEngine {
         if st != STATE_CLEAN {
             return;
         }
-        if cap_wave_requeues {
-            let count = self.wave_spill_requeues.entry(fid).or_insert(0);
-            if *count >= MAX_WAVE_SPILL_REQUEUES {
+        if cap_wave_requeues && self.is_requeued_without_end(fid) {
+            if self.settle.active {
+                if let Some(key) = self.slot_of(fid).map(|s| s.key) {
+                    self.settle.note_stuck(key);
+                }
                 return;
             }
-            *count = count.saturating_add(1);
+            self.flag_spill_tangle();
         }
         let next_state = if want_maybe {
             STATE_MAYBE_DIRTY
@@ -4999,7 +4724,7 @@ impl FormulaEngine {
             return;
         }
         let st = self.strip_state_of(sid);
-        let want_maybe = as_maybe && self.can_maybe_dirty_strip(sid);
+        let want_maybe = as_maybe && !self.wave_without_cutoff && self.can_maybe_dirty_strip(sid);
         let (eff_lo, eff_hi, added, non_empty) = {
             let Some(Some(s)) = self.strip_slots.get_mut(sid as usize) else {
                 return;
@@ -5032,12 +4757,11 @@ impl FormulaEngine {
             return;
         }
         if st == STATE_CLEAN {
-            if cap_wave_requeues {
-                let count = self.wave_spill_requeues.entry(raw_fid).or_insert(0);
-                if *count >= MAX_WAVE_SPILL_REQUEUES {
+            if cap_wave_requeues && self.is_requeued_without_end(raw_fid) {
+                if self.settle.active {
                     return;
                 }
-                *count = count.saturating_add(1);
+                self.flag_spill_tangle();
             }
             self.set_strip_state(
                 sid,
@@ -5048,7 +4772,7 @@ impl FormulaEngine {
                 },
             );
             self.dirty_queue.push(raw_fid);
-            self.dirty_needs_sort = true;
+            self.dirty_needs_sort |= !cap_wave_requeues;
         } else if !want_maybe {
             match st {
                 STATE_MAYBE_DIRTY => self.set_strip_state(sid, STATE_DIRTY),
@@ -5251,62 +4975,105 @@ impl FormulaEngine {
                 );
             }
         }
-        if !bfs.is_empty() {
+        // Formulas woken by a spill wait for the next pass: sorted to the front again,
+        // a reader of n spills would be evaluated after each of them.
+        if !bfs.is_empty() && !cap_wave_requeues {
             self.dirty_needs_sort = true;
         }
     }
 
     fn abort_paused_call_stack(&mut self) {
-        self.wave_cycle_verified.clear();
-        self.wave_deferred_dirty.clear();
-        self.cur_strip_eval = None;
-        if self.call_stack.is_empty() && self.scc_stack.is_empty() {
-            return;
-        }
-        let paused = core::mem::take(&mut self.call_stack);
-        for fid in paused {
-            match self.node_state(fid) {
-                STATE_EVALUATING => {
-                    self.set_node_state(fid, STATE_DIRTY);
-                    self.dirty_queue.push(fid);
-                    self.dirty_needs_sort = true;
-                }
-                STATE_EVALUATING_MAYBE => {
-                    self.set_node_state(fid, STATE_MAYBE_DIRTY);
-                    self.dirty_queue.push(fid);
-                    self.dirty_needs_sort = true;
-                }
-                _ => {}
-            }
-        }
-        let parked = core::mem::take(&mut self.scc_stack);
-        self.scc_low.clear();
-        for fid in parked {
-            if self.node_state(fid) == STATE_SCC_WAIT {
-                self.set_node_state(fid, STATE_DIRTY);
-                self.dirty_queue.push(fid);
-                self.dirty_needs_sort = true;
-            }
-        }
+        self.abandon_settlement();
+        self.wave_spill_requeues.clear();
+        self.wave_without_cutoff = false;
+        self.unwind_call_stack();
     }
 
-    fn release_scc_wait_at_or_above(&mut self, min_pos: usize) {
-        self.release_scc_wait_while(Some(min_pos));
+    /// Evaluates formulas again whose references are computed (`INDIRECT`,
+    /// `OFFSET`) if a spill moved since: nothing else tells them that a cell they
+    /// looked at got or lost a spilled value.
+    fn wake_dynamic_references(&mut self) -> bool {
+        if !core::mem::take(&mut self.spilled_cells_changed) || self.dynamic_ref_set.is_empty() {
+            return false;
+        }
+        let mut roots = DirtyRoots::default();
+        roots.singles.extend(&self.dynamic_ref_set);
+        self.propagate_dirty_in_wave_roots(roots, &[]);
+        true
+    }
+
+    fn push_frame(&mut self, node: u32) {
+        self.call_stack.push(Frame { node, entered: 0 });
+    }
+
+    /// Puts the dirty precedents the top frame is waiting for on the stack, the
+    /// first one on top, and returns how much work they hold.
+    fn push_precedents(&mut self, deps: &[u32]) -> usize {
+        if let Some(frame) = self.call_stack.last() {
+            self.waiting_since.insert(frame.node, frame.entered);
+        }
+        let mut work = 0usize;
+        for &dep_fid in deps.iter().rev() {
+            if matches!(self.node_state(dep_fid), STATE_DIRTY | STATE_MAYBE_DIRTY) {
+                work = work.saturating_add(self.node_remaining_work(dep_fid));
+                self.push_frame(dep_fid);
+            }
+        }
+        if self.call_stack.len() > self.call_stack_limit {
+            self.drop_repeated_frames();
+        }
+        work
+    }
+
+    /// Drops frames that were not entered yet and whose formula is on the stack
+    /// again further up: it will have its value before they are reached. Formulas
+    /// that wait for many of the same precedents would otherwise make the stack
+    /// grow with the number of references instead of the number of formulas.
+    fn drop_repeated_frames(&mut self) {
+        let mut seen: FxSet<u32> = FxSet::default();
+        let mut kept: Vec<Frame> = Vec::new();
+        for &frame in self.call_stack.iter().rev() {
+            if seen.insert(frame.node) || frame.entered != 0 {
+                kept.push(frame);
+            }
+        }
+        kept.reverse();
+        self.call_stack = kept;
+        self.call_stack_limit = self
+            .call_stack
+            .len()
+            .saturating_mul(2)
+            .max(MIN_CALL_STACK_LIMIT);
+    }
+
+    /// Returns the entry order of the top frame, assigning it on the first visit.
+    fn enter_top_frame(&mut self) -> u32 {
+        let next = self.frames_entered.saturating_add(1);
+        match self.call_stack.last_mut() {
+            Some(frame) if frame.entered == 0 => {
+                frame.entered = next;
+                self.frames_entered = next;
+                next
+            }
+            Some(frame) => frame.entered,
+            None => 0,
+        }
     }
 
     fn release_all_scc_wait_to_dirty(&mut self) {
-        self.release_scc_wait_while(None);
+        self.release_scc_wait_since(0);
     }
 
-    fn release_scc_wait_while(&mut self, min_pos: Option<usize>) {
+    /// Makes formulas parked since the frame entered as `entered` dirty again. Once
+    /// that frame has a value they are not on a loop with it.
+    fn release_scc_wait_since(&mut self, entered: u32) {
         let mut repropagate = Vec::new();
         while let Some(&top) = self.scc_stack.last() {
-            if let Some(threshold) = min_pos
-                && self.scc_low.get(&top).copied().unwrap_or(0) < threshold
-            {
+            if top.entered < entered {
                 break;
             }
             let _ = self.scc_stack.pop();
+            let top = top.node;
             let _ = self.scc_low.remove(&top);
             if self.node_state(top) == STATE_SCC_WAIT {
                 if self.wave_deferred_dirty.contains(&top) {
@@ -5433,6 +5200,7 @@ impl FormulaEngine {
         }
         if self.dirty_cursor > 0 {
             self.dirty_queue.drain(0..self.dirty_cursor);
+            self.dirty_pass_end = self.dirty_pass_end.saturating_sub(self.dirty_cursor);
             self.dirty_cursor = 0;
         }
         self.ensure_levels_valid();
@@ -5477,6 +5245,7 @@ impl FormulaEngine {
             (lvl, key, fid)
         });
         self.dirty_queue.dedup();
+        self.dirty_pass_end = self.dirty_queue.len();
         self.dirty_needs_sort = false;
     }
 
@@ -5742,42 +5511,16 @@ impl FormulaEngine {
             });
     }
 
-    fn collect_cleared_spill_dependents(
-        &self,
-        fid: u32,
-        key: WorkbookCellKey,
-        clear_out: &crate::spill::ClearSpillOutcome,
-        post_dirty: &mut DirtyRoots,
-    ) {
-        for &shadow_key in &clear_out.cleared_shadows {
-            self.collect_direct_dependents(shadow_key, post_dirty);
-        }
-        self.collect_spill_anchor_dependents(key, &mut post_dirty.singles);
-        self.push_unblocked_watchers(&clear_out.unblocked_watchers, fid, &mut post_dirty.singles);
-    }
-
-    fn collect_strip_fids_in_scc(&self, cur_fid: u32, min_pos: usize) -> SmallVec<[u32; 4]> {
+    fn collect_strip_fids_in_scc(&self, cur_fid: u32, low: u32) -> SmallVec<[u32; 4]> {
         let mut sids: SmallVec<[u32; 4]> = SmallVec::new();
         if is_strip_fid(cur_fid) {
             let sid = strip_index(cur_fid);
             sids.push(sid);
         }
-        if let Some(slice) = self.call_stack.get(min_pos..) {
-            for &node in slice {
-                if is_strip_fid(node) {
-                    let sid = strip_index(node);
-                    if !sids.contains(&sid) {
-                        sids.push(sid);
-                    }
-                }
-            }
-        }
-        for &node in self.scc_stack.iter().rev() {
-            if self.scc_low.get(&node).copied().unwrap_or(0) < min_pos {
-                break;
-            }
-            if is_strip_fid(node) {
-                let sid = strip_index(node);
+        let entered = self.call_stack.iter().rev().filter(|f| f.entered != 0);
+        for frame in entered.take_while(|f| f.entered >= low) {
+            if is_strip_fid(frame.node) {
+                let sid = strip_index(frame.node);
                 if !sids.contains(&sid) {
                     sids.push(sid);
                 }
@@ -5786,12 +5529,19 @@ impl FormulaEngine {
         sids
     }
 
-    fn handle_cycle(&mut self, cur_fid: u32, min_pos: usize) {
-        let strip_sids = self.collect_strip_fids_in_scc(cur_fid, min_pos);
+    /// Handles the formula on top of the stack waiting on a loop that reaches back
+    /// to the formula entered as `low`: it is parked until evaluation returns
+    /// there, or, when that is the formula itself, completes the loop.
+    fn handle_cycle(&mut self, cur_fid: u32, low: u32) {
+        let strip_sids = self.collect_strip_fids_in_scc(cur_fid, low);
         if !strip_sids.is_empty() {
-            let target_len = min_pos.min(self.call_stack.len());
+            let target_len = self
+                .call_stack
+                .iter()
+                .position(|frame| frame.entered >= low && frame.entered != 0)
+                .unwrap_or(self.call_stack.len());
             while self.call_stack.len() > target_len {
-                if let Some(frame) = self.call_stack.pop()
+                if let Some(Frame { node: frame, .. }) = self.call_stack.pop()
                     && !is_strip_fid(frame)
                     && matches!(
                         self.state_of(frame),
@@ -5803,14 +5553,10 @@ impl FormulaEngine {
                     self.dirty_needs_sort = true;
                 }
             }
-            while let Some(&top) = self.scc_stack.last() {
-                if self.scc_low.get(&top).copied().unwrap_or(0) < min_pos {
-                    break;
-                }
-                let _ = self.scc_stack.pop();
+            while let Some(Frame { node: top, .. }) = self.scc_stack.pop() {
                 let _ = self.scc_low.remove(&top);
-                if !is_strip_fid(top) && self.state_of(top) == STATE_SCC_WAIT {
-                    self.set_state(top, STATE_DIRTY);
+                if self.node_state(top) == STATE_SCC_WAIT {
+                    self.set_node_state(top, STATE_DIRTY);
                     self.dirty_queue.push(top);
                     self.dirty_needs_sort = true;
                 }
@@ -5822,123 +5568,59 @@ impl FormulaEngine {
             return;
         }
 
-        let my_pos = self.call_stack.len().saturating_sub(1);
-        if min_pos < my_pos {
-            let _ = self.call_stack.pop();
+        let Some(frame) = self.call_stack.pop() else {
+            return;
+        };
+        if low < frame.entered {
             self.set_state(cur_fid, STATE_SCC_WAIT);
-            self.scc_stack.push(cur_fid);
-            self.scc_low.insert(cur_fid, min_pos);
+            self.scc_stack.push(frame);
+            self.scc_low.insert(cur_fid, low);
             return;
         }
-        let _ = self.call_stack.pop();
         let mut scc_fids: SmallVec<[u32; 8]> = SmallVec::new();
         scc_fids.push(cur_fid);
         while let Some(&top) = self.scc_stack.last() {
-            let top_low = self.scc_low.get(&top).copied().unwrap_or(0);
-            if top_low < my_pos {
+            if top.entered < frame.entered {
                 break;
             }
             let _ = self.scc_stack.pop();
-            let _ = self.scc_low.remove(&top);
-            if self.state_of(top) == STATE_SCC_WAIT {
-                scc_fids.push(top);
+            let _ = self.scc_low.remove(&top.node);
+            if self.state_of(top.node) == STATE_SCC_WAIT {
+                scc_fids.push(top.node);
             }
         }
 
-        let mut active_spill_fids: SmallVec<[u32; 4]> = SmallVec::new();
-        let mut unverified_cycle_spill_fids: SmallVec<[u32; 4]> = SmallVec::new();
-        let mut needs_verify = false;
-        for &fid in &scc_fids {
-            if let Some(key) = self.slot_of(fid).map(|s| s.key) {
-                if self.spills.active_spill(key).is_some() {
-                    active_spill_fids.push(fid);
-                    if !self.wave_cycle_verified.contains(&fid) {
-                        needs_verify = true;
-                    }
-                } else if self.cycle_spills.contains_key(&key)
-                    && !self.wave_cycle_verified.contains(&fid)
-                {
-                    unverified_cycle_spill_fids.push(fid);
-                    needs_verify = true;
-                }
-            }
-        }
-        if needs_verify {
-            // Clear stale active spills (and unverified prior-wave cycle watches)
-            // along the candidate SCC once per wave so conditional formulas that
-            // stop spilling re-evaluate before `#CYCLE!` is committed.
-            for fid in active_spill_fids {
-                self.wave_cycle_verified.insert(fid);
-            }
-            for &fid in &unverified_cycle_spill_fids {
-                self.wave_cycle_verified.insert(fid);
-            }
-            let mut cleared_anchors = Vec::new();
-            let mut post_dirty = DirtyRoots::default();
-            for &fid in &scc_fids {
-                if let Some(key) = self.slot_of(fid).map(|s| s.key) {
-                    if self.spills.active_spill(key).is_some() {
-                        let clear_out = self.spills.clear_anchor(key);
-                        if clear_out.had_state {
-                            self.record_changed_cells(&clear_out.cleared_shadows);
-                            cleared_anchors.push((fid, key, clear_out));
-                        }
-                    } else if unverified_cycle_spill_fids.contains(&fid) {
-                        self.drain_cycle_spill_anchor(key, None, &mut post_dirty.singles);
-                    }
-                }
-                self.set_state(fid, STATE_DIRTY);
-                self.dirty_queue.push(fid);
-                self.dirty_needs_sort = true;
-            }
-            for (fid, key, clear_out) in cleared_anchors {
-                self.collect_cleared_spill_dependents(fid, key, &clear_out, &mut post_dirty);
-            }
-            if !post_dirty.singles.is_empty() || !post_dirty.strips.is_empty() {
-                self.propagate_dirty_in_wave_roots(post_dirty, &[]);
-            }
-            self.flush_deferred_dirty();
+        if self.settle.active {
+            self.commit_settling_loop(&scc_fids);
             return;
         }
 
-        let mut cleared_anchors = Vec::new();
-        let mut retained_cycle_anchors: SmallVec<[WorkbookCellKey; 4]> = SmallVec::new();
-        let mut unwound_keys: SmallVec<[WorkbookCellKey; 8]> = SmallVec::new();
-        let mut post_dirty = DirtyRoots::default();
+        // A spill on the loop may be a leftover of earlier values or the very reason
+        // for the loop; only a settlement can tell.
+        let touches_spill = scc_fids.iter().any(|&fid| {
+            self.slot_of(fid)
+                .is_some_and(|s| self.spills.active_spill(s.key).is_some())
+        });
+        if touches_spill {
+            self.flag_spill_tangle();
+            for &fid in &scc_fids {
+                self.set_state(fid, STATE_DIRTY);
+                self.dirty_queue.push(fid);
+            }
+            self.dirty_needs_sort = true;
+            return;
+        }
+
         for &fid in &scc_fids {
             if let Some(key) = self.slot_of(fid).map(|s| s.key) {
-                let clear_out = self.spills.clear_anchor(key);
-                if clear_out.had_state {
-                    self.record_changed_cells(&clear_out.cleared_shadows);
-                    cleared_anchors.push((fid, key, clear_out));
-                } else if self.cycle_spills.contains_key(&key) {
-                    retained_cycle_anchors.push(key);
-                } else {
-                    self.drain_cycle_spill_anchor(key, None, &mut post_dirty.singles);
-                }
+                let _ = self.spills.release(key);
+                self.loop_members.insert(key);
                 if self.store_eval_scalar(key, EvalScalar::Error(CalcError::Cycle)) {
                     self.upgrade_cell_dependents_to_dirty(key);
                 }
-                unwound_keys.push(key);
             }
             self.set_state(fid, STATE_CLEAN);
             self.wave_done = self.wave_done.saturating_add(1);
-        }
-        for key in retained_cycle_anchors {
-            if let Some(rec) = self.cycle_spills.get_mut(&key) {
-                for &peer in &unwound_keys {
-                    if peer != key && !rec.peers.contains(&peer) {
-                        rec.peers.push(peer);
-                    }
-                }
-            }
-        }
-        for (fid, key, clear_out) in cleared_anchors {
-            self.record_cycle_spill(key, &unwound_keys, &clear_out.cleared_shadows);
-            self.collect_cleared_spill_dependents(fid, key, &clear_out, &mut post_dirty);
-        }
-        if !post_dirty.singles.is_empty() || !post_dirty.strips.is_empty() {
-            self.propagate_dirty_in_wave_roots(post_dirty, &scc_fids);
         }
         self.flush_deferred_dirty();
     }
@@ -6115,7 +5797,7 @@ impl FormulaEngine {
             }
             BoundExpr::Binary { op, left, right } => {
                 let mut blocked: SmallVec<[u32; 4]> = SmallVec::new();
-                let mut cycle_low: Option<usize> = None;
+                let mut cycle_low: Option<u32> = None;
                 let lhs_val = self.eval_and_check_ready(
                     left,
                     caller,
@@ -6225,7 +5907,7 @@ impl FormulaEngine {
             };
 
             let mut blocked: SmallVec<[u32; 4]> = SmallVec::new();
-            let mut cycle_low: Option<usize> = None;
+            let mut cycle_low: Option<u32> = None;
             let when_true = if need_true {
                 let Some(t_expr) = args.get(1) else {
                     return ExprOutcome::Ready(EvalValue::Scalar(EvalScalar::Error(
@@ -6355,7 +6037,7 @@ impl FormulaEngine {
             let mut evaluated_choices: Vec<Option<EvalValue>> =
                 Vec::with_capacity(choice_exprs.len());
             let mut blocked: SmallVec<[u32; 4]> = SmallVec::new();
-            let mut cycle_low: Option<usize> = None;
+            let mut cycle_low: Option<u32> = None;
             for (i, c_expr) in choice_exprs.iter().enumerate() {
                 if !needed_mask.get(i).copied().unwrap_or(false) {
                     evaluated_choices.push(None);
@@ -6448,7 +6130,7 @@ impl FormulaEngine {
             }
             let mut branch_vals = Vec::with_capacity(pair_count);
             let mut blocked: SmallVec<[u32; 4]> = SmallVec::new();
-            let mut cycle_low: Option<usize> = None;
+            let mut cycle_low: Option<u32> = None;
             for pair_idx in 0..pair_count {
                 let Some(cond_sa) = conds_so_far.get(pair_idx) else {
                     branch_vals.push(None);
@@ -6592,7 +6274,7 @@ impl FormulaEngine {
             let mut evaled_cands = Vec::with_capacity(pair_count);
             let mut evaled_res = Vec::with_capacity(pair_count);
             let mut blocked: SmallVec<[u32; 4]> = SmallVec::new();
-            let mut cycle_low: Option<usize> = None;
+            let mut cycle_low: Option<u32> = None;
             for p in 0..pair_count {
                 let (Some(cand_e), Some(res_e)) = (
                     rest.get(p.saturating_mul(2)),
@@ -6705,7 +6387,7 @@ impl FormulaEngine {
             let mut evaled = Vec::with_capacity(args.len());
             evaled.push(base_ref.clone());
             let mut blocked: SmallVec<[u32; 4]> = SmallVec::new();
-            let mut cycle_low: Option<usize> = None;
+            let mut cycle_low: Option<u32> = None;
             for arg in args.get(1..).unwrap_or(&[]) {
                 if let Some(v) =
                     self.eval_and_check_ready(arg, caller, depth, &mut blocked, &mut cycle_low)
@@ -6852,7 +6534,7 @@ impl FormulaEngine {
 
         let mut evaluated_args = Vec::with_capacity(args.len());
         let mut all_blocked: SmallVec<[u32; 4]> = SmallVec::new();
-        let mut cycle_low: Option<usize> = None;
+        let mut cycle_low: Option<u32> = None;
         for arg in args {
             let val_opt = if deref_args {
                 self.eval_and_check_ready(arg, caller, depth, &mut all_blocked, &mut cycle_low)
@@ -6906,7 +6588,7 @@ impl FormulaEngine {
         caller: CallerContext,
         depth: usize,
         blocked: &mut SmallVec<[u32; 4]>,
-        cycle_low: &mut Option<usize>,
+        cycle_low: &mut Option<u32>,
     ) -> Option<EvalValue> {
         let val = match self.eval_expr(expr, caller, false, depth) {
             ExprOutcome::Ready(v) => v,
@@ -6930,18 +6612,19 @@ impl FormulaEngine {
         Some(val)
     }
 
-    fn wait_outcome(blocked: SmallVec<[u32; 4]>, cycle_low: Option<usize>) -> Option<ExprOutcome> {
+    fn wait_outcome(blocked: SmallVec<[u32; 4]>, cycle_low: Option<u32>) -> Option<ExprOutcome> {
         if !blocked.is_empty() {
             return Some(ExprOutcome::Blocked(blocked));
         }
         cycle_low.map(ExprOutcome::Cycle)
     }
 
-    fn cycle_low_of(&self, fid: u32) -> Option<usize> {
+    fn cycle_low_of(&self, fid: u32) -> Option<u32> {
         match self.node_state(fid) {
-            STATE_EVALUATING | STATE_EVALUATING_MAYBE => {
-                self.call_stack.iter().rposition(|&f| f == fid)
-            }
+            STATE_EVALUATING | STATE_EVALUATING_MAYBE => match self.call_stack.last() {
+                Some(top) if top.node == fid => Some(top.entered),
+                _ => self.waiting_since.get(&fid).copied(),
+            },
             STATE_SCC_WAIT => self.scc_low.get(&fid).copied(),
             _ => None,
         }
@@ -6951,7 +6634,7 @@ impl FormulaEngine {
         &self,
         fid: u32,
         blocked: &mut SmallVec<[u32; 4]>,
-        cycle_low: &mut Option<usize>,
+        cycle_low: &mut Option<u32>,
     ) {
         match self.node_state(fid) {
             STATE_EVALUATING | STATE_EVALUATING_MAYBE | STATE_SCC_WAIT => {
@@ -6959,13 +6642,9 @@ impl FormulaEngine {
                     merge_cycle(cycle_low, low);
                 }
             }
-            STATE_DIRTY | STATE_MAYBE_DIRTY => {
-                if let Some(low) = self.call_stack.iter().rposition(|&f| f == fid) {
-                    merge_cycle(cycle_low, low);
-                } else if !blocked.contains(&fid) {
-                    blocked.push(fid);
-                }
-            }
+            // A dirty node further down the stack is a precedent waiting for its turn,
+            // not one being evaluated: only the latter closes a loop.
+            STATE_DIRTY | STATE_MAYBE_DIRTY => push_blocked(blocked, fid),
             _ => {}
         }
     }
@@ -6975,14 +6654,12 @@ impl FormulaEngine {
             return Ok(());
         };
         let mut blocked: SmallVec<[u32; 4]> = SmallVec::new();
-        let mut cycle_low: Option<usize> = None;
+        let mut cycle_low: Option<u32> = None;
         let mut absorb = |res: Result<(), ExprOutcome>| match res {
             Ok(()) | Err(ExprOutcome::Ready(_)) => {}
             Err(ExprOutcome::Blocked(deps)) => {
                 for dep in deps {
-                    if !blocked.contains(&dep) {
-                        blocked.push(dep);
-                    }
+                    push_blocked(&mut blocked, dep);
                 }
             }
             Err(ExprOutcome::Cycle(low)) => merge_cycle(&mut cycle_low, low),
@@ -7005,14 +6682,12 @@ impl FormulaEngine {
             return Ok(());
         };
         let mut blocked: SmallVec<[u32; 4]> = SmallVec::new();
-        let mut cycle_low: Option<usize> = None;
+        let mut cycle_low: Option<u32> = None;
         let mut absorb = |res: Result<(), ExprOutcome>| match res {
             Ok(()) | Err(ExprOutcome::Ready(_)) => {}
             Err(ExprOutcome::Blocked(deps)) => {
                 for dep in deps {
-                    if !blocked.contains(&dep) {
-                        blocked.push(dep);
-                    }
+                    push_blocked(&mut blocked, dep);
                 }
             }
             Err(ExprOutcome::Cycle(low)) => merge_cycle(&mut cycle_low, low),
@@ -7032,19 +6707,25 @@ impl FormulaEngine {
                 if lo >= hi {
                     continue;
                 }
-                let r1 = sub.row.base.saturating_add(u64::from(lo));
-                let r2 = if is_self_back {
+                if is_self_back {
+                    let r1 = sub.row.base.saturating_add(u64::from(lo));
                     if r1 >= strip.start_row.0 {
                         continue;
                     }
-                    sub.row
+                    let r2 = sub
+                        .row
                         .base
                         .saturating_add(u64::from(hi.saturating_sub(1)))
-                        .min(strip.start_row.0.saturating_sub(1))
-                } else {
-                    sub.row.base.saturating_add(u64::from(hi.saturating_sub(1)))
+                        .min(strip.start_row.0.saturating_sub(1));
+                    absorb(self.check_span_ready(s, r1, r2, col.0, col.0));
+                    continue;
+                }
+                let Some(sh) = self.workbook.sheet(s) else {
+                    continue;
                 };
-                absorb(self.check_span_ready(s, r1, r2, col.0, col.0));
+                if let Some((r1, r2)) = affine_rows_hull(&[sub.row], lo, hi, sh.row_axis()) {
+                    absorb(self.check_span_ready(s, r1, r2, col.0, col.0));
+                }
             }
         }
         for &(s, sub) in strip.reg.area_subs() {
@@ -7064,9 +6745,10 @@ impl FormulaEngine {
                 if lo >= hi {
                     continue;
                 }
-                let r1 = sub.first_row.resolve(lo).0;
-                let r2 = sub.last_row.resolve(hi.saturating_sub(1)).0;
-                absorb(self.check_span_ready(s, r1, r2, c1, c2));
+                let ends = [sub.first_row, sub.last_row];
+                if let Some((r1, r2)) = affine_rows_hull(&ends, lo, hi, sh.row_axis()) {
+                    absorb(self.check_span_ready(s, r1, r2, c1, c2));
+                }
             }
         }
         strip
@@ -7083,7 +6765,7 @@ impl FormulaEngine {
     fn check_cell_ready(&self, sheet: SheetId, row: RowId, col: ColId) -> Result<(), ExprOutcome> {
         let target_key = (sheet, row, col);
         let mut blocked: SmallVec<[u32; 4]> = SmallVec::new();
-        let mut cycle_low: Option<usize> = None;
+        let mut cycle_low: Option<u32> = None;
         let fid_opt = self.cell_to_fid.get(&target_key).copied().or_else(|| {
             if let Some((sid, off)) = self.strip_covering_cell(target_key) {
                 let is_cur_back = self.cur_strip_eval.is_some_and(|(cur_sid, cur_off)| {
@@ -7111,13 +6793,6 @@ impl FormulaEngine {
         });
         if let Some(fid) = fid_opt {
             self.record_fid_wait(fid, &mut blocked, &mut cycle_low);
-        }
-        if let Some(anchors) = self.cycle_shadow_watch.get(&target_key) {
-            for &anchor in anchors {
-                if let Some(&fid) = self.cell_to_fid.get(&anchor) {
-                    self.record_fid_wait(fid, &mut blocked, &mut cycle_low);
-                }
-            }
         }
         if let Some(wait) = Self::wait_outcome(blocked, cycle_low) {
             return Err(wait);
@@ -7227,16 +6902,12 @@ impl FormulaEngine {
                     }
                 }
             });
-        if active_single_cols.is_empty()
-            && active_strip_cols.is_empty()
-            && shadow_cols.is_empty()
-            && self.cycle_shadow_watch.is_empty()
-        {
+        if active_single_cols.is_empty() && active_strip_cols.is_empty() && shadow_cols.is_empty() {
             return Ok(());
         }
 
         let mut blocked: SmallVec<[u32; 4]> = SmallVec::new();
-        let mut cycle_low: Option<usize> = None;
+        let mut cycle_low: Option<u32> = None;
         if !active_single_cols.is_empty() {
             sheet
                 .row_axis()
@@ -7283,33 +6954,6 @@ impl FormulaEngine {
                             self.record_fid_wait(fid, &mut blocked, &mut cycle_low);
                         }
                     });
-            }
-        }
-
-        if !self.cycle_shadow_watch.is_empty()
-            && let Some((c1_ord, c2_ord)) =
-                live_span_positions(sheet.col_axis(), first_col, last_col)
-        {
-            let start = (sheet_id, RowId(0), ColId(0));
-            let end = (sheet_id, RowId(u64::MAX), ColId(u64::MAX));
-            for (&(_, cell_row, cell_col), anchors) in self.cycle_shadow_watch.range(start..=end) {
-                let Some(r_pos) = sheet.row_axis().id_to_pos(cell_row.0) else {
-                    continue;
-                };
-                if r_pos < r1_ord || r_pos > r2_ord {
-                    continue;
-                }
-                let Some(c_pos) = sheet.col_axis().id_to_pos(cell_col.0) else {
-                    continue;
-                };
-                if c_pos < c1_ord || c_pos > c2_ord {
-                    continue;
-                }
-                for &anchor in anchors {
-                    if let Some(&fid) = self.cell_to_fid.get(&anchor) {
-                        self.record_fid_wait(fid, &mut blocked, &mut cycle_low);
-                    }
-                }
             }
         }
 
@@ -7485,6 +7129,31 @@ fn walk_affine_eligibility(
     }
 }
 
+/// The first and last row, in axis order, that `ends` refer to for the strip
+/// offsets `lo..hi`. References that moved apart are followed one by one.
+fn affine_rows_hull(ends: &[AffineRow], lo: u32, hi: u32, row_axis: &Axis) -> Option<(u64, u64)> {
+    let mut hull: Option<((u32, u64), (u32, u64))> = None;
+    let mut include = |row: RowId| {
+        if let Some(order) = row_axis.axis_order_of(row.0) {
+            let at = (order, row.0);
+            hull = Some(hull.map_or((at, at), |(first, last)| (first.min(at), last.max(at))));
+        }
+    };
+    for end in ends {
+        let first = end.resolve(lo);
+        let last = end.resolve(hi.saturating_sub(1));
+        if end.stride == 0 || row_axis.single_run_covers(first.0, hi.saturating_sub(lo)) {
+            include(first);
+            include(last);
+        } else {
+            for offset in lo..hi {
+                include(end.resolve(offset));
+            }
+        }
+    }
+    hull.map(|(first, last)| (first.1, last.1))
+}
+
 fn strip_run_overlap(strip: &StripSlot, run: IdRun) -> Option<(u32, u32)> {
     if id_stream(run.first_id) != id_stream(strip.start_row.0) {
         return None;
@@ -7627,7 +7296,20 @@ fn workbook_fallback_sheet(workbook: &Workbook<BoundFormula>) -> SheetId {
         .map_or(SheetId(0), Sheet::id)
 }
 
-const fn merge_cycle(dst: &mut Option<usize>, pos: usize) {
+/// Adds `fid` to the precedents to wait for. Long lists are not searched for
+/// repetitions: they are rare there, and harmless.
+fn push_blocked(blocked: &mut SmallVec<[u32; 4]>, fid: u32) {
+    let is_known = if blocked.len() < 64 {
+        blocked.contains(&fid)
+    } else {
+        blocked.last() == Some(&fid)
+    };
+    if !is_known {
+        blocked.push(fid);
+    }
+}
+
+const fn merge_cycle(dst: &mut Option<u32>, pos: u32) {
     *dst = Some(match *dst {
         Some(cur) if cur <= pos => cur,
         _ => pos,
@@ -9860,7 +9542,7 @@ mod tests {
             );
         }
 
-        // 13. Stale `cycle_spills` peers wake cleanly when an anchor enters a new `#CYCLE!`.
+        // 13. Formulas held at `#CYCLE!` wake cleanly when an anchor enters a new loop.
         let mut s5 = FormulaEngine::new();
         s5.edit_cell_raw(s0, RowId(3), ColId(1), "=B1:C1").unwrap();
         s5.recalc_all();
@@ -9919,6 +9601,583 @@ mod tests {
                 expected
             );
         }
+    }
+
+    /// Values and spill shadows of the top-left 8 x 8 cells, by position.
+    fn spill_grid(eng: &FormulaEngine) -> Vec<(Value, Option<crate::value_eval::EvalScalar>)> {
+        let sheet = eng.workbook().sheet(SheetId(0)).unwrap();
+        let mut cells = Vec::new();
+        for r in 0..8 {
+            for c in 0..8 {
+                let row = RowId(sheet.row_axis().pos_to_id(r).unwrap());
+                let col = ColId(sheet.col_axis().pos_to_id(c).unwrap());
+                let shadow = eng.spills().shadow_value(SheetId(0), row, col).cloned();
+                cells.push((sheet.value_by_id(row, col), shadow));
+            }
+        }
+        cells
+    }
+
+    #[test]
+    fn settled_spills_do_not_depend_on_edit_order() {
+        let s0 = SheetId(0);
+        let at = |eng: &FormulaEngine, r: u64, c: u64| {
+            let sheet = eng.workbook().sheet(s0).unwrap();
+            sheet.value_by_id(RowId(r), ColId(c))
+        };
+        let num = Value::Number;
+        let err = Value::Error;
+        type Formulas = [(u64, u64, &'static str); 3];
+        let cases: [(Formulas, [Value; 3]); 6] = [
+            // Arrays that read each other's cells and want the same one: the
+            // collision counts, and without spills there is no loop.
+            (
+                [(0, 3, "=B2:C3"), (1, 2, "=D2:E2"), (5, 5, "=IFERROR(D1,7)")],
+                [err(CalcError::Spill), err(CalcError::Spill), num(7.0)],
+            ),
+            // A spill reading itself stays a loop for everyone who looks at it.
+            (
+                [
+                    (0, 2, "=C2:D3"),
+                    (1, 1, "=C1#"),
+                    (6, 0, "=COUNTBLANK(C2:D3)"),
+                ],
+                [err(CalcError::Cycle), err(CalcError::Ref), num(4.0)],
+            ),
+            // C6 changes its shape once it sees A1's spill, which then no longer
+            // reads C6's.
+            (
+                [
+                    (5, 2, "=IF(COUNT(A1:B2)>1,SEQUENCE(2),{1,2,3})"),
+                    (0, 0, "=TRANSPOSE(D5:E6)"),
+                    (7, 7, "=SUM(D6:E6)"),
+                ],
+                [num(1.0), num(0.0), num(0.0)],
+            ),
+            // The same with the spill that decides evaluated last.
+            (
+                [
+                    (0, 4, "=IFERROR(B6#,{5;6})"),
+                    (5, 1, "=UNIQUE(D2:E3)"),
+                    (7, 0, "=COUNTBLANK(E1:E3)"),
+                ],
+                [num(0.0), num(0.0), num(2.0)],
+            ),
+            // The reader of a spill yields to it, however far apart they are.
+            (
+                [(5, 2, "={1,2;3,4}"), (4, 3, "=C7:C8"), (0, 0, "=D5")],
+                [num(1.0), err(CalcError::Spill), err(CalcError::Spill)],
+            ),
+            // Equal formulas below each other form a strip, yet each has its spill.
+            (
+                [(2, 2, "=A1:A2"), (3, 2, "=A1:A2"), (0, 0, "4")],
+                [err(CalcError::Spill), num(4.0), num(4.0)],
+            ),
+        ];
+        let orders = [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ];
+        for (formulas, expected) in cases {
+            for order in orders {
+                let mut eng = FormulaEngine::new();
+                for i in order {
+                    let (r, c, raw) = formulas[i];
+                    eng.edit_cell_raw(s0, RowId(r), ColId(c), raw).unwrap();
+                    eng.recalc_all();
+                }
+                let fresh = FormulaEngine::from_workbook_recalc_all(eng.workbook().clone());
+                for ((r, c, raw), value) in formulas.into_iter().zip(expected) {
+                    assert_eq!(at(&eng, r, c), value, "{raw} entered in order {order:?}");
+                }
+                assert_eq!(
+                    spill_grid(&eng),
+                    spill_grid(&fresh),
+                    "{formulas:?} {order:?}"
+                );
+
+                // Retyping a formula, stepping one evaluation at a time and compacting
+                // all start from another state and must end in the same one.
+                let (r, c, raw) = formulas[order[0]];
+                eng.edit_cell_raw(s0, RowId(r), ColId(c), raw).unwrap();
+                while matches!(eng.recalc_step(1), RecalcStatus::InProgress { .. }) {}
+                assert_eq!(
+                    spill_grid(&eng),
+                    spill_grid(&fresh),
+                    "{formulas:?} {order:?}"
+                );
+                eng.compact_local_garbage();
+                assert_eq!(
+                    spill_grid(&eng),
+                    spill_grid(&fresh),
+                    "{formulas:?} {order:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn disputes_are_settled_again_when_anything_they_depend_on_changes() {
+        let s0 = SheetId(0);
+        let mut eng = FormulaEngine::new();
+        for (r, c, raw) in [
+            (0, 1, "=IF(A1=1,SEQUENCE(3),9)"), // B1:B3 while A1 = 1
+            (1, 0, "={1,2}"),                  // A2:B2 collides with it
+            (4, 0, "=A5:A6+A8"),               // A5:A6 reads itself
+            (6, 3, "=SUM(B1:B3)"),
+        ] {
+            eng.edit_cell_raw(s0, RowId(r), ColId(c), raw).unwrap();
+        }
+        for (r, c, raw) in [
+            (0, 0, "1"),
+            (2, 1, "x"),
+            (2, 1, ""),
+            (0, 0, "2"),
+            (4, 0, "=A7:A8"),
+            (0, 0, "1"),
+            (1, 1, "5"),
+            (5, 0, "=B1#"),
+            (1, 1, ""),
+            (1, 0, ""),
+            (4, 0, ""),
+        ] {
+            eng.edit_cell_raw(s0, RowId(r), ColId(c), raw).unwrap();
+            eng.recalc_all();
+            let fresh = FormulaEngine::from_workbook_recalc_all(eng.workbook().clone());
+            assert_eq!(
+                spill_grid(&eng),
+                spill_grid(&fresh),
+                "after ({r}, {c}) = {raw:?}"
+            );
+        }
+        assert_eq!(eng.spill_range((s0, RowId(0), ColId(1))), Some((3, 1)));
+    }
+
+    #[test]
+    fn reader_of_many_spills_sees_all_of_them() {
+        let s0 = SheetId(0);
+        let mut eng = FormulaEngine::new();
+        eng.edit_cell_raw(s0, RowId(0), ColId(0), "=SUM(C2:C61)")
+            .unwrap();
+        for r in 1..=60 {
+            eng.edit_cell_raw(s0, RowId(r), ColId(1), &alloc::format!("={{{r},1}}"))
+                .unwrap();
+        }
+        eng.recalc_all();
+        let fresh = FormulaEngine::from_workbook_recalc_all(eng.workbook().clone());
+        for engine in [&eng, &fresh] {
+            let sheet = engine.workbook().sheet(s0).unwrap();
+            assert_eq!(sheet.value_by_id(RowId(0), ColId(0)), Value::Number(60.0));
+        }
+    }
+
+    #[test]
+    fn strips_reading_spills_pass_changes_on() {
+        let s0 = SheetId(0);
+        let mut eng = FormulaEngine::new();
+        // Rows 2..=6 read only what B1 spills, not B1 itself.
+        for row in 2..=6_u64 {
+            for (c, raw) in [
+                (3, alloc::format!("=IFERROR(B{row}+1,0)")),
+                (4, alloc::format!("=D{row}*2+A{row}")),
+            ] {
+                eng.edit_cell_raw(s0, RowId(row - 1), ColId(c), &raw)
+                    .unwrap();
+            }
+        }
+        eng.edit_cell_raw(s0, RowId(0), ColId(6), "=SUM(E2:E6)")
+            .unwrap();
+        eng.recalc_all();
+        for (raw, total) in [
+            ("={1;2;3}", 20.0),
+            ("={4;5}", 20.0),
+            ("=7", 10.0),
+            ("={1;1;1;1;1;1}", 20.0),
+            ("", 10.0),
+        ] {
+            eng.edit_cell_raw(s0, RowId(0), ColId(1), raw).unwrap();
+            eng.recalc_all();
+            let fresh = FormulaEngine::from_workbook_recalc_all(eng.workbook().clone());
+            for engine in [&eng, &fresh] {
+                let sheet = engine.workbook().sheet(s0).unwrap();
+                let sum = sheet.value_by_id(RowId(0), ColId(6));
+                assert_eq!(sum, Value::Number(total), "after B1 = {raw:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn early_cutoff_never_reports_loops_that_evaluation_does_not_take() {
+        let s0 = SheetId(0);
+        let cell = |eng: &FormulaEngine, r: u64, c: u64| {
+            let sheet = eng.workbook().sheet(s0).unwrap();
+            sheet.value_by_id(RowId(r), ColId(c))
+        };
+
+        // A guarded loop: while C1 = 1, A1 does not read B1.
+        let mut guarded = FormulaEngine::new();
+        for (r, c, raw) in [
+            (0, 0, "=IF(C1=1,5,B1)"),
+            (0, 1, "=A1+D1"),
+            (0, 2, "1"),
+            (0, 3, "1"),
+        ] {
+            guarded.edit_cell_raw(s0, RowId(r), ColId(c), raw).unwrap();
+        }
+        guarded.recalc_all();
+        for d1 in ["2", "3"] {
+            guarded.edit_cell_raw(s0, RowId(0), ColId(3), d1).unwrap();
+            guarded.recalc_all();
+            let expected = Value::Number(5.0 + d1.parse::<f64>().unwrap());
+            assert_eq!(cell(&guarded, 0, 0), Value::Number(5.0));
+            assert_eq!(cell(&guarded, 0, 1), expected);
+        }
+        guarded.edit_cell_raw(s0, RowId(0), ColId(2), "0").unwrap();
+        guarded.recalc_all();
+        assert_eq!(cell(&guarded, 0, 0), Value::Error(CalcError::Cycle));
+        assert_eq!(cell(&guarded, 0, 1), Value::Error(CalcError::Cycle));
+        guarded.edit_cell_raw(s0, RowId(0), ColId(2), "1").unwrap();
+        guarded.recalc_all();
+        assert_eq!(cell(&guarded, 0, 1), Value::Number(8.0));
+
+        // A loop through a deleted row: what is left of it reads nothing.
+        let mut deleted = FormulaEngine::new();
+        for (r, c, raw) in [(1, 2, "=B3:C4"), (2, 2, "=C2")] {
+            deleted.edit_cell_raw(s0, RowId(r), ColId(c), raw).unwrap();
+        }
+        deleted.recalc_all();
+        assert_eq!(cell(&deleted, 2, 2), Value::Error(CalcError::Cycle));
+        deleted
+            .apply_op(Op::DeleteRows {
+                sheet: s0,
+                ids: vec![IdRun::new(1, 1).unwrap()],
+            })
+            .unwrap();
+        deleted.recalc_all();
+        assert_eq!(cell(&deleted, 2, 2), Value::Error(CalcError::Ref));
+        deleted.edit_cell_raw(s0, RowId(3), ColId(1), "").unwrap();
+        deleted.recalc_all();
+        assert_eq!(cell(&deleted, 2, 2), Value::Error(CalcError::Ref));
+    }
+
+    #[test]
+    fn loops_contain_only_formulas_that_depend_on_themselves() {
+        let s0 = SheetId(0);
+        // A5 feeds the loop of C2 and A7 without depending on it; C1 reads the loop.
+        let formulas = [
+            (6, 1, "=B6#"),
+            (0, 0, "=COUNTIF(C2:E4,\">1\")"),
+            (0, 2, "=COUNTIF(C2:E4,\">1\")"),
+            (1, 2, "=COUNTIF(A5:C7,\">1\")"),
+            (6, 0, "=COUNTIF(C1:E3,\">1\")"),
+            (4, 0, "=COUNTIF(B5:D7,\">1\")"),
+        ];
+        for first in 0..formulas.len() {
+            let mut eng = FormulaEngine::new();
+            for i in 0..formulas.len() {
+                let (r, c, raw) = formulas[(first + i) % formulas.len()];
+                eng.edit_cell_raw(s0, RowId(r), ColId(c), raw).unwrap();
+                if i % 2 == first % 2 {
+                    eng.recalc_all();
+                }
+            }
+            eng.recalc_all();
+            let sheet = eng.workbook().sheet(s0).unwrap();
+            let cycle = Value::Error(CalcError::Cycle);
+            for (r, c, expected) in [
+                (1, 2, cycle),
+                (6, 0, cycle),
+                (0, 2, cycle),
+                (4, 0, Value::Number(0.0)),
+                (0, 0, Value::Number(0.0)),
+                (6, 1, Value::Error(CalcError::Ref)),
+            ] {
+                assert_eq!(
+                    sheet.value_by_id(RowId(r), ColId(c)),
+                    expected,
+                    "({r}, {c}) when starting with formula {first}"
+                );
+            }
+        }
+    }
+
+    /// Applies `steps` and checks after each of them that a recalculation from
+    /// scratch agrees.
+    fn assert_steps_match_full_recalc(steps: &[Step]) {
+        let s0 = SheetId(0);
+        let at = |a1: &str| {
+            let addr = crate::address::parse_cell_addr(a1).unwrap();
+            (RowId(u64::from(addr.row)), ColId(u64::from(addr.col)))
+        };
+        let mut eng = FormulaEngine::new();
+        for (i, step) in steps.iter().enumerate() {
+            match *step {
+                Step::Cell(a1, raw) => {
+                    let (row, col) = at(a1);
+                    eng.edit_cell_raw(s0, row, col, raw).unwrap();
+                }
+                Step::Fill(a1, len, raw) => {
+                    let (row, col) = at(a1);
+                    let mode = reticula_core::ops::FormulaMode::Dynamic;
+                    let bound =
+                        crate::binder::BoundFormula::parse_and_bind(raw, mode, eng.workbook(), s0)
+                            .unwrap();
+                    eng.apply_op(Op::FillFormula {
+                        sheet: s0,
+                        rows: vec![IdRun::new(row.0, len).unwrap()],
+                        cols: vec![IdRun::new(col.0, 1).unwrap()],
+                        template: crate::binder::templatize_formula(&bound, row, col),
+                    })
+                    .unwrap();
+                }
+                Step::ClearRows(a1, len) => {
+                    let (row, col) = at(a1);
+                    eng.apply_op(Op::ClearRange {
+                        sheet: s0,
+                        rows: vec![IdRun::new(row.0, len).unwrap()],
+                        cols: vec![IdRun::new(col.0, 1).unwrap()],
+                    })
+                    .unwrap();
+                }
+                Step::InsertRowAfter(after) => {
+                    let ids = eng.allocator_mut().alloc_run(1).unwrap();
+                    let after = Some(RowId(after));
+                    let sheet = s0;
+                    eng.apply_op(Op::InsertRows { sheet, after, ids }).unwrap();
+                }
+                Step::DeleteRow(id) => {
+                    let ids = vec![IdRun::new(id, 1).unwrap()];
+                    eng.apply_op(Op::DeleteRows { sheet: s0, ids }).unwrap();
+                }
+                Step::UndeleteRow(id) => {
+                    let ids = vec![IdRun::new(id, 1).unwrap()];
+                    eng.apply_op(Op::UndeleteRows { sheet: s0, ids }).unwrap();
+                }
+                Step::DeleteCol(id) => {
+                    let ids = vec![IdRun::new(id, 1).unwrap()];
+                    eng.apply_op(Op::DeleteCols { sheet: s0, ids }).unwrap();
+                }
+                Step::UndeleteCol(id) => {
+                    let ids = vec![IdRun::new(id, 1).unwrap()];
+                    eng.apply_op(Op::UndeleteCols { sheet: s0, ids }).unwrap();
+                }
+                Step::MoveRow(id, after) => {
+                    eng.apply_op(Op::MoveRows {
+                        sheet: s0,
+                        ids: vec![IdRun::new(id, 1).unwrap()],
+                        after: Some(RowId(after)),
+                    })
+                    .unwrap();
+                }
+            }
+            eng.recalc_all();
+            let fresh = FormulaEngine::from_workbook_recalc_all(eng.workbook().clone());
+            for s in eng.workbook().live_sheets() {
+                for r in 0..16 {
+                    for c in 0..8 {
+                        let row = RowId(s.row_axis().pos_to_id(r).unwrap());
+                        let col = ColId(s.col_axis().pos_to_id(c).unwrap());
+                        let show = |e: &FormulaEngine| {
+                            let sheet = e.workbook().sheet(s.id()).unwrap();
+                            let shadow = e.spills().shadow_value(s.id(), row, col).cloned();
+                            (sheet.value_by_id(row, col), shadow)
+                        };
+                        assert_eq!(show(&eng), show(&fresh), "({r}, {c}) after step {i}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum Step {
+        Cell(&'static str, &'static str),
+        Fill(&'static str, u32, &'static str),
+        ClearRows(&'static str, u32),
+        InsertRowAfter(u64),
+        DeleteRow(u64),
+        UndeleteRow(u64),
+        DeleteCol(u64),
+        UndeleteCol(u64),
+        MoveRow(u64, u64),
+    }
+
+    #[test]
+    fn filled_spills_return_with_their_row_or_column() {
+        use Step::{DeleteCol, DeleteRow, Fill, UndeleteCol, UndeleteRow};
+        assert_steps_match_full_recalc(&[
+            Fill("C2", 2, "={5,6}"),
+            DeleteRow(2),
+            UndeleteRow(2),
+            DeleteCol(2),
+            UndeleteCol(2),
+        ]);
+        assert_steps_match_full_recalc(&[
+            Fill("A4", 4, "=SEQUENCE(2)"),
+            DeleteCol(0),
+            UndeleteCol(0),
+            DeleteRow(6),
+            UndeleteRow(6),
+        ]);
+    }
+
+    #[test]
+    fn computed_references_see_spills_that_come_later() {
+        use Step::Cell;
+        // Nothing but the spill itself connects C5 with D6.
+        assert_steps_match_full_recalc(&[
+            Cell("C5", "={1,8;3,4}"),
+            Cell("B4", "=INDIRECT(\"D6:D7\")"),
+            Cell("C5", "={1,8;3,9}"),
+            Cell("C5", ""),
+        ]);
+        // D2 turns out to be on a loop through its own cells.
+        assert_steps_match_full_recalc(&[
+            Cell("D2", "=TRANSPOSE(D4:F4)"),
+            Cell("C1", "=SUM(OFFSET(D1,0,0,2,2))"),
+        ]);
+        // F6 and E7 collide.
+        assert_steps_match_full_recalc(&[
+            Cell("F6", "=E5:E6"),
+            Cell("E7", "=F8:G9"),
+            Cell("B8", "=SUM(OFFSET(D5,1,1,2,2))"),
+            Cell("F6", ""),
+        ]);
+    }
+
+    #[test]
+    fn strips_follow_rows_that_moved_apart() {
+        use Step::{Cell, ClearRows, Fill, MoveRow};
+        for formula in [
+            "=D4",
+            "=D4:D4",
+            "=SUM(D4:D5)",
+            "=SUM(D$4:D4)",
+            "=SUM(D$8:D3)",
+        ] {
+            for (moved, after) in [(5, 12), (5, 0), (6, 0), (3, 12)] {
+                let order = [
+                    Fill("E1", 4, formula),
+                    Cell("D6", "=E8"),
+                    Cell("E8", "1"),
+                    MoveRow(moved, after),
+                    Cell("E8", "5"),
+                    Cell("E8", "6"),
+                ];
+                assert_steps_match_full_recalc(&order);
+                let [fill, formula_cell, input, mv, first, second] = order;
+                assert_steps_match_full_recalc(&[formula_cell, input, mv, fill, first, second]);
+            }
+        }
+        // Row 6 sits above row 4 when the run of rows 4 to 7 is written.
+        assert_steps_match_full_recalc(&[
+            MoveRow(1, 5),
+            MoveRow(5, 2),
+            Cell("C8", "=TRANSPOSE(F1:F3)"),
+            Fill("F4", 4, "=D5:E6"),
+            ClearRows("F4", 4),
+        ]);
+    }
+
+    #[test]
+    fn strips_on_other_sheets_follow_moved_rows() {
+        let s0 = SheetId(0);
+        let mut eng = FormulaEngine::new();
+        let s2 = eng.alloc_sheet_id();
+        eng.apply_op(Op::AddSheet {
+            sheet: s2,
+            name: alloc::string::String::from("S2"),
+            after: Some(s0),
+        })
+        .unwrap();
+        let bound = crate::binder::BoundFormula::parse_and_bind(
+            "=SUM(Sheet1!C4:C5)",
+            reticula_core::ops::FormulaMode::Dynamic,
+            eng.workbook(),
+            s2,
+        )
+        .unwrap();
+        let (row, col) = (RowId(3), ColId(3));
+        eng.apply_op(Op::FillFormula {
+            sheet: s2,
+            rows: vec![IdRun::new(row.0, 5).unwrap()],
+            cols: vec![IdRun::new(col.0, 1).unwrap()],
+            template: crate::binder::templatize_formula(&bound, row, col),
+        })
+        .unwrap();
+        for r in 3..9 {
+            eng.edit_cell_raw(s0, RowId(r), ColId(2), &alloc::format!("{r}"))
+                .unwrap();
+        }
+        eng.recalc_all();
+        eng.apply_op(Op::MoveRows {
+            sheet: s0,
+            ids: vec![IdRun::new(4, 1).unwrap()],
+            after: Some(RowId(7)),
+        })
+        .unwrap();
+        eng.recalc_all();
+        let fresh = FormulaEngine::from_workbook_recalc_all(eng.workbook().clone());
+        for r in 3..8 {
+            let value = |e: &FormulaEngine| {
+                let sheet = e.workbook().sheet(s2).unwrap();
+                sheet.value_by_id(RowId(r), col)
+            };
+            assert_eq!(value(&eng), value(&fresh), "row {r}");
+        }
+    }
+
+    #[test]
+    fn grouping_into_strips_does_not_show_in_settled_spills() {
+        use Step::{Fill, InsertRowAfter};
+        assert_steps_match_full_recalc(&[
+            Fill("C5", 5, "=C8:C9*2"),
+            Fill("C8", 2, "=E4:E6*2"),
+            Fill("E1", 3, "=TRANSPOSE(D5:F7)"),
+            Fill("E6", 5, "=COUNTBLANK(C1:D1)"),
+            Fill("D5", 4, "={5,6}"),
+            Fill("C8", 2, "={1,4;3,4}"),
+            InsertRowAfter(0),
+        ]);
+    }
+
+    #[test]
+    fn formulas_waiting_for_each_other_do_not_pile_up() {
+        let s0 = SheetId(0);
+        let count = 400_u64;
+        // Every formula reads the whole column, itself included.
+        let mut eng = FormulaEngine::new();
+        for r in 0..count {
+            let raw = alloc::format!("=SUM(A$1:A${count})+0*{r}");
+            eng.edit_cell_raw(s0, RowId(r), ColId(0), &raw).unwrap();
+        }
+        eng.recalc_all();
+        let sheet = eng.workbook().sheet(s0).unwrap();
+        for r in 0..count {
+            let value = sheet.value_by_id(RowId(r), ColId(0));
+            assert_eq!(value, Value::Error(CalcError::Cycle));
+        }
+
+        // Every formula reads all formulas below it, and the last one could read the
+        // first, so that no order of evaluation is known beforehand.
+        let mut eng = FormulaEngine::new();
+        for r in 0..count - 1 {
+            let raw = alloc::format!("=SUM(A{}:A{count})*0+{r}", r + 2);
+            eng.edit_cell_raw(s0, RowId(r), ColId(0), &raw).unwrap();
+        }
+        eng.edit_cell_raw(s0, RowId(count - 1), ColId(0), "=IF(C1=0,1,A1)")
+            .unwrap();
+        let mut deepest = 0;
+        while matches!(eng.recalc_step(1), RecalcStatus::InProgress { .. }) {
+            deepest = deepest.max(eng.call_stack.len());
+        }
+        assert!(deepest <= super::MIN_CALL_STACK_LIMIT, "{deepest} frames");
+        let sheet = eng.workbook().sheet(s0).unwrap();
+        assert_eq!(sheet.value_by_id(RowId(7), ColId(0)), Value::Number(7.0));
     }
 
     #[test]
