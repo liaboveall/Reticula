@@ -7,6 +7,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { expect, type Page } from "@playwright/test";
 import { fillFormulaBar } from "./formula-bar-helpers.ts";
+import { listen } from "./listen.ts";
 
 export type DevAccount = "alice" | "bob" | "carol";
 
@@ -64,26 +65,10 @@ export interface CollabServerHandle {
 }
 
 async function allocatePort(): Promise<number> {
-  return new Promise((resolvePort, reject) => {
-    const server = createServer();
-    server.unref();
-    server.on("error", reject);
-    server.listen(0, "127.0.0.1", () => {
-      const addr = server.address();
-      if (!addr || typeof addr === "string") {
-        server.close(() => reject(new Error("Could not allocate loopback port")));
-        return;
-      }
-      const { port } = addr;
-      server.close((err) => {
-        if (err) {
-          reject(err);
-        } else {
-          resolvePort(port);
-        }
-      });
-    });
-  });
+  const server = createServer();
+  const port = await listen(server);
+  await new Promise<void>((closed) => server.close(() => closed()));
+  return port;
 }
 
 export async function startCollabServer(): Promise<CollabServerHandle> {

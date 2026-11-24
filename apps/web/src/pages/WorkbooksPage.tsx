@@ -22,7 +22,8 @@ import {
   type StorageBackendKind,
   type WorkbookCatalogEntry,
 } from "../engine/storage.ts";
-import { fmtBytes, t } from "../i18n/index.ts";
+import { fmtBytes } from "../i18n/formats.ts";
+import { t } from "../i18n/index.ts";
 import { ActionButton } from "../ui/ActionButton.tsx";
 import { announce } from "../ui/announcer.ts";
 import { isComposing, useKeptFocus } from "../ui/focus.ts";

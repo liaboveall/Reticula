@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { mayPrefetch } from "./preload.ts";
+import { mayPrefetch } from "./prefetch.ts";
 
 describe("mayPrefetch", () => {
   it("wants a fine pointer and no wish to save data", () => {

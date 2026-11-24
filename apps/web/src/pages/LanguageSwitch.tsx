@@ -1,12 +1,6 @@
 import { setLocale, t } from "../i18n/index.ts";
-import type { Locale } from "../i18n/locale-rule.ts";
+import { LANGUAGES } from "../i18n/languages.ts";
 import { useLocale } from "../i18n/react.ts";
-
-/** Every language under its own name, which is found in any of them. */
-const LANGUAGES: readonly (readonly [Locale, string])[] = [
-  ["en", "English"],
-  ["zh-CN", "简体中文"],
-];
 
 export function LanguageSwitch() {
   const shown = useLocale();

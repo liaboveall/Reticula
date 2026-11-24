@@ -2,7 +2,7 @@ import { startTransition, useCallback, useEffect, useRef, useState } from "react
 import { ErrorBoundary } from "./ErrorBoundary.tsx";
 import { enterRoute, t } from "./i18n/index.ts";
 import { useLocale } from "./i18n/react.ts";
-import { prefetchEditorWhenIdle, preloadEditor } from "./preload.ts";
+import { preloadEditor } from "./preload.ts";
 import { type AppRoute, normalizeAppRoute } from "./routes.ts";
 import { loadPage, type Page } from "./routes-load.ts";
 import type { LoadRecovery } from "./routes-recovery.ts";
@@ -98,11 +98,6 @@ export function App({ first, recovery }: AppProps) {
     window.addEventListener("popstate", onPopState);
     return () => window.removeEventListener("popstate", onPopState);
   }, [show]);
-
-  useEffect(
-    () => (shown.route === "landing" ? prefetchEditorWhenIdle() : undefined),
-    [shown.route],
-  );
 
   const navigate = useCallback(
     (path: string) => {

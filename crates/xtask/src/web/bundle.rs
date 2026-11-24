@@ -42,7 +42,10 @@ const BOOT_MARKER: &str = "<!-- boot -->";
 /// Everything is requested the way it will be requested again (module scripts
 /// and the worker's `fetch` are CORS requests without credentials for other
 /// origins), so that nothing is downloaded twice.
-const BOOT_SCRIPT: &str = r#"((p,x)=>{const s={},load=window.__reticulaPreload=k=>{for(const f of p[k]||x[k]||[])if(!s[f]){s[f]=1;const l=document.createElement("link");if(f.endsWith(".wasm")){l.rel="preload";l.as="fetch";l.type="application/wasm"}else l.rel="modulepreload";l.crossOrigin="";l.href="/assets/"+f;document.head.append(l)}},[,a,b]=location.pathname.split("/"),r=a=="join"&&b!=null?"app":Object.hasOwn(p,a)?a:"landing";load(r);if(r=="app")load("engine");if(__LOCALE__!="en")load("zh:"+r)})"#;
+///
+/// On a narrow screen, where the editor gives way to a card (`EditorPage.tsx`),
+/// the engine is left alone, unless a link leads to a workbook.
+const BOOT_SCRIPT: &str = r#"((p,x)=>{const s={},load=window.__reticulaPreload=k=>{if(k!="engine"||a=="join"||!matchMedia("(max-width: 767px)").matches)for(const f of p[k]||x[k]||[])if(!s[f]){s[f]=1;const l=document.createElement("link");if(f.endsWith(".wasm")){l.rel="preload";l.as="fetch";l.type="application/wasm"}else l.rel="modulepreload";l.crossOrigin="";l.href="/assets/"+f;document.head.append(l)}},[,a,b]=location.pathname.split("/"),r=a=="join"&&b!=null?"app":Object.hasOwn(p,a)?a:"landing";load(r);if(r=="app")load("engine");if(__LOCALE__!="en")load("zh:"+r)})"#;
 const LOCALE_MARKER: &str = "__LOCALE__";
 
 /// Brotli-compressed sizes the build must not exceed, in bytes.
@@ -118,6 +121,23 @@ impl Manifest {
             open.extend(chunk.imports.iter().map(String::as_str));
         }
         Ok(files)
+    }
+
+    /// Of chunks that import each other, the one that runs first finds the other
+    /// unfinished. `vite.config.ts` makes chunks of modules that import the entry,
+    /// and that the entry therefore must not import.
+    fn check_cycles(&self) -> Result {
+        for (key, chunk) in &self.0 {
+            let file = asset_name(&chunk.file)?;
+            for import in &chunk.imports {
+                if self.closure(import)?.contains(file) {
+                    return Err(format!(
+                        "the chunks `{key}` and `{import}` import each other"
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -293,6 +313,7 @@ impl Closures {
                 "`{module}` is missing in the list of pages: nothing would preload it"
             ));
         }
+        manifest.check_cycles()?;
         let entry = manifest.closure(ENTRY)?;
         let mut pages = BTreeMap::new();
         let mut texts = BTreeMap::new();
@@ -682,6 +703,18 @@ mod tests {
     }
 
     #[test]
+    fn chunks_that_import_each_other_are_an_error() {
+        assert!(Manifest::parse(MANIFEST).unwrap().check_cycles().is_ok());
+        let entry = MANIFEST.replace(r#"["_runtime-R.js"],"#, r#"["_shared-S.js"],"#);
+        assert!(built(&entry).is_err_and(|e| e.contains("shared-S") && e.contains("index.html")));
+        let later = MANIFEST.replace(
+            r#""_deep-D.js": { "file": "assets/deep-D.js", "imports": ["_shared-S.js"]"#,
+            r#""_deep-D.js": { "file": "assets/deep-D.js", "imports": ["src/EditorPage.tsx"]"#,
+        );
+        assert!(built(&later).is_err_and(|e| e.contains("deep-D")));
+    }
+
+    #[test]
     fn a_chunk_that_cannot_be_named_in_the_document_is_an_error() {
         let odd = |file: &str| {
             let json = format!(r#"{{ "x": {{ "file": "{file}" }} }}"#);
@@ -792,6 +825,10 @@ mod tests {
         assert!(script.contains(r#""zh:app":["zh-core-Z.js"]"#), "{script}");
         assert!(
             script.contains(r#""zh:landing":["zh-core-Z.js","zh-pages-Z.js"]"#),
+            "{script}"
+        );
+        assert!(
+            script.contains(r#"k!="engine"||a=="join"||!matchMedia("(max-width: 767px)")"#),
             "{script}"
         );
         // The entry and what it imports are in the document itself.

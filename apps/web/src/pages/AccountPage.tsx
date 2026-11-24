@@ -9,7 +9,8 @@ import {
   logout,
 } from "@reticula/protocol/collab-api";
 import { useCallback, useEffect, useState } from "react";
-import { fmtBytes, fmtInt, t } from "../i18n/index.ts";
+import { fmtBytes } from "../i18n/formats.ts";
+import { fmtInt, t } from "../i18n/index.ts";
 import { tx } from "../i18n/react.ts";
 import { ActionButton } from "../ui/ActionButton.tsx";
 import { useKeptFocus } from "../ui/focus.ts";

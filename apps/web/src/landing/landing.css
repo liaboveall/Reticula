@@ -1,0 +1,721 @@
+/* The front page, drawn with what the editor is drawn with: its title bar at
+   the top, its sheet tabs along the bottom, and cells in between. */
+
+:root:has(.landing) {
+  scroll-padding-block: 24px 64px;
+}
+
+.landing {
+  min-height: 100%;
+  /* The sheet tabs'. */
+  padding-bottom: 38px;
+  background: var(--shell-surface);
+  color: var(--shell-text);
+  font-size: 16px;
+  line-height: 1.6;
+  overflow-wrap: break-word;
+}
+
+/* What the parts of the page say about themselves goes before these. */
+:where(.landing) :where(h1, h2, h3, p, ul, ol, figure) {
+  margin: 0;
+  padding: 0;
+}
+
+:where(.landing) p {
+  text-wrap: pretty;
+}
+
+:where(.landing) ul {
+  list-style: none;
+}
+
+.landing-header,
+.landing-hero,
+.landing-section,
+.landing-footer,
+.landing-tabs {
+  padding-inline: max(20px, calc((100% - 1200px) / 2));
+}
+
+:where(.landing) h1 {
+  max-width: 17em;
+  font-size: clamp(32px, 4.9vw, 60px);
+  font-weight: 650;
+  line-height: 1.1;
+  letter-spacing: -0.022em;
+  text-wrap: balance;
+}
+
+:where(.landing) h2 {
+  font-size: 30px;
+  font-weight: 650;
+  line-height: 1.2;
+  letter-spacing: -0.015em;
+}
+
+:where(.landing) h3 {
+  font-size: 18px;
+  font-weight: 600;
+  line-height: 1.35;
+}
+
+:where(.landing:lang(zh)) :is(h1, h2) {
+  letter-spacing: 0;
+  /* Lines end with a clause, not inside a word. */
+  word-break: keep-all;
+  overflow-wrap: anywhere;
+}
+
+:where(.landing:lang(zh)) h1 {
+  font-size: clamp(30px, 4.2vw, 52px);
+  line-height: 1.25;
+}
+
+.landing a:not([class]),
+.landing-more {
+  color: var(--shell-accent);
+  text-underline-offset: 3px;
+}
+
+.landing-more {
+  font-weight: 600;
+}
+
+/* --- The bar at the top --------------------------------------------------- */
+
+.landing-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 20px;
+  padding-block: 8px;
+  border-bottom: 1px solid var(--shell-line);
+  background: var(--shell-background);
+  font-size: 14px;
+}
+
+.landing-brand {
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.landing-nav {
+  display: flex;
+  flex-wrap: wrap;
+  flex: 1;
+  gap: 4px 20px;
+  justify-content: flex-end;
+}
+
+.landing-link {
+  padding: 4px 0;
+  border: 0;
+  background: none;
+  color: var(--shell-muted);
+  font: inherit;
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.landing-link:hover {
+  color: var(--shell-text);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+/* --- Buttons -------------------------------------------------------------- */
+
+.landing-cta,
+.landing-secondary {
+  display: inline-block;
+  padding: 11px 20px;
+  border: 1px solid var(--shell-control);
+  border-radius: 6px;
+  background: var(--shell-surface);
+  color: var(--shell-text);
+  font-size: 15px;
+  font-weight: 600;
+  line-height: 20px;
+  text-decoration: none;
+}
+
+.landing-cta {
+  border-color: var(--shell-accent);
+  background: var(--shell-accent);
+  color: var(--shell-on-accent);
+}
+
+.landing-cta:hover {
+  background: color-mix(in srgb, var(--shell-accent) 88%, var(--shell-text));
+}
+
+.landing-secondary:hover {
+  border-color: var(--shell-accent);
+  color: var(--shell-accent);
+}
+
+.landing-cta-small {
+  padding: 4px 12px;
+  font-size: 13px;
+}
+
+.landing-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+/* --- Sections ------------------------------------------------------------- */
+
+.landing-section {
+  padding-top: 88px;
+  scroll-margin-top: -48px;
+}
+
+.landing-intro {
+  max-width: 44em;
+  padding-top: 12px;
+  color: var(--shell-muted);
+}
+
+.landing-hero-text {
+  display: grid;
+  gap: 24px;
+  padding-block: 72px 48px;
+}
+
+.landing-lead {
+  max-width: 40em;
+  color: var(--shell-muted);
+  font-size: 18px;
+}
+
+.landing-note,
+:where(.landing) figcaption {
+  color: var(--shell-muted);
+  font-size: 14px;
+}
+
+:where(.landing) figcaption {
+  padding-top: 10px;
+}
+
+/* A border would count towards the proportions of one that has not loaded. */
+.landing-shot {
+  display: block;
+  width: 100%;
+  height: auto;
+  border-radius: 6px;
+  box-shadow: 0 0 0 1px var(--shell-line);
+  background: var(--shell-background);
+}
+
+/* --- Things to try -------------------------------------------------------- */
+
+.landing-stop {
+  display: grid;
+  grid-template-columns: minmax(0, 7fr) minmax(0, 4fr);
+  align-items: center;
+  gap: 40px;
+  padding-top: 48px;
+}
+
+.landing-stop:nth-of-type(even) {
+  grid-template-columns: minmax(0, 4fr) minmax(0, 7fr);
+}
+
+.landing-stop:nth-of-type(even) picture {
+  order: 1;
+}
+
+.landing-stop > div,
+.landing-pair > article {
+  display: grid;
+  justify-items: start;
+  align-content: start;
+  gap: 10px;
+}
+
+.landing-pair {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 40px;
+  margin-top: 56px;
+  padding-top: 32px;
+  border-top: 1px solid var(--shell-line);
+}
+
+/* --- Numbers, in cells ---------------------------------------------------- */
+
+.landing-cells {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  margin-top: 32px;
+  border: 1px solid var(--shell-line);
+  border-width: 1px 0 0 1px;
+}
+
+.landing-cell {
+  position: relative;
+  display: grid;
+  grid-template-rows: auto auto 1fr auto;
+  gap: 6px;
+  padding: 18px 20px;
+  border: 1px solid var(--shell-line);
+  border-width: 0 1px 1px 0;
+}
+
+.landing-cell h3 {
+  min-height: 2.7em;
+  font-size: 15px;
+}
+
+.landing-value {
+  font-size: 36px;
+  font-weight: 600;
+  line-height: 1.15;
+  letter-spacing: -0.01em;
+  font-variant-numeric: tabular-nums;
+  text-align: end;
+}
+
+.landing-detail {
+  color: var(--shell-muted);
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+/* Where there is room for three columns, they and the rows have their headers.
+   These are not read out. */
+@media (min-width: 1001px) {
+  .landing-cells {
+    margin: 60px 0 0 44px;
+    counter-reset: row;
+  }
+
+  .landing-cell:nth-child(3n + 1) {
+    counter-increment: row;
+  }
+
+  .landing-cell:nth-child(3n + 1)::before,
+  .landing-cell:nth-child(-n + 3) h3::before {
+    position: absolute;
+    display: grid;
+    place-content: center;
+    border: 1px solid var(--shell-line);
+    background: var(--shell-background);
+    color: var(--shell-muted);
+    font-size: 13px;
+    font-weight: 400;
+  }
+
+  .landing-cell:nth-child(3n + 1)::before {
+    content: counter(row) / "";
+    inset: -1px auto -1px -45px;
+    width: 43px;
+  }
+
+  .landing-cell:nth-child(-n + 3) h3::before {
+    content: "A" / "";
+    inset: -29px -1px auto;
+    height: 27px;
+  }
+
+  .landing-cell:nth-child(2) h3::before {
+    content: "B" / "";
+  }
+
+  .landing-cell:nth-child(3) h3::before {
+    content: "C" / "";
+  }
+
+  .landing-cell:is(:hover, :focus-within)::before,
+  .landing-cell:is(:hover, :focus-within) h3::before {
+    background: var(--shell-accent-soft);
+  }
+}
+
+/* What the grid does with the cell that is selected. */
+.landing-cell:is(:hover, :focus-within)::after {
+  content: "";
+  position: absolute;
+  inset: -1px;
+  z-index: 1;
+  border: 2px solid var(--shell-accent);
+  background:
+    linear-gradient(var(--shell-accent), var(--shell-accent)) 100% 100% / 6px 6px no-repeat;
+  pointer-events: none;
+}
+
+.landing-source {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0 12px;
+  color: var(--shell-muted);
+  font-size: 12.5px;
+  line-height: 1.6;
+}
+
+.landing-cell .landing-source {
+  padding-top: 8px;
+}
+
+/* --- Renderers ------------------------------------------------------------ */
+
+.landing-renderers {
+  width: 100%;
+  margin: 32px 0 12px;
+  border-collapse: collapse;
+  font-variant-numeric: tabular-nums;
+}
+
+.landing-renderers :is(th, td) {
+  padding: 10px 12px;
+  border: 1px solid var(--shell-line);
+  text-align: start;
+}
+
+.landing-renderers thead th {
+  background: var(--shell-background);
+  color: var(--shell-muted);
+  font-size: 14px;
+  font-weight: 500;
+}
+
+.landing-bar {
+  display: inline-block;
+  height: 10px;
+  margin-inline-end: 10px;
+  border-radius: 2px;
+  background: var(--shell-accent);
+}
+
+/* --- Architecture --------------------------------------------------------- */
+
+.landing-diagram {
+  display: block;
+  width: 100%;
+  height: auto;
+  margin: 32px 0 40px;
+}
+
+.landing-diagram.tall {
+  display: none;
+  max-width: 440px;
+  margin-inline: auto;
+}
+
+.landing-diagram rect {
+  fill: var(--shell-surface);
+  stroke: var(--shell-control);
+}
+
+.landing-diagram .place {
+  fill: var(--shell-background);
+  stroke: var(--shell-line);
+}
+
+.landing-diagram .part {
+  stroke: var(--shell-line);
+}
+
+.landing-diagram .apart {
+  stroke-dasharray: 5 4;
+}
+
+.landing-diagram text {
+  fill: var(--shell-muted);
+  font-size: 13px;
+}
+
+.landing-diagram .title,
+.landing-diagram .part-title {
+  fill: var(--shell-text);
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.landing-diagram .part-title {
+  font-weight: 500;
+}
+
+.landing-diagram .edge {
+  fill: var(--shell-accent);
+  font-size: 12.5px;
+}
+
+.landing-diagram polyline {
+  fill: none;
+  stroke: var(--shell-accent);
+  stroke-width: 1.5;
+}
+
+.landing-diagram polygon {
+  fill: var(--shell-accent);
+}
+
+.landing-diagram .same polyline {
+  stroke: var(--shell-control);
+  stroke-dasharray: 5 4;
+}
+
+.landing-steps {
+  display: grid;
+  gap: 8px;
+  max-width: 44em;
+  padding: 12px 0 0 1.4em;
+}
+
+.landing-steps li::marker {
+  color: var(--shell-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+/* --- Checks and limits ---------------------------------------------------- */
+
+.landing-rows {
+  margin-top: 24px;
+}
+
+.landing-rows > article {
+  display: grid;
+  grid-template-columns: minmax(0, 3fr) minmax(0, 7fr) minmax(0, 2fr);
+  gap: 8px 32px;
+  padding-block: 18px;
+  border-top: 1px solid var(--shell-line);
+}
+
+.landing-rows h3 {
+  font-size: 16px;
+}
+
+:where(.landing) code {
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-size: 13px;
+}
+
+.landing-limits {
+  columns: 2 380px;
+  column-gap: 40px;
+  padding: 24px 0 0 1.2em;
+  list-style: disc;
+}
+
+.landing-limits li {
+  padding-bottom: 12px;
+  break-inside: avoid;
+}
+
+.landing-limits li::marker {
+  color: var(--shell-control);
+}
+
+.landing-articles li {
+  padding-top: 12px;
+}
+
+/* --- Footer --------------------------------------------------------------- */
+
+.landing-footer {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px 40px;
+  margin-top: 88px;
+  padding-block: 24px 32px;
+  border-top: 1px solid var(--shell-line);
+  background: var(--shell-background);
+  color: var(--shell-muted);
+  font-size: 14px;
+}
+
+.landing-footer p:nth-child(2) {
+  display: flex;
+  gap: 20px;
+}
+
+.landing-footer .page-language {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.landing-footer .page-language legend {
+  float: left;
+  margin-inline-end: 6px;
+  padding: 0;
+}
+
+.landing-footer .page-tab {
+  padding: 4px 10px;
+  border: 1px solid var(--shell-control);
+  border-radius: 5px;
+  background: var(--shell-surface);
+  color: var(--shell-text);
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.landing-footer .page-tab.active {
+  border-color: var(--shell-accent);
+  background: var(--shell-accent);
+  color: var(--shell-on-accent);
+}
+
+/* --- The sections as sheets ------------------------------------------------ */
+
+.landing-tabs {
+  position: fixed;
+  inset: auto 0 0;
+  z-index: 10;
+  display: flex;
+  align-items: end;
+  gap: 2px;
+  box-sizing: border-box;
+  height: 38px;
+  padding-top: 4px;
+  border-top: 1px solid var(--shell-line);
+  background: var(--shell-background);
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.landing-tabs .sheet-tab {
+  flex: none;
+  padding: 6px 14px 7px;
+  font-size: 13.5px;
+  line-height: 20px;
+  text-decoration: none;
+}
+
+/* --- Narrower windows ----------------------------------------------------- */
+
+@media (max-width: 1000px) {
+  .landing-cells {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .landing-cell:last-child:nth-child(odd) {
+    grid-column: 1 / -1;
+  }
+
+  .landing-diagram.wide {
+    display: none;
+  }
+
+  .landing-diagram.tall {
+    display: block;
+  }
+
+  .landing-rows > article {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+
+  .landing-rows > article > div {
+    grid-area: 2 / 1 / auto / -1;
+  }
+}
+
+@media (max-width: 780px) {
+  /* What is left out is right below. */
+  .landing-header .landing-cta-small,
+  .landing-nav .landing-link:last-child {
+    display: none;
+  }
+
+  .landing-brand {
+    flex-basis: 100%;
+  }
+
+  .landing-nav {
+    justify-content: flex-start;
+    gap: 4px 16px;
+  }
+
+  .landing-hero-text {
+    padding-block: 40px 32px;
+  }
+
+  .landing-lead {
+    font-size: 17px;
+  }
+
+  .landing-section {
+    padding-top: 64px;
+  }
+
+  .landing-stop,
+  .landing-stop:nth-of-type(even) {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 16px;
+    padding-top: 40px;
+  }
+
+  .landing-stop:nth-of-type(even) picture {
+    order: 0;
+  }
+
+  .landing-pair {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+@media (max-width: 560px) {
+  /* Shrunk to fit, nothing in it could be read. */
+  .landing-shot {
+    aspect-ratio: 4 / 3;
+    object-fit: cover;
+    object-position: 0 0;
+  }
+
+  .landing-shot:is(.landing-shot-review, .landing-shot-history) {
+    object-position: 100% 0;
+  }
+
+  .landing-cells {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .landing-cell h3 {
+    min-height: 0;
+  }
+
+  .landing-actions > * {
+    flex: 1 1 auto;
+    text-align: center;
+  }
+
+  .landing-rows > article {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .landing-rows > article > div {
+    grid-area: auto;
+  }
+
+  .landing-renderers {
+    font-size: 13px;
+  }
+}
+
+@media (forced-colors: active) {
+  .landing-secondary,
+  .landing-cell {
+    border-color: CanvasText;
+  }
+
+  .landing-tabs .sheet-tab.active {
+    border: 2px solid Highlight;
+  }
+
+  .landing-bar {
+    background: Highlight;
+  }
+}

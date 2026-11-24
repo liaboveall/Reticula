@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <title>Reticula</title>
+  <style>
+    .sheet { fill: #fff; stroke: #1a5fd0 }
+    .lines { stroke: #1a5fd0 }
+    .cell { fill: #1a5fd0 }
+    @media (prefers-color-scheme: dark) {
+      .sheet { fill: #16181c; stroke: #6ea1ff }
+      .lines { stroke: #6ea1ff }
+      .cell { fill: #6ea1ff }
+    }
+  </style>
+  <rect class="sheet" x="2.5" y="2.5" width="27" height="27" rx="4" stroke-width="3" />
+  <path class="lines" d="M12 3v26M21 3v26M3 12h26M3 21h26" stroke-width="2" />
+  <rect class="cell" x="11" y="11" width="11" height="11" />
+</svg>

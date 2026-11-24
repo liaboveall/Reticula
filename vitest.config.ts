@@ -4,6 +4,10 @@ import { defineConfig } from "vitest/config";
 // are made with. They run in Node: nothing here needs a browser or the engine.
 export default defineConfig({
   test: {
-    include: ["packages/*/src/**/*.test.ts", "apps/*/src/**/*.test.ts", "tests/visual/*.test.ts"],
+    include: [
+      "packages/*/src/**/*.test.ts",
+      "apps/*/{build,src}/**/*.test.ts",
+      "tests/visual/*.test.ts",
+    ],
   },
 });

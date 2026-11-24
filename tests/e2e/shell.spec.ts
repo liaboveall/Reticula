@@ -1,14 +1,14 @@
 import { readFile } from "node:fs/promises";
 import { createServer, type Server } from "node:http";
-import type { AddressInfo } from "node:net";
 import { extname, join, resolve } from "node:path";
 import { expect, type Page, test } from "@playwright/test";
 import { type AppRoute, normalizeAppRoute } from "../../apps/web/src/routes.ts";
+import { listen } from "./listen.ts";
 
 // How the app starts, moves between its pages and fails: what is downloaded
 // when, and what is on screen when some of it cannot be.
 
-const DIST_DIR = resolve(process.cwd(), "apps/web/dist");
+const DIST_DIR = resolve(process.cwd(), process.env.RETICULA_E2E_DIST ?? "apps/web/dist");
 
 /**
  * Scripts that may be fetched before the first screen without being part of
@@ -78,8 +78,7 @@ async function startDistServer(): Promise<DistServer> {
       response.writeHead(404, { "cache-control": "no-cache" }).end();
     }
   });
-  await new Promise<void>((ready) => server.listen(0, "127.0.0.1", ready));
-  const { port } = server.address() as AddressInfo;
+  const port = await listen(server);
   const handle: DistServer = {
     origin: `http://localhost:${port}`,
     requests,
@@ -336,7 +335,7 @@ test("a page of text asks for nothing but its own code", async ({ page }) => {
   await page.waitForTimeout(500);
   const scripts = (await assetRequests(page)).map(({ name }) => name).filter(isScript);
   expect(
-    scripts.filter((name) => !build.entry.includes(name) && !name.startsWith("PrivacyPage-")),
+    scripts.filter((name) => !build.entry.includes(name) && !/^(?:PrivacyPage|page)-/.test(name)),
   ).toEqual([]);
   expect(server.requests.filter((path) => path.endsWith(".wasm"))).toEqual([]);
 });
@@ -422,7 +421,7 @@ test("a part of the editor that is gone leaves a message in place of a blank pag
 }) => {
   await page.goto(`${server.origin}/app?hooks`);
   await expect(page.getByTestId("engine-status")).toHaveText("ready");
-  server.missing = /\/LocalModals-/;
+  server.missing = /\/dialogs-/;
 
   const reloaded = page.waitForEvent("load");
   await page.getByTestId("workbooks-btn").click();
@@ -438,7 +437,7 @@ test("a part of the editor that is gone leaves a message in place of a blank pag
 test("a message in place of a page stays when the address changes", async ({ page }) => {
   await page.goto(`${server.origin}/app?hooks`);
   await expect(page.getByTestId("engine-status")).toHaveText("ready");
-  server.missing = /\/LocalModals-/;
+  server.missing = /\/dialogs-/;
   const reloaded = page.waitForEvent("load");
   await page.getByTestId("workbooks-btn").click();
   await reloaded;

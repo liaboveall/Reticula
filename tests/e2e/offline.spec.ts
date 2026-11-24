@@ -1,11 +1,11 @@
 import { readFile } from "node:fs/promises";
 import { createServer, type Server } from "node:http";
-import type { AddressInfo } from "node:net";
 import { extname, join, resolve } from "node:path";
 import { expect, type Page, test } from "@playwright/test";
 import { fillFormulaBar } from "./formula-bar-helpers.ts";
+import { listen } from "./listen.ts";
 
-const DIST_DIR = resolve(process.cwd(), "apps/web/dist");
+const DIST_DIR = resolve(process.cwd(), process.env.RETICULA_E2E_DIST ?? "apps/web/dist");
 
 const MIME_TYPES: Readonly<Record<string, string>> = {
   ".html": "text/html; charset=utf-8",
@@ -61,8 +61,7 @@ async function startDistServer(): Promise<StaticTestServer> {
     }
   });
 
-  await new Promise<void>((resolveReady) => server.listen(0, "127.0.0.1", resolveReady));
-  const { port } = server.address() as AddressInfo;
+  const port = await listen(server);
 
   return {
     origin: `http://localhost:${port}`,

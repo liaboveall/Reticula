@@ -1,5 +1,9 @@
 //! Building the WebAssembly module and its JavaScript bindings.
 
+mod fallbacks;
+mod names;
+
+use std::fs;
 use std::path::Path;
 
 use crate::util::{self, Cmd, Result, cargo, node, pnpm, tool};
@@ -133,6 +137,43 @@ fn build_package(
                 module_path,
             ])
             .run()?;
+        // A parallel module imports its memory, which the bindings name in their own way.
+        if !parallel {
+            slim(module_path)?;
+        }
+    }
+    Ok(())
+}
+
+/// Makes a module and the files wasm-bindgen wrote for it smaller.
+fn slim(module_path: &str) -> Result {
+    let module = util::root().join(module_path);
+    let stem = module_path.trim_end_matches("_bg.wasm");
+    let bindings = util::root().join(format!("{stem}.js"));
+    let types = util::root().join(format!("{stem}.d.ts"));
+    let module_types = util::root().join(format!("{stem}_bg.wasm.d.ts"));
+
+    let error = |what: &str, path: &Path, e: std::io::Error| {
+        format!("cannot {what} {}: {e}", path.display())
+    };
+    let read = |path: &Path| fs::read_to_string(path).map_err(|e| error("read", path, e));
+    let (slim_bindings, slim_types) = fallbacks::remove(&read(&bindings)?, &read(&types)?)
+        .map_err(|e| format!("{}: {e}", bindings.display()))?;
+    let short = names::Package {
+        module: fs::read(&module).map_err(|e| error("read", &module, e))?,
+        bindings: slim_bindings,
+        types: slim_types,
+        module_types: read(&module_types)?,
+    }
+    .shorten()
+    .map_err(|e| format!("{module_path}: {e}"))?;
+    for (path, content) in [
+        (&module, short.module.as_slice()),
+        (&bindings, short.bindings.as_bytes()),
+        (&types, short.types.as_bytes()),
+        (&module_types, short.module_types.as_bytes()),
+    ] {
+        fs::write(path, content).map_err(|e| error("write", path, e))?;
     }
     Ok(())
 }
