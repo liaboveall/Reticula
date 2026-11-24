@@ -113,7 +113,7 @@ const browser = await (options.browser === "firefox" ? firefox : chromium).launc
   ...(options.browser === "chrome" ? { channel: "chrome" } : {}),
 });
 // 1676 by 1036 leaves room for 20 columns and 50 rows of the sizes the page uses.
-const context = await browser.newContext({ viewport: { width: 1676, height: 1036 }, deviceScaleFactor: options.dpr });
+const context = await browser.newContext({ locale: "en-US", viewport: { width: 1676, height: 1036 }, deviceScaleFactor: options.dpr });
 const page = await context.newPage();
 const problems = [];
 page.on("pageerror", (error) => problems.push(String(error)));

@@ -144,7 +144,7 @@ for (build of builds) {
   for (let run = 0; run < options.runs; run++) {
     const browser = await type.launch(launch);
     version ||= browser.version();
-    const page = await browser.newPage();
+    const page = await browser.newPage({ locale: "en-US" });
     await page.goto(address);
     await page.waitForFunction(() => window.__engine !== undefined);
     runs.push(await page.evaluate(([rows, reserve]) => window.__engine(rows, reserve), [options.rows, options.reserve]));
@@ -176,7 +176,7 @@ const pages = Math.ceil((results[0]?.memoryBytes ?? 0) / 65536);
 const grows = [];
 for (let run = 0; run < options.runs; run++) {
   const browser = await type.launch(launch);
-  const page = await browser.newPage();
+  const page = await browser.newPage({ locale: "en-US" });
   await page.goto(address);
   await page.waitForFunction(() => window.__grow !== undefined);
   grows.push(await page.evaluate((pages) => window.__grow(pages), pages));

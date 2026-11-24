@@ -937,6 +937,7 @@ try {
   context = await launcher.launchPersistentContext(profileDir, {
     ...(options.browser === "chrome" ? { channel: "chrome" } : {}),
     headless: true,
+    locale: "en-US",
   });
   browserVersion = context.browser()?.version() ?? "unknown";
   const page = context.pages()[0] ?? (await context.newPage());

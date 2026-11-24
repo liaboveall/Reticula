@@ -30,7 +30,7 @@ if (name) {
   const browser = await browsers[name].launch({ headless: false });
   // No fixed viewport: the page follows the window, and the browser's own
   // zoom works as it does for a user.
-  const context = await browser.newContext({ viewport: null });
+  const context = await browser.newContext({ locale: "en-US", viewport: null });
   const page = await context.newPage();
   await page.goto(address);
   console.log(`Opened ${name} ${browser.version()}. Close its window when done.`);

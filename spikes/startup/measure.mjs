@@ -30,12 +30,16 @@
 //   --affinity <mask>  pin this process, and so the browser, to a set of
 //                      logical processors: a hexadecimal mask
 //   --headed           show the browser window
+//   --locale <tag>     the browser's language (default en-US: the numbers are
+//                      comparable only between visits in the same language)
+//   --site <dir>       another build to serve instead of apps/web/dist, for
+//                      comparing two
 //   --quick            five visits, to see that everything works
 //   --out <file>       the data file (default: target/spikes/startup/<name>.json,
 //                      the name made of the options)
 
 import { execFileSync } from "node:child_process";
-import { mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { chromium, firefox } from "@playwright/test";
@@ -53,7 +57,7 @@ const TARGETS = { shell: 1500, firstScreen: 2000 };
 
 // --- options ---------------------------------------------------------------
 
-const options = { browser: "chrome", runs: 20, path: "/app", network: "reference", connect: REFERENCE.connectRoundTrips, shaping: "server", encoding: "br", slowdown: 1, affinity: "", headed: false, quick: false, out: "" };
+const options = { browser: "chrome", runs: 20, path: "/app", network: "reference", connect: REFERENCE.connectRoundTrips, shaping: "server", encoding: "br", slowdown: 1, affinity: "", headed: false, locale: "en-US", site: "", quick: false, out: "" };
 const given = process.argv.slice(2);
 for (let index = 0; index < given.length; index++) {
   const name = given[index].replace(/^--/, "");
@@ -104,7 +108,19 @@ function git(...args) {
 
 // --- what is served --------------------------------------------------------
 
-const site = join(root, "apps/web/dist");
+const site = options.site ? resolve(options.site) : join(root, "apps/web/dist");
+const html = readFileSync(join(site, "index.html"), "utf8");
+/**
+ * The scripts the editor's page cannot run without, apart from the worker's:
+ * the ones the document names, and the ones its inline script adds for /app.
+ */
+const editorScripts = new Set([
+  ...[...html.matchAll(/<(?:script|link)\b[^>]*?\b(?:src|href)="\/assets\/([^"]+\.js)"/g)].map((match) => match[1]),
+  ...JSON.parse(html.match(/"app":(\[[^\]]*\])/)?.[1] ?? "[]"),
+].filter((name) => !name.startsWith("worker-")));
+if (editorScripts.size === 0) {
+  fail(`${site}/index.html names no scripts`);
+}
 /** The size of each file of the build: as it is, and in both compressed forms. */
 function sizes(directory = site, prefix = "") {
   return readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
@@ -159,6 +175,7 @@ async function visit(number) {
   const context = await type.launchPersistentContext(profile, {
     headless: !options.headed,
     ...(options.browser === "chrome" ? { channel: "chrome" } : {}),
+    locale: options.locale,
     viewport: { width: 1280, height: 800 },
   });
   try {
@@ -195,7 +212,6 @@ async function visit(number) {
           ...timeline(),
           navigation: { responseStart: navigation.responseStart, responseEnd: navigation.responseEnd, domInteractive: navigation.domInteractive, transferSize: navigation.transferSize },
           paints: Object.fromEntries(performance.getEntriesByType("paint").map((paint) => [paint.name, paint.startTime])),
-          generation: document.querySelector('[data-testid="generation"]')?.textContent ?? "",
           userAgent: navigator.userAgent,
         };
       })()`,
@@ -209,6 +225,10 @@ async function visit(number) {
       return found ? { start: found.start + offset, end: found.end + offset, transferSize: found.transferSize } : null;
     };
     const wasm = request(fromWorker.requests, /\.wasm$/, shift);
+    const scripts = fromPage.requests.filter((entry) => editorScripts.has(entry.name));
+    if (scripts.length !== editorScripts.size) {
+      problems.push(`of ${editorScripts.size} scripts the page reports ${scripts.length}`);
+    }
     const marks = {
       shell: fromPage.marks["reticula:shell"],
       engineReady: fromPage.marks["reticula:engine-ready"],
@@ -220,7 +240,12 @@ async function visit(number) {
     return {
       marks,
       document: { firstByte: fromPage.navigation.responseStart, end: fromPage.navigation.responseEnd, transferSize: fromPage.navigation.transferSize },
-      script: request(fromPage.requests, /^index-.*\.js$/),
+      // From the first script's request to the arrival of the last one.
+      script: {
+        start: Math.min(...scripts.map((entry) => entry.start)),
+        end: Math.max(...scripts.map((entry) => entry.end)),
+        transferSize: scripts.reduce((sum, entry) => sum + entry.transferSize, 0),
+      },
       style: request(fromPage.requests, /\.css$/),
       workerScript: request(fromPage.requests, /^worker-.*\.js$/),
       wasm,
@@ -228,7 +253,6 @@ async function visit(number) {
       // Parts of the way that are the engine's own doing.
       compileAfterDownload: wasm ? marks.wasmReady - wasm.end : null,
       generation: marks.sampleReady - marks.wasmReady,
-      generationAsShown: Number(fromPage.generation.match(/([\d.]+) ms/)?.[1] ?? Number.NaN),
       readyToFirstScreen: marks.firstScreen - marks.engineReady,
       userAgent: fromPage.userAgent,
       problems,
@@ -274,7 +298,7 @@ const results = {
   firstScreen: pick((result) => result.marks.firstScreen),
   steps: {
     "document, first byte": pick((result) => result.document.firstByte),
-    "script, loaded": pick((result) => result.script?.end),
+    "scripts, all loaded": pick((result) => result.script?.end),
     "style sheet, loaded": pick((result) => result.style?.end),
     "first contentful paint": pick((result) => result.firstContentfulPaint),
     "shell: the grid's first frame": pick((result) => result.marks.shell),
@@ -325,6 +349,7 @@ const name = [
   options.encoding,
   ...(options.slowdown > 1 ? [`slow${options.slowdown}`] : []),
   ...(options.headed ? ["headed"] : []),
+  ...(options.locale === "en-US" ? [] : [options.locale]),
   ...(options.quick ? ["quick"] : []),
 ].join("-");
 const out = options.out ? resolve(options.out) : join(directory, `${name}.json`);
@@ -334,6 +359,7 @@ writeFileSync(
   `${JSON.stringify(
     {
       spike: "s9",
+      suite: "m6-startup",
       date: new Date().toISOString(),
       commit: git("rev-parse", "--short", "HEAD"),
       uncommittedChanges: git("status", "--porcelain") !== "",
