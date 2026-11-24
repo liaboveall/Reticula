@@ -9,6 +9,8 @@ const onCi = Boolean(process.env.CI);
 // on a port of their own; the tests of the cell editor use one of them.
 export default defineConfig({
   testDir: "tests/e2e",
+  // Needs a WebGPU adapter: see playwright.webgpu.config.ts.
+  testIgnore: "webgpu.spec.ts",
   forbidOnly: onCi,
   // Half the logical processors (Playwright's default, 16 on the development
   // machine) overloads it once the collaborative tests add a server and two

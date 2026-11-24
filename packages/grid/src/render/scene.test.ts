@@ -1,7 +1,8 @@
 import { FLAG_NUMBER } from "@reticula/protocol/viewport";
 import { describe, expect, test } from "vitest";
 import { FilterRowMap } from "../filter.ts";
-import { SparseAxis } from "../layout.ts";
+import { type SheetLayout, SparseAxis, viewMetrics } from "../layout.ts";
+import { ZOOM_STEPS } from "../zoom.ts";
 import { packColor } from "./color.ts";
 import {
   axes,
@@ -441,6 +442,255 @@ describe("at any density", () => {
       const first = Math.round(45 * scale) + Math.round(75 * scale);
       expect(down[0]?.left).toBe(first - width);
     }
+  });
+});
+
+type Sizes = readonly (readonly [number, number])[];
+
+/** A frame the way the grid has it at a zoom: the sizes in it are already those on the screen. */
+function zoomedFrame(
+  zoom: number,
+  changes: Partial<Frame> = {},
+  { scale = 1, rows = [] as Sizes, cols = [] as Sizes, frozen = 0 } = {},
+): Frame {
+  return frameOf({
+    zoom,
+    scale,
+    metrics: viewMetrics(METRICS, zoom, scale),
+    layout: {
+      rowAxis: new SparseAxis(METRICS.rowHeight, rows, scale, zoom),
+      colAxis: new SparseAxis(METRICS.colWidth, cols, scale, zoom),
+      frozenRows: frozen,
+      frozenCols: frozen,
+    },
+    sheet: { rows: 1000, cols: 400 },
+    size: { width: 640, height: 400 },
+    ...changes,
+  });
+}
+
+/** The labels of rows and their middles, from the top. */
+function numbersOf(scene: Scene): { readonly number: number; readonly middle: number }[] {
+  const step = scene.steps.find((candidate) => candidate.kind === "labels");
+  if (step?.kind !== "labels") {
+    throw new Error("no labels");
+  }
+  const { runs } = step;
+  return runs.texts
+    .slice(0, runs.length)
+    .flatMap((text, run) =>
+      /^\d+$/.test(text) ? [{ number: Number(text), middle: runs.baseline[run] ?? 0 }] : [],
+    )
+    .sort((a, b) => a.middle - b.middle);
+}
+
+describe("at a zoom", () => {
+  test("the cells' text grows, the headers' within limits, and the name plates' not", () => {
+    const presence = { replica: 1, displayName: "Li", colorSlot: 1, cursorRow: 4, cursorCol: 1 };
+    for (const [zoom, cells, headers] of [
+      [0.25, 3.25, 9.75],
+      [1, 13, 13],
+      [1.25, 16.25, 16.25],
+      [2, 26, 19.5],
+    ] as const) {
+      const scene = sceneOf(zoomedFrame(zoom, { remotePresences: [presence] }));
+      expect(scene.look.fonts).toEqual([
+        `${cells}px sans-serif`,
+        `700 ${cells}px sans-serif`,
+        `italic ${cells}px sans-serif`,
+        `italic 700 ${cells}px sans-serif`,
+        `${headers}px sans-serif`,
+      ]);
+      const step = scene.steps.find((candidate) => candidate.kind === "labels");
+      expect(
+        step?.kind === "labels" && new Set(step.runs.font.subarray(0, step.runs.length)),
+      ).toEqual(new Set([4]));
+      const plate = sprites(scene).find((sprite) => sprite.spec.kind === "plate");
+      expect(plate?.spec).toMatchObject({ height: 18, font: "600 11px sans-serif", padding: 6 });
+    }
+  });
+
+  test("lines are as wide as ever", () => {
+    for (const zoom of ZOOM_STEPS) {
+      const scene = sceneOf(zoomedFrame(zoom, { selection: { row: 3, col: 2 } }, { frozen: 1 }));
+      const { metrics } = zoomedFrame(zoom);
+      for (const line of rectsIn(scene, packed(theme.line))) {
+        expect(Math.min(line.width, line.height)).toBe(1);
+      }
+      for (const line of rectsIn(scene, packed(theme.freezeLine))) {
+        expect(Math.min(line.width, line.height)).toBe(2);
+      }
+      const outline = rectsIn(scene, packed(theme.selection));
+      if (metrics.rowHeight > 8) {
+        expect(outline).toHaveLength(4);
+        expect(outline.every((side) => Math.min(side.width, side.height) === 2)).toBe(true);
+      }
+    }
+  });
+
+  test("the fill handle is no larger than half of its cell", () => {
+    const range = { firstRow: 1, endRow: 4, firstCol: 1, endCol: 3 };
+    for (const [zoom, size] of [
+      [0.25, 2],
+      [0.5, 5],
+      [1, 6],
+      [2, 6],
+    ] as const) {
+      const frame = zoomedFrame(zoom, { selection: { row: 1, col: 1 }, selectionRange: range });
+      expect(rectsIn(sceneOf(frame), packed(theme.selection)).at(-1)).toMatchObject({
+        width: size,
+        height: size,
+      });
+    }
+  });
+
+  test("filter buttons grow with their cells", () => {
+    const filterState = {
+      headerRow: 0,
+      lastRow: 10,
+      firstCol: 0,
+      lastCol: 0,
+      activeCols: [0],
+      hiddenRowSpans: [],
+    };
+    for (const [zoom, size] of [
+      [0.5, 7],
+      [1, 14],
+      [2, 28],
+    ] as const) {
+      const scene = sceneOf(zoomedFrame(zoom, { filterState }));
+      const funnel = sprites(scene).find((step) => step.spec.kind === "funnel");
+      expect(funnel?.spec).toMatchObject({ width: size, height: size, scale: zoom });
+      const { metrics } = zoomedFrame(zoom);
+      const right = metrics.headerWidth + metrics.colWidth;
+      expect(Math.abs(right - (funnel?.x ?? 0) - size - 3 * zoom)).toBeLessThanOrEqual(0.5);
+    }
+  });
+});
+
+describe("labels of headers that are too small for them", () => {
+  // Twice what the baseline is below the middle, and a line above and below.
+  const needed = Math.ceil(9.75 * 0.83) + 2;
+
+  test("are those of every second, fifth or tenth one", () => {
+    const steps = ZOOM_STEPS.map((zoom) => {
+      const { rows, frame } = {
+        rows: numbersOf(sceneOf(zoomedFrame(zoom))).map(({ number }) => number),
+        frame: zoomedFrame(zoom),
+      };
+      const step = (rows[1] ?? 0) - (rows[0] ?? 0);
+      expect(rows.slice(1, -1).every((number) => number % step === 0)).toBe(true);
+      expect(step * frame.metrics.rowHeight).toBeGreaterThanOrEqual(needed);
+      return step;
+    });
+    expect(steps.slice(0, 4)).toEqual([5, 2, 2, 1]);
+    expect(new Set(steps.slice(3))).toEqual(new Set([1]));
+  });
+
+  test("of columns too, with the longest name in view deciding", () => {
+    const base = { ...METRICS, colWidth: 48 };
+    const names = (firstCol: number, width: number) => {
+      const frame = zoomedFrame(0.25);
+      const layout = { ...frame.layout, colAxis: new SparseAxis(48, [], 1, 0.25) } as SheetLayout;
+      // A column is 12 px wide.
+      const scene = sceneOf(
+        zoomedFrame(0.25, {
+          metrics: viewMetrics(base, 0.25, 1),
+          layout,
+          size: { width, height: 400 },
+          scroll: { top: 0, left: firstCol * 12 },
+        }),
+      );
+      return labels(scene)
+        .map(({ text }) => text)
+        .filter((text) => /^[A-Z]+$/.test(text));
+    };
+    expect(names(0, 34 + 10 + 10 * 12).slice(0, 4)).toEqual(["A", "B", "C", "D"]);
+    const wide = names(0, 640);
+    expect(wide.slice(0, 4)).toEqual(["A", "B", "C", "D"]);
+    expect(wide.slice(24, 29)).toEqual(["Y", "Z", "AA", "AC", "AE"]);
+    expect(names(60, 640)).toContain("BI");
+    expect(names(60, 640)).not.toContain("BJ");
+  });
+
+  test("are the same ones wherever the sheet is scrolled to", () => {
+    const at = (top: number) => numbersOf(sceneOf(zoomedFrame(0.25, { scroll: { top, left: 0 } })));
+    const before = new Map(at(500).map(({ number, middle }) => [number, middle]));
+    let compared = 0;
+    for (let by = 1; by < 30; by++) {
+      for (const { number, middle } of at(500 + by)) {
+        const was = before.get(number);
+        if (was !== undefined) {
+          expect(was - middle).toBe(by);
+          compared++;
+        }
+      }
+    }
+    expect(compared).toBeGreaterThan(200);
+  });
+
+  test("come into view before their rows do", () => {
+    // Row 5 is 5 px high and ends where the cells begin: the lower half of its label is in view.
+    const scene = sceneOf(zoomedFrame(0.25, { scroll: { top: 25, left: 0 } }));
+    const [first] = numbersOf(scene);
+    expect(first?.number).toBe(5);
+    const { clip } = labels(scene).find((label) => label.text === "5") ?? {};
+    expect(clip?.[1]).toBe(Math.round(30 * 0.75));
+  });
+
+  test("leave room for those of headers that are large enough", () => {
+    const rows: Sizes = [
+      [11, 80],
+      [12, 80],
+      [13, 18],
+      [20, 60],
+      [33, 2],
+      [34, 2],
+      [40, 0],
+    ];
+    const scene = sceneOf(zoomedFrame(0.25, {}, { rows }));
+    const shown = numbersOf(scene);
+    const numbers = shown.map(({ number }) => number);
+    for (const large of [12, 13, 21]) {
+      expect(numbers).toContain(large);
+    }
+    expect(numbers).not.toContain(41);
+    for (let index = 1; index < shown.length; index++) {
+      const distance = (shown[index]?.middle ?? 0) - (shown[index - 1]?.middle ?? 0);
+      expect(distance, `${numbers[index]}`).toBeGreaterThanOrEqual(needed - 1);
+    }
+  });
+
+  test("have marks between them instead of lines", () => {
+    const lines = (zoom: number) =>
+      rectsIn(sceneOf(zoomedFrame(zoom)), packed(theme.headerLine)).filter(
+        (rect) => rect.height === 1 && rect.top > 60,
+      );
+    expect(new Set(lines(0.25).map((rect) => rect.width))).toEqual(new Set([4]));
+    const { metrics } = zoomedFrame(1);
+    expect(new Set(lines(1).map((rect) => rect.width))).toEqual(new Set([metrics.headerWidth]));
+  });
+
+  test("are those of the rows that are left by a filter", () => {
+    const filterRowMap = new FilterRowMap(1000, [[10, 899]]);
+    const filterState = {
+      headerRow: 0,
+      lastRow: 950,
+      firstCol: 0,
+      lastCol: 2,
+      activeCols: [1],
+      hiddenRowSpans: [[10, 899]] as const,
+    };
+    const frame = zoomedFrame(0.25, {
+      filterRowMap,
+      filterState,
+      sheet: { rows: filterRowMap.visibleRows, cols: 400 },
+    });
+    expect(
+      numbersOf(sceneOf(frame))
+        .map(({ number }) => number)
+        .slice(0, 4),
+    ).toEqual([5, 10, 905, 910]);
   });
 });
 

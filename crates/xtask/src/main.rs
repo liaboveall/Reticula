@@ -76,10 +76,12 @@ Commands:
                           (~60 MiB) workbook under 768m/1.0-CPU compose limits.
   build [--skip-wasm] [--check-budget]
                           Production build with preloads, precompressed assets and size budget check.
-  e2e [--browser <name>] [--skip-build]
+  e2e [--browser <name>] [--webgpu] [--skip-build]
                           End-to-end tests in chromium, firefox and webkit. The
                           collaborative ones use RETICULA_TEST_DATABASE_URL, or else
-                          the development database, which they start.
+                          the development database, which they start. --webgpu runs
+                          those of the WebGPU renderer instead, in chromium with a
+                          software adapter.
   visual [--update] [--skip-build]
                           Visual regression: pictures of the grid, compared between the
                           renderers and, on the CI runner only, with the golden images.
@@ -180,7 +182,11 @@ fn run(args: &[String]) -> Result {
         "drill" => stack::drill(&Flags::parse(rest, &["skip-image"], &[])?),
         "loadtest" => stack::loadtest(&Flags::parse(rest, &["skip-image"], &["out"])?),
         "build" => build(&Flags::parse(rest, &["skip-wasm", "check-budget"], &[])?),
-        "e2e" => e2e(&Flags::parse(rest, &["skip-build"], &["browser"])?),
+        "e2e" => e2e(&Flags::parse(
+            rest,
+            &["skip-build", "webgpu"],
+            &["browser"],
+        )?),
         "visual" => visual(&Flags::parse(rest, &["update", "skip-build"], &[])?),
         "ci" => {
             Flags::parse(rest, &[], &[])?;
@@ -274,6 +280,9 @@ fn e2e(flags: &Flags) -> Result {
         web::build()?;
         web::build_spikes()?;
     }
+    if flags.has("webgpu") {
+        return web::e2e_webgpu();
+    }
     web::e2e(flags.get("browser"))
 }
 
@@ -312,5 +321,6 @@ fn ci() -> Result {
     web::build()?;
     web::build_spikes()?;
     web::visual(false)?;
+    web::e2e_webgpu()?;
     web::e2e(None)
 }

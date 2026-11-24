@@ -4,7 +4,9 @@ import {
   columnName,
   defaultLayout,
   frozenPixels,
+  headerZoom,
   isEmpty,
+  labelStep,
   type SheetLayout,
   type SheetSize,
   type Span,
@@ -17,7 +19,7 @@ import {
   type Frame,
   type GridCellStyle,
 } from "./frame.ts";
-import { FIXED, type Look, makeLook, NO_COLOR, StyleTable } from "./look.ts";
+import { FIXED, HEADER_FONT, type Look, makeLook, NO_COLOR, StyleTable } from "./look.ts";
 import {
   BAND_ROWS,
   edgeOf,
@@ -179,6 +181,12 @@ export class SceneBuilder {
     this.#layouts = new PageLayouts();
   }
 
+  /** The layout of a page that may come into view, as those of the last frame have theirs. */
+  layoutOf(frame: Frame, page: PageLayout["page"]): PageLayout | null {
+    const layout = frame.layout ?? this.#defaultLayout(frame);
+    return this.#setting && this.#layouts.get(page, layout, this.#setting);
+  }
+
   build(frame: Frame): Scene {
     const { size, scale, metrics, visible } = frame;
     const look = this.#lookOf(frame);
@@ -250,9 +258,22 @@ export class SceneBuilder {
       }
     }
 
+    const pinned = { ...rowsPinned, ...colsPinned };
     const strips: Strip[] = [
-      { ...colsPinned, ...rowsPinned, ...leftOf, ...above, x: pinnedX, y: pinnedY },
-      { ...visible, ...rightOf, ...below, x: scrolledX, y: scrolledY },
+      { ...pinned, ...leftOf, ...above, x: pinnedX, y: pinnedY, all: pinned },
+      {
+        ...visible,
+        ...rightOf,
+        ...below,
+        x: scrolledX,
+        y: scrolledY,
+        all: {
+          firstRow: frozen.frozenRows,
+          endRow: sheet.rows,
+          firstCol: frozen.frozenCols,
+          endCol: sheet.cols,
+        },
+      },
     ];
     this.#headers(frame, look, sheet, { left, top, right: width, bottom: height }, strips);
     this.#dividers(look, frozen, { left: 0, top: 0, right, bottom }, frozenX, frozenY);
@@ -271,8 +292,9 @@ export class SceneBuilder {
   }
 
   #lookOf(frame: Frame): Look {
-    if (this.#look?.theme !== frame.theme || this.#look.scale !== frame.scale) {
-      this.#look = makeLook(frame.theme, frame.scale, this.measure, this.#colors);
+    const { theme, scale, zoom = 1 } = frame;
+    if (this.#look?.theme !== theme || this.#look.scale !== scale || this.#look.zoom !== zoom) {
+      this.#look = makeLook(theme, scale, this.measure, this.#colors, zoom);
     }
     return this.#look;
   }
@@ -464,10 +486,12 @@ export class SceneBuilder {
       return;
     }
     const { scale } = frame;
+    const { zoom } = look;
+    const height = layout.rowAxis.sizeOf(row);
     const first = Math.max(span.firstCol, filter.firstCol);
     const last = Math.min(span.endCol - 1, filter.lastCol);
     for (let col = first; col <= last; col++) {
-      const button = filterButtonBox(0, 0, layout.colAxis.sizeOf(col), layout.rowAxis.sizeOf(row));
+      const button = filterButtonBox(0, 0, layout.colAxis.sizeOf(col), height, zoom);
       if (!button) {
         continue;
       }
@@ -499,7 +523,7 @@ export class SceneBuilder {
           kind: active ? "funnel" : "chevron",
           width: size,
           height: size,
-          scale,
+          scale: scale * zoom,
           color: active ? look.filterIconActive : look.filterIcon,
         },
         x: left,
@@ -637,9 +661,18 @@ export class SceneBuilder {
       holds(quadrant.span, selectionRange.endRow - 1, selectionRange.endCol - 1)
     ) {
       const { clip, x, y } = quadrant;
-      const size = lineWidth(FILL_HANDLE_SIZE, scale);
-      const left = x(selectionRange.endCol) - Math.floor(size / 2);
-      const top = y(selectionRange.endRow) - Math.floor(size / 2);
+      const { endRow, endCol } = selectionRange;
+      // No larger than lets the last cell be seen.
+      const size = Math.max(
+        1,
+        Math.min(
+          lineWidth(FILL_HANDLE_SIZE, scale),
+          (x(endCol) - x(endCol - 1)) >> 1,
+          (y(endRow) - y(endRow - 1)) >> 1,
+        ),
+      );
+      const left = x(endCol) - Math.floor(size / 2);
+      const top = y(endRow) - Math.floor(size / 2);
       const rim = look.hairline;
       this.#rects.add(
         clip,
@@ -784,8 +817,9 @@ export class SceneBuilder {
   ): void {
     const rects = this.#rects;
     const { left, top, right, bottom } = box;
-    const { hairline } = look;
-    const { selection, selectionRange } = frame;
+    const { hairline, scale } = look;
+    const { metrics, selection, selectionRange } = frame;
+    const font = look.fonts[HEADER_FONT] ?? "";
     const ranges = rangesOf(frame);
     if (ranges.length === 0 && selection) {
       const { row, col } = selection;
@@ -794,6 +828,14 @@ export class SceneBuilder {
 
     rects.push(0, 0, right, top, look.headerBackground);
     rects.push(0, 0, left, bottom, look.headerBackground);
+
+    // Between labels that take up several headers there are marks, not lines.
+    const mark = lineWidth(4, scale);
+    // Names of one length count as equally wide, or the narrow letters would make a pattern.
+    const nameWidth = (col: number) =>
+      this.measure.width(font, "W".repeat(columnName(col).length)) + 4 * scale;
+    const lastCol = Math.max(0, ...strips.map((strip) => strip.endCol - 1));
+    const colStep = labelStep(metrics.colWidth * scale, nameWidth(lastCol));
 
     for (const strip of strips) {
       const clip = { left: strip.left, top: 0, right: strip.right, bottom: top };
@@ -807,19 +849,23 @@ export class SceneBuilder {
           rects.add(clip, strip.x(first), 0, strip.x(end), top, look.headerSelected);
         }
       }
-      for (let col = strip.firstCol; col < strip.endCol; col++) {
-        const from = strip.x(col);
-        const to = strip.x(col + 1);
-        this.#label(look, columnName(col), look.headerText, clip, from, 0, to, top);
+      const cols = { first: strip.firstCol, end: strip.endCol };
+      const all = { first: strip.all.firstCol, end: strip.all.endCol };
+      for (const { index, from, to } of labelled(cols, all, colStep, 0, strip.x, nameWidth)) {
+        this.#label(look, columnName(index), look.headerText, clip, from, 0, to, top);
       }
       for (let col = strip.firstCol + 1; col <= strip.endCol; col++) {
         const at = strip.x(col);
-        rects.add(clip, at - hairline, 0, at, top, look.headerLine);
+        const start = colStep > 1 ? top - mark : 0;
+        rects.add(clip, at - hairline, start, at, top, look.headerLine);
       }
     }
 
     const map = frame.filterRowMap ?? null;
     const filter = map?.hasHiddenRows ? (frame.filterState ?? null) : null;
+    // Digits reach no further from the middle than the baseline is below it.
+    const numberHeight = Math.ceil(2 * (look.lifts[HEADER_FONT] ?? 0)) + 2 * hairline;
+    const rowStep = labelStep(metrics.rowHeight * scale, numberHeight);
     for (const strip of strips) {
       const clip = { left: 0, top: strip.top, right: left, bottom: strip.bottom };
       if (isEmptyBox(clip) || strip.firstRow >= strip.endRow) {
@@ -832,7 +878,10 @@ export class SceneBuilder {
           rects.add(clip, 0, strip.y(first), left, strip.y(end), look.headerSelected);
         }
       }
-      for (let row = strip.firstRow; row < strip.endRow; row++) {
+      const rows = { first: strip.firstRow, end: strip.endRow };
+      const all = { first: strip.all.firstRow, end: strip.all.endRow };
+      for (const label of labelled(rows, all, rowStep, 1, strip.y, () => numberHeight)) {
+        const row = label.index;
         const physical = map ? map.displayToPhysical(row) : row;
         const filtered =
           filter !== null &&
@@ -841,12 +890,12 @@ export class SceneBuilder {
             map.isGapBefore(row) ||
             map.isGapAfter(row));
         const color = filtered ? look.filterHeaderText : look.headerText;
-        const from = strip.y(row);
-        this.#label(look, String(physical + 1), color, clip, 0, from, left, strip.y(row + 1));
+        this.#label(look, String(physical + 1), color, clip, 0, label.from, left, label.to);
       }
       for (let row = strip.firstRow + 1; row <= strip.endRow; row++) {
         const at = strip.y(row);
-        rects.add(clip, 0, at - hairline, left, at, look.headerLine);
+        const start = rowStep > 1 ? left - mark : 0;
+        rects.add(clip, start, at - hairline, left, at, look.headerLine);
       }
       if (filter !== null && map !== null) {
         const width = lineWidth(2, look.scale);
@@ -878,8 +927,9 @@ export class SceneBuilder {
       selectionRange.firstCol === 0 &&
       selectionRange.endCol === sheet.cols;
     rects.push(0, 0, left, top, allSelected ? look.headerSelected : look.headerBackground);
-    const size = lineWidth(8, look.scale);
-    const inset = Math.round(5 * look.scale);
+    const cornerScale = scale * headerZoom(look.zoom);
+    const size = lineWidth(8, cornerScale);
+    const inset = Math.round(5 * cornerScale);
     this.#step({
       kind: "sprite",
       spec: { kind: "corner", width: size, height: size, color: look.headerLine },
@@ -910,12 +960,12 @@ export class SceneBuilder {
     if (boxLeft >= boxRight || boxTop >= boxBottom) {
       return;
     }
-    const width = this.measure.width(look.fonts[0] ?? "", text);
+    const width = this.measure.width(look.fonts[HEADER_FONT] ?? "", text);
     const x = (left + right - width) / 2;
-    const lineHeight = look.lineHeights[0] ?? 0;
+    const lineHeight = look.lineHeights[HEADER_FONT] ?? 0;
     const middle = (top + bottom) / 2;
-    const baseline = Math.round(middle + (look.lifts[0] ?? 0));
-    const run = this.#labels.push(text, x, width, baseline, 0, color, 0);
+    const baseline = Math.round(middle + (look.lifts[HEADER_FONT] ?? 0));
+    const run = this.#labels.push(text, x, width, baseline, HEADER_FONT, color, 0);
     if (
       x - 1 < boxLeft ||
       x + width + 1 > boxRight ||
@@ -976,7 +1026,67 @@ export class SceneBuilder {
 }
 
 /** The header cells of a quadrant on the diagonal: its rows on the left and its columns on top. */
-type Strip = Span & PixelBox & Pick<Quadrant, "x" | "y">;
+interface Strip extends Span, PixelBox, Pick<Quadrant, "x" | "y"> {
+  /** The cells that scroll as these do, in view or not. */
+  readonly all: Span;
+}
+
+interface Range {
+  readonly first: number;
+  readonly end: number;
+}
+
+/**
+ * The headers of a strip that have a label, each with the stretch that is the
+ * label's: its own cell, or where those are too small some of the ones around
+ * it. With a step of more than one, labels that do not fit are only those of
+ * every so many cells, counted from the start of the sheet: they stay the same
+ * while it is scrolled.
+ */
+function* labelled(
+  shown: Range,
+  all: Range,
+  step: number,
+  base: number,
+  edge: (index: number) => number,
+  needed: (index: number) => number,
+): Generator<{ readonly index: number; readonly from: number; readonly to: number }> {
+  if (step === 1) {
+    for (let index = shown.first; index < shown.end; index++) {
+      yield { index, from: edge(index), to: edge(index + 1) };
+    }
+    return;
+  }
+  const middle = (index: number) => (edge(index) + edge(index + 1)) / 2;
+  const fits = (index: number) => edge(index + 1) - edge(index) >= needed(index);
+  const isApart = (index: number, other: number) =>
+    Math.abs(middle(index) - middle(other)) >= (needed(index) + needed(other)) / 2;
+  /** Whether a label that takes up the cells around it leaves others theirs. */
+  const hasRoom = (index: number): boolean => {
+    if (index - step >= all.first && !isApart(index, index - step)) {
+      return false;
+    }
+    for (let other = index - step + 1; other < index + step; other++) {
+      const inSheet = other >= all.first && other < all.end && other !== index;
+      if (inSheet && fits(other) && !isApart(index, other)) {
+        return false;
+      }
+    }
+    return true;
+  };
+  // A label may reach into view from a cell that does not.
+  const last = Math.min(all.end, shown.end + step);
+  for (let index = Math.max(all.first, shown.first - step); index < last; index++) {
+    const from = edge(index);
+    const to = edge(index + 1);
+    if (fits(index)) {
+      yield { index, from, to };
+    } else if ((index + base) % step === 0 && to > from && hasRoom(index)) {
+      const start = Math.floor((from + to - needed(index)) / 2);
+      yield { index, from: start, to: from + to - start };
+    }
+  }
+}
 
 function rangesOf(frame: Frame): Span[] {
   if (frame.selectionRanges && frame.selectionRanges.length > 0) {

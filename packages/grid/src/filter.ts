@@ -29,21 +29,24 @@ export const FILTER_BUTTON_SIZE = 14;
 
 /**
  * Computes the AutoFilter dropdown chevron button rectangle inside a header
- * cell, or `null` if the cell is too narrow/short to host the 14px control.
+ * cell, or `null` if the cell is too narrow/short to host the control, which
+ * is 14px large and grows with the cells.
  */
 export function filterButtonBox(
   cellX: number,
   cellY: number,
   cellW: number,
   cellH: number,
+  zoom = 1,
 ): FilterButtonRect | null {
-  if (cellW < 18 || cellH < FILTER_BUTTON_SIZE) {
+  const size = FILTER_BUTTON_SIZE * zoom;
+  if (cellW < 18 * zoom || cellH < size) {
     return null;
   }
-  const marginX = 3;
-  const x = cellX + cellW - FILTER_BUTTON_SIZE - marginX;
-  const y = cellY + Math.floor((cellH - FILTER_BUTTON_SIZE) / 2);
-  return { x, y, size: FILTER_BUTTON_SIZE };
+  const marginX = 3 * zoom;
+  const x = cellX + cellW - size - marginX;
+  const y = cellY + Math.floor((cellH - size) / 2);
+  return { x, y, size };
 }
 
 /**

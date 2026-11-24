@@ -182,7 +182,7 @@ function strike(runs: TextRuns, run: number, look: Look, box: PixelBox): void {
   const left = Math.max(box.left, Math.round(x));
   const right = Math.min(box.right, Math.round(x + (runs.width[run] ?? 0)));
   const top = Math.round((box.top + box.bottom) / 2);
-  const height = lineWidth(1, look.scale);
+  const height = lineWidth(1, look.scale * look.zoom);
   if (runs.strikes === NO_RECTS) {
     runs.strikes = new RectList(8);
   }

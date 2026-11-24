@@ -12,7 +12,10 @@ import {
   PAGE_ROWS,
 } from "@reticula/protocol/viewport";
 
-/** Default sizes in CSS pixels. */
+/**
+ * Sizes in CSS pixels: the ones the workbook has, which are what operations
+ * carry, or the ones they come to on the screen (`viewMetrics`).
+ */
 export interface Metrics {
   readonly rowHeight: number;
   readonly colWidth: number;
@@ -32,6 +35,34 @@ export const DEFAULT_METRICS: Metrics = {
   headerWidth: 64,
   scrollbarSize: 12,
 };
+
+/** Whole device pixels for a size in CSS pixels. Only what has no size at all gets none. */
+function deviceUnits(size: number, deviceScale: number): number {
+  return size > 0 ? Math.max(1, Math.round(size * deviceScale)) : 0;
+}
+
+/** How much the headers are enlarged: less than the cells, as they have to stay legible. */
+export function headerZoom(zoom: number): number {
+  return Math.min(1.5, Math.max(0.75, zoom));
+}
+
+/**
+ * The sizes on the screen. All of them are whole device pixels: the same rows
+ * would otherwise come out higher or lower depending on where they are, and
+ * sums of them would lead to other rows than the ones that are drawn.
+ */
+export function viewMetrics(base: Metrics, zoom: number, deviceScale: number): Metrics {
+  const sized = (size: number, factor: number) =>
+    deviceUnits(size * factor, deviceScale) / deviceScale;
+  const header = headerZoom(zoom);
+  return {
+    rowHeight: sized(base.rowHeight, zoom),
+    colWidth: sized(base.colWidth, zoom),
+    headerHeight: sized(base.headerHeight, header),
+    headerWidth: sized(base.headerWidth, header),
+    scrollbarSize: sized(base.scrollbarSize, 1),
+  };
+}
 
 export interface SheetSize {
   readonly rows: number;
@@ -58,6 +89,16 @@ export interface Span {
 
 export const EMPTY_SPAN: Span = { firstRow: 0, endRow: 0, firstCol: 0, endCol: 0 };
 
+/** A place along an axis: an item, and how much of it comes before. */
+export interface AxisPlace {
+  readonly index: number;
+  /** From 0 to 1. */
+  readonly fraction: number;
+}
+
+/** More than arithmetic in device pixels is off by, and less than can be seen. */
+const ROUNDING = 1e-3;
+
 /**
  * Sparse 1-D axis metrics (`14-m1b.md` 6.2):
  * - `O(1)` arithmetic when there are no custom row/column overrides;
@@ -66,7 +107,8 @@ export const EMPTY_SPAN: Span = { firstRow: 0, endRow: 0, firstCol: 0, endCol: 0
  *
  * Given a device scale, sizes are whole device pixels and all sums are done in
  * those, so that an offset found from a position leads back to it whatever the
- * scale: `floor((p * d) / d)` is not always `p`.
+ * scale: `floor((p * d) / d)` is not always `p`. Sizes are given the way the
+ * workbook has them, and come out enlarged by the zoom.
  */
 export class SparseAxis {
   readonly defaultSize: number;
@@ -82,10 +124,13 @@ export class SparseAxis {
     defaultSize: number,
     custom: readonly (readonly [number, number])[] = [],
     deviceScale?: number,
+    zoom = 1,
   ) {
     this.#snaps = deviceScale !== undefined;
     this.#unitsPerPixel = deviceScale ?? 1;
-    this.#defaultUnits = this.#snaps ? Math.max(1, this.#toUnits(defaultSize)) : defaultSize;
+    const units = (size: number) =>
+      deviceScale === undefined ? size * zoom : deviceUnits(size * zoom, deviceScale);
+    this.#defaultUnits = this.#snaps ? Math.max(1, units(defaultSize)) : units(defaultSize);
     this.defaultSize = this.#defaultUnits / this.#unitsPerPixel;
     const k = custom.length;
     this.#indices = new Uint32Array(k);
@@ -95,10 +140,10 @@ export class SparseAxis {
     for (let i = 0; i < k; i++) {
       const entry = custom[i];
       const idx = entry ? entry[0] : 0;
-      const units = entry ? this.#toUnits(entry[1]) : this.#defaultUnits;
+      const size = entry ? units(entry[1]) : this.#defaultUnits;
       this.#indices[i] = idx;
-      this.#sizes[i] = units;
-      acc += units - this.#defaultUnits;
+      this.#sizes[i] = size;
+      acc += size - this.#defaultUnits;
       this.#deltasPrefix[i + 1] = acc;
     }
   }
@@ -140,17 +185,41 @@ export class SparseAxis {
 
   /** `0`-based item index covering pixel offset `px >= 0`. */
   indexAtOffset(px: number): number {
-    return this.#indexAtUnits(this.#toUnits(px));
+    // The device pixel the offset is in. One that is meant to be the start of
+    // a pixel may come out a little before it.
+    const units = this.#snaps ? Math.floor(px * this.#unitsPerPixel + ROUNDING) : px;
+    return this.#indexAtUnits(units);
   }
 
   /** Index after the last item that starts before pixel offset `px`. */
   endAtOffset(px: number): number {
-    const before = this.#snaps ? this.#toUnits(px) - 1 : px - 0.0001;
+    const before = this.#snaps ? Math.ceil(px * this.#unitsPerPixel - ROUNDING) - 1 : px - 0.0001;
     return this.#indexAtUnits(Math.max(0, before)) + 1;
   }
 
-  #toUnits(px: number): number {
-    return this.#snaps ? Math.round(px * this.#unitsPerPixel) : px;
+  /** Where in the sheet a place in an item is. */
+  offsetOfPlace({ index, fraction }: AxisPlace): number {
+    return this.offsetOf(index) + fraction * this.sizeOf(index);
+  }
+
+  /** Like `offsetOfPlace`, but the start of a pixel that is the item's. */
+  pixelOfPlace({ index, fraction }: AxisPlace): number {
+    const size = this.sizeOf(index);
+    if (!this.#snaps) {
+      return this.offsetOf(index) + fraction * size;
+    }
+    const units = Math.round(size * this.#unitsPerPixel);
+    const inside = Math.max(0, Math.min(units - 1, Math.round(fraction * units)));
+    return this.offsetOf(index) + inside / this.#unitsPerPixel;
+  }
+
+  /** The place of an offset among the first `count` items. */
+  placeAt(px: number, count: number): AxisPlace {
+    const at = Math.min(Math.max(0, px), this.totalSize(count));
+    const index = Math.max(0, Math.min(count - 1, this.indexAtOffset(at)));
+    const size = this.sizeOf(index);
+    const fraction = size > 0 ? (at - this.offsetOf(index)) / size : 0;
+    return { index, fraction: Math.min(1, Math.max(0, fraction)) };
   }
 
   #indexAtUnits(units: number): number {
@@ -396,6 +465,21 @@ export type HeaderHit =
   | { readonly kind: "rowResize"; readonly row: number };
 
 const RESIZE_HANDLE_RADIUS = 4;
+/** Headers smaller than this have no room for anything but themselves. */
+const LEAST_GRIPPED = 10;
+const FILL_HANDLE_RADIUS = 8;
+
+/**
+ * Whether a distance from the edge of something is within reach of its edge.
+ * The middle half of everything is its own, however small it is.
+ */
+function isNearEdge(distance: number, radius: number, size: number): boolean {
+  return distance <= radius && distance * 4 < size;
+}
+
+function isOnGrip(distance: number, size: number): boolean {
+  return size >= LEAST_GRIPPED && isNearEdge(distance, RESIZE_HANDLE_RADIUS, size);
+}
 
 /** Classifies a pointer coordinate `(x, y)` inside the header strips (`null` if in body/scrollbars). */
 export function headerHitAt(
@@ -434,11 +518,11 @@ export function headerHitAt(
       return null;
     }
     const colStart = resolved.colAxis.offsetOf(col);
-    const colEnd = colStart + resolved.colAxis.sizeOf(col);
-    if (Math.abs(sheetX - colEnd) <= RESIZE_HANDLE_RADIUS) {
+    const colSize = resolved.colAxis.sizeOf(col);
+    if (isOnGrip(colStart + colSize - sheetX, colSize)) {
       return { kind: "colResize", col };
     }
-    if (col > 0 && Math.abs(sheetX - colStart) <= RESIZE_HANDLE_RADIUS) {
+    if (col > 0 && isOnGrip(sheetX - colStart, colSize)) {
       // Do not cross the freeze boundary to resize a scrolled-under column when over frozen strip.
       if (!(areaX >= fz.width && col - 1 < fz.frozenCols && scroll.left > 0)) {
         return { kind: "colResize", col: col - 1 };
@@ -462,11 +546,11 @@ export function headerHitAt(
       return null;
     }
     const rowStart = resolved.rowAxis.offsetOf(row);
-    const rowEnd = rowStart + resolved.rowAxis.sizeOf(row);
-    if (Math.abs(sheetY - rowEnd) <= RESIZE_HANDLE_RADIUS) {
+    const rowSize = resolved.rowAxis.sizeOf(row);
+    if (isOnGrip(rowStart + rowSize - sheetY, rowSize)) {
       return { kind: "rowResize", row };
     }
-    if (row > 0 && Math.abs(sheetY - rowStart) <= RESIZE_HANDLE_RADIUS) {
+    if (row > 0 && isOnGrip(sheetY - rowStart, rowSize)) {
       if (!(areaY >= fz.height && row - 1 < fz.frozenRows && scroll.top > 0)) {
         return { kind: "rowResize", row: row - 1 };
       }
@@ -515,6 +599,208 @@ export function cellBox(
     width: layout.colAxis.sizeOf(col),
     height: layout.rowAxis.sizeOf(row),
   };
+}
+
+/** Everything the place of a cell on the screen depends on. */
+export interface View {
+  readonly metrics: Metrics;
+  readonly sheet: SheetSize;
+  readonly size: Size;
+  readonly layout: SheetLayout;
+  readonly scroll: Scroll;
+}
+
+/** A position in CSS pixels from the top left corner of the grid's area. */
+export interface Point {
+  readonly x: number;
+  readonly y: number;
+}
+
+/** Whether a point is over the handle at the last corner of some selected cells. */
+export function isOverFillHandle(view: View, range: Span, { x, y }: Point): boolean {
+  const { metrics, sheet, size, layout, scroll } = view;
+  if (isEmpty(range) || x < metrics.headerWidth || y < metrics.headerHeight) {
+    return false;
+  }
+  const row = range.endRow - 1;
+  const col = range.endCol - 1;
+  const corner = cellBox(metrics, scroll, row, col, size, sheet, layout);
+  const dx = Math.abs(x - corner.left - corner.width);
+  const dy = Math.abs(y - corner.top - corner.height);
+  const cell = cellAt(metrics, sheet, scroll, size, x, y, layout);
+  if (!cell) {
+    // Past the last row or column, where there is nothing else to point at.
+    return dx <= FILL_HANDLE_RADIUS && dy <= FILL_HANDLE_RADIUS;
+  }
+  return (
+    (cell.row === row || cell.row === row + 1) &&
+    (cell.col === col || cell.col === col + 1) &&
+    isNearEdge(dx, FILL_HANDLE_RADIUS, layout.colAxis.sizeOf(cell.col)) &&
+    isNearEdge(dy, FILL_HANDLE_RADIUS, layout.rowAxis.sizeOf(cell.row))
+  );
+}
+
+/** One axis of a view. */
+interface AxisView {
+  readonly axis: SparseAxis;
+  readonly count: number;
+  /** Where the cells begin, and where the frozen ones among them end. */
+  readonly header: number;
+  readonly frozen: number;
+  readonly room: number;
+  readonly scroll: number;
+}
+
+function axesOf(view: View): { readonly rows: AxisView; readonly cols: AxisView } {
+  const { metrics, sheet, size, layout, scroll } = view;
+  const area = cellArea(metrics, size);
+  const frozen = frozenPixels(metrics, sheet, size, layout);
+  return {
+    rows: {
+      axis: layout.rowAxis,
+      count: sheet.rows,
+      header: metrics.headerHeight,
+      frozen: frozen.height,
+      room: area.height,
+      scroll: scroll.top,
+    },
+    cols: {
+      axis: layout.colAxis,
+      count: sheet.cols,
+      header: metrics.headerWidth,
+      frozen: frozen.width,
+      room: area.width,
+      scroll: scroll.left,
+    },
+  };
+}
+
+/** The sheet's place in the corner of the part of a view that scrolls. */
+export interface Corner {
+  readonly row: AxisPlace;
+  readonly col: AxisPlace;
+}
+
+export function cornerOf(view: View): Corner {
+  const { rows, cols } = axesOf(view);
+  const first = ({ axis, count, frozen, scroll }: AxisView) => axis.placeAt(scroll + frozen, count);
+  return { row: first(rows), col: first(cols) };
+}
+
+/** The scroll position that has a place in the corner, as far as the sheet allows. */
+export function scrollToCorner(view: View, corner: Corner): Scroll {
+  const { rows, cols } = axesOf(view);
+  const scroll = {
+    top: rows.axis.pixelOfPlace(corner.row) - rows.frozen,
+    left: cols.axis.pixelOfPlace(corner.col) - cols.frozen,
+  };
+  return clampScroll(scroll, scrollLimits(view.metrics, view.sheet, view.size, view.layout));
+}
+
+function anchored(before: AxisView, after: AxisView, point: number | null): number {
+  const at = point === null ? -1 : Math.min(point - before.header, before.room);
+  if (point === null || at < before.frozen) {
+    // What is frozen stays where it is anyway.
+    const corner = before.axis.placeAt(before.scroll + before.frozen, before.count);
+    return after.axis.pixelOfPlace(corner) - after.frozen;
+  }
+  const place = before.axis.placeAt(before.scroll + at, before.count);
+  const wanted = before.header + at - after.header;
+  return after.axis.offsetOfPlace(place) - Math.max(after.frozen, wanted);
+}
+
+/**
+ * The scroll position at which a view that has changed its sizes shows, at a
+ * point, what it showed there before. Over the headers and the frozen cells,
+ * or without a point, that is its corner's place.
+ */
+export function reanchor(before: View, after: View, point: Point | null): Scroll {
+  const from = axesOf(before);
+  const to = axesOf(after);
+  const scroll = {
+    top: anchored(from.rows, to.rows, point?.y ?? null),
+    left: anchored(from.cols, to.cols, point?.x ?? null),
+  };
+  return clampScroll(scroll, scrollLimits(after.metrics, after.sheet, after.size, after.layout));
+}
+
+/** The middle of what is in view of a cell, if anything is. */
+export function pointOfCell(
+  view: View,
+  cell: { readonly row: number; readonly col: number },
+): Point | null {
+  const { metrics, sheet, size, layout, scroll } = view;
+  const frozen = frozenPixels(metrics, sheet, size, layout);
+  const { rows, cols } = axesOf(view);
+  const box = cellBox(metrics, scroll, cell.row, cell.col, size, sheet, layout);
+  const least = (along: AxisView, isFrozen: boolean) =>
+    along.header + (isFrozen ? 0 : along.frozen);
+  const left = Math.max(box.left, least(cols, cell.col < frozen.frozenCols));
+  const top = Math.max(box.top, least(rows, cell.row < frozen.frozenRows));
+  const right = Math.min(box.left + box.width, cols.header + cols.room);
+  const bottom = Math.min(box.top + box.height, rows.header + rows.room);
+  return left < right && top < bottom ? { x: (left + right) / 2, y: (top + bottom) / 2 } : null;
+}
+
+/** The middle of the part of a view that scrolls. */
+export function middleOf(view: View): Point {
+  const { rows, cols } = axesOf(view);
+  const along = ({ header, frozen, room }: AxisView) => header + (frozen + room) / 2;
+  return { x: along(cols), y: along(rows) };
+}
+
+/** Where a cell's editor is, and how large what is in it. */
+export interface EditorBox extends Box {
+  /** What is enlarged by: at least what a font of a legible size takes. */
+  readonly zoom: number;
+  /** How far it may grow with its text. */
+  readonly maxWidth: number;
+}
+
+/**
+ * The editor of a cell. It is as large as the cell if text of a legible size
+ * fits into that, and floats over the cells around it otherwise, inside the
+ * cells' area. Shown, it stays on its cell even if that is scrolled away;
+ * hidden, it is somewhere in view, where an input method can open its window.
+ */
+export function editorBox(
+  metrics: Metrics,
+  size: Size,
+  cell: Box,
+  zoom: number,
+  leastZoom: number,
+  deviceScale: number,
+  shown: boolean,
+): EditorBox {
+  const area = cellArea(metrics, size);
+  const enlarged = Math.max(zoom, leastZoom);
+  const along = (from: number, extent: number, lead: number, header: number, room: number) => {
+    const length = deviceUnits(extent * (enlarged / zoom), deviceScale) / deviceScale;
+    const spare = Math.floor((length - extent) * lead * deviceScale) / deviceScale;
+    const start = Math.max(header, Math.min(from - spare, header + room - length));
+    return {
+      start: shown ? Math.min(from, Math.max(start, from + extent - length)) : start,
+      length,
+    };
+  };
+  // What is typed starts where the cell's text does, and is on a line with it.
+  const x = along(cell.left, cell.width, 0, metrics.headerWidth, area.width);
+  const y = along(cell.top, cell.height, 0.5, metrics.headerHeight, area.height);
+  return {
+    left: x.start,
+    top: y.start,
+    width: x.length,
+    height: y.length,
+    zoom: enlarged,
+    maxWidth: Math.max(x.length, metrics.headerWidth + area.width - x.start),
+  };
+}
+
+/** Every how many of a header's cells there is a label, so that the labels have room: 1, 2, 5, 10... */
+export function labelStep(size: number, needed: number): number {
+  const least = needed / Math.max(1, size);
+  const magnitude = 10 ** Math.max(0, Math.floor(Math.log10(Math.max(1, least))));
+  return magnitude * ([1, 2, 5].find((step) => step * magnitude >= least) ?? 10);
 }
 
 /**

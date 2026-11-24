@@ -2,6 +2,7 @@ import { PageCache } from "./cache.ts";
 import { type CellRect, type FilterDisplayState, FilterRowMap, filterButtonBox } from "./filter.ts";
 import {
   type Box,
+  type Corner,
   cellArea,
   cellAt,
   cellBox,
@@ -9,14 +10,22 @@ import {
   clampScroll,
   columnName,
   contentSize,
+  cornerOf,
   DEFAULT_METRICS,
-  defaultLayout,
+  type EditorBox,
   EMPTY_SPAN,
+  editorBox,
   frozenPixels,
+  type HeaderHit,
   headerHitAt,
   isEmpty,
+  isOverFillHandle,
   type Metrics,
+  middleOf,
+  type Point,
   pagesToHold,
+  pointOfCell,
+  reanchor,
   type Scroll,
   type SheetLayout,
   type SheetSize,
@@ -25,23 +34,28 @@ import {
   SparseAxis,
   sameSpan,
   scrollLimits,
+  scrollToCorner,
   scrollToReveal,
+  type View,
+  viewMetrics,
   visibleCells,
 } from "./layout.ts";
 import { decodePage } from "./page.ts";
 import { Canvas2dRenderer } from "./render/canvas2d.ts";
-import {
-  type DiffHighlightMap,
-  FILL_HANDLE_SIZE,
-  type FormulaReferenceOverlay,
-  type GridCellStyle,
-  type RemotePresenceOverlay,
-  type ReorderGuide,
+import type {
+  DiffHighlightMap,
+  FormulaReferenceOverlay,
+  Frame,
+  GridCellStyle,
+  RemotePresenceOverlay,
+  ReorderGuide,
 } from "./render/frame.ts";
 import { TextMeasurer } from "./render/text-measure.ts";
-import type { GridRenderer } from "./render/types.ts";
+import type { GridRenderer, RendererCounters, RendererKind } from "./render/types.ts";
+import { type RendererPreference, type RendererReason, startUpgrade } from "./render/upgrade.ts";
 import { Scrollbar } from "./scrollbar.ts";
 import { readTheme, type Theme } from "./theme.ts";
+import { clampZoom, nextZoom, ZoomGesture } from "./zoom.ts";
 
 /** Contiguous run of row or column identifiers (`firstId .. firstId + len`). */
 export interface IdRun {
@@ -84,7 +98,11 @@ export interface GridContextTarget {
 export interface GridOptions {
   readonly subscribe: (subscription: Subscription) => void;
   readonly margin?: { readonly rows: number; readonly cols: number };
+  /** Sizes at a zoom of 1. */
   readonly metrics?: Metrics;
+  /** Whether Ctrl with the wheel and pinches zoom the sheet, and not the page. */
+  readonly zoom?: boolean;
+  readonly onZoomChange?: (zoom: number) => void;
   readonly onFrame?: (frame: FrameReport) => void;
   readonly onSelectionChange?: (selection: Selection | null) => void;
   readonly onActivateEdit?: (cell: { readonly row: number; readonly col: number }) => void;
@@ -128,8 +146,25 @@ export interface Selection {
   readonly text: string | null;
 }
 
+/** What of a sheet is in view and selected: what there is to remember of it. */
+export interface GridView {
+  readonly zoom: number;
+  /** The first row and column in view that are not frozen, and how much of them is out of view. */
+  readonly row: number;
+  readonly rowFraction: number;
+  readonly col: number;
+  readonly colFraction: number;
+  readonly selection: {
+    readonly anchor: { readonly row: number; readonly col: number };
+    readonly focus: { readonly row: number; readonly col: number };
+    readonly scope: SelectionScope;
+  } | null;
+}
+
 export interface GridStats {
   readonly sheet: SheetSize;
+  readonly zoom: number;
+  /** The sizes on the screen: those of the sheet, enlarged by the zoom. */
   readonly metrics: Metrics;
   readonly scroll: Scroll;
   readonly scrollLimits: Scroll;
@@ -152,6 +187,13 @@ export interface GridStats {
     readonly max: number;
   };
   readonly selection: Selection | null;
+  readonly renderer: {
+    readonly kind: RendererKind;
+    /** Why it is not the one for WebGPU. */
+    readonly reason: RendererReason | null;
+    readonly adapter: string | null;
+    readonly counters: RendererCounters | null;
+  };
 }
 
 const IDLE_MARGIN = { rows: 0.5, cols: 1 };
@@ -163,6 +205,10 @@ const MIN_ROW_PX = 16;
 const MAX_ROW_PX = 600;
 const MIN_COL_PX = 24;
 const MAX_COL_PX = 1200;
+/** Turns of the wheel that follow each other within this time are one gesture. */
+const ZOOM_GESTURE_MS = 200;
+/** The smallest font that cells are edited in, in CSS pixels. */
+const LEAST_EDITED_FONT = 11;
 
 /** Coalesces sorted/ordered `bigint` IDs into contiguous `{ firstId, len }` runs. */
 export function coalesceIdRuns(ids: readonly bigint[]): IdRun[] {
@@ -186,10 +232,25 @@ function withSize(sizes: CustomSizes, index: number, px: number, standard: numbe
   return px === standard ? others : [...others, [index, px] as const].sort((a, b) => a[0] - b[0]);
 }
 
-/** The size an edge has been dragged to. One that has not moved has not changed it. */
-function dragged(size: number, by: number, least: number, most: number): number {
-  return by === 0 ? size : Math.min(most, Math.max(least, Math.round(size + by)));
+function sizeIn(sizes: CustomSizes, index: number, standard: number): number {
+  return sizes.find(([other]) => other === index)?.[1] ?? standard;
 }
+
+/**
+ * The size an edge has been dragged to, as it is kept: at a zoom of 1. An edge
+ * that has not moved has not changed it.
+ */
+function dragged(size: number, by: number, zoom: number, least: number, most: number): number {
+  return by === 0 ? size : Math.min(most, Math.max(least, Math.round(size + by / zoom)));
+}
+
+interface Cell {
+  readonly row: number;
+  readonly col: number;
+}
+
+const PINCH_EVENTS = ["gesturestart", "gesturechange", "gestureend"] as const;
+const KEY_EVENTS = ["keydown", "keyup", "blur"] as const;
 
 type DragInteraction =
   | { readonly kind: "select"; readonly mode: SelectionScope }
@@ -203,13 +264,13 @@ type DragInteraction =
       readonly kind: "colResize";
       readonly col: number;
       readonly startClientX: number;
-      readonly startWidth: number;
+      readonly startBase: number;
     }
   | {
       readonly kind: "rowResize";
       readonly row: number;
       readonly startClientY: number;
-      readonly startHeight: number;
+      readonly startBase: number;
     }
   | { readonly kind: "rowReorder"; readonly startRow: number; moved: boolean }
   | { readonly kind: "colReorder"; readonly startCol: number; moved: boolean };
@@ -223,13 +284,32 @@ export class Grid {
   #renderer: GridRenderer;
   /** The renderer that was replaced, shown until the one in its place has drawn. */
   #retired: GridRenderer | null = null;
+  #rendererPreference: RendererPreference = "canvas2d";
+  #rendererState: Pick<GridStats["renderer"], "reason" | "adapter"> = {
+    reason: "preference",
+    adapter: null,
+  };
+  #endUpgrade = () => {};
+  /** What was drawn last. */
+  #drawn: Frame | null = null;
   /** Where the pointer is listened to, whatever draws the picture below. */
   #input: HTMLDivElement;
   #vertical: Scrollbar;
   #horizontal: Scrollbar;
   #corner: HTMLDivElement;
   #options: GridOptions;
+  /** The sizes of the workbook, and what they come to on the screen. */
+  #base: Metrics;
   #metrics: Metrics;
+  #zoom = 1;
+  #gesture = new ZoomGesture();
+  /** What a gesture has come to since the last frame, and where it is. */
+  #zoomGoal: { readonly zoom: number; readonly point: Point } | null = null;
+  #zoomTimer = 0;
+  /** Whether fingers are on the trackpad, as Safari has it. */
+  #pinching = false;
+  /** Whether the key is held, which a pinch that comes as a turn of the wheel only claims. */
+  #controlHeld = false;
   #fixedMargin: { readonly rows: number; readonly cols: number } | null;
   #frameListeners = new Set<(frame: FrameReport) => void>();
 
@@ -260,6 +340,10 @@ export class Grid {
   #size: Size = { width: 0, height: 0 };
   #scale = 1;
   #scroll: Scroll = { top: 0, left: 0 };
+  /** Where to scroll once there is a size to go by. */
+  #scrollGoal: Corner | null = null;
+  /** The place a sheet was opened at, while nothing has been scrolled, zoomed or changed since. */
+  #openedAt: Corner | null = null;
   #anchor: { row: number; col: number } | null = null;
   #focus: { row: number; col: number } | null = null;
   #extraRanges: Span[] = [];
@@ -267,6 +351,8 @@ export class Grid {
   #cache = new PageCache();
   #epoch = 0;
   #lastFreezeKey = "0:0";
+  /** Whether more pages than are wanted may be held. */
+  #holdsTooMuch = false;
 
   #lastVelocityTop = 0;
   #lastVelocityTime = 0;
@@ -301,8 +387,10 @@ export class Grid {
   constructor(host: HTMLElement, options: GridOptions) {
     this.#host = host;
     this.#options = options;
-    this.#metrics = options.metrics ?? DEFAULT_METRICS;
-    this.#layout = defaultLayout(this.#metrics);
+    this.#base = options.metrics ?? DEFAULT_METRICS;
+    this.#scale = window.devicePixelRatio || 1;
+    this.#metrics = viewMetrics(this.#base, this.#zoom, this.#scale);
+    this.#layout = this.#makeLayout();
     this.#fixedMargin = options.margin ?? null;
     if (options.onFrame) {
       this.#frameListeners.add(options.onFrame);
@@ -310,10 +398,7 @@ export class Grid {
 
     host.classList.add("reticula-grid");
     host.tabIndex = 0;
-    this.#renderer = new Canvas2dRenderer({
-      measure: this.#measurer,
-      onRestored: () => this.#invalidate(),
-    });
+    this.#renderer = this.#canvas2d();
     this.#renderer.canvas.setAttribute("aria-hidden", "true");
     this.#input = document.createElement("div");
     this.#input.className = "reticula-input";
@@ -334,6 +419,14 @@ export class Grid {
     this.#watchDensity();
 
     host.addEventListener("wheel", this.#onWheel, { passive: false });
+    if (options.zoom) {
+      for (const type of PINCH_EVENTS) {
+        host.addEventListener(type, this.#onPinch, { passive: false });
+      }
+      for (const type of KEY_EVENTS) {
+        window.addEventListener(type, this.#onControlKey, { capture: true });
+      }
+    }
     this.#input.addEventListener("pointerdown", this.#onPointerDown);
     this.#input.addEventListener("pointermove", this.#onPointerMove);
     this.#input.addEventListener("pointerup", this.#onPointerUp);
@@ -350,17 +443,34 @@ export class Grid {
     this.#invalidate();
   }
 
-  /** Opens a new sheet, resetting scroll, selection, and page cache. */
-  setSheet(sheet: SheetConfig): void {
+  /**
+   * Opens a new sheet, where it was left if that is known. Something is
+   * selected then if there is anything to select: without a selection, the
+   * keyboard would be of no use.
+   */
+  setSheet(sheet: SheetConfig, view: Partial<GridView> = {}): void {
     this.cancelDrag();
+    this.#zoomGoal = null;
+    this.#endZoomGesture();
+    const zoom = clampZoom(view.zoom ?? this.#zoom, this.#zoom);
+    const isZoomed = zoom !== this.#zoom;
+    this.#zoom = zoom;
+    this.#metrics = viewMetrics(this.#base, zoom, this.#scale);
     this.#sheet = { rows: sheet.rows, cols: sheet.cols };
     this.#applySheetConfig(sheet);
-    this.#scroll = { top: 0, left: 0 };
-    this.#anchor = null;
-    this.#focus = null;
+    this.#placeScroll({ top: 0, left: 0 });
+    const { row = 0, rowFraction = 0, col = 0, colFraction = 0, selection } = view;
+    const first = this.#cellWithin({ row, col });
+    this.#scrollGoal = first && {
+      row: { index: first.row, fraction: first.row === row ? rowFraction : 0 },
+      col: { index: first.col, fraction: first.col === col ? colFraction : 0 },
+    };
+    this.#settleScroll();
+    this.#anchor = selection ? this.#cellWithin(selection.anchor) : first;
+    this.#focus = selection ? this.#cellWithin(selection.focus) : first;
     this.#extraRanges = [];
     this.#remotePresences = [];
-    this.#scope = "cells";
+    this.#scope = selection?.scope ?? "cells";
     this.#clipboardRange = null;
     this.#fillPreview = null;
     this.#reorderGuide = null;
@@ -370,12 +480,33 @@ export class Grid {
       this.#filterRowMap = null;
     }
     this.#cache.clear();
+    if (isZoomed) {
+      this.#options.onZoomChange?.(zoom);
+    }
     this.#notifySelection();
     this.#invalidate();
   }
 
+  /** What `setSheet` takes to show the sheet the way it is shown now. */
+  view(): GridView {
+    const { row, col } = this.#scrollGoal ?? cornerOf(this.#viewNow());
+    return {
+      zoom: this.#zoom,
+      row: row.index,
+      rowFraction: row.fraction,
+      col: col.index,
+      colFraction: col.fraction,
+      selection:
+        this.#anchor && this.#focus
+          ? { anchor: this.#anchor, focus: this.#focus, scope: this.#scope }
+          : null,
+    };
+  }
+
   /** Updates sheet dimensions, metrics, freeze panes, and styles while preserving scroll & selection. */
   updateSheet(sheet: SheetConfig): void {
+    this.#openedAt = null;
+    const hadCells = this.#sheet.rows > 0 && this.#sheet.cols > 0;
     const prevFreezeKey = `${this.#frozenRows}:${this.#frozenCols}`;
     this.#sheet = { rows: sheet.rows, cols: sheet.cols };
     this.#applySheetConfig(sheet);
@@ -409,6 +540,9 @@ export class Grid {
           endCol: Math.min(this.#sheet.cols, r.endCol),
         }))
         .filter((r) => !isEmpty(r));
+    } else if (!this.#anchor && !hadCells) {
+      this.#anchor = this.#cellWithin({ row: 0, col: 0 });
+      this.#focus = this.#anchor;
     }
     this.#notifySelection();
     this.#invalidate();
@@ -490,16 +624,44 @@ export class Grid {
     this.#rebuildLayout();
   }
 
-  #rebuildLayout(): void {
-    const { rowHeight, colWidth } = this.#metrics;
+  #makeLayout(): SheetLayout {
+    const { rowHeight, colWidth } = this.#base;
     const preview = this.#sizePreview;
-    const sizesOf = (axis: "row" | "col", sizes: CustomSizes, standard: number) =>
-      preview?.axis === axis ? withSize(sizes, preview.index, preview.px, standard) : sizes;
-    this.#layout = {
-      rowAxis: new SparseAxis(rowHeight, sizesOf("row", this.#customRows, rowHeight)),
-      colAxis: new SparseAxis(colWidth, sizesOf("col", this.#customCols, colWidth)),
+    const axisOf = (axis: "row" | "col", sizes: CustomSizes, standard: number) => {
+      const shown =
+        preview?.axis === axis ? withSize(sizes, preview.index, preview.px, standard) : sizes;
+      return new SparseAxis(standard, shown, this.#scale, this.#zoom);
+    };
+    return {
+      rowAxis: axisOf("row", this.#customRows, rowHeight),
+      colAxis: axisOf("col", this.#customCols, colWidth),
       frozenRows: this.#frozenRows,
       frozenCols: this.#frozenCols,
+    };
+  }
+
+  #rebuildLayout(): void {
+    this.#layout = this.#makeLayout();
+  }
+
+  /** What the pointer is over, and what is drawn, is in the view as it was last drawn. */
+  #viewNow(scroll: Scroll = this.#drawnScroll()): View {
+    return {
+      metrics: this.#metrics,
+      sheet: this.#sheet,
+      size: this.#size,
+      layout: this.#layout,
+      scroll,
+    };
+  }
+
+  #cellWithin(cell: { readonly row: number; readonly col: number }): Cell | null {
+    if (this.#sheet.rows <= 0 || this.#sheet.cols <= 0) {
+      return null;
+    }
+    return {
+      row: Math.min(this.#sheet.rows - 1, Math.max(0, cell.row)),
+      col: Math.min(this.#sheet.cols - 1, Math.max(0, cell.col)),
     };
   }
 
@@ -531,6 +693,9 @@ export class Grid {
 
   /** Scrolls to a position in CSS pixels, as far as the sheet allows. */
   scrollTo(position: Partial<Scroll>): void {
+    this.#settleScroll();
+    this.#scrollGoal = null;
+    this.#openedAt = null;
     const limits = scrollLimits(this.#metrics, this.#sheet, this.#size, this.#layout);
     const next = clampScroll({ ...this.#scroll, ...position }, limits);
     if (next.top !== this.#scroll.top || next.left !== this.#scroll.left) {
@@ -550,21 +715,127 @@ export class Grid {
     }
   }
 
+  /** Scrolls to where the sheet was left, if that has not been possible before. */
+  #settleScroll(): void {
+    const goal = this.#scrollGoal;
+    if (!goal) {
+      return;
+    }
+    if (this.#resized) {
+      this.#resize();
+    }
+    if (this.#size.width > 0 && this.#size.height > 0) {
+      this.#scrollGoal = null;
+      this.#placeScroll(scrollToCorner(this.#viewNow(), goal));
+      this.#openedAt = goal;
+    }
+  }
+
+  /** Scrolls without that being a movement: nothing says that it will go on. */
+  #placeScroll(scroll: Scroll): void {
+    this.#openedAt = null;
+    this.#scroll = scroll;
+    this.#lastVelocityTop = scroll.top;
+    this.#lastVelocityTime = performance.now();
+  }
+
+  /** How much the sheet is enlarged. */
+  get zoom(): number {
+    return this.#zoom;
+  }
+
+  /**
+   * Enlarges the sheet, with what is at a point of the grid's area staying
+   * there. By default that is the selected cell, which stays in view as well,
+   * or the middle if the cell is not in view. Returns whether it did: while
+   * something is dragged, it does not.
+   */
+  setZoom(zoom: number, anchor?: Point): boolean {
+    if (this.#drag || !Number.isFinite(zoom)) {
+      return false;
+    }
+    this.#zoomGoal = null;
+    this.#endZoomGesture();
+    this.#settleScroll();
+    const view = this.#viewNow();
+    const cell = anchor ? null : this.#anchor;
+    const point = cell && pointOfCell(view, cell);
+    const wanted = clampZoom(Math.round(zoom * 100) / 100);
+    if (this.#changeZoom(wanted, anchor ?? point ?? middleOf(view)) && cell && point) {
+      const { metrics, size, sheet, layout, scroll } = this.#viewNow(this.#scroll);
+      this.#placeScroll(scrollToReveal(metrics, size, scroll, cell.row, cell.col, sheet, layout));
+    }
+    return true;
+  }
+
+  zoomIn(): boolean {
+    return this.setZoom(nextZoom(this.#zoom, 1));
+  }
+
+  zoomOut(): boolean {
+    return this.setZoom(nextZoom(this.#zoom, -1));
+  }
+
+  zoomReset(): boolean {
+    return this.setZoom(1);
+  }
+
+  #changeZoom(zoom: number, point: Point): boolean {
+    if (zoom === this.#zoom) {
+      return false;
+    }
+    this.#rescale(zoom, this.#scale, this.#size, point);
+    this.#invalidate();
+    this.#options.onZoomChange?.(zoom);
+    return true;
+  }
+
+  /** Takes on other sizes, with the sheet staying where it is at a point or at its corner. */
+  #rescale(zoom: number, scale: number, size: Size, point: Point | null): void {
+    // Rounded, the place of a point would move with every step of a gesture.
+    const before = this.#viewNow(point ? this.#scroll : this.#drawnScroll());
+    this.#zoom = zoom;
+    this.#scale = scale;
+    this.#size = size;
+    this.#metrics = viewMetrics(this.#base, zoom, scale);
+    this.#rebuildLayout();
+    const after = this.#viewNow(this.#scroll);
+    this.#placeScroll(
+      before.size.width > 0 && before.size.height > 0
+        ? reanchor(before, after, point)
+        : clampScroll(this.#scroll, scrollLimits(this.#metrics, this.#sheet, size, this.#layout)),
+    );
+  }
+
+  /** Zooms with the next frame, which a gesture may have more to add to until then. */
+  #zoomSoon(zoom: number | null, point: Point): void {
+    if (zoom !== null) {
+      this.#zoomGoal = { zoom, point };
+      this.#invalidate();
+    }
+    window.clearTimeout(this.#zoomTimer);
+    this.#zoomTimer = window.setTimeout(this.#endZoomGesture, ZOOM_GESTURE_MS);
+  }
+
+  #endZoomGesture = (): void => {
+    window.clearTimeout(this.#zoomTimer);
+    this.#zoomTimer = 0;
+    this.#gesture.end();
+    if (this.#zoomGoal && !this.#drag) {
+      this.#changeZoom(this.#zoomGoal.zoom, this.#zoomGoal.point);
+    }
+    this.#zoomGoal = null;
+    // Zooming in leaves pages held that are far out of view.
+    this.#holdsTooMuch = true;
+    this.#invalidate();
+  };
+
   /** Selects a single cell, clearing extra ranges. */
   select(cell: { row: number; col: number } | null): void {
     this.#extraRanges = [];
     this.#scope = "cells";
-    if (!cell || this.#sheet.rows <= 0 || this.#sheet.cols <= 0) {
-      this.#anchor = null;
-      this.#focus = null;
-    } else {
-      const clamped = {
-        row: Math.min(this.#sheet.rows - 1, Math.max(0, cell.row)),
-        col: Math.min(this.#sheet.cols - 1, Math.max(0, cell.col)),
-      };
-      this.#anchor = clamped;
-      this.#focus = clamped;
-    }
+    this.#anchor = cell && this.#cellWithin(cell);
+    this.#focus = this.#anchor;
     this.#notifySelection();
     this.#invalidate();
   }
@@ -827,6 +1098,7 @@ export class Grid {
 
   /** Scrolls just far enough for a cell to be fully in view. */
   reveal(row: number, col: number): void {
+    this.#settleScroll();
     this.scrollTo(
       scrollToReveal(this.#metrics, this.#size, this.#scroll, row, col, this.#sheet, this.#layout),
     );
@@ -842,6 +1114,22 @@ export class Grid {
       this.#size,
       this.#sheet,
       this.#layout,
+    );
+  }
+
+  /**
+   * Where the editor of a cell is, shown or not. Other than the cell itself
+   * it is never too small to read what is in it.
+   */
+  editorBoxOf(row: number, col: number, shown: boolean): EditorBox {
+    return editorBox(
+      this.#metrics,
+      this.#size,
+      this.boxOf(row, col),
+      this.#zoom,
+      Math.min(1, LEAST_EDITED_FONT / this.#theme.fontSize),
+      this.#scale,
+      shown,
     );
   }
 
@@ -865,6 +1153,7 @@ export class Grid {
     const quantile = (q: number) => sorted[Math.min(samples - 1, Math.floor(q * samples))] ?? 0;
     return {
       sheet: this.#sheet,
+      zoom: this.#zoom,
       metrics: this.#metrics,
       scroll: this.#scroll,
       scrollLimits: scrollLimits(this.#metrics, this.#sheet, this.#size, this.#layout),
@@ -887,6 +1176,11 @@ export class Grid {
         max: sorted[samples - 1] ?? 0,
       },
       selection: this.#selection(),
+      renderer: {
+        kind: this.#renderer.kind,
+        ...this.#rendererState,
+        counters: this.#renderer.counters ?? null,
+      },
     };
   }
 
@@ -915,15 +1209,49 @@ export class Grid {
   }
 
   /**
-   * Has another renderer draw from the next frame on. Refused, with `false`,
-   * while something is dragged.
-   *
-   * @internal
+   * Chooses what draws the grid. WebGPU takes over from the 2D canvas once it
+   * is ready to, and hands back to another one when it is lost.
    */
-  swapRenderer(renderer: GridRenderer): boolean {
-    if (this.#drag || this.#destroyed) {
+  setRenderer(preference: RendererPreference): void {
+    if (this.#destroyed || preference === this.#rendererPreference) {
+      return;
+    }
+    this.#rendererPreference = preference;
+    this.#endUpgrade();
+    if (this.#renderer.kind !== "canvas2d") {
+      this.#swapRenderer(null);
+    }
+    this.#endUpgrade = startUpgrade(
+      {
+        measure: this.#measurer,
+        frame: () => this.#drawn,
+        invalidate: () => this.#invalidate(),
+        swap: (renderer) => this.#swapRenderer(renderer),
+        report: (reason, adapter = null) => {
+          this.#rendererState = { reason, adapter };
+        },
+      },
+      preference,
+    );
+  }
+
+  #canvas2d(): GridRenderer {
+    return new Canvas2dRenderer({
+      measure: this.#measurer,
+      onRestored: () => this.#invalidate(),
+    });
+  }
+
+  /**
+   * Has another renderer draw from the next frame on; without one, a new 2D
+   * canvas. Refused, with `false`, while something is dragged, unless what drew
+   * so far cannot go on.
+   */
+  #swapRenderer(next: GridRenderer | null): boolean {
+    if (this.#destroyed || (next && this.#drag)) {
       return false;
     }
+    const renderer = next ?? this.#canvas2d();
     this.#retired?.destroy();
     this.#retired = this.#renderer;
     this.#renderer = renderer;
@@ -936,6 +1264,7 @@ export class Grid {
 
   destroy(): void {
     this.#stopAutoScroll();
+    window.clearTimeout(this.#zoomTimer);
     this.#hold(EMPTY_SPAN);
     this.#destroyed = true;
     this.#frameListeners.clear();
@@ -944,6 +1273,13 @@ export class Grid {
     this.#scheme.removeEventListener("change", this.#restyle);
     this.#density?.removeEventListener("change", this.#onDensityChange);
     this.#host.removeEventListener("wheel", this.#onWheel);
+    for (const type of PINCH_EVENTS) {
+      this.#host.removeEventListener(type, this.#onPinch);
+    }
+    for (const type of KEY_EVENTS) {
+      window.removeEventListener(type, this.#onControlKey, { capture: true });
+    }
+    this.#endUpgrade();
     this.#renderer.destroy();
     this.#retired?.destroy();
     this.#input.remove();
@@ -1010,30 +1346,42 @@ export class Grid {
     if (this.#size.width <= 0 || this.#size.height <= 0) {
       return;
     }
+    this.#settleScroll();
+    if (this.#zoomGoal) {
+      const { zoom, point } = this.#zoomGoal;
+      this.#zoomGoal = null;
+      if (!this.#drag) {
+        this.#changeZoom(zoom, point);
+      }
+    }
 
     const metrics = this.#metrics;
-    const visible = visibleCells(metrics, this.#sheet, this.#scroll, this.#size, this.#layout);
+    const scroll = this.#drawnScroll();
+    const visible = visibleCells(metrics, this.#sheet, scroll, this.#size, this.#layout);
     this.#visible = visible;
     const wantedPages = pagesToHold(visible, this.#sheet, this.#effectiveMargin(started));
     const freezeKey = `${this.#frozenRows}:${this.#frozenCols}`;
     const freezeChanged = freezeKey !== this.#lastFreezeKey;
     if (
       freezeChanged ||
+      this.#holdsTooMuch ||
       (!this.#fixedMargin &&
         started >= this.#fastScrollUntil &&
         !isEmptySpanSubset(wantedPages, this.#cache.span))
     ) {
+      this.#holdsTooMuch = false;
       this.#hold(wantedPages, freezeChanged);
     } else if (this.#fixedMargin || started < this.#fastScrollUntil || this.#cache.size === 0) {
       this.#hold(wantedPages, freezeChanged);
     }
 
-    const counts = this.#renderer.draw({
+    this.#drawn = {
       size: this.#size,
       scale: this.#scale,
+      zoom: this.#zoom,
       metrics,
       theme: this.#theme,
-      scroll: this.#drawnScroll(),
+      scroll,
       visible,
       cache: this.#cache,
       selection: this.#anchor,
@@ -1052,7 +1400,8 @@ export class Grid {
       filterState: this.#filterState,
       filterRowMap: this.#filterRowMap,
       activeSpillRange: this.#activeSpillRange,
-    });
+    };
+    const counts = this.#renderer.draw(this.#drawn);
 
     this.#retired?.destroy();
     this.#retired = null;
@@ -1119,13 +1468,10 @@ export class Grid {
 
   #resize(): void {
     this.#resized = false;
-    const width = this.#host.clientWidth;
-    const height = this.#host.clientHeight;
     const scale = window.devicePixelRatio || 1;
-    this.#size = { width, height };
-    this.#scale = scale;
-    const pixelWidth = Math.round(width * scale);
-    const pixelHeight = Math.round(height * scale);
+    const pixelWidth = Math.round(this.#host.clientWidth * scale);
+    const pixelHeight = Math.round(this.#host.clientHeight * scale);
+    const size = { width: pixelWidth / scale, height: pixelHeight / scale };
     this.#renderer.resize(pixelWidth, pixelHeight);
     const { style } = this.#renderer.canvas;
     // The size the backing store has on the screen, not the host's, which is
@@ -1133,10 +1479,26 @@ export class Grid {
     // to the other and blur every line. The host clips what is too much.
     style.width = `${pixelWidth / scale}px`;
     style.height = `${pixelHeight / scale}px`;
+    if (scale !== this.#scale) {
+      // At another density, sizes are rounded to other numbers of pixels. A
+      // million rows down, that is thousands of rows.
+      this.#rescale(this.#zoom, scale, size, null);
+      this.#placeScrollbars();
+      this.#holdsTooMuch = true;
+      return;
+    }
+    this.#size = size;
     this.#scroll = clampScroll(
       this.#scroll,
-      scrollLimits(this.#metrics, this.#sheet, this.#size, this.#layout),
+      scrollLimits(this.#metrics, this.#sheet, size, this.#layout),
     );
+    const opened = this.#openedAt;
+    if (opened && size.width > 0 && size.height > 0) {
+      // Where there was too much room to scroll to the end of a sheet, there may
+      // be less of it once everything around the grid is there.
+      this.#placeScroll(scrollToCorner(this.#viewNow(), opened));
+      this.#openedAt = opened;
+    }
   }
 
   #placeScrollbars(): void {
@@ -1174,11 +1536,15 @@ export class Grid {
   };
 
   #onWheel = (event: WheelEvent): void => {
-    if (event.ctrlKey) {
+    if (event.ctrlKey && !this.#options.zoom) {
       return;
     }
     const started = performance.now();
     event.preventDefault();
+    if (event.ctrlKey) {
+      this.#onZoomWheel(event);
+      return;
+    }
     const area = cellArea(this.#metrics, this.#size);
     const unit = (extent: number) =>
       event.deltaMode === WheelEvent.DOM_DELTA_LINE
@@ -1195,16 +1561,73 @@ export class Grid {
     this.#pendingWork += performance.now() - started;
   };
 
+  #onZoomWheel(event: WheelEvent): void {
+    const isPixels = event.deltaMode === WheelEvent.DOM_DELTA_PIXEL;
+    const delta = event.deltaY * (isPixels ? 1 : WHEEL_LINE);
+    if (this.#drag || this.#pinching || delta === 0) {
+      return;
+    }
+    const zoom = this.#zoomGoal?.zoom ?? this.#zoom;
+    this.#zoomSoon(
+      isPixels && !this.#controlHeld
+        ? this.#gesture.pinch(delta, zoom)
+        : this.#gesture.turn(delta, zoom),
+      this.#pointOf(event),
+    );
+  }
+
+  /** Safari has events of its own for pinches on a trackpad. */
+  #onPinch = (event: Event): void => {
+    event.preventDefault();
+    this.#pinching = event.type !== "gestureend";
+    if (event.type === "gesturestart") {
+      this.#endZoomGesture();
+      this.#gesture.begin(this.#zoom);
+    } else if (event.type === "gestureend") {
+      this.#endZoomGesture();
+    } else if (!this.#drag && "scale" in event && "clientX" in event && "clientY" in event) {
+      const { scale, clientX, clientY } = event;
+      const zoom = this.#gesture.spread(Number(scale), this.#zoomGoal?.zoom ?? this.#zoom);
+      if (zoom !== null) {
+        const point = this.#pointOf({ clientX: Number(clientX), clientY: Number(clientY) });
+        this.#zoomGoal = { zoom, point };
+        this.#invalidate();
+      }
+    }
+  };
+
+  #onControlKey = (event: Event): void => {
+    if (event instanceof KeyboardEvent) {
+      this.#controlHeld =
+        event.key === "Control" ? event.type === "keydown" : this.#controlHeld && event.ctrlKey;
+    } else if (event.target === window) {
+      // The key may come up while another window has the keyboard.
+      this.#controlHeld = false;
+    }
+  };
+
+  #pointOf(event: { readonly clientX: number; readonly clientY: number }): Point {
+    const bounds = this.#input.getBoundingClientRect();
+    return { x: event.clientX - bounds.left, y: event.clientY - bounds.top };
+  }
+
+  #cellAt(x: number, y: number): Cell | null {
+    const scroll = this.#drawnScroll();
+    return cellAt(this.#metrics, this.#sheet, scroll, this.#size, x, y, this.#layout);
+  }
+
+  #headerAt(x: number, y: number): HeaderHit | null {
+    const scroll = this.#drawnScroll();
+    return headerHitAt(this.#metrics, this.#sheet, scroll, this.#size, x, y, this.#layout);
+  }
+
   #isOverFillHandle(localX: number, localY: number): boolean {
     const range = this.selectionRange;
-    if (!range || this.#extraRanges.length > 0) {
-      return false;
-    }
-    const br = this.boxOf(range.endRow - 1, range.endCol - 1);
-    const hx = br.left + br.width;
-    const hy = br.top + br.height;
-    const hit = FILL_HANDLE_SIZE + 2;
-    return Math.abs(localX - hx) <= hit && Math.abs(localY - hy) <= hit;
+    return (
+      range !== null &&
+      this.#extraRanges.length === 0 &&
+      isOverFillHandle(this.#viewNow(), range, { x: localX, y: localY })
+    );
   }
 
   #cellAtClamped(localX: number, localY: number): { row: number; col: number } | null {
@@ -1218,8 +1641,9 @@ export class Grid {
     const clampedX = Math.min(area.width - 1, Math.max(0, localX - this.#metrics.headerWidth));
     const clampedY = Math.min(area.height - 1, Math.max(0, localY - this.#metrics.headerHeight));
     const fz = frozenPixels(this.#metrics, this.#sheet, this.#size, this.#layout);
-    const sheetY = clampedY < fz.height ? clampedY : this.#scroll.top + clampedY;
-    const sheetX = clampedX < fz.width ? clampedX : this.#scroll.left + clampedX;
+    const scroll = this.#drawnScroll();
+    const sheetY = clampedY < fz.height ? clampedY : scroll.top + clampedY;
+    const sheetX = clampedX < fz.width ? clampedX : scroll.left + clampedX;
     const row = Math.min(
       this.#sheet.rows - 1,
       Math.max(0, this.#layout.rowAxis.indexAtOffset(sheetY)),
@@ -1261,15 +1685,7 @@ export class Grid {
     }
 
     // 2. Check header strips (corner, resize handles, whole-row/col select or drag reorder).
-    const hit = headerHitAt(
-      this.#metrics,
-      this.#sheet,
-      this.#scroll,
-      this.#size,
-      x,
-      y,
-      this.#layout,
-    );
+    const hit = this.#headerAt(x, y);
     if (hit) {
       this.#host.focus({ preventScroll: true });
       if (hit.kind === "corner") {
@@ -1279,7 +1695,7 @@ export class Grid {
           kind: "colResize",
           col: hit.col,
           startClientX: event.clientX,
-          startWidth: this.#layout.colAxis.sizeOf(hit.col),
+          startBase: sizeIn(this.#customCols, hit.col, this.#base.colWidth),
         };
         this.#beginPointerCapture(event);
       } else if (hit.kind === "rowResize") {
@@ -1287,7 +1703,7 @@ export class Grid {
           kind: "rowResize",
           row: hit.row,
           startClientY: event.clientY,
-          startHeight: this.#layout.rowAxis.sizeOf(hit.row),
+          startBase: sizeIn(this.#customRows, hit.row, this.#base.rowHeight),
         };
         this.#beginPointerCapture(event);
       } else if (hit.kind === "col") {
@@ -1355,7 +1771,7 @@ export class Grid {
     }
 
     // 3. Cell body click / drag (after AutoFilter header chevron hit-test).
-    const cell = cellAt(this.#metrics, this.#sheet, this.#scroll, this.#size, x, y, this.#layout);
+    const cell = this.#cellAt(x, y);
     if (cell) {
       if (this.#filterState && this.#options.onFilterButtonClick) {
         const headerDispRow =
@@ -1367,7 +1783,8 @@ export class Grid {
           cell.col <= this.#filterState.lastCol
         ) {
           const cellBox = this.boxOf(cell.row, cell.col);
-          const btn = filterButtonBox(cellBox.left, cellBox.top, cellBox.width, cellBox.height);
+          const { left, top, width, height } = cellBox;
+          const btn = filterButtonBox(left, top, width, height, this.#zoom);
           if (
             btn &&
             x >= btn.x - 2 &&
@@ -1466,12 +1883,14 @@ export class Grid {
 
     if (drag.kind === "colResize") {
       const by = event.clientX - drag.startClientX;
-      this.#previewSize("col", drag.col, dragged(drag.startWidth, by, MIN_COL_PX, MAX_COL_PX));
+      const px = dragged(drag.startBase, by, this.#zoom, MIN_COL_PX, MAX_COL_PX);
+      this.#previewSize("col", drag.col, px);
       return;
     }
     if (drag.kind === "rowResize") {
       const by = event.clientY - drag.startClientY;
-      this.#previewSize("row", drag.row, dragged(drag.startHeight, by, MIN_ROW_PX, MAX_ROW_PX));
+      const px = dragged(drag.startBase, by, this.#zoom, MIN_ROW_PX, MAX_ROW_PX);
+      this.#previewSize("row", drag.row, px);
       return;
     }
     if (drag.kind === "rowReorder") {
@@ -1519,12 +1938,12 @@ export class Grid {
 
     if (finishedDrag.kind === "colResize") {
       const px = this.#takeSizePreview();
-      if (px !== null && px !== finishedDrag.startWidth) {
+      if (px !== null && px !== finishedDrag.startBase) {
         this.#resizeCol(finishedDrag.col, px);
       }
     } else if (finishedDrag.kind === "rowResize") {
       const px = this.#takeSizePreview();
-      if (px !== null && px !== finishedDrag.startHeight) {
+      if (px !== null && px !== finishedDrag.startBase) {
         this.#resizeRow(finishedDrag.row, px);
       }
     } else if (finishedDrag.kind === "fill") {
@@ -1590,15 +2009,7 @@ export class Grid {
     }
 
     // 2. Double-click column resize border -> auto-fit column width to visible text!
-    const hit = headerHitAt(
-      this.#metrics,
-      this.#sheet,
-      this.#scroll,
-      this.#size,
-      x,
-      y,
-      this.#layout,
-    );
+    const hit = this.#headerAt(x, y);
     if (hit && hit.kind === "colResize") {
       const fz = frozenPixels(this.#metrics, this.#sheet, this.#size, this.#layout);
       const fitPx = this.#measurer.columnFitWidth(
@@ -1609,14 +2020,14 @@ export class Grid {
         fz.frozenRows > 0 ? 0 : this.#visible.firstRow,
         Math.max(fz.frozenRows, this.#visible.endRow),
       );
-      if (fitPx !== this.#layout.colAxis.sizeOf(hit.col)) {
+      if (fitPx !== sizeIn(this.#customCols, hit.col, this.#base.colWidth)) {
         this.#resizeCol(hit.col, fitPx);
       }
       return;
     }
 
     // 3. Double-click cell -> open editor!
-    const cell = cellAt(this.#metrics, this.#sheet, this.#scroll, this.#size, x, y, this.#layout);
+    const cell = this.#cellAt(x, y);
     if (cell) {
       this.select(cell);
       this.#options.onActivateEdit?.(cell);
@@ -1630,15 +2041,7 @@ export class Grid {
     const bounds = this.#input.getBoundingClientRect();
     const x = event.clientX - bounds.left;
     const y = event.clientY - bounds.top;
-    const hit = headerHitAt(
-      this.#metrics,
-      this.#sheet,
-      this.#scroll,
-      this.#size,
-      x,
-      y,
-      this.#layout,
-    );
+    const hit = this.#headerAt(x, y);
     if (hit && hit.kind === "row") {
       event.preventDefault();
       const range = this.selectionRange;
@@ -1677,7 +2080,7 @@ export class Grid {
       });
       return;
     }
-    const cell = cellAt(this.#metrics, this.#sheet, this.#scroll, this.#size, x, y, this.#layout);
+    const cell = this.#cellAt(x, y);
     if (cell) {
       event.preventDefault();
       const range = this.selectionRange;
@@ -1705,15 +2108,7 @@ export class Grid {
     if (this.#isOverFillHandle(localX, localY)) {
       cursor = "crosshair";
     } else {
-      const hit = headerHitAt(
-        this.#metrics,
-        this.#sheet,
-        this.#scroll,
-        this.#size,
-        localX,
-        localY,
-        this.#layout,
-      );
+      const hit = this.#headerAt(localX, localY);
       if (hit) {
         if (hit.kind === "colResize") {
           cursor = "col-resize";
@@ -1766,7 +2161,7 @@ export class Grid {
     if (id === undefined) {
       return;
     }
-    const { colWidth } = this.#metrics;
+    const { colWidth } = this.#base;
     this.#customCols = withSize(this.#customCols, col, px, colWidth);
     this.#rebuildLayout();
     this.#invalidate();
@@ -1779,7 +2174,7 @@ export class Grid {
     if (id === undefined) {
       return;
     }
-    const { rowHeight } = this.#metrics;
+    const { rowHeight } = this.#base;
     this.#customRows = withSize(this.#customRows, row, px, rowHeight);
     this.#rebuildLayout();
     this.#invalidate();

@@ -41,6 +41,12 @@ export const CASES = {
   placeholders: { scale: 1, dark: true },
   "reorder-guide": { scale: 2, dark: true },
   "every-overlay": { scale: 2, dark: false },
+  "zoom-quarter": { scale: 1, dark: false },
+  "zoom-quarter-headers": { scale: 2, dark: true },
+  "zoom-half": { scale: 1.25, dark: false },
+  "zoom-half-frozen": { scale: 1, dark: true },
+  "zoom-one-and-a-half": { scale: 1.25, dark: true },
+  "zoom-double": { scale: 1, dark: false },
 } as const satisfies Record<string, CaseInfo>;
 
 export type CaseName = keyof typeof CASES;

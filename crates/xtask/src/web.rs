@@ -206,6 +206,21 @@ pub fn e2e(browser: Option<&str>) -> Result {
     test.run()
 }
 
+/// The end-to-end tests of the WebGPU renderer. They need neither the server
+/// nor a database.
+pub fn e2e_webgpu() -> Result {
+    util::step("playwright (WebGPU)");
+    pnpm()
+        .args([
+            "exec",
+            "playwright",
+            "test",
+            "-c",
+            "playwright.webgpu.config.ts",
+        ])
+        .run()
+}
+
 /// Golden images belong to one environment, the runner of the `visual` CI job,
 /// which sets this: elsewhere the same text is drawn a little differently.
 pub fn is_golden_environment() -> bool {

@@ -6,7 +6,8 @@
 //   2. CoW `RTCLSNAP` v1 compaction + `RTCLWAL1` persistence across a full reload;
 //   3. Dual-tab single-instance Web Lock (`blocked`) and graceful takeover (`yielded` -> `ready`);
 //   4. Hung-worker takeover exercising the 500 ms watchdog & Safari `InvalidStateError` recovery;
-//   5. Determinism digest match against `tests/determinism/expected.txt`.
+//   5. Determinism digest match against `tests/determinism/expected.txt`;
+//   6. The renderer the grid gets, and how far what WebGPU draws is from a 2D canvas.
 //
 // Usage:
 //   node tests/e2e/safari-smoke.mjs [--dist apps/web/dist] [--out target/safari-smoke/report.json]
@@ -118,6 +119,89 @@ async function wdRequest(baseUrl, method, path, body) {
     throw new Error(`${method} ${path} failed: ${json?.value?.error}: ${json?.value?.message}`);
   }
   return json.value;
+}
+
+/**
+ * Has the grid drawn in several states, with the renderer it has and then on a
+ * 2D canvas, and compares. Runs in the page, which must be drawn with WebGPU.
+ */
+async function compareRenderers() {
+  const hooks = window.__reticula;
+  const nextFrame = () => new Promise((resolve) => requestAnimationFrame(resolve));
+  const waitFor = async (label, test) => {
+    for (let frame = 0; !test(); frame++) {
+      if (frame > 600) {
+        throw new Error(`timed out waiting for ${label}`);
+      }
+      await nextFrame();
+    }
+  };
+  const zoomTo = async (percent) => {
+    document.querySelector('[data-testid="zoom-value"]').click();
+    await waitFor("the zoom steps", () =>
+      document.querySelector(`[data-testid="zoom-${percent}"]`),
+    );
+    document.querySelector(`[data-testid="zoom-${percent}"]`).click();
+    await waitFor("the zoom", () => hooks.stats().zoom === percent / 100);
+  };
+  const states = [
+    { label: "top", scroll: { top: 0, left: 0 }, zoom: 100 },
+    { label: "scrolled", scroll: { top: 247, left: 131 }, zoom: 100 },
+    { label: "zoomed out", scroll: { top: 60, left: 0 }, zoom: 50 },
+    { label: "zoomed in", scroll: { top: 33, left: 71 }, zoom: 150 },
+  ];
+  const pictures = async () => {
+    const taken = [];
+    for (const { scroll, zoom } of states) {
+      await zoomTo(zoom);
+      hooks.scrollTo(scroll);
+      await nextFrame();
+      await waitFor("the pages", () => hooks.stats().missingCells === 0);
+      hooks.selectRange({ row: 2, col: 1 }, { row: 5, col: 2 });
+      // After the grid's own callback, which selecting has requested.
+      await nextFrame();
+      const canvas = [...document.querySelectorAll(".reticula-grid canvas")].at(-1);
+      const copy = document.createElement("canvas");
+      copy.width = canvas.width;
+      copy.height = canvas.height;
+      const context = copy.getContext("2d");
+      context.drawImage(canvas, 0, 0);
+      taken.push(context.getImageData(0, 0, copy.width, copy.height).data);
+    }
+    return taken;
+  };
+  const drawn = await pictures();
+  hooks.setRenderer("canvas2d");
+  await waitFor("a 2D canvas", () => hooks.stats().renderer.kind === "canvas2d");
+  await nextFrame();
+  const wanted = await pictures();
+  return states.map(({ label }, index) => {
+    const a = drawn[index];
+    const b = wanted[index];
+    const result = {
+      label,
+      pixels: b.length / 4,
+      drawn: 0,
+      differing: 0,
+      over16: 0,
+      over96: 0,
+      most: 0,
+    };
+    for (let at = 0; at < b.length; at += 4) {
+      let apart = 0;
+      let drawn = false;
+      for (let channel = at; channel < at + 4; channel++) {
+        apart = Math.max(apart, Math.abs(a[channel] - b[channel]));
+        drawn ||= b[channel] !== b[channel % 4];
+      }
+      result.drawn += drawn ? 1 : 0;
+      result.differing += apart > 0 ? 1 : 0;
+      result.over16 += apart > 16 ? 1 : 0;
+      result.over96 += apart > 96 ? 1 : 0;
+      result.most = Math.max(result.most, apart);
+    }
+    return result;
+  });
 }
 
 function assert(condition, message) {
@@ -421,6 +505,50 @@ try {
     `determinism digest mismatch: got ${digestRes.digest}, expected ${expectedDigest}`,
   );
 
+  // 6. The renderer: by itself, and when WebGPU is asked for.
+  const automatic = await execSync(tab1, `return window.__reticula.stats().renderer;`);
+  assert(
+    automatic.kind === "canvas2d",
+    `expected Canvas 2D by default, got ${JSON.stringify(automatic)}`,
+  );
+  const gpuTab = await openTab(`${server.origin}/app?hooks&renderer=webgpu&doc=${docId}-webgpu`);
+  await waitReady(gpuTab);
+  await editCell(gpuTab, 0, 0, "A1", "Overhead 永东国酱 fjord", "Overhead 永东国酱 fjord");
+  await editCell(gpuTab, 2, 1, "B3", "0.25", "0.25");
+  const asked = await waitUntil("the renderer to be decided on", () =>
+    execSync(
+      gpuTab,
+      `
+      const { renderer } = window.__reticula.stats();
+      return renderer.reason === "starting" ? null : renderer;
+      `,
+    ),
+  );
+  let compared = null;
+  if (asked.kind === "webgpu") {
+    const comparison = await execAsync(
+      gpuTab,
+      `
+      const done = arguments[arguments.length - 1];
+      (${compareRenderers})().then(
+        (states) => done({ ok: true, states }),
+        (err) => done({ ok: false, err: String(err) }),
+      );
+      `,
+    );
+    assert(comparison.ok, `comparing the renderers failed: ${comparison.err}`);
+    compared = comparison.states;
+    for (const state of compared) {
+      // Whether text is close enough for WebGPU to be the default is for whoever
+      // reads the report to say; here it only has to be the same sheet.
+      assert(
+        state.drawn > 0 && state.over96 <= state.drawn * 0.02,
+        `WebGPU draws something else: ${JSON.stringify(state)}`,
+      );
+    }
+  }
+  console.log(`[safari-smoke] step 6 ok: ${asked.kind} (${asked.reason ?? asked.adapter})`);
+
   const report = {
     browser: "safari",
     version: safariVersion,
@@ -436,6 +564,12 @@ try {
       dualTabLockAndGracefulTakeover: true,
       hungWorkerTakeover: true,
       determinismDigestMatch: true,
+    },
+    renderer: {
+      automatic: { kind: automatic.kind, reason: automatic.reason },
+      asked: { kind: asked.kind, reason: asked.reason, adapter: asked.adapter },
+      counters: asked.counters,
+      compared,
     },
   };
 

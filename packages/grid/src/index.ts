@@ -28,6 +28,7 @@ export {
   type GridContextTarget,
   type GridOptions,
   type GridStats,
+  type GridView,
   type IdRun,
   type Selection,
   type SelectionScope,
@@ -53,6 +54,7 @@ export type {
   GridCellStyle,
   RemotePresenceOverlay,
 } from "./render/frame.ts";
+export type { RendererPreference, RendererReason } from "./render/upgrade.ts";
 export {
   DARK_PALETTE_FILL,
   DARK_PALETTE_TEXT,
@@ -61,3 +63,4 @@ export {
   REF_COLORS_DARK,
   REF_COLORS_LIGHT,
 } from "./theme.ts";
+export { clampZoom, MAX_ZOOM, MIN_ZOOM, nextZoom, ZOOM_STEPS } from "./zoom.ts";

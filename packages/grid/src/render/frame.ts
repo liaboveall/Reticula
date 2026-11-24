@@ -35,6 +35,8 @@ export interface Frame {
   readonly size: Size;
   /** Device pixels per CSS pixel. */
   readonly scale: number;
+  /** How much the cells are enlarged, which the metrics and the layout already are. */
+  readonly zoom?: number;
   readonly metrics: Metrics;
   readonly theme: Theme;
   /** Scroll position, already aligned to device pixels. */

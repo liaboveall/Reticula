@@ -13,7 +13,7 @@ import { difference, GOLDEN, goldenNames, readGolden, UPDATE, writeGolden } from
 import { encodePng, type Picture } from "./png.ts";
 
 /** Whether there is a WebGPU renderer, whose pictures must then be compared. */
-const WEBGPU_COMPARED = false;
+const WEBGPU_COMPARED = true;
 
 /** Tests that wait for that renderer. */
 const onWebGpu = WEBGPU_COMPARED ? test : test.fixme;

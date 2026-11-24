@@ -1,6 +1,7 @@
 import type { Grid, GridStats, RemotePresenceOverlay } from "@reticula/grid";
 import type { SafeModeInfo } from "./engine/client.ts";
 import type { StorageBackendKind } from "./engine/storage.ts";
+import { setRendererPreference } from "./renderer.ts";
 
 export interface SwStatus {
   readonly supported: boolean;
@@ -83,6 +84,8 @@ export interface Hooks {
   collabStatus(): CollabHookStatus;
   /** Forces the collaborative WebSocket transport offline or back online (for tests). */
   setCollabOffline(offline: boolean): void;
+  /** Chooses what draws the grid, as the menu does. */
+  setRenderer(preference: "auto" | "canvas2d"): void;
 }
 
 declare global {
@@ -125,6 +128,7 @@ export function installHooks(grid: Grid, extras: HookExtras): () => void {
     checkSwUpdate: extras.checkSwUpdate,
     collabStatus: extras.collabStatus,
     setCollabOffline: extras.setCollabOffline,
+    setRenderer: (preference) => setRendererPreference(grid, preference),
   };
   window.__reticula = hooks;
   return () => {

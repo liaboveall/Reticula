@@ -100,7 +100,7 @@ async function compare(name: CaseName, options: CompareOptions = {}): Promise<Re
       firstStray ??= { x: pixel % leftPixels.width, y: Math.floor(pixel / leftPixels.width) };
     }
   }
-  const smallText = frame.theme.fontSize * scale < SMALL_TEXT;
+  const smallText = frame.theme.fontSize * scale * (frame.zoom ?? 1) < SMALL_TEXT;
   const comparison = comparePictures(leftPixels, rightPixels, masks, ink, smallText);
   return {
     ...comparison,

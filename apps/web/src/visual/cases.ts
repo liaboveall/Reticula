@@ -8,6 +8,7 @@ import {
   type Span,
   SparseAxis,
   type Theme,
+  viewMetrics,
   visibleCells,
 } from "@reticula/grid/internals";
 import { PAGE_COLS, PAGE_ROWS } from "@reticula/protocol/viewport";
@@ -52,6 +53,8 @@ type Overlays = Partial<
 
 interface Setting {
   readonly sheet: SyntheticSheet;
+  readonly zoom?: number;
+  /** In the pixels on the screen, whatever the zoom. */
   readonly scroll?: Scroll;
   readonly frozenRows?: number;
   readonly frozenCols?: number;
@@ -531,6 +534,95 @@ const SETTINGS: Record<CaseName, () => Setting> = {
       },
     },
   }),
+  "zoom-quarter": () => ({ sheet: styled(), zoom: 0.25, ...UNEVEN, overlays: ZOOMED }),
+  // Labels of every second row and column, the first ones cut off.
+  "zoom-quarter-headers": () => ({
+    sheet: new SyntheticSheet(1_000_000, 1_000).fill(sparse),
+    zoom: 0.25,
+    scroll: { top: 6 * 999_870 + 3, left: 20 * 700 + 7 },
+    overlays: {
+      selection: { row: 999_880, col: 704 },
+      selectionRange: span(999_878, 999_890, 704, 711),
+    },
+  }),
+  "zoom-half": () => ({
+    sheet: styled(),
+    zoom: 0.5,
+    ...UNEVEN,
+    scroll: { top: 5, left: 3 },
+    overlays: ZOOMED,
+  }),
+  "zoom-half-frozen": () => ({
+    sheet: filled(),
+    zoom: 0.5,
+    ...UNEVEN,
+    frozenRows: 3,
+    frozenCols: 2,
+    scroll: { top: 12 * 70 + 5, left: 40 * 15 + 13 },
+    overlays: {
+      selection: { row: 78, col: 18 },
+      selectionRange: span(78, 79, 18, 19),
+    },
+  }),
+  "zoom-one-and-a-half": () => ({
+    sheet: styled(),
+    zoom: 1.5,
+    ...UNEVEN,
+    scroll: { top: 11, left: 17 },
+    overlays: ZOOMED,
+  }),
+  "zoom-double": () => ({
+    sheet: filled(),
+    zoom: 2,
+    frozenRows: 1,
+    frozenCols: 1,
+    scroll: { top: 9, left: 31 },
+    overlays: ZOOMED,
+  }),
+};
+
+/** Rows and columns from a hair's breadth to most of the picture. */
+const UNEVEN = {
+  rowHeights: [
+    [1, 40],
+    [2, 7],
+    [6, 120],
+    [9, 16],
+    [10, 3],
+    [17, 61],
+  ],
+  colWidths: [
+    [0, 33],
+    [1, 141],
+    [2, 24],
+    [4, 9],
+    [5, 203],
+  ],
+} as const satisfies Pick<Setting, "rowHeights" | "colWidths">;
+
+const ZOOMED: Overlays = {
+  selection: { row: 3, col: 1 },
+  selectionRange: span(3, 6, 1, 4),
+  clipboardRange: { span: span(4, 9, 0, 2), cut: false },
+  formulaReferences: [{ colorIndex: 2, firstRow: 0, lastRow: 4, firstCol: 2, lastCol: 3 }],
+  remotePresences: [
+    {
+      replica: 1,
+      displayName: "Ada",
+      colorSlot: 0,
+      cursorRow: 8,
+      cursorCol: 3,
+      selection: span(7, 11, 2, 4),
+    },
+  ],
+  filterState: {
+    headerRow: 1,
+    lastRow: 40,
+    firstCol: 0,
+    lastCol: 5,
+    activeCols: [1],
+    hiddenRowSpans: [],
+  },
 };
 
 function pageSpan(cells: Span): Span {
@@ -559,20 +651,21 @@ export function cacheOf(
 
 export function buildCase(name: CaseName, theme: Theme, scale: number): BuiltCase {
   const setting = SETTINGS[name]();
-  const { sheet, frozenRows = 0, frozenCols = 0, overlays = {} } = setting;
+  const { sheet, zoom, frozenRows = 0, frozenCols = 0, overlays = {} } = setting;
+  const metrics = zoom === undefined ? METRICS : viewMetrics(METRICS, zoom, scale);
   const enlarged = Math.min(MOST_ENLARGED, Math.max(1, 1 / scale));
   const size = { width: SIZE.width * enlarged, height: SIZE.height * enlarged };
   const snap = (position: number) => Math.round(position * scale) / scale;
   const scroll = { top: snap(setting.scroll?.top ?? 0), left: snap(setting.scroll?.left ?? 0) };
   const layout = {
-    rowAxis: new SparseAxis(METRICS.rowHeight, setting.rowHeights ?? [], scale),
-    colAxis: new SparseAxis(METRICS.colWidth, setting.colWidths ?? [], scale),
+    rowAxis: new SparseAxis(METRICS.rowHeight, setting.rowHeights ?? [], scale, zoom),
+    colAxis: new SparseAxis(METRICS.colWidth, setting.colWidths ?? [], scale, zoom),
     frozenRows,
     frozenCols,
   };
   const rows = overlays.filterRowMap?.visibleRows ?? sheet.rows;
   const extent = { rows, cols: sheet.cols };
-  const visible = visibleCells(METRICS, extent, scroll, size, layout);
+  const visible = visibleCells(metrics, extent, scroll, size, layout);
 
   const pages: Page[] = [];
   const held = pageSpan(visible);
@@ -595,7 +688,8 @@ export function buildCase(name: CaseName, theme: Theme, scale: number): BuiltCas
     frame: {
       size,
       scale,
-      metrics: METRICS,
+      ...(zoom === undefined ? {} : { zoom }),
+      metrics,
       theme,
       scroll,
       visible,

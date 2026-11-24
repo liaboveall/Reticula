@@ -15,7 +15,8 @@ async function settled(page: Page): Promise<void> {
 }
 
 async function open(page: Page) {
-  await page.goto("/app?hooks");
+  // One of them reads what is drawn back, from a 2D canvas.
+  await page.goto("/app?hooks&renderer=canvas2d");
   await expect(page.getByTestId("engine-status")).toHaveText("ready");
   await settled(page);
   const box = await page.getByTestId("grid").boundingBox();

@@ -23,5 +23,15 @@ export type {
   ReorderGuide,
 } from "./render/frame.ts";
 export { type DrawWebGpu, drawCanvas2d, masksOf } from "./render/testing.ts";
-export type { FrameMasks, GridRenderer, Pixels, RendererKind } from "./render/types.ts";
+export { TextMeasurer } from "./render/text-measure.ts";
+export type {
+  FrameMasks,
+  GridRenderer,
+  Pixels,
+  RendererCounters,
+  RendererKind,
+} from "./render/types.ts";
+export { acquire } from "./render/webgpu/device.ts";
+export { WebGpuRenderer } from "./render/webgpu/renderer.ts";
+export { drawWebGpu } from "./render/webgpu/testing.ts";
 export { readTheme, type Theme } from "./theme.ts";

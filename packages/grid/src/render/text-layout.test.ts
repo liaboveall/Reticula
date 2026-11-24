@@ -79,6 +79,57 @@ function runsOf(
 
 const LONG = "a text that is long enough to run on over several columns";
 
+describe("at a zoom", () => {
+  const looks = [0.25, 0.5, 1, 1.5, 2].map((zoom) => makeLook(theme, 1.5, measure, colors, zoom));
+
+  test("text keeps the same part of the distance from its cell's edges", () => {
+    expect(looks.map((look) => look.padding)).toEqual([2, 5, 9, 14, 18]);
+    for (const look of looks) {
+      const styles = new StyleTable(colors);
+      styles.use([PLAIN], theme);
+      const { zoom } = look;
+      const layout = {
+        ...axes(),
+        rowAxis: new SparseAxis(20, [], 1.5, zoom),
+        colAxis: new SparseAxis(75, [], 1.5, zoom),
+      };
+      const cells = { "0:0": "x", "0:1": { text: "1", flags: FLAG_NUMBER } };
+      const page = new PageLayout(pageOf(cells, 0, 0), layout, {
+        measure,
+        look,
+        styles,
+        frozenCols: 0,
+      });
+      const { texts } = page;
+      expect(page.band(0).end).toBe(2);
+      const edge = 2 * Math.round(75 * zoom * 1.5);
+      expect(texts.x[0]).toBe(look.padding);
+      expect(edge - (texts.x[1] ?? 0) - (texts.width[1] ?? 0)).toBeCloseTo(look.padding, 9);
+    }
+  });
+
+  test("the line through a text is as heavy as the text, and no lighter than a pixel", () => {
+    const heights = looks.map((look) => {
+      const styles = new StyleTable(colors);
+      styles.use([PLAIN, { ...PLAIN, strikethrough: true }], theme);
+      const layout = {
+        ...axes(),
+        rowAxis: new SparseAxis(20, [], 1.5, look.zoom),
+        colAxis: new SparseAxis(75, [], 1.5, look.zoom),
+      };
+      const page = new PageLayout(pageOf({ "0:0": { text: "gone", style: 1 } }, 0, 0), layout, {
+        measure,
+        look,
+        styles,
+        frozenCols: 0,
+      });
+      page.band(0);
+      return page.texts.strikes.geometry[3];
+    });
+    expect(heights).toEqual([1, 1, 2, 2, 3]);
+  });
+});
+
 describe("the place of a text", () => {
   test("is left, right or in the middle of its cell, as its kind or its style has it", () => {
     const styles = [

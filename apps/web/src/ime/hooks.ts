@@ -16,10 +16,30 @@ export interface ImeHooks {
     readonly committed: Readonly<Record<string, string>>;
     /** Whether the editor can be seen. */
     readonly shown: boolean;
-    /** Where the editor is, in CSS pixels from the top left corner of the window. */
-    readonly box: { readonly left: number; readonly top: number };
+    /** Where the editor is, in CSS pixels from the top left corner of the window, and its text. */
+    readonly box: {
+      readonly left: number;
+      readonly top: number;
+      readonly width: number;
+      readonly height: number;
+      readonly fontSize: number;
+    };
   };
   grid(): GridStats;
+  /** Enlarges the sheet, which this page has no controls for. */
+  setZoom(zoom: number): void;
+  /** Scrolls a cell into view and selects it. */
+  select(row: number, col: number): void;
+  /** Where a cell is drawn, in CSS pixels from the top left corner of the window. */
+  boxOf(
+    row: number,
+    col: number,
+  ): {
+    readonly left: number;
+    readonly top: number;
+    readonly width: number;
+    readonly height: number;
+  };
   /** The text the grid shows in a cell, or `null` while it does not hold the cell. */
   textAt(row: number, col: number): string | null;
 }

@@ -24,8 +24,8 @@
   --grid-filter-icon-active: #1a5fd0;
   --grid-spill-border: #1a5fd0;
   --grid-scrollbar-track: #f6f7f8;
-  --grid-scrollbar-thumb: #b4bac1;
-  --grid-scrollbar-thumb-active: #7d8590;
+  --grid-scrollbar-thumb: #878e97;
+  --grid-scrollbar-thumb-active: #656d76;
 
   position: relative;
   overflow: hidden;
@@ -61,8 +61,8 @@
     --grid-filter-icon-active: #6ea1ff;
     --grid-spill-border: #6ea1ff;
     --grid-scrollbar-track: #1e2127;
-    --grid-scrollbar-thumb: #4a515c;
-    --grid-scrollbar-thumb-active: #7a8492;
+    --grid-scrollbar-thumb: #6b7482;
+    --grid-scrollbar-thumb-active: #8b95a3;
   }
 }
 
@@ -156,7 +156,7 @@
 }
 
 .reticula-editor .cm-content {
-  padding: 0 6px;
+  padding: 0 var(--editor-padding, 6px);
 }
 
 .reticula-editor .cm-line {

@@ -87,7 +87,7 @@ if (hasGpu) {
     console.log(`zoom ${zoom}: the texture against a 2D canvas, ${fidelity.texts} texts, ${fidelity.darkPixels} dark pixels, differences ${JSON.stringify(fidelity.difference)}`);
   }
 }
-const subjects = hasGpu ? ["canvas", "string", "glyph"] : ["canvas"];
+const subjects = hasGpu ? ["canvas", "webgpu", "string", "glyph"] : ["canvas"];
 for (const zoom of [1, 0.5, 0.25]) {
   for (const screensPerSecond of [5, 0]) {
     for (const subject of subjects) {
@@ -95,7 +95,7 @@ for (const zoom of [1, 0.5, 0.25]) {
       results.scroll.push(scroll);
       console.log(
         `zoom ${zoom} ${screensPerSecond === 0 ? "a new screen every frame" : "5 screens a second"}, ${subject.padEnd(6)} ${scroll.visibleCells} cells: work p50 ${scroll.work.p50.toFixed(2)} p95 ${scroll.work.p95.toFixed(2)} p99 ${scroll.work.p99.toFixed(2)} max ${scroll.work.max.toFixed(1)} ms; ` +
-          `frames every p50 ${scroll.interval.p50.toFixed(1)} p95 ${scroll.interval.p95.toFixed(1)} p99 ${scroll.interval.p99.toFixed(1)} ms, ${scroll.framesOver60Hz} of ${scroll.frames} over 16.7; ${scroll.adapter} ${scroll.usage ? JSON.stringify(scroll.usage) : ""}`,
+          `frames every p50 ${scroll.interval.p50.toFixed(1)} p95 ${scroll.interval.p95.toFixed(1)} p99 ${scroll.interval.p99.toFixed(1)} ms, ${scroll.framesOver60Hz} of ${scroll.frames} over 16.7; ${scroll.adapter} ${JSON.stringify(scroll.usage ?? scroll.counters.end ?? "")}`,
       );
     }
   }

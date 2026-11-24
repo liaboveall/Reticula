@@ -238,10 +238,28 @@ const hooks: ImeHooks = {
       selection: grid.selection,
       committed: Object.fromEntries(typed),
       shown: box instanceof HTMLElement && getComputedStyle(box).opacity === "1",
-      box: { left: bounds?.left ?? 0, top: bounds?.top ?? 0 },
+      box: {
+        left: bounds?.left ?? 0,
+        top: bounds?.top ?? 0,
+        width: bounds?.width ?? 0,
+        height: bounds?.height ?? 0,
+        fontSize: box ? Number.parseFloat(getComputedStyle(box).fontSize) : 0,
+      },
     };
   },
   grid: () => grid.stats(),
+  setZoom: (zoom) => {
+    grid.setZoom(zoom);
+  },
+  select: (row, col) => {
+    grid.select({ row, col });
+    grid.reveal(row, col);
+  },
+  boxOf: (row, col) => {
+    const bounds = host.getBoundingClientRect();
+    const { left, top, width, height } = grid.boxOf(row, col);
+    return { left: bounds.left + left, top: bounds.top + top, width, height };
+  },
   textAt: (row, col) => grid.textAt(row, col),
 };
 window.__ime = hooks;

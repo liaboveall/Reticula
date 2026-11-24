@@ -1,11 +1,11 @@
-import type { DrawWebGpu } from "@reticula/grid/internals";
+import { type DrawWebGpu, drawWebGpu as draw } from "@reticula/grid/internals";
 
 /**
- * How a frame is drawn with WebGPU, once there is a renderer that can. The
- * tests know from `WEBGPU_COMPARED` in tests/visual/visual.spec.ts whether to
- * expect one.
+ * How a frame is drawn with WebGPU, if there is a renderer that can. The tests
+ * know from `WEBGPU_COMPARED` in tests/visual/visual.spec.ts whether to expect
+ * one.
  */
-export const drawWebGpu: DrawWebGpu | null = null;
+export const drawWebGpu: DrawWebGpu | null = draw;
 
 let device: Promise<GPUDevice> | undefined;
 

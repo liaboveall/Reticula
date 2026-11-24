@@ -274,6 +274,101 @@ test("clicking another cell accepts the edit and selects that cell", async ({ pa
   expect(await state(page)).toMatchObject({ editing: { row: 4, col: 5 }, text: "z" });
 });
 
+for (const zoom of [0.25, 0.5, 2]) {
+  test(`at ${zoom * 100}% a composition begins where the editor was, in view and legible`, async ({
+    page,
+  }) => {
+    await open(page);
+    const session = await page.context().newCDPSession(page);
+    await page.evaluate((zoom) => window.__ime?.setZoom(zoom), zoom);
+    await page.waitForFunction((zoom) => window.__ime?.grid().zoom === zoom, zoom);
+
+    /** What the editor is, and has to be, about a cell once it is selected and has been drawn. */
+    const about = (row: number, col: number) =>
+      page.evaluate(
+        async ([row, col]) => {
+          const hooks = window.__ime;
+          const host = document.getElementById("grid")?.getBoundingClientRect();
+          if (!hooks || !host) {
+            throw new Error("the page's hooks are not installed");
+          }
+          const { metrics } = hooks.grid();
+          return {
+            box: hooks.state().box,
+            cell: hooks.boxOf(row, col),
+            area: {
+              left: host.left + metrics.headerWidth,
+              top: host.top + metrics.headerHeight,
+              right: host.right - metrics.scrollbarSize,
+              bottom: host.bottom - metrics.scrollbarSize,
+            },
+          };
+        },
+        [row, col] as const,
+      );
+    const frames = () =>
+      page.evaluate(
+        () =>
+          new Promise<void>((done) =>
+            requestAnimationFrame(() => requestAnimationFrame(() => done())),
+          ),
+      );
+
+    const { sheet, visible } = await page.evaluate(() => {
+      const stats = window.__ime?.grid();
+      if (!stats) {
+        throw new Error("the page's hooks are not installed");
+      }
+      return stats;
+    });
+    const lastInView = { row: visible.endRow - 2, col: visible.endCol - 1 };
+    let committed = 0;
+    for (const [row, col] of [
+      [4, 2],
+      [lastInView.row, 1],
+      [2, lastInView.col],
+      [lastInView.row, lastInView.col],
+      [sheet.rows - 1, sheet.cols - 1],
+    ] as const) {
+      await page.evaluate(([row, col]) => window.__ime?.select(row, col), [row, col] as const);
+      await frames();
+      const hidden = await about(row, col);
+
+      await compose(session, "n");
+      await compose(session, "ni");
+      expect(await state(page)).toMatchObject({
+        editing: { row, col },
+        composing: true,
+        shown: true,
+      });
+      const shown = await about(row, col);
+      // The input method's window is where it opened, and the cell where it was.
+      expect(shown.cell).toEqual(hidden.cell);
+      expect(shown.box).toEqual(hidden.box);
+
+      const { box, cell, area } = shown;
+      expect(box.fontSize).toBeCloseTo(Math.max(11, 13 * zoom), 2);
+      expect(box.height).toBeGreaterThanOrEqual(box.fontSize * 1.2);
+      expect(box.left).toBeGreaterThanOrEqual(area.left - 0.01);
+      expect(box.top).toBeGreaterThanOrEqual(area.top - 0.01);
+      expect(box.left + box.width).toBeLessThanOrEqual(area.right + 0.01);
+      expect(box.top + box.height).toBeLessThanOrEqual(area.bottom + 0.01);
+      expect(box.left).toBeLessThanOrEqual(cell.left + 0.01);
+      expect(box.left + box.width).toBeGreaterThanOrEqual(cell.left + cell.width - 0.01);
+      expect(box.top).toBeLessThanOrEqual(cell.top + 0.01);
+      expect(box.top + box.height).toBeGreaterThanOrEqual(cell.top + cell.height - 0.01);
+
+      await session.send("Input.insertText", { text: "你" });
+      expect(await state(page)).toMatchObject({ composing: false, text: "你" });
+      await page.keyboard.press("Tab");
+      committed++;
+      const after = await state(page);
+      expect(after.editing).toBeNull();
+      expect(Object.values(after.committed)).toHaveLength(committed);
+    }
+  });
+}
+
 test("clipboard shortcuts reach the editor and leave it empty", async ({ page }) => {
   await open(page);
   for (const key of ["Control+C", "Control+X", "Control+V"]) {

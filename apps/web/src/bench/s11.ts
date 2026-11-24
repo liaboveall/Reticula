@@ -10,11 +10,16 @@
 // uniform, so that scrolling touches nothing but that uniform.
 
 import {
+  acquire,
   Canvas2dRenderer,
+  type GridRenderer,
   type Page,
   PageCache,
+  type RendererCounters,
   readTheme,
+  TextMeasurer,
   type Theme,
+  WebGpuRenderer,
 } from "@reticula/grid/internals";
 import { FLAG_NUMBER, PAGE_COLS, PAGE_ROWS } from "@reticula/protocol/viewport";
 import { stage } from "./stage.ts";
@@ -907,7 +912,8 @@ export async function fidelity(options: { zoom: number }) {
   };
 }
 
-export type Subject = "canvas" | TextMode;
+/** The grid's own renderers, and the prototype. */
+export type Subject = "canvas" | "webgpu" | TextMode;
 
 export interface ScrollResult {
   readonly subject: Subject;
@@ -921,7 +927,13 @@ export interface ScrollResult {
   /** Milliseconds between frames. */
   readonly interval: Summary;
   readonly framesOver60Hz: number;
+  /** The frames of the warm-up, the first of which finds nothing drawn before. */
+  readonly cold: { readonly work: Summary; readonly interval: Summary };
   readonly usage: ReturnType<Prototype["usage"]> | null;
+  readonly counters: {
+    readonly warm: RendererCounters | null;
+    readonly end: RendererCounters | null;
+  };
 }
 
 /** Scrolls the zoomed-out sheet; `screensPerSecond` of 0 jumps a screen a frame. */
@@ -936,7 +948,12 @@ export async function scroll(options: {
   host.classList.add("reticula-grid");
   const dpr = window.devicePixelRatio || 1;
   const scale = dpr * options.zoom;
-  const renderer = options.subject === "canvas" ? new Canvas2dRenderer() : null;
+  const lease = options.subject === "webgpu" ? await acquire(false, () => {}) : null;
+  const renderer: GridRenderer | null = lease
+    ? new WebGpuRenderer(lease, { measure: new TextMeasurer(), onIncomplete: () => {} })
+    : options.subject === "canvas"
+      ? new Canvas2dRenderer()
+      : null;
   const canvas = renderer?.canvas ?? document.createElement("canvas");
   canvas.width = Math.round(host.clientWidth * dpr);
   canvas.height = Math.round(host.clientHeight * dpr);
@@ -948,9 +965,9 @@ export async function scroll(options: {
   const rows = (size.height - METRICS.headerHeight) / METRICS.rowHeight;
   const cols = Math.ceil((size.width - METRICS.headerWidth) / METRICS.colWidth);
   const cache = new PageCache();
-  let adapterName = "";
+  let adapterName = lease?.gpu.adapter ?? "";
   let prototype: Prototype | null = null;
-  if (options.subject !== "canvas") {
+  if (!renderer && (options.subject === "string" || options.subject === "glyph")) {
     const adapter = await navigator.gpu?.requestAdapter();
     if (!adapter) {
       throw new Error("no WebGPU adapter");
@@ -959,12 +976,14 @@ export async function scroll(options: {
     prototype = new Prototype(await adapter.requestDevice(), canvas, theme, scale, options.subject);
   }
   const made = new Map<string, Page>();
+  // The grid holds pages around the ones in view.
+  const spare = renderer ? 1 : 0;
   const pagesAt = (firstRow: number): Page[] => {
     const pages: Page[] = [];
     const wanted = new Set<string>();
     for (
-      let pr = Math.floor(firstRow / PAGE_ROWS);
-      pr <= Math.floor((firstRow + rows) / PAGE_ROWS);
+      let pr = Math.max(0, Math.floor(firstRow / PAGE_ROWS) - spare);
+      pr <= Math.floor((firstRow + rows) / PAGE_ROWS) + spare;
       pr++
     ) {
       for (let pc = 0; pc <= Math.floor((cols - 1) / PAGE_COLS); pc++) {
@@ -992,6 +1011,8 @@ export async function scroll(options: {
 
   const work: number[] = [];
   const intervals: number[] = [];
+  const cold = { work: [] as number[], intervals: [] as number[] };
+  let warm: RendererCounters | null = null;
   let top = 0;
   const started = await nextFrame();
   let buildsAt = 0;
@@ -1035,10 +1056,15 @@ export async function scroll(options: {
       intervals.push(now - last);
     } else {
       buildsAt = prototype?.builds ?? 0;
+      cold.work.push(spent);
+      cold.intervals.push(now - last);
+      warm = renderer?.counters ?? null;
     }
     last = now;
   }
   const usage = prototype?.usage() ?? null;
+  const end = renderer?.counters ?? null;
+  renderer?.destroy();
   canvas.remove();
   prototype?.device.destroy();
   host.classList.remove("reticula-grid");
@@ -1053,6 +1079,8 @@ export async function scroll(options: {
     work: summarize(work),
     interval: summarize(intervals),
     framesOver60Hz: intervals.filter((sample) => sample > 1000 / 60 + 0.5).length,
+    cold: { work: summarize(cold.work), interval: summarize(cold.intervals) },
     usage,
+    counters: { warm, end },
   };
 }

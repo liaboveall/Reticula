@@ -3,6 +3,7 @@ import type { SheetInfo } from "@reticula/protocol";
 import { fmtMs, t } from "../i18n/index.ts";
 import { type Activity, activityText } from "./activity.ts";
 import type { EngineStatus } from "./types.ts";
+import { ZoomControl, type ZoomControlProps } from "./ZoomControl.tsx";
 
 export interface StatusBarProps {
   readonly status: EngineStatus;
@@ -14,6 +15,7 @@ export interface StatusBarProps {
   readonly activity: Activity | null;
   readonly stats: GridStats | null;
   readonly kernelVersion: string;
+  readonly zoom: ZoomControlProps | null;
 }
 
 function statusText(status: EngineStatus): string {
@@ -43,6 +45,7 @@ export function StatusBar({
   activity,
   stats,
   kernelVersion,
+  zoom,
 }: StatusBarProps) {
   const selected = selection ?? stats?.selection;
   return (
@@ -87,6 +90,7 @@ export function StatusBar({
           <span data-testid="kernel-version">
             {t("kernel {version}", { version: kernelVersion })}
           </span>
+          {zoom && <ZoomControl {...zoom} />}
         </>
       )}
     </footer>

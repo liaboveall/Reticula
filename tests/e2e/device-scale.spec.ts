@@ -14,7 +14,8 @@ import {
 
 test.skip(({ browserName }) => browserName !== "chromium", "a switch of Chromium's is used");
 
-const ADDRESS = "http://localhost:5274/app?hooks";
+// What is drawn on is a 2D canvas.
+const ADDRESS = "http://localhost:5274/app?hooks&renderer=canvas2d";
 /** Takes back the project's device, which a viewport cannot be without. */
 const NOT_EMULATED = Object.assign<BrowserContextOptions, object>(
   { viewport: null },

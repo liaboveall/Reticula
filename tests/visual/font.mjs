@@ -28,12 +28,19 @@ const BLOCKS = [
 ];
 
 /**
+ * Not half of the em: at most sizes, pens would come to be exactly between two
+ * of the positions a glyph can be drawn at, and which one it is drawn at would
+ * depend on how far along the screen it is and so how precise its position.
+ */
+const ADVANCE = 487;
+
+/**
  * Advance, where the pattern's lower left corner is, and the size of a dot. A
  * mark has no advance and sits over the half-width glyph before it.
  */
 const SHAPES = {
-  half: { advance: EM / 2, left: 50, bottom: 0, width: 80, height: 100 },
-  full: { advance: EM, left: 75, bottom: -110, width: 170, height: 130 },
+  half: { advance: ADVANCE, left: 50, bottom: 0, width: 80, height: 100 },
+  full: { advance: 2 * ADVANCE, left: 75, bottom: -110, width: 170, height: 130 },
   mark: { advance: 0, left: -400, bottom: 720, width: 60, height: 20 },
 };
 

@@ -3,6 +3,7 @@ import { EditorView } from "@codemirror/view";
 import type { WireFormulaAnalysis } from "@reticula/protocol";
 import { formulaDecorationExtension, setFormulaAnalysisEffect } from "./formula-input.ts";
 import type { Grid } from "./grid.ts";
+import { PADDING } from "./render/frame.ts";
 
 /** A cell, by position. */
 export interface CellPosition {
@@ -285,13 +286,15 @@ export class CellEditor {
     this.#view.focus();
   }
 
-  cancelExternal(): void {
+  cancelExternal(focusEditor = true): void {
     const cell = this.#cell;
     if (cell) {
       this.#finish();
       this.#note({ kind: "cancelled", cell });
     }
-    this.#view.focus();
+    if (focusEditor) {
+      this.#view.focus();
+    }
   }
 
   /** Closes the in-grid overlay without emitting `cancelled` or stealing focus (used when switching tabs mid-formula). */
@@ -319,19 +322,19 @@ export class CellEditor {
 
   #place = (): void => {
     const cell = this.#cell ?? this.#grid.selection;
+    // Hidden, it is as large as it is going to be: an input method opens its
+    // window where the editor is before there is anything to show in it.
     const box = cell
-      ? this.#grid.boxOf(cell.row, cell.col)
-      : { left: 0, top: 0, width: 0, height: 0 };
-    let { left, top } = box;
-    if (!this.#cell) {
-      left = Math.min(Math.max(0, left), Math.max(0, this.#host.clientWidth - box.width));
-      top = Math.min(Math.max(0, top), Math.max(0, this.#host.clientHeight - box.height));
-    }
+      ? this.#grid.editorBoxOf(cell.row, cell.col, this.#cell !== null)
+      : { left: 0, top: 0, width: 0, height: 0, zoom: 1, maxWidth: 0 };
     const style = this.#box.style;
-    style.transform = `translate(${left}px, ${top}px)`;
+    style.transform = `translate(${box.left}px, ${box.top}px)`;
     style.minWidth = `${box.width}px`;
+    style.maxWidth = `${box.maxWidth}px`;
     style.height = `${box.height}px`;
     style.lineHeight = `${box.height}px`;
+    style.fontSize = `${box.zoom}em`;
+    style.setProperty("--editor-padding", `${PADDING * box.zoom}px`);
   };
 
   #start(

@@ -1,3 +1,4 @@
+import { headerZoom } from "../layout.ts";
 import { rgbToHex, type Theme } from "../theme.ts";
 import { type Colors, type PackedColor, packColor } from "./color.ts";
 import type { GridCellStyle } from "./frame.ts";
@@ -7,15 +8,20 @@ import { BOLD, fontOf, ITALIC, type TextMeasure } from "./text-measure.ts";
 /** No colour of its own; also what a fully transparent colour packs to. */
 export const NO_COLOR: PackedColor = 0;
 
-/** A theme at a scale: colours packed, sizes in device pixels. */
+/** Index among the fonts of the one of the headers' labels, after the variants of the sheet's. */
+export const HEADER_FONT = 4;
+
+/** A theme at a scale and a zoom: colours packed, sizes in device pixels. */
 export interface Look {
   readonly theme: Theme;
   readonly scale: number;
-  /** The sheet's font by variant (`BOLD`, `ITALIC`). */
+  /** How much the cells and what is in them are enlarged. Lines and name plates are not. */
+  readonly zoom: number;
+  /** The sheet's font by variant (`BOLD`, `ITALIC`), and the headers'. */
   readonly fonts: readonly string[];
-  /** From the middle of a row down to its baseline, by variant. */
+  /** From the middle of a row down to its baseline, by font. */
   readonly lifts: readonly number[];
-  /** Height of a line of text, by variant. */
+  /** Height of a line of text, by font. */
   readonly lineHeights: readonly number[];
   readonly plateFont: string;
   /** Space between a cell's edge and its text. */
@@ -42,9 +48,18 @@ export interface Look {
   readonly refFills: readonly PackedColor[];
 }
 
-export function makeLook(theme: Theme, scale: number, measure: TextMeasure, colors: Colors): Look {
+export function makeLook(
+  theme: Theme,
+  scale: number,
+  measure: TextMeasure,
+  colors: Colors,
+  zoom = 1,
+): Look {
   const variants = [0, BOLD, ITALIC, BOLD | ITALIC];
-  const fonts = variants.map((variant) => fontOf(theme, variant, scale));
+  const fonts = [
+    ...variants.map((variant) => fontOf(theme, variant, scale * zoom)),
+    fontOf(theme, 0, scale * headerZoom(zoom)),
+  ];
   const lines = fonts.map((font) => measure.line(font));
   const slots = [0, 1, 2, 3, 4, 5, 6, 7];
   const selection = colors.parse(theme.selection);
@@ -52,11 +67,12 @@ export function makeLook(theme: Theme, scale: number, measure: TextMeasure, colo
   return {
     theme,
     scale,
+    zoom,
     fonts,
     lifts: lines.map((line) => (line.ascent - line.descent) / 2),
     lineHeights: lines.map((line) => Math.ceil(line.ascent + line.descent)),
     plateFont: `600 ${11 * scale}px ${theme.fontFamily}`,
-    padding: Math.round(PADDING * scale),
+    padding: Math.round(PADDING * zoom * scale),
     hairline: Math.max(1, Math.round(scale)),
     background: colors.parse(theme.background),
     text: colors.parse(theme.text),
