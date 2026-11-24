@@ -52,7 +52,7 @@ export type {
   FormulaReferenceOverlay,
   GridCellStyle,
   RemotePresenceOverlay,
-} from "./renderer.ts";
+} from "./render/frame.ts";
 export {
   DARK_PALETTE_FILL,
   DARK_PALETTE_TEXT,

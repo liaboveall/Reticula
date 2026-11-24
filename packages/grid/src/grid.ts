@@ -29,15 +29,17 @@ import {
   visibleCells,
 } from "./layout.ts";
 import { decodePage } from "./page.ts";
+import { Canvas2dRenderer } from "./render/canvas2d.ts";
 import {
   type DiffHighlightMap,
   FILL_HANDLE_SIZE,
   type FormulaReferenceOverlay,
   type GridCellStyle,
   type RemotePresenceOverlay,
-  Renderer,
   type ReorderGuide,
-} from "./renderer.ts";
+} from "./render/frame.ts";
+import { TextMeasurer } from "./render/text-measure.ts";
+import type { GridRenderer } from "./render/types.ts";
 import { Scrollbar } from "./scrollbar.ts";
 import { readTheme, type Theme } from "./theme.ts";
 
@@ -176,6 +178,19 @@ export function coalesceIdRuns(ids: readonly bigint[]): IdRun[] {
   return runs;
 }
 
+/** Rows or columns with a size of their own, in order. */
+type CustomSizes = readonly (readonly [number, number])[];
+
+function withSize(sizes: CustomSizes, index: number, px: number, standard: number): CustomSizes {
+  const others = sizes.filter(([other]) => other !== index);
+  return px === standard ? others : [...others, [index, px] as const].sort((a, b) => a[0] - b[0]);
+}
+
+/** The size an edge has been dragged to. One that has not moved has not changed it. */
+function dragged(size: number, by: number, least: number, most: number): number {
+  return by === 0 ? size : Math.min(most, Math.max(least, Math.round(size + by)));
+}
+
 type DragInteraction =
   | { readonly kind: "select"; readonly mode: SelectionScope }
   | {
@@ -204,8 +219,12 @@ type DragInteraction =
  */
 export class Grid {
   #host: HTMLElement;
-  #canvas: HTMLCanvasElement;
-  #renderer: Renderer;
+  #measurer = new TextMeasurer();
+  #renderer: GridRenderer;
+  /** The renderer that was replaced, shown until the one in its place has drawn. */
+  #retired: GridRenderer | null = null;
+  /** Where the pointer is listened to, whatever draws the picture below. */
+  #input: HTMLDivElement;
   #vertical: Scrollbar;
   #horizontal: Scrollbar;
   #corner: HTMLDivElement;
@@ -216,8 +235,14 @@ export class Grid {
 
   #theme: Theme;
   #sheet: SheetSize = { rows: 0, cols: 0 };
-  #customRows: [number, number][] = [];
-  #customCols: [number, number][] = [];
+  #customRows: CustomSizes = [];
+  #customCols: CustomSizes = [];
+  /** The size shown while a row's or column's edge is dragged, which nobody else knows of. */
+  #sizePreview: {
+    readonly axis: "row" | "col";
+    readonly index: number;
+    readonly px: number;
+  } | null = null;
   #frozenRows = 0;
   #frozenCols = 0;
   #layout: SheetLayout;
@@ -285,14 +310,23 @@ export class Grid {
 
     host.classList.add("reticula-grid");
     host.tabIndex = 0;
-    this.#canvas = document.createElement("canvas");
-    this.#renderer = new Renderer(this.#canvas);
+    this.#renderer = new Canvas2dRenderer({
+      measure: this.#measurer,
+      onRestored: () => this.#invalidate(),
+    });
+    this.#renderer.canvas.setAttribute("aria-hidden", "true");
+    this.#input = document.createElement("div");
+    this.#input.className = "reticula-input";
     this.#vertical = new Scrollbar("vertical", (top) => this.scrollTo({ top }));
     this.#horizontal = new Scrollbar("horizontal", (left) => this.scrollTo({ left }));
     this.#corner = document.createElement("div");
     this.#corner.className = "reticula-scrollbar-corner";
     this.#placeScrollbars();
-    host.append(this.#canvas, this.#vertical.element, this.#horizontal.element, this.#corner);
+    const bars = [this.#vertical.element, this.#horizontal.element, this.#corner];
+    for (const bar of bars) {
+      bar.setAttribute("aria-hidden", "true");
+    }
+    host.append(this.#renderer.canvas, this.#input, ...bars);
 
     this.#theme = readTheme(host);
     this.#scheme = matchMedia("(prefers-color-scheme: dark)");
@@ -300,12 +334,14 @@ export class Grid {
     this.#watchDensity();
 
     host.addEventListener("wheel", this.#onWheel, { passive: false });
-    this.#canvas.addEventListener("pointerdown", this.#onPointerDown);
-    this.#canvas.addEventListener("pointermove", this.#onPointerMove);
-    this.#canvas.addEventListener("pointerup", this.#onPointerUp);
-    this.#canvas.addEventListener("pointercancel", this.#onPointerUp);
-    this.#canvas.addEventListener("dblclick", this.#onDoubleClick);
-    this.#canvas.addEventListener("contextmenu", this.#onContextMenu);
+    this.#input.addEventListener("pointerdown", this.#onPointerDown);
+    this.#input.addEventListener("pointermove", this.#onPointerMove);
+    this.#input.addEventListener("pointerup", this.#onPointerUp);
+    this.#input.addEventListener("pointercancel", this.#onPointerLost);
+    // Follows every release too, by when there is no drag left to abort.
+    this.#input.addEventListener("lostpointercapture", this.#onPointerLost);
+    this.#input.addEventListener("dblclick", this.#onDoubleClick);
+    this.#input.addEventListener("contextmenu", this.#onContextMenu);
     this.#observer = new ResizeObserver(() => {
       this.#resized = true;
       this.#invalidate();
@@ -316,6 +352,7 @@ export class Grid {
 
   /** Opens a new sheet, resetting scroll, selection, and page cache. */
   setSheet(sheet: SheetConfig): void {
+    this.cancelDrag();
     this.#sheet = { rows: sheet.rows, cols: sheet.cols };
     this.#applySheetConfig(sheet);
     this.#scroll = { top: 0, left: 0 };
@@ -454,9 +491,13 @@ export class Grid {
   }
 
   #rebuildLayout(): void {
+    const { rowHeight, colWidth } = this.#metrics;
+    const preview = this.#sizePreview;
+    const sizesOf = (axis: "row" | "col", sizes: CustomSizes, standard: number) =>
+      preview?.axis === axis ? withSize(sizes, preview.index, preview.px, standard) : sizes;
     this.#layout = {
-      rowAxis: new SparseAxis(this.#metrics.rowHeight, this.#customRows),
-      colAxis: new SparseAxis(this.#metrics.colWidth, this.#customCols),
+      rowAxis: new SparseAxis(rowHeight, sizesOf("row", this.#customRows, rowHeight)),
+      colAxis: new SparseAxis(colWidth, sizesOf("col", this.#customCols, colWidth)),
       frozenRows: this.#frozenRows,
       frozenCols: this.#frozenCols,
     };
@@ -849,6 +890,50 @@ export class Grid {
     };
   }
 
+  /**
+   * Ends the drag in progress as if it had not begun: nothing is resized, moved
+   * or filled. Cells it has selected stay selected. Returns whether there was one.
+   */
+  cancelDrag(): boolean {
+    const drag = this.#drag;
+    const pointer = this.#draggingPointerId;
+    if (!drag || pointer === null) {
+      return false;
+    }
+    this.#drag = null;
+    this.#draggingPointerId = null;
+    this.#stopAutoScroll();
+    this.#releasePointer(pointer);
+    this.#fillPreview = null;
+    this.#reorderGuide = null;
+    if (this.#sizePreview) {
+      this.#sizePreview = null;
+      this.#rebuildLayout();
+    }
+    this.#invalidate();
+    return true;
+  }
+
+  /**
+   * Has another renderer draw from the next frame on. Refused, with `false`,
+   * while something is dragged.
+   *
+   * @internal
+   */
+  swapRenderer(renderer: GridRenderer): boolean {
+    if (this.#drag || this.#destroyed) {
+      return false;
+    }
+    this.#retired?.destroy();
+    this.#retired = this.#renderer;
+    this.#renderer = renderer;
+    renderer.canvas.setAttribute("aria-hidden", "true");
+    this.#input.before(renderer.canvas);
+    this.#resize();
+    this.#invalidate();
+    return true;
+  }
+
   destroy(): void {
     this.#stopAutoScroll();
     this.#hold(EMPTY_SPAN);
@@ -859,7 +944,9 @@ export class Grid {
     this.#scheme.removeEventListener("change", this.#restyle);
     this.#density?.removeEventListener("change", this.#onDensityChange);
     this.#host.removeEventListener("wheel", this.#onWheel);
-    this.#canvas.remove();
+    this.#renderer.destroy();
+    this.#retired?.destroy();
+    this.#input.remove();
     this.#vertical.element.remove();
     this.#horizontal.element.remove();
     this.#corner.remove();
@@ -967,6 +1054,9 @@ export class Grid {
       activeSpillRange: this.#activeSpillRange,
     });
 
+    this.#retired?.destroy();
+    this.#retired = null;
+
     const content = contentSize(metrics, this.#sheet, this.#layout);
     const area = cellArea(metrics, this.#size);
     this.#vertical.update(content.height, area.height, this.#scroll.top);
@@ -1036,15 +1126,13 @@ export class Grid {
     this.#scale = scale;
     const pixelWidth = Math.round(width * scale);
     const pixelHeight = Math.round(height * scale);
-    if (this.#canvas.width !== pixelWidth || this.#canvas.height !== pixelHeight) {
-      this.#canvas.width = pixelWidth;
-      this.#canvas.height = pixelHeight;
-    }
+    this.#renderer.resize(pixelWidth, pixelHeight);
+    const { style } = this.#renderer.canvas;
     // The size the backing store has on the screen, not the host's, which is
     // rarely a whole number of device pixels: the browser would scale the one
     // to the other and blur every line. The host clips what is too much.
-    this.#canvas.style.width = `${pixelWidth / scale}px`;
-    this.#canvas.style.height = `${pixelHeight / scale}px`;
+    style.width = `${pixelWidth / scale}px`;
+    style.height = `${pixelHeight / scale}px`;
     this.#scroll = clampScroll(
       this.#scroll,
       scrollLimits(this.#metrics, this.#sheet, this.#size, this.#layout),
@@ -1147,8 +1235,15 @@ export class Grid {
     if (event.button !== 0) {
       return;
     }
+    if (this.#drag) {
+      if (event.pointerId !== this.#draggingPointerId) {
+        return;
+      }
+      // The pointer's release was never heard of.
+      this.cancelDrag();
+    }
     const started = performance.now();
-    const bounds = this.#canvas.getBoundingClientRect();
+    const bounds = this.#input.getBoundingClientRect();
     const x = event.clientX - bounds.left;
     const y = event.clientY - bounds.top;
     const multiMod = event.ctrlKey || event.metaKey;
@@ -1332,14 +1427,31 @@ export class Grid {
     this.#dragClientX = event.clientX;
     this.#dragClientY = event.clientY;
     try {
-      this.#canvas.setPointerCapture(event.pointerId);
+      this.#input.setPointerCapture(event.pointerId);
     } catch {
       // Synthetic pointer events in unit tests may lack capture.
     }
   }
 
+  #releasePointer(pointerId: number): void {
+    try {
+      if (this.#input.hasPointerCapture(pointerId)) {
+        this.#input.releasePointerCapture(pointerId);
+      }
+    } catch {
+      // Ignore synthetic pointer release errors.
+    }
+  }
+
+  /** The pointer is gone without having been lifted: what it did counts for nothing. */
+  #onPointerLost = (event: PointerEvent): void => {
+    if (this.#draggingPointerId === event.pointerId) {
+      this.cancelDrag();
+    }
+  };
+
   #onPointerMove = (event: PointerEvent): void => {
-    const bounds = this.#canvas.getBoundingClientRect();
+    const bounds = this.#input.getBoundingClientRect();
     const localX = event.clientX - bounds.left;
     const localY = event.clientY - bounds.top;
 
@@ -1353,21 +1465,13 @@ export class Grid {
     const drag = this.#drag;
 
     if (drag.kind === "colResize") {
-      const nextW = Math.min(
-        MAX_COL_PX,
-        Math.max(MIN_COL_PX, Math.round(drag.startWidth + (event.clientX - drag.startClientX))),
-      );
-      this.#setPreviewColSize(drag.col, nextW);
-      this.#invalidate();
+      const by = event.clientX - drag.startClientX;
+      this.#previewSize("col", drag.col, dragged(drag.startWidth, by, MIN_COL_PX, MAX_COL_PX));
       return;
     }
     if (drag.kind === "rowResize") {
-      const nextH = Math.min(
-        MAX_ROW_PX,
-        Math.max(MIN_ROW_PX, Math.round(drag.startHeight + (event.clientY - drag.startClientY))),
-      );
-      this.#setPreviewRowSize(drag.row, nextH);
-      this.#invalidate();
+      const by = event.clientY - drag.startClientY;
+      this.#previewSize("row", drag.row, dragged(drag.startHeight, by, MIN_ROW_PX, MAX_ROW_PX));
       return;
     }
     if (drag.kind === "rowReorder") {
@@ -1407,39 +1511,21 @@ export class Grid {
     this.#draggingPointerId = null;
     this.#drag = null;
     this.#stopAutoScroll();
-    try {
-      if (this.#canvas.hasPointerCapture(event.pointerId)) {
-        this.#canvas.releasePointerCapture(event.pointerId);
-      }
-    } catch {
-      // Ignore synthetic pointer release errors.
-    }
+    this.#releasePointer(event.pointerId);
 
     if (!finishedDrag) {
       return;
     }
 
     if (finishedDrag.kind === "colResize") {
-      const px = this.#layout.colAxis.sizeOf(finishedDrag.col);
-      const colId = this.#cache.colIdAt(finishedDrag.col);
-      if (colId !== undefined) {
-        this.#options.onResizeCols?.([
-          {
-            run: { firstId: String(colId), len: 1 },
-            sizePx: px === this.#metrics.colWidth ? null : px,
-          },
-        ]);
+      const px = this.#takeSizePreview();
+      if (px !== null && px !== finishedDrag.startWidth) {
+        this.#resizeCol(finishedDrag.col, px);
       }
     } else if (finishedDrag.kind === "rowResize") {
-      const px = this.#layout.rowAxis.sizeOf(finishedDrag.row);
-      const rowId = this.#cache.rowIdAt(finishedDrag.row);
-      if (rowId !== undefined) {
-        this.#options.onResizeRows?.([
-          {
-            run: { firstId: String(rowId), len: 1 },
-            sizePx: px === this.#metrics.rowHeight ? null : px,
-          },
-        ]);
+      const px = this.#takeSizePreview();
+      if (px !== null && px !== finishedDrag.startHeight) {
+        this.#resizeRow(finishedDrag.row, px);
       }
     } else if (finishedDrag.kind === "fill") {
       const preview = this.#fillPreview;
@@ -1492,7 +1578,7 @@ export class Grid {
   };
 
   #onDoubleClick = (event: MouseEvent): void => {
-    const bounds = this.#canvas.getBoundingClientRect();
+    const bounds = this.#input.getBoundingClientRect();
     const x = event.clientX - bounds.left;
     const y = event.clientY - bounds.top;
 
@@ -1514,27 +1600,17 @@ export class Grid {
       this.#layout,
     );
     if (hit && hit.kind === "colResize") {
-      const colId = this.#cache.colIdAt(hit.col);
-      if (colId !== undefined) {
-        const fz = frozenPixels(this.#metrics, this.#sheet, this.#size, this.#layout);
-        const startR = fz.frozenRows > 0 ? 0 : this.#visible.firstRow;
-        const endR = Math.max(fz.frozenRows, this.#visible.endRow);
-        const fitPx = this.#renderer.measureColumnFitWidth(
-          this.#theme,
-          this.#cache,
-          this.#styles,
-          hit.col,
-          startR,
-          endR,
-        );
-        this.#setPreviewColSize(hit.col, fitPx);
-        this.#invalidate();
-        this.#options.onResizeCols?.([
-          {
-            run: { firstId: String(colId), len: 1 },
-            sizePx: fitPx === this.#metrics.colWidth ? null : fitPx,
-          },
-        ]);
+      const fz = frozenPixels(this.#metrics, this.#sheet, this.#size, this.#layout);
+      const fitPx = this.#measurer.columnFitWidth(
+        this.#theme,
+        this.#cache,
+        this.#styles,
+        hit.col,
+        fz.frozenRows > 0 ? 0 : this.#visible.firstRow,
+        Math.max(fz.frozenRows, this.#visible.endRow),
+      );
+      if (fitPx !== this.#layout.colAxis.sizeOf(hit.col)) {
+        this.#resizeCol(hit.col, fitPx);
       }
       return;
     }
@@ -1551,7 +1627,7 @@ export class Grid {
     if (!this.#options.onContextMenu) {
       return;
     }
-    const bounds = this.#canvas.getBoundingClientRect();
+    const bounds = this.#input.getBoundingClientRect();
     const x = event.clientX - bounds.left;
     const y = event.clientY - bounds.top;
     const hit = headerHitAt(
@@ -1664,29 +1740,51 @@ export class Grid {
         }
       }
     }
-    if (this.#canvas.style.cursor !== cursor) {
-      this.#canvas.style.cursor = cursor;
+    if (this.#input.style.cursor !== cursor) {
+      this.#input.style.cursor = cursor;
     }
   }
 
-  #setPreviewColSize(col: number, px: number): void {
-    const filtered = this.#customCols.filter(([c]) => c !== col);
-    if (px !== this.#metrics.colWidth) {
-      filtered.push([col, px]);
-      filtered.sort((a, b) => a[0] - b[0]);
-    }
-    this.#customCols = filtered;
+  #previewSize(axis: "row" | "col", index: number, px: number): void {
+    this.#sizePreview = { axis, index, px };
     this.#rebuildLayout();
+    this.#invalidate();
   }
 
-  #setPreviewRowSize(row: number, px: number): void {
-    const filtered = this.#customRows.filter(([r]) => r !== row);
-    if (px !== this.#metrics.rowHeight) {
-      filtered.push([row, px]);
-      filtered.sort((a, b) => a[0] - b[0]);
-    }
-    this.#customRows = filtered;
+  /** Ends the preview of a size, and returns the size it showed. */
+  #takeSizePreview(): number | null {
+    const px = this.#sizePreview?.px ?? null;
+    this.#sizePreview = null;
     this.#rebuildLayout();
+    this.#invalidate();
+    return px;
+  }
+
+  /** Resizes a column here, without waiting for the engine to say so, and there. */
+  #resizeCol(col: number, px: number): void {
+    const id = this.#cache.colIdAt(col);
+    if (id === undefined) {
+      return;
+    }
+    const { colWidth } = this.#metrics;
+    this.#customCols = withSize(this.#customCols, col, px, colWidth);
+    this.#rebuildLayout();
+    this.#invalidate();
+    const run = { firstId: String(id), len: 1 };
+    this.#options.onResizeCols?.([{ run, sizePx: px === colWidth ? null : px }]);
+  }
+
+  #resizeRow(row: number, px: number): void {
+    const id = this.#cache.rowIdAt(row);
+    if (id === undefined) {
+      return;
+    }
+    const { rowHeight } = this.#metrics;
+    this.#customRows = withSize(this.#customRows, row, px, rowHeight);
+    this.#rebuildLayout();
+    this.#invalidate();
+    const run = { firstId: String(id), len: 1 };
+    this.#options.onResizeRows?.([{ run, sizePx: px === rowHeight ? null : px }]);
   }
 
   #updateDragTarget(): void {
@@ -1694,7 +1792,7 @@ export class Grid {
     if (!drag) {
       return;
     }
-    const bounds = this.#canvas.getBoundingClientRect();
+    const bounds = this.#input.getBoundingClientRect();
     const lx = this.#dragClientX - bounds.left;
     const ly = this.#dragClientY - bounds.top;
     const next = this.#cellAtClamped(
@@ -1784,7 +1882,7 @@ export class Grid {
   }
 
   #syncAutoScroll(): void {
-    const bounds = this.#canvas.getBoundingClientRect();
+    const bounds = this.#input.getBoundingClientRect();
     const area = cellArea(this.#metrics, this.#size);
     const localX = this.#dragClientX - bounds.left - this.#metrics.headerWidth;
     const localY = this.#dragClientY - bounds.top - this.#metrics.headerHeight;
@@ -1801,7 +1899,7 @@ export class Grid {
         this.#stopAutoScroll();
         return;
       }
-      const b = this.#canvas.getBoundingClientRect();
+      const b = this.#input.getBoundingClientRect();
       const a = cellArea(this.#metrics, this.#size);
       const lx = this.#dragClientX - b.left - this.#metrics.headerWidth;
       const ly = this.#dragClientY - b.top - this.#metrics.headerHeight;

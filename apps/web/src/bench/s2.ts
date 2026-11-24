@@ -5,13 +5,11 @@
 // but drawing is timed and the mix of content is what the target specifies.
 
 import {
-  ALL_SHORTCUTS,
+  Canvas2dRenderer,
   type Page,
   PageCache,
   pagesToHold,
-  Renderer,
   readTheme,
-  type Shortcuts,
   scrollLimits,
   visibleCells,
 } from "@reticula/grid/internals";
@@ -102,19 +100,18 @@ function syntheticPage(pageRow: number, pageCol: number, content: Content): Page
   };
 }
 
-/** A canvas on the stage, sized the way the grid sizes its own. */
-function openCanvas(shortcuts: Shortcuts) {
+/** A renderer on the stage, its canvas sized the way the grid sizes it. */
+function openCanvas() {
   const host = stage();
   host.classList.add("reticula-grid");
-  const canvas = document.createElement("canvas");
+  const renderer = new Canvas2dRenderer();
+  const { canvas } = renderer;
   const scale = window.devicePixelRatio || 1;
   const size = { width: host.clientWidth, height: host.clientHeight };
-  canvas.width = Math.round(size.width * scale);
-  canvas.height = Math.round(size.height * scale);
-  canvas.style.width = `${size.width}px`;
-  canvas.style.height = `${size.height}px`;
+  renderer.resize(Math.round(size.width * scale), Math.round(size.height * scale));
+  canvas.style.width = `${canvas.width / scale}px`;
+  canvas.style.height = `${canvas.height / scale}px`;
   host.append(canvas);
-  const renderer = new Renderer(canvas, shortcuts);
   const theme = readTheme(host);
   const cache = new PageCache();
 
@@ -151,7 +148,7 @@ function openCanvas(shortcuts: Shortcuts) {
       return { elapsed: performance.now() - started, counts };
     },
     close() {
-      canvas.remove();
+      renderer.destroy();
       host.classList.remove("reticula-grid");
     },
   };
@@ -160,13 +157,12 @@ function openCanvas(shortcuts: Shortcuts) {
 export interface DrawResult {
   readonly content: Content;
   readonly rowsPerFrame: number;
-  readonly shortcuts: Shortcuts;
   readonly scale: number;
   readonly font: string;
   readonly frames: number;
   /** Cells whose text was drawn, per frame. */
   readonly cells: Summary;
-  /** Of those, the cells drawn through a clip, per frame. */
+  /** Texts drawn through a clip of their own, per frame. */
   readonly clipped: Summary;
   /** Milliseconds the main thread took to issue one frame's draw calls. */
   readonly draw: Summary;
@@ -186,10 +182,8 @@ export async function draw(options: {
   rowsPerFrame: number;
   frames: number;
   warmup: number;
-  shortcuts?: Partial<Shortcuts>;
 }): Promise<DrawResult> {
-  const shortcuts = { ...ALL_SHORTCUTS, ...options.shortcuts };
-  const canvas = openCanvas(shortcuts);
+  const canvas = openCanvas();
   const draws: number[] = [];
   const intervals: number[] = [];
   const cells: number[] = [];
@@ -212,7 +206,6 @@ export async function draw(options: {
   return {
     content: options.content,
     rowsPerFrame: options.rowsPerFrame,
-    shortcuts,
     scale: canvas.scale,
     font: canvas.font,
     frames: options.frames,
@@ -252,7 +245,7 @@ export async function pace(options: {
   seconds: number;
   warmupSeconds: number;
 }): Promise<PaceResult> {
-  const canvas = openCanvas(ALL_SHORTCUTS);
+  const canvas = openCanvas();
   const screen = canvas.size.height - METRICS.headerHeight - METRICS.scrollbarSize;
   const draws: number[] = [];
   const intervals: number[] = [];

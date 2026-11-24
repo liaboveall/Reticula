@@ -404,6 +404,10 @@ export class CellEditor {
     if (event.isComposing || event.keyCode === 229 || view.composing || view.compositionStarted) {
       return "input method";
     }
+    if (event.key === "Escape" && this.#grid.cancelDrag()) {
+      event.preventDefault();
+      return "swallowed";
+    }
     const mod = event.ctrlKey || event.metaKey;
     const plain = !mod && !event.altKey;
 

@@ -72,6 +72,14 @@
   display: block;
 }
 
+/* Over the picture and under the scrollbars and the editor: the pointer is
+   listened to here, so that what draws the picture can be replaced. */
+.reticula-input {
+  position: absolute;
+  inset: 0;
+  touch-action: none;
+}
+
 .reticula-scrollbar {
   position: absolute;
   background: var(--grid-scrollbar-track);

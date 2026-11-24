@@ -232,16 +232,6 @@ if (bench === "s2") {
   const worst = Math.max(...results.draw.map((result) => result.draw.p95));
   console.log(`  target p95 <= 4 ms: ${verdict(worst <= 4)}`);
 
-  results.shortcuts = [];
-  console.log("\nwith one shortcut turned off (ms)");
-  for (const shortcut of ["cacheWidths", "clipOnlyOverwide", "batchState"]) {
-    for (const [label, parameters] of [cases[0], cases[2]]) {
-      const result = await call("s2", "draw", { ...parameters, frames, warmup: 60, shortcuts: { [shortcut]: false } });
-      results.shortcuts.push({ off: shortcut, label, ...result });
-      row(`without ${shortcut}: ${parameters.content}`, result.draw);
-    }
-  }
-
   const tracePath = options.trace && options.browser !== "firefox" ? join(root, `target/spikes/grid/s2-trace-${options.browser}.json`) : "";
   if (tracePath) {
     mkdirSync(dirname(tracePath), { recursive: true });

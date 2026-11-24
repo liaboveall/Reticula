@@ -9,7 +9,13 @@
 // The prototype keeps one buffer of instances for a page and moves it by a
 // uniform, so that scrolling touches nothing but that uniform.
 
-import { type Page, PageCache, Renderer, readTheme, type Theme } from "@reticula/grid/internals";
+import {
+  Canvas2dRenderer,
+  type Page,
+  PageCache,
+  readTheme,
+  type Theme,
+} from "@reticula/grid/internals";
 import { FLAG_NUMBER, PAGE_COLS, PAGE_ROWS } from "@reticula/protocol/viewport";
 import { stage } from "./stage.ts";
 import { nextFrame, Random, type Summary, summarize } from "./stats.ts";
@@ -930,7 +936,8 @@ export async function scroll(options: {
   host.classList.add("reticula-grid");
   const dpr = window.devicePixelRatio || 1;
   const scale = dpr * options.zoom;
-  const canvas = document.createElement("canvas");
+  const renderer = options.subject === "canvas" ? new Canvas2dRenderer() : null;
+  const canvas = renderer?.canvas ?? document.createElement("canvas");
   canvas.width = Math.round(host.clientWidth * dpr);
   canvas.height = Math.round(host.clientHeight * dpr);
   canvas.style.width = `${host.clientWidth}px`;
@@ -943,10 +950,7 @@ export async function scroll(options: {
   const cache = new PageCache();
   let adapterName = "";
   let prototype: Prototype | null = null;
-  let renderer: Renderer | null = null;
-  if (options.subject === "canvas") {
-    renderer = new Renderer(canvas);
-  } else {
+  if (options.subject !== "canvas") {
     const adapter = await navigator.gpu?.requestAdapter();
     if (!adapter) {
       throw new Error("no WebGPU adapter");
