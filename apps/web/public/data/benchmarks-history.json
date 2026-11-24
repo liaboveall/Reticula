@@ -157,6 +157,7 @@
       }
     }
   ],
+  "gpuRuns": [],
   "latestDiff": {
     "agreementRatio": 0.9965268292682928,
     "byFamily": [
@@ -579,28 +580,31 @@
   },
   "renderRuns": [
     {
-      "browser": "chrome 158.0.8127.36",
+      "browser": "Chrome 158.0.8127.36",
       "chromeMargin2P99Ms": 0.93,
       "commit": "7096d6e",
       "date": "2026-11-18",
+      "firefoxJumpMaxMs": 6.74,
       "firefoxJumpP99Ms": 6.14,
       "scrollWorkP99Ms": 0.93,
       "suite": "m1a-render"
     },
     {
-      "browser": "chrome 158.0.8127.36",
+      "browser": "Chrome 158.0.8127.36",
       "chromeMargin2P99Ms": 1.01,
       "commit": "2fe2ae4",
       "date": "2026-11-19",
+      "firefoxJumpMaxMs": null,
       "firefoxJumpP99Ms": null,
       "scrollWorkP99Ms": 1.01,
       "suite": "m1b-render"
     },
     {
-      "browser": "chrome 158.0.8127.36",
+      "browser": "Chrome 158.0.8127.36",
       "chromeMargin2P99Ms": 1.28,
       "commit": "31ca8a9",
       "date": "2026-11-22",
+      "firefoxJumpMaxMs": null,
       "firefoxJumpP99Ms": null,
       "scrollWorkP99Ms": 1.28,
       "suite": "m3a-render"

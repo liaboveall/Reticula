@@ -57,6 +57,16 @@ impl Flags {
         self.switches.iter().any(|switch| switch == name)
     }
 
+    /// The first flag given that is not one of these.
+    pub fn other_than(&self, known: &[&str]) -> Option<&str> {
+        let options = self.options.iter().map(|(option, _)| option);
+        self.switches
+            .iter()
+            .chain(options)
+            .map(String::as_str)
+            .find(|name| !known.contains(name))
+    }
+
     /// The value of `--name value`, if given.
     pub fn get(&self, name: &str) -> Option<&str> {
         self.options

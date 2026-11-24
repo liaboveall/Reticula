@@ -1,5 +1,5 @@
-// Serves the pages built by `vite build --mode spikes` (apps/web/dist-spikes):
-// the measurement page and the page for checking input methods.
+// Serves pages to pages that measure: the ones built by `vite build --mode
+// spikes` (apps/web/dist-spikes), unless another build is named.
 
 import { readFile } from "node:fs/promises";
 import { createServer } from "node:http";
@@ -9,21 +9,25 @@ import { fileURLToPath } from "node:url";
 /** The repository root. */
 export const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 
-const site = join(root, "apps/web/dist-spikes");
 const types = {
   ".html": "text/html; charset=utf-8",
   ".js": "text/javascript",
   ".css": "text/css",
   ".wasm": "application/wasm",
+  ".json": "application/json",
+  ".svg": "image/svg+xml",
 };
 
 /**
- * Starts the server on a port of the system's choosing, or on `port`.
- * Resolves to its address and a function that stops it.
+ * Starts the server on a port of the system's choosing, or on `port`, with
+ * the files of `site`. Paths that name no file get the `document`, if there is
+ * one: the app has many addresses. Resolves to the server's address and a
+ * function that stops it.
  */
-export async function serve(port = 0) {
+export async function serve(port = 0, { site = join(root, "apps/web/dist-spikes"), document = "" } = {}) {
   const server = createServer(async (request, response) => {
-    const path = new URL(request.url, "http://localhost").pathname;
+    const { pathname } = new URL(request.url, "http://localhost");
+    const path = document && !extname(pathname) ? `/${document}` : pathname;
     if (path === "/favicon.ico") {
       response.writeHead(204).end();
       return;

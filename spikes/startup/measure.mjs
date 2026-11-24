@@ -38,11 +38,11 @@
 //   --out <file>       the data file (default: target/spikes/startup/<name>.json,
 //                      the name made of the options)
 
-import { execFileSync } from "node:child_process";
 import { mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { chromium, firefox } from "@playwright/test";
+import { commit } from "../machine.mjs";
 import { pin } from "../pin.mjs";
 import { root, serve } from "./serve.mjs";
 
@@ -96,14 +96,6 @@ function fail(message) {
 // The browser is started by this process and inherits the setting.
 if (options.affinity) {
   pin(options.affinity);
-}
-
-function git(...args) {
-  try {
-    return execFileSync("git", args, { cwd: root, encoding: "utf8" }).trim();
-  } catch {
-    return "";
-  }
 }
 
 // --- what is served --------------------------------------------------------
@@ -361,8 +353,7 @@ writeFileSync(
       spike: "s9",
       suite: "m6-startup",
       date: new Date().toISOString(),
-      commit: git("rev-parse", "--short", "HEAD"),
-      uncommittedChanges: git("status", "--porcelain") !== "",
+      ...commit(),
       machine: {
         cpu: os.cpus()[0]?.model.trim(),
         logicalProcessors: os.cpus().length,

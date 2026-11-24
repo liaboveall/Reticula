@@ -6,9 +6,9 @@
 
 import "@reticula/grid/grid.css";
 import "./bench.css";
+import * as b13 from "./b13.ts";
 import * as s1 from "./s1.ts";
 import * as s2 from "./s2.ts";
-import * as s11 from "./s11.ts";
 import { stage } from "./stage.ts";
 import { frameInterval, type Summary, timerResolution } from "./stats.ts";
 
@@ -47,7 +47,7 @@ async function environment(): Promise<Environment> {
   };
 }
 
-const bench = { environment, s1, s2, s11 };
+const bench = { environment, s1, s2, b13 };
 
 declare global {
   interface Window {

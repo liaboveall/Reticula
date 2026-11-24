@@ -1,6 +1,14 @@
 import { useEffect, useState } from "react";
+import type { GpuResult, GpuRun } from "../generated/benchmarks.ts";
 import { fmtInt, t } from "../i18n/index.ts";
 import { tx } from "../i18n/react.ts";
+import {
+  comparisons,
+  latestComparison,
+  logPosition,
+  rendererName,
+  workloadName,
+} from "./benchmarks.ts";
 import { errorText } from "./errors.ts";
 import { PageLink, PageNav } from "./PageNav.tsx";
 import "./pages.css";
@@ -45,10 +53,10 @@ interface RenderRun {
   readonly date: string;
   readonly commit: string;
   readonly suite: string;
-  readonly browser: string;
+  readonly browser: string | null;
   readonly scrollWorkP99Ms: number | null;
-  readonly chromeMargin2P99Ms: number | null;
   readonly firefoxJumpP99Ms: number | null;
+  readonly firefoxJumpMaxMs: number | null;
 }
 
 interface SyncRun {
@@ -146,6 +154,8 @@ interface BenchmarksHistory {
   readonly engineRuns: readonly EngineRun[];
   readonly startupRuns: readonly StartupRun[];
   readonly renderRuns: readonly RenderRun[];
+  /** Missing in what a browser has kept from before there were any. */
+  readonly gpuRuns?: readonly GpuRun[];
   readonly syncRuns: readonly SyncRun[];
   readonly loadRuns: readonly LoadRun[];
   readonly latestDiff: DiffSummary | null;
@@ -214,9 +224,9 @@ export default function BenchmarksPage({ onNavigate }: BenchmarksPageProps) {
   const latestSync = data?.syncRuns[data.syncRuns.length - 1] ?? null;
   const latestLoad = data?.loadRuns[data.loadRuns.length - 1] ?? null;
   const latestRender = data?.renderRuns[data.renderRuns.length - 1] ?? null;
-  const earliestRender = data?.renderRuns[0] ?? null;
-  const firefoxP99 =
-    data?.renderRuns.find((r) => r.firefoxJumpP99Ms !== null)?.firefoxJumpP99Ms ?? null;
+  const firefox = data?.renderRuns.findLast((run) => run.firefoxJumpP99Ms !== null);
+  const gpuRuns = data?.gpuRuns ?? [];
+  const comparison = latestComparison(gpuRuns);
   const diff = data?.latestDiff ?? null;
 
   const tableRows: BenchTableRow[] = [];
@@ -336,7 +346,7 @@ export default function BenchmarksPage({ onNavigate }: BenchmarksPageProps) {
       tableRows.push({
         id: `${run.commit}-render`,
         category: "startup",
-        env: run.browser,
+        env: run.browser ?? "—",
         suite: run.suite,
         commit: run.commit,
         metric: t("S1/S2 Canvas2D scroll work p99 (vs Firefox headed jump)"),
@@ -349,6 +359,41 @@ export default function BenchmarksPage({ onNavigate }: BenchmarksPageProps) {
             : t("{chrome} (Chrome only)", { chrome: fmtMs(run.scrollWorkP99Ms) }),
         detail: run.date,
       });
+    }
+    for (const run of gpuRuns) {
+      const env =
+        run.slowdown === 1
+          ? (run.browser ?? "—")
+          : t("{browser}, main thread {n}× slower", {
+              browser: run.browser ?? "—",
+              n: run.slowdown ?? "—",
+            });
+      for (const [index, one] of run.results.entries()) {
+        tableRows.push({
+          id: `${run.report}-${env}-${index}`,
+          category: "startup",
+          env,
+          suite: run.suite,
+          commit: run.commit,
+          metric: t("B13 {workload}, {renderer}: frame work (p50 / p99 / max)", {
+            workload: workloadName(one),
+            renderer: rendererName(one.renderer),
+          }),
+          value: `${fmtMs(one.workP50Ms)} / ${fmtMs(one.workP99Ms)} / ${fmtMs(one.workMaxMs)}`,
+          detail: [
+            t("{date} · a frame every {interval} (p99 {tail}) at {hz} Hz · {late} over 16.7 ms", {
+              date: run.date,
+              interval: fmtMs(one.intervalP50Ms),
+              tail: fmtMs(one.intervalP99Ms),
+              hz: run.refreshHz ?? "—",
+              late: one.shareOver60Hz === null ? "—" : fmtPct(one.shareOver60Hz),
+            }),
+            ...(one.placeholderFrames === null
+              ? []
+              : [t("{n} frames with placeholders", { n: one.placeholderFrames })]),
+          ].join(" · "),
+        });
+      }
     }
   }
 
@@ -473,14 +518,16 @@ export default function BenchmarksPage({ onNavigate }: BenchmarksPageProps) {
 
               <p className="bench-note">
                 {tx(
-                  "<0>Hardware & Cross-Browser Methodology:</0> Measured on <1>{cpu}</1> ({browser}). Canvas2D scroll work stays at <0>{scroll}</0> p99 in Chrome (<1>margin=2</1> prefetch: {margin}), whereas headed Firefox Canvas2D jump frame work measured <0>{firefox}</0> p99 due to Gecko software 2D text upload overhead — both strictly inside the 16.7 ms 60 Hz frame budget.",
+                  "<0>Hardware & Cross-Browser Methodology:</0> Measured on <1>{cpu}</1> ({browser}). Scrolling a thousand cells takes the main thread <0>{scroll}</0> a frame at p99 with Canvas 2D in {chrome}; the frame that completes a jump, <0>{firefox}</0> at p99 and <0>{worst}</0> at worst in Firefox ({date}). At 60 Hz there are 16.7 ms to a frame.",
                   { 0: <strong />, 1: <code /> },
                   {
                     cpu: latestEngine?.cpu ?? "i9-13980HX",
                     browser: latestEngine?.browser ?? "Chrome",
                     scroll: fmtMs(latestRender?.scrollWorkP99Ms),
-                    margin: fmtMs(latestRender?.chromeMargin2P99Ms),
-                    firefox: fmtMs(firefoxP99 ?? earliestRender?.firefoxJumpP99Ms),
+                    chrome: latestRender?.browser ?? "Chrome",
+                    firefox: fmtMs(firefox?.firefoxJumpP99Ms),
+                    worst: fmtMs(firefox?.firefoxJumpMaxMs),
+                    date: firefox?.date ?? "—",
                   },
                 )}
               </p>
@@ -492,6 +539,7 @@ export default function BenchmarksPage({ onNavigate }: BenchmarksPageProps) {
           <section className="page-card">
             <h2>{t("Cross-Milestone SVG Trends")}</h2>
             <div className="bench-charts-grid">
+              {comparison && <RendererChart run={comparison} />}
               <div className="bench-chart-card">
                 <h3>{t("Engine & Startup Latency (ms, Chrome WASM p50)")}</h3>
                 <EngineTrendSvg engineRuns={data.engineRuns} startupRuns={data.startupRuns} />
@@ -717,6 +765,90 @@ export default function BenchmarksPage({ onNavigate }: BenchmarksPageProps) {
         </section>
       </main>
     </div>
+  );
+}
+
+const PANELS: readonly [
+  left: number,
+  heading: () => string,
+  read: (one: GpuResult) => [number | null, number | null],
+][] = [
+  [180, () => t("Frame work, ms"), (one) => [one.workP50Ms, one.workP99Ms]],
+  [480, () => t("Between frames, ms"), (one) => [one.intervalP50Ms, one.intervalP99Ms]],
+];
+const PANEL_WIDTH = 260;
+const RENDERERS = ["canvas2d", "webgpu"] as const;
+
+/** The median and the p99 of both renderers, on a scale that what takes a thousand times longer is on as well. */
+function RendererChart({ run }: { readonly run: GpuRun }) {
+  const rows = comparisons(run);
+  const bottom = 30 + rows.length * 26;
+  const x = (ms: number | null) => logPosition(ms) * PANEL_WIDTH;
+  return (
+    <figure className="bench-chart-card bench-renderers">
+      <h3>{t("Canvas 2D and WebGPU: Median (Dot) and p99 (Ring)")}</h3>
+      <p className="page-muted">
+        {t("{date} · {commit} · {browser} · {cpu} · {hz} Hz. All numbers are in the table below.", {
+          date: run.date,
+          commit: run.commit,
+          browser: run.browser ?? "—",
+          cpu: run.cpu ?? "—",
+          hz: run.refreshHz ?? "—",
+        })}
+      </p>
+      <p className="bench-legend">
+        {RENDERERS.map((renderer) => (
+          <span key={renderer} className={renderer}>
+            {rendererName(renderer)}
+          </span>
+        ))}
+      </p>
+      <div className="bench-table-wrap">
+        <svg
+          viewBox={`0 0 750 ${bottom + 18}`}
+          className="bench-svg"
+          role="img"
+          data-testid="bench-svg-renderers"
+        >
+          <title>{t("Canvas 2D and WebGPU: Median (Dot) and p99 (Ring)")}</title>
+          {rows.map(({ name }, row) => (
+            <text key={name} x={0} y={47 + row * 26}>
+              {name}
+            </text>
+          ))}
+          {PANELS.map(([left, heading, read]) => (
+            <g key={left} transform={`translate(${left} 0)`}>
+              <text y={12}>{heading()}</text>
+              {[0.1, 1, 10, 100, 1000, 16.7].map((ms, index) => (
+                <g key={ms} className="scale">
+                  <path d={`M${x(ms)} 24V${bottom}`} />
+                  {/* A frame at 60 Hz, which is not part of the scale. */}
+                  <text x={x(ms)} y={index === 5 ? 20 : bottom + 14}>
+                    {ms}
+                  </text>
+                </g>
+              ))}
+              {rows.flatMap((one, row) =>
+                RENDERERS.map((renderer, nth) => {
+                  const [middle, tail] = read(one[renderer]);
+                  const y = 38 + row * 26 + nth * 10;
+                  return (
+                    <g key={one.name + renderer} className={renderer}>
+                      <title>
+                        {`${one.name}, ${rendererName(renderer)}: ${fmtMs(middle)} / ${fmtMs(tail)}`}
+                      </title>
+                      <path d={`M${x(middle)} ${y}H${x(tail)}`} />
+                      <circle cx={x(tail)} cy={y} r={4} className="tail" />
+                      <circle cx={x(middle)} cy={y} r={4} />
+                    </g>
+                  );
+                }),
+              )}
+            </g>
+          ))}
+        </svg>
+      </div>
+    </figure>
   );
 }
 

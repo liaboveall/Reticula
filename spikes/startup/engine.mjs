@@ -67,11 +67,16 @@ const PAGE = `<!doctype html><meta charset="utf-8"><title>engine</title><script 
   const started = performance.now();
   const wasm = await init({ module_or_path: "/build/reticula_wasm_bg.wasm" });
   const loaded = performance.now() - started;
+  // A release build has short names for what the module exports. Which of them
+  // are the allocator's, the bindings show by how they use them.
+  const bindings = await (await fetch("/build/reticula_wasm.js")).text();
+  const allocate = wasm[/passArray8ToWasm0\\(\\w+, wasm\\.(\\w+)\\)/.exec(bindings)[1]];
+  const free = wasm[/wasm\\.(\\w+)\\(ret\\[0\\], ret\\[1\\] \\* 1, 1\\)/.exec(bindings)[1]];
   window.__engine = (rows, reserve) => {
     if (reserve > 0) {
       // The allocator keeps what is freed, so the engine's allocations that
       // follow come out of this block and the memory does not grow again.
-      wasm.__wbindgen_free(wasm.__wbindgen_malloc(reserve, 1), reserve, 1);
+      free(allocate(reserve, 1), reserve, 1);
     }
     const generations = [];
     for (let turn = 0; turn < 3; turn++) {

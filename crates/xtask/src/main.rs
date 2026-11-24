@@ -55,6 +55,16 @@ Commands:
   bench [--affinity <mask>] [--browser <name>] [--quick] [--out <file>] [--suite engine|b9]
                           Run native and Chrome WASM engine benchmarks (B1-B8, B11, B12),
                           or with --suite b9 the collaborative slow path (B9).
+  bench --suite render|grid|startup|ab [--affinity <mask>] [--quick] [--skip-build] [--no-archive] [options]
+                          What is measured on the app in a browser, archived only of a
+                          clean working tree. `render` (B13): the renderers, for about
+                          two minutes in a window that must stay in view; [--browser
+                          <name>] [--slowdown <n>] add runs to the same archive, see
+                          bench/run-render-bench.mjs. `grid` (S1, S2): viewport pages and
+                          a thousand cells, with Firefox in a window at the end unless
+                          --skip-firefox. `startup` (B10): a first visit. `ab
+                          [--baseline <commit>]`: against an earlier commit, which it
+                          builds as well, see bench/ab.mjs.
   dev                     Build a debug module and start the development server.
   db up|down|reset        The development database (PostgreSQL 18 in Docker on
                           127.0.0.1:5434) for the server, its tests and the end-to-end
@@ -168,8 +178,8 @@ fn run(args: &[String]) -> Result {
         )?),
         "bench" => qa::bench(&Flags::parse(
             rest,
-            &["quick"],
-            &["affinity", "browser", "date", "out", "suite"],
+            &qa::BENCH_SWITCHES,
+            &qa::BENCH_OPTIONS,
         )?),
         "dev" => {
             Flags::parse(rest, &[], &[])?;

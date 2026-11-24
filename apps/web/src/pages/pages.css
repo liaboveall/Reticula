@@ -227,6 +227,87 @@
   display: block;
 }
 
+.bench-renderers {
+  grid-column: 1 / -1;
+  margin: 0;
+  font-size: 12px;
+}
+
+.bench-renderers p {
+  margin: 0;
+}
+
+/* Both are told apart on either background, whatever colours one sees. */
+.bench-renderers g.canvas2d,
+.bench-legend .canvas2d::before {
+  color: #2a78d6;
+}
+
+.bench-renderers g.webgpu,
+.bench-legend .webgpu::before {
+  color: #eb6834;
+}
+
+@media (prefers-color-scheme: dark) {
+  .bench-renderers g.canvas2d,
+  .bench-legend .canvas2d::before {
+    color: #3987e5;
+  }
+
+  .bench-renderers g.webgpu,
+  .bench-legend .webgpu::before {
+    color: #d95926;
+  }
+}
+
+.bench-legend {
+  display: flex;
+  gap: 16px;
+}
+
+.bench-legend span::before {
+  content: "";
+  display: inline-block;
+  width: 9px;
+  height: 9px;
+  margin-inline-end: 6px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+.bench-renderers svg {
+  min-width: 640px;
+  font-size: 11px;
+  fill: currentColor;
+}
+
+.bench-renderers svg path {
+  stroke: currentColor;
+  stroke-width: 2;
+}
+
+.bench-renderers svg circle {
+  fill: currentColor;
+  stroke: var(--shell-surface, #ffffff);
+  stroke-width: 2;
+}
+
+.bench-renderers svg .tail {
+  fill: var(--shell-surface, #ffffff);
+  stroke: currentColor;
+}
+
+.bench-renderers svg .scale path {
+  stroke: var(--shell-line, #e2e8f0);
+  stroke-width: 1;
+}
+
+.bench-renderers svg .scale text {
+  font-size: 9px;
+  text-anchor: middle;
+  fill: var(--shell-muted, #64748b);
+}
+
 .bench-note {
   margin: 0;
   padding: 8px 12px;

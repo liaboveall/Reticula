@@ -1,10 +1,13 @@
-//! Differential testing (`diff`), fuzzing (`fuzz`) and archived engine
-//! benchmarks (`bench`) (`13-m1a.md` 7.2, 7.3 & 7.4).
+//! Differential testing (`diff`), fuzzing (`fuzz`) and archived benchmarks
+//! (`bench`) (`13-m1a.md` 7.2, 7.3 & 7.4).
 
 use std::fs;
 use std::process::Command;
+use std::time::{Duration, UNIX_EPOCH};
 
 use crate::util::{self, Cmd, Flags, Result, cargo, node, pnpm, tool};
+use crate::wasm::{self, Profile};
+use crate::web;
 
 const WASM_TARGET: &str = "wasm32-unknown-unknown";
 
@@ -182,16 +185,218 @@ pub fn sim(flags: &Flags) -> Result {
     cmd.run()
 }
 
+/// The switches and the options of `bench`.
+pub const BENCH_SWITCHES: [&str; 7] = [
+    "quick",
+    "headless",
+    "headed",
+    "software",
+    "no-archive",
+    "skip-build",
+    "skip-firefox",
+];
+pub const BENCH_OPTIONS: [&str; 14] = [
+    "affinity",
+    "browser",
+    "date",
+    "out",
+    "suite",
+    "slowdown",
+    "dpr",
+    "rounds",
+    "seconds",
+    "product-seconds",
+    "only",
+    "results",
+    "baseline",
+    "visits",
+];
+
+const RENDER_SWITCHES: [&str; 4] = ["quick", "headless", "software", "no-archive"];
+const RENDER_OPTIONS: [&str; 8] = [
+    "browser",
+    "slowdown",
+    "dpr",
+    "rounds",
+    "seconds",
+    "product-seconds",
+    "only",
+    "results",
+];
+const GRID_SWITCHES: [&str; 3] = ["quick", "no-archive", "skip-firefox"];
+const GRID_OPTIONS: [&str; 1] = ["results"];
+const AB_SWITCHES: [&str; 3] = ["quick", "no-archive", "headed"];
+const AB_OPTIONS: [&str; 5] = ["baseline", "rounds", "visits", "only", "results"];
+
+/// A flag that the suite would not heed is a mistake: what is measured would not
+/// be what was asked for.
+fn check_flags(flags: &Flags, suite: &str) -> Result {
+    let known: Vec<&str> = match suite {
+        "engine" | "b9" => vec!["quick", "browser", "date", "out"],
+        "render" => [&["skip-build"], &RENDER_SWITCHES[..], &RENDER_OPTIONS].concat(),
+        "grid" => [&["skip-build"], &GRID_SWITCHES[..], &GRID_OPTIONS].concat(),
+        "ab" => [&["skip-build"], &AB_SWITCHES[..], &AB_OPTIONS].concat(),
+        "startup" => vec!["skip-build", "quick", "no-archive", "results"],
+        other => {
+            return Err(format!(
+                "unknown benchmark suite `{other}` (engine, b9, render, grid, startup or ab)"
+            ));
+        }
+    };
+    let known = [&["suite", "affinity"], &known[..]].concat();
+    match flags.other_than(&known) {
+        Some(name) => Err(format!("the suite `{suite}` takes no `--{name}`")),
+        None => Ok(()),
+    }
+}
+
 pub fn bench(flags: &Flags) -> Result {
+    let suite = flags.get("suite").unwrap_or("engine");
+    check_flags(flags, suite)?;
+    match suite {
+        // B1-B8, B11 and B12.
+        "engine" => kernel_bench(flags, "engine", "native-bench", "m3b-engine", "engine"),
+        // The collaborative slow path.
+        "b9" => kernel_bench(flags, "b9", "sync-bench", "m3a-sync", "sync"),
+        // B13: the renderers.
+        "render" => script_bench(
+            flags,
+            "bench/run-render-bench.mjs",
+            &RENDER_SWITCHES,
+            &RENDER_OPTIONS,
+        ),
+        // S1 and S2: viewport pages, and drawing a thousand cells.
+        "grid" => script_bench(
+            flags,
+            "bench/run-grid-bench.mjs",
+            &GRID_SWITCHES,
+            &GRID_OPTIONS,
+        ),
+        // Against an earlier commit, which the script builds as well.
+        "ab" => script_bench(flags, "bench/ab.mjs", &AB_SWITCHES, &AB_OPTIONS),
+        // B10: a first visit.
+        _ => startup_bench(flags),
+    }
+}
+
+/// Builds the pages and the app, and runs a script that measures them and
+/// archives its own report.
+fn script_bench(flags: &Flags, script: &str, switches: &[&str], options: &[&str]) -> Result {
+    build_for_bench(flags)?;
+    util::step(script);
+    let mut command = node()
+        .arg(script)
+        .args(["--affinity", flags.get("affinity").unwrap_or("FFFF")]);
+    for name in switches {
+        if flags.has(name) {
+            command = command.arg(format!("--{name}"));
+        }
+    }
+    for name in options {
+        if let Some(value) = flags.get(name) {
+            command = command.arg(format!("--{name}")).arg(value);
+        }
+    }
+    command.run()
+}
+
+fn build_for_bench(flags: &Flags) -> Result {
+    if flags.has("skip-build") {
+        return Ok(());
+    }
+    wasm::build(Profile::Release)?;
+    web::build()?;
+    web::build_spikes()
+}
+
+/// Measures a first visit of the production build, and archives the report.
+fn startup_bench(flags: &Flags) -> Result {
+    const REPORT: &str = "target/bench-render/startup.json";
+    build_for_bench(flags)?;
+    util::step("B10: a first visit");
+    let mut command = node().args([
+        "spikes/startup/measure.mjs",
+        "--affinity",
+        flags.get("affinity").unwrap_or("FFFF"),
+        "--out",
+        REPORT,
+    ]);
+    if flags.has("quick") {
+        command = command.arg("--quick");
+    }
+    command.run()?;
+    if flags.has("no-archive") {
+        return Ok(());
+    }
+    let text = fs::read_to_string(util::root().join(REPORT))
+        .map_err(|e| format!("cannot read {REPORT}: {e}"))?;
+    let results = util::root().join(flags.get("results").unwrap_or("bench/results"));
+    let archive = results.join(startup_archive_name(&text)?);
+    check_built_after_commit("apps/web/dist/index.html")?;
+    fs::create_dir_all(&results).map_err(|e| format!("mkdir {}: {e}", results.display()))?;
+    fs::write(&archive, text).map_err(|e| format!("write {}: {e}", archive.display()))?;
+    println!("archived in {}", archive.display());
+    Ok(())
+}
+
+/// Whether a file that a build wrote is the commit's, going by when it was written.
+fn check_built_after_commit(path: &str) -> Result {
+    let committed = git_output(&["log", "-1", "--format=%ct"])
+        .parse()
+        .map_err(|e| format!("cannot tell when the commit was made: {e}"))?;
+    let built = fs::metadata(util::root().join(path))
+        .and_then(|file| file.modified())
+        .map_err(|e| format!("cannot read {path}: {e}"))?;
+    if built < UNIX_EPOCH + Duration::from_secs(committed) {
+        return Err(format!(
+            "the report is not archived: {path} was not built after the commit"
+        ));
+    }
+    Ok(())
+}
+
+/// The name of a report of first visits among the results: when it was made and
+/// of what. A report with something wrong has none.
+fn startup_archive_name(text: &str) -> Result<String> {
+    let report: serde_json::Value =
+        serde_json::from_str(text).map_err(|e| format!("cannot parse the report: {e}"))?;
+    let mut reasons = Vec::new();
+    if report["uncommittedChanges"] != serde_json::json!(false) {
+        reasons.push("the working tree has uncommitted changes");
+    }
+    if report["problems"] != serde_json::json!([]) {
+        reasons.push("the page reported errors");
+    }
+    if report["options"]["quick"] != serde_json::json!(false) {
+        reasons.push("it is of a quick run");
+    }
+    if !reasons.is_empty() {
+        return Err(format!(
+            "the report is not archived: {}",
+            reasons.join("; ")
+        ));
+    }
+    let (Some(date), Some(commit)) = (
+        report["date"].as_str().and_then(|date| date.get(..10)),
+        report["commit"]
+            .as_str()
+            .filter(|commit| !commit.is_empty()),
+    ) else {
+        return Err("the report does not say when it was made, or of what".to_owned());
+    };
+    Ok(format!("{date}-{commit}-startup.json"))
+}
+
+/// Runs a suite natively and in the browser, and archives both.
+fn kernel_bench(
+    flags: &Flags,
+    suite: &str,
+    native_command: &str,
+    suite_label: &str,
+    archive_kind: &str,
+) -> Result {
     let affinity = flags.get("affinity").unwrap_or("FFFF");
     let browser = flags.get("browser").unwrap_or("chrome");
-    // `engine` is B1-B8, B11 and B12; `b9` is the collaborative slow path.
-    let suite = flags.get("suite").unwrap_or("engine");
-    let (native_command, suite_label, archive_kind) = match suite {
-        "engine" => ("native-bench", "m3b-engine", "engine"),
-        "b9" => ("sync-bench", "m3a-sync", "sync"),
-        other => return Err(format!("unknown benchmark suite `{other}` (engine or b9)")),
-    };
 
     util::step("native benchmarks (release)");
     let native_out = util::root().join("target/bench-wasm/native.json");
@@ -281,7 +486,16 @@ pub fn bench(flags: &Flags) -> Result {
     .map_err(|e| format!("parse wasm.json: {e}"))?;
 
     let commit = git_output(&["rev-parse", "--short", "HEAD"]);
-    let dirty = !git_output(&["status", "--porcelain"]).is_empty();
+    // Results do not count: nothing is built from them, and the first one that is
+    // archived of a commit must not stand in the way of the others.
+    let dirty = !git_output(&[
+        "status",
+        "--porcelain",
+        "--",
+        ".",
+        ":(exclude)bench/results",
+    ])
+    .is_empty();
     let today = flags
         .get("date")
         .map_or_else(current_utc_date, str::to_owned);
@@ -336,4 +550,80 @@ pub(crate) fn current_utc_date() -> String {
         .ok()
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .unwrap_or_else(|| "2026-11-18".to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::{Value, json};
+
+    use super::{BENCH_OPTIONS, BENCH_SWITCHES, check_flags, startup_archive_name};
+    use crate::util::Flags;
+
+    fn check(suite: &str, args: &[&str]) -> super::Result {
+        let args: Vec<String> = args.iter().map(|arg| (*arg).to_owned()).collect();
+        check_flags(
+            &Flags::parse(&args, &BENCH_SWITCHES, &BENCH_OPTIONS)?,
+            suite,
+        )
+    }
+
+    #[test]
+    fn a_suite_takes_its_own_flags_only() {
+        assert_eq!(check("engine", &["--quick", "--out", "a.json"]), Ok(()));
+        assert_eq!(
+            check("render", &["--slowdown", "4", "--skip-build"]),
+            Ok(())
+        );
+        assert_eq!(check("ab", &["--visits", "5", "--affinity", "FF"]), Ok(()));
+        for (suite, flag) in [
+            ("engine", "--headless"),
+            ("grid", "--headless"),
+            ("ab", "--software"),
+            ("startup", "--headless"),
+        ] {
+            assert!(check(suite, &[flag]).is_err(), "{suite} {flag}");
+        }
+        // It would be archived in place of the one in Chrome.
+        assert!(check("startup", &["--browser", "firefox"]).is_err());
+        assert!(check("other", &[]).is_err());
+    }
+
+    fn report() -> Value {
+        json!({
+            "suite": "m6-startup",
+            "date": "2026-11-26T10:13:32.305Z",
+            "commit": "abc1234",
+            "uncommittedChanges": false,
+            "options": { "quick": false },
+            "problems": [],
+        })
+    }
+
+    #[test]
+    fn a_startup_report_is_archived_under_its_date_and_commit() {
+        assert_eq!(
+            startup_archive_name(&report().to_string()).as_deref(),
+            Ok("2026-11-26-abc1234-startup.json")
+        );
+    }
+
+    #[test]
+    fn a_startup_report_with_something_wrong_is_not_archived() {
+        for (key, value) in [
+            ("uncommittedChanges", json!(true)),
+            ("uncommittedChanges", Value::Null),
+            ("problems", json!(["an error"])),
+            ("options", json!({ "quick": true })),
+            ("commit", json!("")),
+            ("date", Value::Null),
+        ] {
+            let mut report = report();
+            report[key] = value;
+            assert!(
+                startup_archive_name(&report.to_string()).is_err(),
+                "{report}"
+            );
+        }
+        assert!(startup_archive_name("{").is_err());
+    }
 }
