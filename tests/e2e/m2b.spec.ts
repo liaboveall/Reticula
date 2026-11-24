@@ -55,10 +55,14 @@ test.describe("M2b governance, workbooks, history, and account lifecycle", () =>
       await page.goto(`${server.baseUrl}/workbooks`);
       await expect(page.getByTestId("workbooks-page")).toBeVisible();
       await page.getByTestId("workbooks-dev-alice").click();
-      await expect(page.getByTestId("workbooks-create-btn")).toBeVisible({ timeout: 10_000 });
+      const createBtn = page.getByTestId("workbooks-create-btn");
+      await expect(createBtn).toBeVisible({ timeout: 10_000 });
+      await expect(createBtn).toBeEnabled({ timeout: 10_000 });
 
-      await page.getByPlaceholder("New cloud workbook title").fill(createdTitle);
-      await page.getByTestId("workbooks-create-btn").click();
+      const titleInput = page.getByPlaceholder("New cloud workbook title");
+      await titleInput.fill(createdTitle);
+      await expect(titleInput).toHaveValue(createdTitle);
+      await createBtn.click();
       await expect(page).toHaveURL(/\?collab=/, { timeout: 10_000 });
       const createdId = new URL(page.url()).searchParams.get("collab");
       if (!createdId) {
@@ -147,6 +151,7 @@ test.describe("M2b governance, workbooks, history, and account lifecycle", () =>
       });
       const viewerUrl = await alice.getByTestId("share-link-url").inputValue();
       await alice.getByTestId("collab-modal-close").click();
+      await expect(alice.getByTestId("collab-modal")).toBeHidden();
 
       await anon.goto(`${viewerUrl}&hooks`);
       await expect(anon.getByTestId("collab-readonly-badge")).toBeVisible({ timeout: 10_000 });
@@ -180,6 +185,7 @@ test.describe("M2b governance, workbooks, history, and account lifecycle", () =>
       const editorUrl = await alice.getByTestId("share-link-url").inputValue();
       const editorJoinPath = new URL(editorUrl).pathname;
       await alice.getByTestId("collab-modal-close").click();
+      await expect(alice.getByTestId("collab-modal")).toBeHidden();
 
       await joinViaSharePath(bob, server.baseUrl, editorJoinPath, "bob");
       await editCell(bob, 0, 1, "B1", "77");

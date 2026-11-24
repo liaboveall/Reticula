@@ -509,6 +509,7 @@ export default function CollabShell(props: CollabShellProps) {
       return;
     }
     setBusy(true);
+    setShareUrl(null);
     setCopiedShare(false);
     setAuthError(null);
     try {
@@ -539,6 +540,7 @@ export default function CollabShell(props: CollabShellProps) {
     setBusy(true);
     setAuthError(null);
     try {
+      let autoShareUrl: string | null = null;
       if (nextVisibility === "link_view") {
         const hasActiveViewer = shareLinks.some(
           (link) =>
@@ -553,12 +555,15 @@ export default function CollabShell(props: CollabShellProps) {
             label: "Link-view access",
             singleUse: false,
           });
-          setShareUrl(`${window.location.origin}${created.url}`);
+          autoShareUrl = `${window.location.origin}${created.url}`;
         }
       }
       const updated = await updateWorkbook(activeTarget.docId, { visibility: nextVisibility });
       onUpdateVisibility(updated.visibility);
       await refreshGovernance(activeTarget.docId, activeTarget.role);
+      if (autoShareUrl) {
+        setShareUrl(autoShareUrl);
+      }
     } catch (err) {
       setAuthError(apiErrorMessage(err, "Could not update workbook visibility."));
     } finally {

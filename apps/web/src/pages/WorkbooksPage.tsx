@@ -13,7 +13,7 @@ import {
   type WorkbookListItem,
   type WorkbookLists,
 } from "@reticula/protocol/collab-api";
-import { type ChangeEvent, useCallback, useEffect, useState } from "react";
+import { type ChangeEvent, useCallback, useEffect, useRef, useState } from "react";
 import { uploadLocalDocToCloud } from "../engine/local-upload.ts";
 import {
   readCatalog,
@@ -47,17 +47,25 @@ export default function WorkbooksPage({ onNavigate }: WorkbooksPageProps) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [statusMsg, setStatusMsg] = useState<string | null>(null);
+  const loadSeqRef = useRef(0);
 
   const loadData = useCallback(async () => {
+    const seq = ++loadSeqRef.current;
     setError(null);
     const localPromise = readCatalog(localBackend()).catch(() => [] as WorkbookCatalogEntry[]);
     try {
       const [current, lists, local] = await Promise.all([me(), listWorkbooks(), localPromise]);
+      if (seq !== loadSeqRef.current) {
+        return;
+      }
       setUser(current);
       setCloudLists(lists);
       setLocalDocs(local);
     } catch (err) {
       const local = await localPromise;
+      if (seq !== loadSeqRef.current) {
+        return;
+      }
       setLocalDocs(local);
       if (err instanceof ApiError && err.status === 401) {
         setUser(null);
@@ -73,11 +81,11 @@ export default function WorkbooksPage({ onNavigate }: WorkbooksPageProps) {
   }, [loadData]);
 
   const handleDevSignIn = async (account: DevAccount) => {
+    loadSeqRef.current += 1;
     setBusy(true);
     setError(null);
     try {
-      const signedIn = await devLogin({ account });
-      setUser(signedIn);
+      await devLogin({ account });
       await loadData();
     } catch (err) {
       setError(apiErrorMessage(err, "Sign-in failed"));
