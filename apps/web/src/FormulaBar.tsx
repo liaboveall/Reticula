@@ -9,6 +9,8 @@ import {
   useRef,
   useState,
 } from "react";
+import { functionParameters, functionSummary, translateEngineText } from "./i18n/engine-text.ts";
+import { t } from "./i18n/index.ts";
 
 export interface FormulaBarHandle {
   focus(): void;
@@ -46,6 +48,14 @@ export interface FormulaBarProps {
 
 const MAX_VISIBLE_COMPLETIONS = 8;
 
+/** What the engine says about a name that has no comment. */
+const NO_COMMENT = "Named range";
+
+/** What is said about a worksheet or a name. The formula and the comment of a name are the user's. */
+function ownText({ kind }: Pick<WireCompletionItem, "kind">, text: string): string {
+  return kind === "namedRange" && text !== NO_COMMENT ? text : translateEngineText(text);
+}
+
 export function FormulaBar({
   ref,
   nameBoxText,
@@ -65,6 +75,7 @@ export function FormulaBar({
   onToggleDollar,
   onAcceptCompletion,
 }: FormulaBarProps) {
+  const inputName = t("Formula bar");
   const mountRef = useRef<HTMLDivElement>(null);
   const editorRef = useRef<FormulaBarEditor | null>(null);
   const [focused, setFocused] = useState(false);
@@ -94,6 +105,7 @@ export function FormulaBar({
   // Keep latest callbacks/completions in a ref for CodeMirror's synchronous DOM keydown listener.
   const latestRef = useRef({
     value,
+    inputName,
     disabled,
     analysisSource,
     completions,
@@ -108,6 +120,7 @@ export function FormulaBar({
   });
   latestRef.current = {
     value,
+    inputName,
     disabled,
     analysisSource,
     completions,
@@ -196,7 +209,7 @@ export function FormulaBar({
     }
     const cm = new FormulaBarEditor(parent, {
       testId: "formula-input",
-      ariaLabel: "Formula bar",
+      ariaLabel: latestRef.current.inputName,
       disabled: latestRef.current.disabled,
       onChange: (text, cursorUtf16) => {
         latestRef.current.onChange(text, cursorUtf16);
@@ -241,6 +254,11 @@ export function FormulaBar({
     editorRef.current?.setDisabled(disabled);
   }, [disabled]);
 
+  // The editor takes its name when it is made; the language may change later.
+  useEffect(() => {
+    mountRef.current?.querySelector('[role="textbox"]')?.setAttribute("aria-label", inputName);
+  }, [inputName]);
+
   useLayoutEffect(() => {
     // A React render can lag behind the current CodeMirror edit.
     if (getEditSource() === (isEditing ? value : null)) {
@@ -283,16 +301,20 @@ export function FormulaBar({
         data-disabled={disabled ? "" : undefined}
         data-inspected={inspected ? "" : undefined}
       >
-        <output className="name-box" data-testid="name-box" aria-label="Selected cell or range">
+        <output
+          className="name-box"
+          data-testid="name-box"
+          aria-label={t("Selected cell or range")}
+        >
           {nameBoxText}
         </output>
         {isSpillShadow && (
           <span
             className="spill-badge"
             data-testid="spill-badge"
-            title="Spilled from dynamic array formula"
+            title={t("Spilled from dynamic array formula")}
           >
-            SPILL
+            {t("SPILL")}
           </span>
         )}
         <span
@@ -313,9 +335,9 @@ export function FormulaBar({
           <span
             className="formula-diag-pill"
             data-testid="formula-diagnostic"
-            title={firstDiagnostic.message}
+            title={translateEngineText(firstDiagnostic.message)}
           >
-            {firstDiagnostic.message}
+            {translateEngineText(firstDiagnostic.message)}
           </span>
         )}
       </div>
@@ -336,12 +358,16 @@ export function FormulaBar({
                 return (
                   <span key={`${signature.name}-${param}`}>
                     {idx > 0 && <span className="sig-punct">, </span>}
-                    <span className={isActive ? "sig-param active" : "sig-param"}>{param}</span>
+                    <span className={isActive ? "sig-param active" : "sig-param"}>
+                      {functionParameters(param)}
+                    </span>
                   </span>
                 );
               })}
               <span className="sig-punct">)</span>
-              <span className="sig-summary">{signature.summary}</span>
+              <span className="sig-summary">
+                {functionSummary(signature.name, signature.summary)}
+              </span>
             </div>
           )}
 
@@ -349,7 +375,7 @@ export function FormulaBar({
             <div
               className="formula-completions"
               role="listbox"
-              aria-label="Formula completions"
+              aria-label={t("Formula completions")}
               data-testid="formula-completions"
             >
               {completions.map((item, idx) => {
@@ -385,8 +411,16 @@ export function FormulaBar({
                       {item.kind === "function" ? "fx" : "⊞"}
                     </span>
                     <span className="completion-label">{item.label}</span>
-                    <span className="completion-sig">{item.signature}</span>
-                    <span className="completion-summary">{item.summary}</span>
+                    <span className="completion-sig">
+                      {item.kind === "function"
+                        ? functionParameters(item.signature)
+                        : ownText(item, item.signature)}
+                    </span>
+                    <span className="completion-summary">
+                      {item.kind === "function"
+                        ? functionSummary(item.label, item.summary)
+                        : ownText(item, item.summary)}
+                    </span>
                     {active && <kbd className="completion-kbd">Tab</kbd>}
                   </div>
                 );

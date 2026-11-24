@@ -21,7 +21,11 @@ import {
   type StorageBackendKind,
   type WorkbookCatalogEntry,
 } from "../engine/storage.ts";
-import { apiErrorMessage, formatBytes } from "./helpers.ts";
+import { fmtBytes, t } from "../i18n/index.ts";
+import { apiErrorMessage } from "./helpers.ts";
+import { roleName, visibilityName } from "./labels.ts";
+import { PageNav } from "./PageNav.tsx";
+import "../collab/collab.css";
 import "./pages.css";
 
 export interface WorkbooksPageProps {
@@ -71,7 +75,7 @@ export default function WorkbooksPage({ onNavigate }: WorkbooksPageProps) {
         setUser(null);
         setCloudLists(null);
       } else {
-        setError(apiErrorMessage(err, "Failed to load workbooks"));
+        setError(apiErrorMessage(err, t("Failed to load workbooks")));
       }
     }
   }, []);
@@ -88,7 +92,7 @@ export default function WorkbooksPage({ onNavigate }: WorkbooksPageProps) {
       await devLogin({ account });
       await loadData();
     } catch (err) {
-      setError(apiErrorMessage(err, "Sign-in failed"));
+      setError(apiErrorMessage(err, t("Sign-in failed")));
     } finally {
       setBusy(false);
     }
@@ -101,7 +105,7 @@ export default function WorkbooksPage({ onNavigate }: WorkbooksPageProps) {
       const key = await createWorkbook({ title: newTitle.trim() || "Cloud Workbook" });
       onNavigate(`/app?collab=${encodeURIComponent(key.id)}`);
     } catch (err) {
-      setError(apiErrorMessage(err, "Could not create cloud workbook"));
+      setError(apiErrorMessage(err, t("Could not create cloud workbook")));
     } finally {
       setBusy(false);
     }
@@ -119,7 +123,7 @@ export default function WorkbooksPage({ onNavigate }: WorkbooksPageProps) {
       setRenameId(null);
       await loadData();
     } catch (err) {
-      setError(apiErrorMessage(err, "Could not rename workbook"));
+      setError(apiErrorMessage(err, t("Could not rename workbook")));
     } finally {
       setBusy(false);
     }
@@ -130,10 +134,10 @@ export default function WorkbooksPage({ onNavigate }: WorkbooksPageProps) {
     setError(null);
     try {
       await deleteWorkbook(item.id);
-      setStatusMsg(`Deleted "${item.title}".`);
+      setStatusMsg(t('Deleted "{title}".', { title: item.title }));
       await loadData();
     } catch (err) {
-      setError(apiErrorMessage(err, "Could not delete workbook"));
+      setError(apiErrorMessage(err, t("Could not delete workbook")));
     } finally {
       setBusy(false);
     }
@@ -153,7 +157,7 @@ export default function WorkbooksPage({ onNavigate }: WorkbooksPageProps) {
       const key = await importWorkbook(encodeURIComponent(baseTitle), new Uint8Array(buf));
       onNavigate(`/app?collab=${encodeURIComponent(key.id)}`);
     } catch (err) {
-      setError(apiErrorMessage(err, "Could not import snapshot"));
+      setError(apiErrorMessage(err, t("Could not import snapshot")));
     } finally {
       setBusy(false);
     }
@@ -162,13 +166,13 @@ export default function WorkbooksPage({ onNavigate }: WorkbooksPageProps) {
   const handleConvertLocal = async (entry: WorkbookCatalogEntry) => {
     setBusy(true);
     setError(null);
-    setStatusMsg(`Packing "${entry.title}" and uploading to cloud…`);
+    setStatusMsg(t('Packing "{title}" and uploading to cloud…', { title: entry.title }));
     try {
       const key = await uploadLocalDocToCloud(entry.id, entry.title);
       onNavigate(`/app?collab=${encodeURIComponent(key.id)}`);
     } catch (err) {
       setStatusMsg(null);
-      setError(apiErrorMessage(err, "Could not convert local workbook to cloud"));
+      setError(apiErrorMessage(err, t("Could not convert local workbook to cloud")));
     } finally {
       setBusy(false);
     }
@@ -180,7 +184,7 @@ export default function WorkbooksPage({ onNavigate }: WorkbooksPageProps) {
       const next = await removeDocStorage(entry.id, localBackend());
       setLocalDocs(next);
     } catch (err) {
-      setError(apiErrorMessage(err, "Could not remove local workbook"));
+      setError(apiErrorMessage(err, t("Could not remove local workbook")));
     } finally {
       setBusy(false);
     }
@@ -203,18 +207,23 @@ export default function WorkbooksPage({ onNavigate }: WorkbooksPageProps) {
               disabled={busy}
               onClick={() => void handleRenameSubmit(item.id)}
             >
-              Save
+              {t("Save")}
             </button>
             <button type="button" className="toolbar-btn" onClick={() => setRenameId(null)}>
-              Cancel
+              {t("Cancel")}
             </button>
           </div>
         ) : (
           <strong>{item.title}</strong>
         )}
         <span className="page-muted">
-          role: {item.role} · visibility: {item.visibility} · head #{item.headSeq} ·{" "}
-          {formatBytes(item.estBytes)} · updated {item.updatedAt}
+          {t("role: {role} · visibility: {visibility} · head #{seq} · {size} · updated {time}", {
+            role: roleName(item.role),
+            visibility: visibilityName(item.visibility),
+            seq: item.headSeq,
+            size: fmtBytes(item.estBytes),
+            time: item.updatedAt,
+          })}
         </span>
       </div>
       <div className="collab-row">
@@ -223,7 +232,7 @@ export default function WorkbooksPage({ onNavigate }: WorkbooksPageProps) {
           className="toolbar-btn primary-btn"
           onClick={() => onNavigate(`/app?collab=${encodeURIComponent(item.id)}`)}
         >
-          Open
+          {t("Open|verb")}
         </button>
         {owned && (
           <>
@@ -236,7 +245,7 @@ export default function WorkbooksPage({ onNavigate }: WorkbooksPageProps) {
                 setRenameTitle(item.title);
               }}
             >
-              Rename
+              {t("Rename")}
             </button>
             <button
               type="button"
@@ -244,7 +253,7 @@ export default function WorkbooksPage({ onNavigate }: WorkbooksPageProps) {
               disabled={busy}
               onClick={() => void handleDeleteCloud(item)}
             >
-              Delete
+              {t("Delete")}
             </button>
           </>
         )}
@@ -254,71 +263,26 @@ export default function WorkbooksPage({ onNavigate }: WorkbooksPageProps) {
 
   return (
     <div className="page-shell" data-testid="workbooks-page">
-      <nav className="page-nav">
-        <a
-          href="/"
-          className="page-brand"
-          onClick={(e) => {
-            e.preventDefault();
-            onNavigate("/");
-          }}
-        >
-          Reticula
-        </a>
-        <div className="page-nav-links">
-          <a
-            href="/app"
-            className="toolbar-btn"
-            onClick={(e) => {
-              e.preventDefault();
-              onNavigate("/app");
-            }}
-          >
-            Editor
-          </a>
-          <a
-            href="/sim"
-            className="toolbar-btn"
-            onClick={(e) => {
-              e.preventDefault();
-              onNavigate("/sim");
-            }}
-          >
-            Sync Simulator
-          </a>
-          <a
-            href="/account"
-            className="toolbar-btn"
-            onClick={(e) => {
-              e.preventDefault();
-              onNavigate("/account");
-            }}
-          >
-            Account
-          </a>
-          <a
-            href="/privacy"
-            className="toolbar-btn"
-            onClick={(e) => {
-              e.preventDefault();
-              onNavigate("/privacy");
-            }}
-          >
-            Privacy
-          </a>
-        </div>
-      </nav>
+      <PageNav
+        onNavigate={onNavigate}
+        links={[
+          ["/app", t("Editor")],
+          ["/sim", t("Sync Simulator")],
+          ["/account", t("Account")],
+          ["/privacy", t("Privacy")],
+        ]}
+      />
 
       <main className="page-main">
         <div className="page-card">
-          <h1>Workbooks</h1>
+          <h1>{t("Workbooks")}</h1>
           <div className="page-tabs">
             {(
               [
-                ["owned", "My Cloud Workbooks"],
-                ["shared", "Shared with Me"],
-                ["local", "Local Browser Docs"],
-                ["samples", "Built-in Examples"],
+                ["owned", t("My Cloud Workbooks")],
+                ["shared", t("Shared with Me")],
+                ["local", t("Local Browser Docs")],
+                ["samples", t("Built-in Examples")],
               ] as const
             ).map(([key, label]) => (
               <button
@@ -342,7 +306,7 @@ export default function WorkbooksPage({ onNavigate }: WorkbooksPageProps) {
 
           {(tab === "owned" || tab === "shared") && !user && (
             <div className="collab-section" data-testid="workbooks-signin">
-              <p className="page-muted">Sign in to manage cloud collaborative workbooks.</p>
+              <p className="page-muted">{t("Sign in to manage cloud collaborative workbooks.")}</p>
               <div className="collab-row">
                 {(["alice", "bob", "carol"] as const).map((acct) => (
                   <button
@@ -353,11 +317,11 @@ export default function WorkbooksPage({ onNavigate }: WorkbooksPageProps) {
                     disabled={busy}
                     onClick={() => void handleDevSignIn(acct)}
                   >
-                    Dev: {acct}
+                    {t("Dev: {account}", { account: acct })}
                   </button>
                 ))}
                 <a className="toolbar-btn primary-btn" href={githubLoginUrl("/workbooks")}>
-                  Sign in with GitHub
+                  {t("Sign in with GitHub")}
                 </a>
               </div>
             </div>
@@ -371,7 +335,7 @@ export default function WorkbooksPage({ onNavigate }: WorkbooksPageProps) {
                   className="collab-input"
                   value={newTitle}
                   onChange={(e) => setNewTitle(e.target.value)}
-                  placeholder="New cloud workbook title"
+                  placeholder={t("New cloud workbook title")}
                 />
                 <button
                   type="button"
@@ -380,10 +344,10 @@ export default function WorkbooksPage({ onNavigate }: WorkbooksPageProps) {
                   disabled={busy}
                   onClick={() => void handleCreateCloud()}
                 >
-                  + New Cloud Workbook
+                  + {t("New Cloud Workbook")}
                 </button>
                 <label className="toolbar-btn" style={{ cursor: "pointer" }}>
-                  Import .rtcl
+                  {t("Import .rtcl")}
                   <input
                     type="file"
                     accept=".rtcl,.rtclsnap,application/octet-stream"
@@ -394,7 +358,7 @@ export default function WorkbooksPage({ onNavigate }: WorkbooksPageProps) {
               </div>
               <div className="page-list">
                 {(cloudLists?.owned ?? []).length === 0 ? (
-                  <p className="page-muted">No cloud workbooks yet.</p>
+                  <p className="page-muted">{t("No cloud workbooks yet.")}</p>
                 ) : (
                   (cloudLists?.owned ?? []).map((item) => renderCloudRow(item, true))
                 )}
@@ -405,7 +369,7 @@ export default function WorkbooksPage({ onNavigate }: WorkbooksPageProps) {
           {tab === "shared" && user && (
             <div className="page-list">
               {(cloudLists?.shared ?? []).length === 0 ? (
-                <p className="page-muted">No shared workbooks yet.</p>
+                <p className="page-muted">{t("No shared workbooks yet.")}</p>
               ) : (
                 (cloudLists?.shared ?? []).map((item) => renderCloudRow(item, false))
               )}
@@ -415,14 +379,17 @@ export default function WorkbooksPage({ onNavigate }: WorkbooksPageProps) {
           {tab === "local" && (
             <div className="page-list">
               {localDocs.length === 0 ? (
-                <p className="page-muted">No local OPFS workbooks found in this browser.</p>
+                <p className="page-muted">{t("No local OPFS workbooks found in this browser.")}</p>
               ) : (
                 localDocs.map((entry) => (
                   <div key={entry.id} className="page-item" data-testid={`local-wb-${entry.id}`}>
                     <div className="page-item-meta">
                       <strong>{entry.title}</strong>
                       <span className="page-muted">
-                        id: {entry.id} · {formatBytes(entry.sizeBytes)}
+                        {t("id: {id} · {size}", {
+                          id: entry.id,
+                          size: fmtBytes(entry.sizeBytes),
+                        })}
                       </span>
                     </div>
                     <div className="collab-row">
@@ -431,7 +398,7 @@ export default function WorkbooksPage({ onNavigate }: WorkbooksPageProps) {
                         className="toolbar-btn primary-btn"
                         onClick={() => onNavigate(`/app?doc=${encodeURIComponent(entry.id)}`)}
                       >
-                        Open Local
+                        {t("Open Local")}
                       </button>
                       {user && (
                         <button
@@ -441,7 +408,7 @@ export default function WorkbooksPage({ onNavigate }: WorkbooksPageProps) {
                           disabled={busy}
                           onClick={() => void handleConvertLocal(entry)}
                         >
-                          Convert to Cloud
+                          {t("Convert to Cloud")}
                         </button>
                       )}
                       {entry.id !== "sample-1m" && (
@@ -451,7 +418,7 @@ export default function WorkbooksPage({ onNavigate }: WorkbooksPageProps) {
                           disabled={busy}
                           onClick={() => void handleDeleteLocal(entry)}
                         >
-                          Delete Local
+                          {t("Delete Local")}
                         </button>
                       )}
                     </div>
@@ -465,9 +432,9 @@ export default function WorkbooksPage({ onNavigate }: WorkbooksPageProps) {
             <div className="page-list">
               <div className="page-item">
                 <div className="page-item-meta">
-                  <strong>1,000,000-Row Budget Sample</strong>
+                  <strong>{t("1,000,000-Row Budget Sample")}</strong>
                   <span className="page-muted">
-                    22 columns · 100,000 bound formulas · runs locally in Web Worker + OPFS
+                    {t("22 columns · 100,000 bound formulas · runs locally in Web Worker + OPFS")}
                   </span>
                 </div>
                 <button
@@ -475,19 +442,20 @@ export default function WorkbooksPage({ onNavigate }: WorkbooksPageProps) {
                   className="toolbar-btn primary-btn"
                   onClick={() => onNavigate("/app")}
                 >
-                  Open Sample
+                  {t("Open Sample")}
                 </button>
               </div>
               <div className="page-item">
                 <div className="page-item-meta">
-                  <strong>Deterministic Sync Simulation Lab</strong>
+                  <strong>{t("Deterministic Sync Simulation Lab")}</strong>
                   <span className="page-muted">
-                    Interactive 2–3 replica offline merge &amp; 5-replica fault injector without
-                    sign-in
+                    {t(
+                      "Interactive 2–3 replica offline merge & 5-replica fault injector without sign-in",
+                    )}
                   </span>
                 </div>
                 <button type="button" className="toolbar-btn" onClick={() => onNavigate("/sim")}>
-                  Open /sim
+                  {t("Open /sim")}
                 </button>
               </div>
             </div>

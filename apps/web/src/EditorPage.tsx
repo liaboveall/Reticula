@@ -1,31 +1,47 @@
 import {
   CellEditor,
-  DARK_PALETTE_FILL,
-  DARK_PALETTE_TEXT,
   Grid,
-  type GridContextTarget,
   type GridStats,
-  LIGHT_PALETTE_FILL,
-  LIGHT_PALETTE_TEXT,
   type RemotePresenceOverlay,
   type Selection,
 } from "@reticula/grid";
 import type {
   CollabEvent,
   EngineCommand,
-  EngineInfo,
-  SheetInfo,
   SheetTabInfo,
   WireCellStyle,
   WireCompletionItem,
-  WireFormatPatch,
   WireFormulaAnalysis,
-  WireHorizontalAlign,
   WireSearchMatch,
-  WireStylePatch,
 } from "@reticula/protocol";
 import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
 import type { CollabWorkbookTarget } from "./collab/CollabShell.tsx";
+import { withPersonTexts } from "./collab/labels.ts";
+import type { Activity, SheetAction } from "./editor/activity.ts";
+import {
+  AiDraftBanner,
+  DemoTip,
+  FrozenRecalcBanner,
+  HistoryPreviewBanner,
+  QuotaBanner,
+  RejectedBanner,
+  UpdateBanner,
+} from "./editor/Banners.tsx";
+import { ContextMenu } from "./editor/ContextMenu.tsx";
+import { type FormatPatch, FormatToolbar } from "./editor/FormatToolbar.tsx";
+import { passGridStrings } from "./editor/grid-strings.ts";
+import { LockOverlay } from "./editor/LockOverlay.tsx";
+import { SheetTabs } from "./editor/SheetTabs.tsx";
+import { StatusBar } from "./editor/StatusBar.tsx";
+import { TitleBar } from "./editor/TitleBar.tsx";
+import type {
+  ClipboardAction,
+  EngineState,
+  FreezeChoice,
+  LockOverlayState,
+  SheetRename,
+} from "./editor/types.ts";
+import { useOverlays } from "./editor/use-overlays.ts";
 import {
   type EngineClient,
   type HostCommand,
@@ -35,7 +51,6 @@ import {
 import type { CollabTransportHandle } from "./engine/collab-transport.ts";
 import type { StorageBackendKind, WorkbookCatalogEntry } from "./engine/storage.ts";
 import { FormulaBar, type FormulaBarHandle } from "./FormulaBar.tsx";
-import { BENCHMARKS } from "./generated/benchmarks.ts";
 import {
   type CollabHookStatus,
   type HookDocStatus,
@@ -43,34 +58,17 @@ import {
   installHooks,
   type SnapshotSaveResult,
 } from "./hooks.ts";
+import { translateEngineText } from "./i18n/engine-text.ts";
+import { t } from "./i18n/index.ts";
 import type { LocalModalMode } from "./LocalModals.tsx";
 import type { M3aModalEvent, M3aToolMode } from "./M3aToolsModal.tsx";
 import type { SwClientHandle } from "./sw-client.ts";
 
+const LazyMobileFallback = lazy(() => import("./editor/MobileFallback.tsx"));
 const LazyLocalModals = lazy(() => import("./LocalModals.tsx"));
 const LazyCollabShell = lazy(() => import("./collab/CollabShell.tsx"));
 const LazyM3aToolsModal = lazy(() => import("./M3aToolsModal.tsx"));
 const LazyAiPanel = lazy(() => import("./ai/AiPanel.tsx"));
-
-type EngineState =
-  | { status: "starting" }
-  | { status: "ready"; info: EngineInfo; sheet: SheetInfo }
-  | { status: "failed"; message: string };
-
-type LockOverlayState =
-  | { readonly kind: "blocked"; readonly docId: string; readonly title: string }
-  | {
-      readonly kind: "takingOver";
-      readonly docId: string;
-      readonly title: string;
-      readonly waitingForFile: boolean;
-    }
-  | {
-      readonly kind: "yielded";
-      readonly docId: string;
-      readonly title: string;
-      readonly evicted: boolean;
-    };
 
 interface InspectedState {
   readonly sheet: number;
@@ -112,15 +110,6 @@ interface CopiedSnapshot {
   readonly html: string;
 }
 
-type ContextMenuState =
-  | { readonly kind: "grid"; readonly target: GridContextTarget }
-  | {
-      readonly kind: "tab";
-      readonly clientX: number;
-      readonly clientY: number;
-      readonly tab: SheetTabInfo;
-    };
-
 const DEFAULT_DOC_ID = "sample-1m";
 const STATUS_INTERVAL_MS = 500;
 const YIELD_WATCHDOG_MS = 500;
@@ -130,28 +119,6 @@ const MARKS = {
   engineReady: "reticula:engine-ready",
   firstScreen: "reticula:first-screen",
 } as const;
-
-const NUMBER_FORMAT_OPTIONS: readonly { readonly code: string; readonly label: string }[] = [
-  { code: "General", label: "General" },
-  { code: "0", label: "Integer (0)" },
-  { code: "0.00", label: "Number (0.00)" },
-  { code: "#,##0.00", label: "Thousands (#,##0.00)" },
-  { code: "$#,##0.00", label: "USD ($#,##0.00)" },
-  { code: "¥#,##0.00", label: "CNY (¥#,##0.00)" },
-  { code: "€#,##0.00", label: "EUR (€#,##0.00)" },
-  { code: "0%", label: "Percent (0%)" },
-  { code: "0.00%", label: "Percent (0.00%)" },
-  { code: "0.00E+00", label: "Scientific (0.00E+00)" },
-  { code: "yyyy-mm-dd", label: "Date (yyyy-mm-dd)" },
-  { code: "yyyy-mm-dd hh:mm", label: "DateTime (yyyy-mm-dd hh:mm)" },
-  { code: "@", label: "Plain Text (@)" },
-];
-
-const integer = new Intl.NumberFormat("en-US");
-const milliseconds = new Intl.NumberFormat("en-US", {
-  minimumFractionDigits: 1,
-  maximumFractionDigits: 1,
-});
 
 function computeLocalExcelSerialNow(): number {
   const now = new Date();
@@ -278,85 +245,9 @@ export function EditorPage({ onNavigate }: EditorPageProps) {
 
   if (isNarrow && !forceEditor && !hooksRequested()) {
     return (
-      <div className="mobile-fallback" data-testid="mobile-fallback">
-        <header className="mobile-header">
-          <a
-            href="/"
-            className="mobile-brand"
-            onClick={(e) => {
-              e.preventDefault();
-              onNavigate("/");
-            }}
-          >
-            ← Reticula
-          </a>
-        </header>
-        <main className="mobile-body">
-          <h1>Desktop Canvas Editor</h1>
-          <p className="mobile-notice">
-            Reticula&apos;s desktop canvas editor requires a keyboard and pointer — please open this
-            link on desktop.
-          </p>
-
-          <svg
-            viewBox="0 0 360 176"
-            className="mobile-preview"
-            role="img"
-            aria-label="Preview of Reticula 1,000,000-row spreadsheet and live formula recalculation"
-          >
-            <rect x="4" y="4" width="352" height="168" rx="8" className="preview-frame" />
-            <rect x="4" y="4" width="352" height="28" rx="8" className="preview-bar" />
-            <text x="16" y="22" className="preview-title">
-              Reticula · 1,000,000 rows × 22 cols · fx =SUM(M2:M100001)
-            </text>
-            <line x1="4" y1="32" x2="356" y2="32" className="preview-line" />
-            <text x="16" y="54" className="preview-cell">
-              U1 Promo Rate
-            </text>
-            <rect x="164" y="39" width="74" height="22" rx="3" className="preview-focus" />
-            <text x="228" y="54" textAnchor="end" className="preview-num">
-              5.00%
-            </text>
-            <text x="16" y="80" className="preview-cell">
-              U2 100k Net Total
-            </text>
-            <text x="228" y="80" textAnchor="end" className="preview-num">
-              298,412,904.18
-            </text>
-            <line x1="12" y1="94" x2="348" y2="94" className="preview-line" />
-            <text x="16" y="116" className="preview-muted">
-              M2..M100001: =ROUND(J2*K2*(1-L2-$V$1), 2)
-            </text>
-            <text x="16" y="152" className="preview-status">
-              recalculated 100,001 cells in {BENCHMARKS.b4Incremental100kP50Ms} ms
-            </text>
-          </svg>
-
-          <div className="mobile-metrics">
-            <div>
-              <strong>{BENCHMARKS.b4Incremental100kP50Ms} ms</strong>
-              <span>100k-formula incremental recalc (p50)</span>
-            </div>
-            <div>
-              <strong>{BENCHMARKS.b7aInsertTopMeanUs} µs</strong>
-              <span>Top-row insert on 1M-row sheet</span>
-            </div>
-            <div>
-              <strong>{BENCHMARKS.b2Sum1mP50Ms} ms</strong>
-              <span>1,000,000-row SUM scan (p50)</span>
-            </div>
-          </div>
-
-          <button
-            type="button"
-            className="mobile-anyway"
-            data-testid="open-anyway"
-            onClick={() => setForceEditor(true)}
-          >
-            Open editor anyway
-          </button>
-        </main>
-      </div>
+      <Suspense fallback={null}>
+        <LazyMobileFallback onNavigate={onNavigate} onOpenAnyway={() => setForceEditor(true)} />
+      </Suspense>
     );
   }
 
@@ -409,7 +300,7 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
   const editSessionRef = useRef<ActiveEditSession | null>(null);
   const analysisRef = useRef<WireFormulaAnalysis | null>(null);
   const lastCopiedRef = useRef<CopiedSnapshot | null>(null);
-  const pendingActionVerbRef = useRef<string>("updated");
+  const pendingActionRef = useRef<SheetAction>("updated");
   const pendingJumpRef = useRef<{ sheet: number; row: number; col: number } | null>(null);
 
   const [engine, setEngine] = useState<EngineState>({ status: "starting" });
@@ -422,7 +313,6 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
   const [m3aEvent, setM3aEvent] = useState<M3aModalEvent | null>(null);
   const [quotaBanner, setQuotaBanner] = useState<string | null>(null);
   const [swUpdateReady, setSwUpdateReady] = useState(false);
-  const [swUpdating, setSwUpdating] = useState(false);
   const [csvProgress, setCsvProgress] = useState<{
     readonly rowsParsed: number;
     readonly percent: number;
@@ -437,17 +327,10 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
     readonly source: string;
     readonly analysis: WireFormulaAnalysis;
   } | null>(null);
-  const [recalcMessage, setRecalcMessage] = useState<string | null>(null);
+  const [activity, setActivity] = useState<Activity | null>(null);
   const [rejectedReason, setRejectedReason] = useState<string | null>(null);
-  const [showTip, setShowTip] = useState(true);
-  const [isDark, setIsDark] = useState<boolean>(() =>
-    typeof window !== "undefined"
-      ? window.matchMedia("(prefers-color-scheme: dark)").matches
-      : false,
-  );
-  const [colorPopover, setColorPopover] = useState<"text" | "fill" | null>(null);
-  const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
-  const [renamingSheet, setRenamingSheet] = useState<{ id: number; draft: string } | null>(null);
+  const { contextMenu, setContextMenu, colorPopover, setColorPopover } = useOverlays();
+  const [renamingSheet, setRenamingSheet] = useState<SheetRename | null>(null);
   const [collabMenuOpen, setCollabMenuOpen] = useState(false);
   const [collabTarget, setCollabTarget] = useState<CollabWorkbookTarget | null>(null);
   const [collabConn, setCollabConn] = useState<CollabHookStatus["connection"]>("offline");
@@ -527,42 +410,6 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
     }
     refreshStorageEstimate();
   }, [refreshStorageEstimate]);
-
-  useEffect(() => {
-    const mq = window.matchMedia("(prefers-color-scheme: dark)");
-    const onChange = (e: MediaQueryListEvent) => setIsDark(e.matches);
-    mq.addEventListener("change", onChange);
-    return () => mq.removeEventListener("change", onChange);
-  }, []);
-
-  useEffect(() => {
-    if (!contextMenu && !colorPopover) {
-      return;
-    }
-    const dismiss = (event: MouseEvent) => {
-      const target = event.target;
-      if (
-        target instanceof Element &&
-        (target.closest(".context-menu") || target.closest(".color-popover-wrap"))
-      ) {
-        return;
-      }
-      setContextMenu(null);
-      setColorPopover(null);
-    };
-    const onKey = (event: KeyboardEvent) => {
-      if (event.key === "Escape") {
-        setContextMenu(null);
-        setColorPopover(null);
-      }
-    };
-    window.addEventListener("mousedown", dismiss);
-    window.addEventListener("keydown", onKey);
-    return () => {
-      window.removeEventListener("mousedown", dismiss);
-      window.removeEventListener("keydown", onKey);
-    };
-  }, [contextMenu, colorPopover]);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -769,7 +616,7 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
           return;
         }
         notePersistenceMutation();
-        pendingActionVerbRef.current = "resized rows";
+        pendingActionRef.current = "resizedRows";
         client.send({
           kind: "resizeRows",
           sheet: activeSheetRef.current,
@@ -782,7 +629,7 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
           return;
         }
         notePersistenceMutation();
-        pendingActionVerbRef.current = "resized columns";
+        pendingActionRef.current = "resizedColumns";
         client.send({
           kind: "resizeCols",
           sheet: activeSheetRef.current,
@@ -795,7 +642,7 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
           return;
         }
         notePersistenceMutation();
-        pendingActionVerbRef.current = "moved rows";
+        pendingActionRef.current = "movedRows";
         client.send({
           kind: "moveRows",
           sheet: activeSheetRef.current,
@@ -809,7 +656,7 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
           return;
         }
         notePersistenceMutation();
-        pendingActionVerbRef.current = "moved columns";
+        pendingActionRef.current = "movedColumns";
         client.send({
           kind: "moveCols",
           sheet: activeSheetRef.current,
@@ -823,7 +670,7 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
           return;
         }
         notePersistenceMutation();
-        pendingActionVerbRef.current = "filled range";
+        pendingActionRef.current = "filledRange";
         sendEvalEnv(client);
         client.send({
           kind: "fillRange",
@@ -848,7 +695,7 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
           return;
         }
         notePersistenceMutation();
-        pendingActionVerbRef.current = "auto-filled column";
+        pendingActionRef.current = "autoFilledColumn";
         sendEvalEnv(client);
         client.send({
           kind: "autoFillDown",
@@ -947,7 +794,7 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
         const runs = grid.selectedCellRuns();
         if (client && !workerTerminatedRef.current && !effectiveReadOnlyRef.current && runs) {
           notePersistenceMutation();
-          pendingActionVerbRef.current = "cleared cells";
+          pendingActionRef.current = "clearedCells";
           client.send({
             kind: "clearCells",
             sheet: activeSheetRef.current,
@@ -1018,14 +865,14 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
       onUndo: () => {
         if (!workerTerminatedRef.current && !effectiveReadOnlyRef.current) {
           notePersistenceMutation();
-          pendingActionVerbRef.current = "undid action";
+          pendingActionRef.current = "undidAction";
           clientRef.current?.send({ kind: "undo" });
         }
       },
       onRedo: () => {
         if (!workerTerminatedRef.current && !effectiveReadOnlyRef.current) {
           notePersistenceMutation();
-          pendingActionVerbRef.current = "redid action";
+          pendingActionRef.current = "redidAction";
           clientRef.current?.send({ kind: "redo" });
         }
       },
@@ -1151,7 +998,7 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
               if (event.sheet === activeSheetRef.current) {
                 collabPresencesRef.current = event.overlays;
                 setCollabPresences(event.overlays);
-                grid.setRemotePresences(event.overlays);
+                grid.setRemotePresences(withPersonTexts(event.overlays));
               }
               break;
             }
@@ -1388,7 +1235,7 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
                 setDraftPreview(message.kind === "draftReady");
                 if (message.kind === "draftExited") {
                   grid.setDiffHighlights(null);
-                  grid.setRemotePresences(collabPresencesRef.current);
+                  grid.setRemotePresences(withPersonTexts(collabPresencesRef.current));
                 }
               }
               requestInspect(grid.selectionDetails(), true);
@@ -1444,13 +1291,14 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
               setEngine((prev) =>
                 prev.status === "ready" ? { ...prev, sheet: message.sheet } : prev,
               );
-              const verb = pendingActionVerbRef.current;
-              pendingActionVerbRef.current = "updated";
-              const extra =
-                message.recalculated > 0
-                  ? `, recalculated ${integer.format(message.recalculated)} cells`
-                  : "";
-              setRecalcMessage(`${verb} in ${milliseconds.format(message.actionMs)} ms${extra}`);
+              const action = pendingActionRef.current;
+              pendingActionRef.current = "updated";
+              setActivity({
+                kind: "done",
+                action,
+                ms: message.actionMs,
+                recalculated: message.recalculated,
+              });
               requestInspect(grid.selectionDetails(), true);
               refreshStorageEstimate();
               break;
@@ -1618,19 +1466,18 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
                   },
                 );
               }
-              const extra =
-                message.recalculated > 0
-                  ? `, recalculated ${integer.format(message.recalculated)} cells`
-                  : "";
-              setRecalcMessage(`pasted in ${milliseconds.format(message.elapsedMs)} ms${extra}`);
+              setActivity({
+                kind: "done",
+                action: "pasted",
+                ms: message.elapsedMs,
+                recalculated: message.recalculated,
+              });
               requestInspect(grid.selectionDetails(), true);
               refreshStorageEstimate();
               break;
             }
             case "recalcProgress":
-              setRecalcMessage(
-                `recalculating ${integer.format(message.done)} / ${integer.format(message.total)}…`,
-              );
+              setActivity({ kind: "recalculating", done: message.done, total: message.total });
               break;
             case "recalcDone":
               setRejectedReason(null);
@@ -1639,13 +1486,11 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
               setEngine((prev) =>
                 prev.status === "ready" ? { ...prev, sheet: message.sheet } : prev,
               );
-              if (message.recalculated > 0) {
-                setRecalcMessage(
-                  `recalculated ${integer.format(message.recalculated)} cells in ${milliseconds.format(message.elapsedMs)} ms`,
-                );
-              } else {
-                setRecalcMessage(`updated cell in ${milliseconds.format(message.elapsedMs)} ms`);
-              }
+              setActivity(
+                message.recalculated > 0
+                  ? { kind: "recalculated", cells: message.recalculated, ms: message.elapsedMs }
+                  : { kind: "done", action: "updatedCell", ms: message.elapsedMs, recalculated: 0 },
+              );
               requestInspect(grid.selectionDetails(), true);
               refreshStorageEstimate();
               break;
@@ -1674,7 +1519,7 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
                 prev.status === "ready" ? { ...prev, sheet: message.sheet } : prev,
               );
               setM3aEvent(message);
-              setRecalcMessage(`replaced ${integer.format(message.replacedCells)} cell(s)`);
+              setActivity({ kind: "replaced", cells: message.replacedCells });
               requestInspect(grid.selectionDetails(), true);
               refreshStorageEstimate();
               break;
@@ -1973,8 +1818,21 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
     requestAnalyze,
     schedulePresenceSend,
     sendPresenceNow,
+    setColorPopover,
+    setContextMenu,
     syncGridFormulaRefs,
   ]);
+
+  const cellEditorName = t("Cell editor");
+  const formulaBarName = t("Formula bar");
+  useEffect(() => {
+    if (gridRef.current && hostRef.current) {
+      passGridStrings(gridRef.current, hostRef.current, {
+        cellEditor: cellEditorName,
+        formulaBar: formulaBarName,
+      });
+    }
+  }, [cellEditorName, formulaBarName]);
 
   useEffect(() => {
     if (effectiveReadOnly) {
@@ -1987,7 +1845,7 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
       setColorPopover(null);
       setRenamingSheet(null);
     }
-  }, [effectiveReadOnly, clearEditState]);
+  }, [effectiveReadOnly, clearEditState, setColorPopover]);
 
   const activeSheetId = engine.status === "ready" ? engine.sheet.sheet : 0;
   const matchingInspected =
@@ -2144,7 +2002,7 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
       return;
     }
     notePersistenceMutation();
-    pendingActionVerbRef.current = "inserted rows";
+    pendingActionRef.current = "insertedRows";
     client.send({
       kind: "insertRows",
       sheet: activeSheetRef.current,
@@ -2165,7 +2023,7 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
       return;
     }
     notePersistenceMutation();
-    pendingActionVerbRef.current = "deleted rows";
+    pendingActionRef.current = "deletedRows";
     client.send({
       kind: "deleteRows",
       sheet: activeSheetRef.current,
@@ -2187,7 +2045,7 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
       return;
     }
     notePersistenceMutation();
-    pendingActionVerbRef.current = "inserted columns";
+    pendingActionRef.current = "insertedColumns";
     client.send({
       kind: "insertCols",
       sheet: activeSheetRef.current,
@@ -2208,7 +2066,7 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
       return;
     }
     notePersistenceMutation();
-    pendingActionVerbRef.current = "deleted columns";
+    pendingActionRef.current = "deletedColumns";
     client.send({
       kind: "deleteCols",
       sheet: activeSheetRef.current,
@@ -2217,7 +2075,7 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
     editorRef.current?.focus();
   };
 
-  const applyFormat = (patch: { numberFormat?: WireFormatPatch; style?: WireStylePatch }) => {
+  const applyFormat = (patch: FormatPatch) => {
     const grid = gridRef.current;
     const client = clientRef.current;
     if (!grid || !client || workerTerminatedRef.current || effectiveReadOnlyRef.current) {
@@ -2228,7 +2086,7 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
       return;
     }
     notePersistenceMutation();
-    pendingActionVerbRef.current = "formatted cells";
+    pendingActionRef.current = "formattedCells";
     client.send({
       kind: "setFormat",
       sheet: activeSheetRef.current,
@@ -2238,7 +2096,7 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
     editorRef.current?.focus();
   };
 
-  const handleFreezeChange = (value: string) => {
+  const handleFreezeChange = (value: FreezeChoice) => {
     const client = clientRef.current;
     if (!client || workerTerminatedRef.current || effectiveReadOnlyRef.current) {
       return;
@@ -2260,7 +2118,7 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
       }
     }
     notePersistenceMutation();
-    pendingActionVerbRef.current = "updated freeze panes";
+    pendingActionRef.current = "updatedFreezePanes";
     client.send({
       kind: "setFreeze",
       sheet: activeSheetRef.current,
@@ -2297,12 +2155,12 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
       editor.commitExternal(false);
     }
     clearEditState(grid, editor);
-    pendingActionVerbRef.current = "switched sheet";
+    pendingActionRef.current = "switchedSheet";
     client.send({ kind: "switchSheet", sheet: targetId });
     editor.focus();
   };
 
-  const handleContextClipboard = async (mode: "cut" | "copy" | "paste") => {
+  const handleContextClipboard = async (mode: ClipboardAction) => {
     const grid = gridRef.current;
     const client = clientRef.current;
     setContextMenu(null);
@@ -2397,165 +2255,120 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
     editorRef.current?.focus();
   };
 
+  const handleExportRtcl = () => clientRef.current?.sendHost({ kind: "exportRtcl" });
+
+  const handleUndoRedo = (kind: "undo" | "redo") => {
+    if (effectiveReadOnlyRef.current) {
+      return;
+    }
+    notePersistenceMutation();
+    pendingActionRef.current = kind === "undo" ? "undidAction" : "redidAction";
+    clientRef.current?.send({ kind });
+    editorRef.current?.focus();
+  };
+
+  const handleClearContents = () => {
+    const runs = gridRef.current?.selectedCellRuns();
+    if (runs && !effectiveReadOnlyRef.current) {
+      notePersistenceMutation();
+      pendingActionRef.current = "clearedCells";
+      clientRef.current?.send({
+        kind: "clearCells",
+        sheet: activeSheetRef.current,
+        rows: runs.rows,
+        cols: runs.cols,
+      });
+    }
+    editorRef.current?.focus();
+  };
+
+  const handleToggleFilter = () => {
+    if (!readySheet) {
+      return;
+    }
+    if (readySheet.filter) {
+      clientRef.current?.send({ kind: "clearFilter", sheet: readySheet.sheet });
+      return;
+    }
+    const r = selection?.range;
+    const headerRow = r ? r.firstRow : 0;
+    const lastRow =
+      r && r.endRow - r.firstRow > 1
+        ? r.endRow - 1
+        : Math.min(readySheet.rows - 1, headerRow + 10_000);
+    const firstCol = r ? r.firstCol : 0;
+    const lastCol =
+      r && r.endCol - r.firstCol > 1
+        ? r.endCol - 1
+        : Math.min(readySheet.cols - 1, Math.max(firstCol, 25));
+    clientRef.current?.send({
+      kind: "setFilterTable",
+      sheet: readySheet.sheet,
+      headerRow,
+      lastRow,
+      firstCol,
+      lastCol,
+    });
+  };
+
+  const handleRenameSheet = (tab: SheetTabInfo, name: string) => {
+    notePersistenceMutation();
+    pendingActionRef.current = "renamedSheet";
+    clientRef.current?.send({ kind: "renameSheet", sheet: tab.id, name });
+  };
+
+  const handleAddSheet = (afterSheet: number) => {
+    if (effectiveReadOnlyRef.current) {
+      return;
+    }
+    notePersistenceMutation();
+    pendingActionRef.current = "addedSheet";
+    clientRef.current?.send({ kind: "addSheet", afterSheet });
+    editorRef.current?.focus();
+  };
+
+  const handleMoveSheet = (tab: SheetTabInfo, afterSheet: number | undefined) => {
+    if (effectiveReadOnlyRef.current) {
+      return;
+    }
+    notePersistenceMutation();
+    pendingActionRef.current = "reorderedSheets";
+    clientRef.current?.send({ kind: "moveSheet", sheet: tab.id, afterSheet });
+  };
+
+  const handleDeleteSheet = (tab: SheetTabInfo) => {
+    if (effectiveReadOnlyRef.current) {
+      return;
+    }
+    notePersistenceMutation();
+    pendingActionRef.current = "deletedSheet";
+    clientRef.current?.send({ kind: "deleteSheet", sheet: tab.id });
+  };
+
   const readySheet = engine.status === "ready" && lockOverlay === null ? engine.sheet : null;
   const canDeleteRows = !effectiveReadOnly && selection !== null && selection.rowId !== null;
   const canDeleteCols = !effectiveReadOnly && selection !== null && selection.colId !== null;
-  const hasSelection = readySheet !== null && selection !== null && !effectiveReadOnly;
-  const activeStyle = matchingInspected?.style;
-  const activeFormatCode = matchingInspected?.formatCode ?? "General";
-  const currentFreezeValue = readySheet
-    ? readySheet.frozenRows === 0 && readySheet.frozenCols === 0
-      ? "none"
-      : readySheet.frozenRows === 1 && readySheet.frozenCols === 0
-        ? "row1"
-        : readySheet.frozenRows === 0 && readySheet.frozenCols === 1
-          ? "col1"
-          : readySheet.frozenRows === 1 && readySheet.frozenCols === 1
-            ? "row1col1"
-            : "active"
-    : "none";
-
-  const textPalette = isDark ? DARK_PALETTE_TEXT : LIGHT_PALETTE_TEXT;
-  const fillPalette = isDark ? DARK_PALETTE_FILL : LIGHT_PALETTE_FILL;
 
   return (
     <div className="app">
-      <header className="titlebar">
-        <a
-          href="/"
-          className="brand-link"
-          onClick={(event) => {
-            event.preventDefault();
-            onNavigate("/");
-          }}
-        >
-          <h1>Reticula</h1>
-        </a>
-        <button
-          type="button"
-          className="toolbar-btn"
-          data-testid="workbooks-btn"
-          onClick={handleOpenWorkbooksDrawer}
-          title="Manage local browser workbooks, import or export .rtcl / .csv"
-        >
-          Workbooks
-        </button>
-        <button
-          type="button"
-          className="toolbar-btn"
-          data-testid="cloud-menu-btn"
-          onClick={() => setCollabMenuOpen(true)}
-          title="Sign in, create, or share collaborative cloud workbooks"
-        >
-          Cloud
-        </button>
-        <button
-          type="button"
-          className="toolbar-btn"
-          data-testid="ai-panel-btn"
-          onClick={() => setAiOpen((open) => !open)}
-          title="Open AI Analyst draft assistant and recorded demos"
-        >
-          AI
-        </button>
-        {collabTarget && (
-          <button
-            type="button"
-            className="toolbar-btn"
-            data-testid="history-btn"
-            onClick={() => setHistoryOpen((open) => !open)}
-            title="Browse revision history and named versions"
-          >
-            History
-          </button>
-        )}
-        {readySheet && (
-          <span className="document" data-testid="document">
-            {docTitle} · {integer.format(readySheet.rows)} rows × {readySheet.cols} columns ·{" "}
-            {integer.format(readySheet.formulaCount)} formulas
-          </span>
-        )}
-        <span className="titlebar-spacer" />
-        <span className="storage-badge" data-testid="storage-badge">
-          {collabTarget
-            ? collabTarget.role === "viewer"
-              ? "Read-only cloud view"
-              : "Cloud replica cached in OPFS"
-            : "Local browser storage only"}{" "}
-          · {storageUsedMb} MB used ·{" "}
-          <button
-            type="button"
-            className="storage-export-link"
-            data-testid="export-rtcl-btn"
-            disabled={!readySheet}
-            onClick={() => clientRef.current?.sendHost({ kind: "exportRtcl" })}
-          >
-            Export .rtcl
-          </button>
-        </span>
-        <div className="toolbar">
-          <button
-            type="button"
-            className="toolbar-btn"
-            data-testid="undo-btn"
-            disabled={!readySheet?.canUndo || effectiveReadOnly}
-            onClick={() => {
-              if (effectiveReadOnlyRef.current) {
-                return;
-              }
-              notePersistenceMutation();
-              pendingActionVerbRef.current = "undid action";
-              clientRef.current?.send({ kind: "undo" });
-              editorRef.current?.focus();
-            }}
-            title={
-              readySheet?.undoLabel ? `Undo ${readySheet.undoLabel} (Ctrl+Z)` : "Undo (Ctrl+Z)"
-            }
-          >
-            ↶ Undo
-          </button>
-          <button
-            type="button"
-            className="toolbar-btn"
-            data-testid="redo-btn"
-            disabled={!readySheet?.canRedo || effectiveReadOnly}
-            onClick={() => {
-              if (effectiveReadOnlyRef.current) {
-                return;
-              }
-              notePersistenceMutation();
-              pendingActionVerbRef.current = "redid action";
-              clientRef.current?.send({ kind: "redo" });
-              editorRef.current?.focus();
-            }}
-            title={
-              readySheet?.redoLabel ? `Redo ${readySheet.redoLabel} (Ctrl+Y)` : "Redo (Ctrl+Y)"
-            }
-          >
-            ↷ Redo
-          </button>
-          <button
-            type="button"
-            className="toolbar-btn"
-            data-testid="insert-row-above"
-            disabled={!readySheet || effectiveReadOnly}
-            onClick={() => handleInsertRow(false)}
-            title="Insert 1 row above the selected row (at row 1 if nothing is selected)"
-          >
-            + Insert Row Above
-          </button>
-          <button
-            type="button"
-            className="toolbar-btn"
-            data-testid="delete-rows"
-            disabled={!readySheet || !canDeleteRows}
-            onClick={handleDeleteSelectedRows}
-            title="Delete all rows spanned by the current selection"
-          >
-            Delete Selected Rows
-          </button>
-        </div>
-      </header>
+      <TitleBar
+        title={docTitle}
+        sheet={readySheet}
+        collabRole={collabTarget?.role ?? null}
+        readOnly={effectiveReadOnly}
+        canDeleteRows={canDeleteRows}
+        storageUsedMb={storageUsedMb}
+        onNavigate={onNavigate}
+        onOpenWorkbooks={handleOpenWorkbooksDrawer}
+        onOpenCloud={() => setCollabMenuOpen(true)}
+        onToggleAi={() => setAiOpen((open) => !open)}
+        onToggleHistory={() => setHistoryOpen((open) => !open)}
+        onExportRtcl={handleExportRtcl}
+        onUndo={() => handleUndoRedo("undo")}
+        onRedo={() => handleUndoRedo("redo")}
+        onInsertRowAbove={() => handleInsertRow(false)}
+        onDeleteRows={handleDeleteSelectedRows}
+      />
 
       {(collabMenuOpen ||
         collabTarget !== null ||
@@ -2642,466 +2455,41 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
         </Suspense>
       )}
 
-      <div className="formatbar" role="toolbar" aria-label="Cell formatting and freeze panes">
-        <select
-          className="fmt-select"
-          data-testid="number-format-select"
-          aria-label="Number format"
-          disabled={!hasSelection}
-          value={
-            NUMBER_FORMAT_OPTIONS.some((o) => o.code === activeFormatCode)
-              ? activeFormatCode
-              : "General"
-          }
-          onChange={(e) => {
-            const code = e.target.value;
-            applyFormat({
-              numberFormat: code === "General" ? { kind: "clear" } : { kind: "set", code },
-            });
-          }}
-        >
-          {NUMBER_FORMAT_OPTIONS.map((opt) => (
-            <option key={opt.code} value={opt.code}>
-              {opt.label}
-            </option>
-          ))}
-        </select>
+      <FormatToolbar
+        sheet={readySheet}
+        readOnly={effectiveReadOnly}
+        canFormat={readySheet !== null && selection !== null && !effectiveReadOnly}
+        canDeleteCols={canDeleteCols}
+        style={matchingInspected?.style}
+        formatCode={matchingInspected?.formatCode ?? "General"}
+        colorPopover={colorPopover}
+        onColorPopover={setColorPopover}
+        onFormat={applyFormat}
+        onFreeze={handleFreezeChange}
+        onInsertColLeft={() => handleInsertCol(false)}
+        onDeleteCols={handleDeleteSelectedCols}
+        onSort={() => setM3aTool({ kind: "sort" })}
+        onToggleFilter={handleToggleFilter}
+        onFind={() => setM3aTool({ kind: "find", replace: false })}
+        onNames={() => setM3aTool({ kind: "names" })}
+      />
 
-        <span className="fmt-divider" aria-hidden="true" />
-
-        <button
-          type="button"
-          className={activeStyle?.bold ? "fmt-btn active" : "fmt-btn"}
-          data-testid="fmt-bold"
-          aria-pressed={activeStyle?.bold ?? false}
-          disabled={!hasSelection}
-          title="Bold"
-          onClick={() => applyFormat({ style: { bold: !(activeStyle?.bold ?? false) } })}
-        >
-          <strong>B</strong>
-        </button>
-        <button
-          type="button"
-          className={activeStyle?.italic ? "fmt-btn active" : "fmt-btn"}
-          data-testid="fmt-italic"
-          aria-pressed={activeStyle?.italic ?? false}
-          disabled={!hasSelection}
-          title="Italic"
-          onClick={() => applyFormat({ style: { italic: !(activeStyle?.italic ?? false) } })}
-        >
-          <em>I</em>
-        </button>
-        <button
-          type="button"
-          className={activeStyle?.strikethrough ? "fmt-btn active" : "fmt-btn"}
-          data-testid="fmt-strike"
-          aria-pressed={activeStyle?.strikethrough ?? false}
-          disabled={!hasSelection}
-          title="Strikethrough"
-          onClick={() =>
-            applyFormat({ style: { strikethrough: !(activeStyle?.strikethrough ?? false) } })
-          }
-        >
-          <span style={{ textDecoration: "line-through" }}>S</span>
-        </button>
-
-        <span className="fmt-divider" aria-hidden="true" />
-
-        {(["left", "center", "right"] as const satisfies readonly WireHorizontalAlign[]).map(
-          (align) => {
-            const isPressed = activeStyle?.align === align;
-            const label = align === "left" ? "⫷" : align === "center" ? "≡" : "⫸";
-            return (
-              <button
-                key={align}
-                type="button"
-                className={isPressed ? "fmt-btn active" : "fmt-btn"}
-                data-testid={`align-${align}`}
-                aria-pressed={isPressed}
-                disabled={!hasSelection}
-                title={`Align ${align}`}
-                onClick={() => applyFormat({ style: { align: isPressed ? "auto" : align } })}
-              >
-                {label}
-              </button>
-            );
-          },
-        )}
-
-        <span className="fmt-divider" aria-hidden="true" />
-
-        <div className="color-popover-wrap">
-          <button
-            type="button"
-            className="fmt-btn"
-            data-testid="text-color-btn"
-            disabled={!hasSelection}
-            title="Text color"
-            onClick={() => setColorPopover((cur) => (cur === "text" ? null : "text"))}
-          >
-            <span className="color-glyph">A</span>
-            <span
-              className="color-swatch-bar"
-              style={{
-                background:
-                  activeStyle?.textColor?.kind === "palette"
-                    ? (textPalette[activeStyle.textColor.slot & 7] ?? "currentColor")
-                    : "currentColor",
-              }}
-            />
-          </button>
-          {colorPopover === "text" && (
-            <div className="color-popover" data-testid="text-color-popover">
-              <button
-                type="button"
-                className="color-clear-btn"
-                data-testid="text-color-clear"
-                onClick={() => {
-                  setColorPopover(null);
-                  applyFormat({ style: { textColor: { kind: "clear" } } });
-                }}
-              >
-                Default text color
-              </button>
-              <div className="color-grid">
-                {textPalette.map((hex, slot) => (
-                  <button
-                    key={hex}
-                    type="button"
-                    className="color-swatch"
-                    data-testid={`text-color-slot-${slot}`}
-                    style={{ background: hex }}
-                    aria-label={`Text palette slot ${slot + 1}`}
-                    onClick={() => {
-                      setColorPopover(null);
-                      applyFormat({
-                        style: { textColor: { kind: "set", color: { kind: "palette", slot } } },
-                      });
-                    }}
-                  />
-                ))}
-              </div>
-            </div>
-          )}
-        </div>
-
-        <div className="color-popover-wrap">
-          <button
-            type="button"
-            className="fmt-btn"
-            data-testid="fill-color-btn"
-            disabled={!hasSelection}
-            title="Fill color"
-            onClick={() => setColorPopover((cur) => (cur === "fill" ? null : "fill"))}
-          >
-            <span className="color-glyph">▨</span>
-            <span
-              className="color-swatch-bar"
-              style={{
-                background:
-                  activeStyle?.fillColor?.kind === "palette"
-                    ? (fillPalette[activeStyle.fillColor.slot & 7] ?? "transparent")
-                    : "var(--shell-line)",
-              }}
-            />
-          </button>
-          {colorPopover === "fill" && (
-            <div className="color-popover" data-testid="fill-color-popover">
-              <button
-                type="button"
-                className="color-clear-btn"
-                data-testid="fill-color-clear"
-                onClick={() => {
-                  setColorPopover(null);
-                  applyFormat({ style: { fillColor: { kind: "clear" } } });
-                }}
-              >
-                No fill
-              </button>
-              <div className="color-grid">
-                {fillPalette.map((hex, slot) => (
-                  <button
-                    key={hex}
-                    type="button"
-                    className="color-swatch"
-                    data-testid={`fill-color-slot-${slot}`}
-                    style={{ background: hex }}
-                    aria-label={`Fill palette slot ${slot + 1}`}
-                    onClick={() => {
-                      setColorPopover(null);
-                      applyFormat({
-                        style: { fillColor: { kind: "set", color: { kind: "palette", slot } } },
-                      });
-                    }}
-                  />
-                ))}
-              </div>
-            </div>
-          )}
-        </div>
-
-        <span className="fmt-divider" aria-hidden="true" />
-
-        <button
-          type="button"
-          className="fmt-btn"
-          data-testid="border-thin"
-          disabled={!hasSelection}
-          title="Thin borders"
-          onClick={() =>
-            applyFormat({
-              style: {
-                borderTop: "thin",
-                borderRight: "thin",
-                borderBottom: "thin",
-                borderLeft: "thin",
-              },
-            })
-          }
-        >
-          ⊞ Thin
-        </button>
-        <button
-          type="button"
-          className="fmt-btn"
-          data-testid="border-medium"
-          disabled={!hasSelection}
-          title="Medium borders"
-          onClick={() =>
-            applyFormat({
-              style: {
-                borderTop: "medium",
-                borderRight: "medium",
-                borderBottom: "medium",
-                borderLeft: "medium",
-              },
-            })
-          }
-        >
-          ⊞ Med
-        </button>
-        <button
-          type="button"
-          className="fmt-btn"
-          data-testid="border-none"
-          disabled={!hasSelection}
-          title="Clear borders"
-          onClick={() =>
-            applyFormat({
-              style: {
-                borderTop: "none",
-                borderRight: "none",
-                borderBottom: "none",
-                borderLeft: "none",
-              },
-            })
-          }
-        >
-          ⊟ Clear
-        </button>
-
-        <span className="fmt-divider" aria-hidden="true" />
-
-        <select
-          className="fmt-select"
-          data-testid="freeze-select"
-          aria-label="Freeze panes"
-          disabled={!readySheet || effectiveReadOnly}
-          value={currentFreezeValue}
-          onChange={(e) => handleFreezeChange(e.target.value)}
-        >
-          <option value="none">No Freeze</option>
-          <option value="row1">Freeze Top Row</option>
-          <option value="col1">Freeze First Column</option>
-          <option value="row1col1">Freeze Row 1 &amp; Col A</option>
-          <option value="active">Freeze to Active Cell</option>
-        </select>
-
-        <span className="fmt-divider" aria-hidden="true" />
-
-        <button
-          type="button"
-          className="fmt-btn"
-          data-testid="insert-col-left"
-          disabled={!readySheet || effectiveReadOnly}
-          title="Insert 1 column to the left of selection"
-          onClick={() => handleInsertCol(false)}
-        >
-          + Col
-        </button>
-        <button
-          type="button"
-          className="fmt-btn"
-          data-testid="delete-cols"
-          disabled={!readySheet || !canDeleteCols}
-          title="Delete selected columns"
-          onClick={handleDeleteSelectedCols}
-        >
-          − Col
-        </button>
-        <span className="fmt-divider" />
-        <button
-          type="button"
-          className="fmt-btn"
-          data-testid="m3a-sort-btn"
-          disabled={!readySheet || effectiveReadOnly}
-          onClick={() => setM3aTool({ kind: "sort" })}
-        >
-          Sort
-        </button>
-        <button
-          type="button"
-          className={readySheet?.filter ? "fmt-btn active" : "fmt-btn"}
-          data-testid="m3a-filter-btn"
-          disabled={!readySheet}
-          onClick={() => {
-            if (!readySheet) {
-              return;
-            }
-            if (readySheet.filter) {
-              clientRef.current?.send({ kind: "clearFilter", sheet: readySheet.sheet });
-              return;
-            }
-            const r = selection?.range;
-            const headerRow = r ? r.firstRow : 0;
-            const lastRow =
-              r && r.endRow - r.firstRow > 1
-                ? r.endRow - 1
-                : Math.min(readySheet.rows - 1, headerRow + 10_000);
-            const firstCol = r ? r.firstCol : 0;
-            const lastCol =
-              r && r.endCol - r.firstCol > 1
-                ? r.endCol - 1
-                : Math.min(readySheet.cols - 1, Math.max(firstCol, 25));
-            clientRef.current?.send({
-              kind: "setFilterTable",
-              sheet: readySheet.sheet,
-              headerRow,
-              lastRow,
-              firstCol,
-              lastCol,
-            });
-          }}
-        >
-          Filter
-        </button>
-        <button
-          type="button"
-          className="fmt-btn"
-          data-testid="m3a-find-btn"
-          disabled={!readySheet}
-          onClick={() => setM3aTool({ kind: "find", replace: false })}
-        >
-          Find
-        </button>
-        <button
-          type="button"
-          className="fmt-btn"
-          data-testid="m3a-names-btn"
-          disabled={!readySheet}
-          onClick={() => setM3aTool({ kind: "names" })}
-        >
-          Names
-        </button>
-      </div>
-
-      {quotaBanner && (
-        <div className="rejected-banner" role="alert" data-testid="quota-banner">
-          <span>{quotaBanner}</span>
-          <div className="banner-actions">
-            <button
-              type="button"
-              className="tip-action"
-              onClick={() => clientRef.current?.sendHost({ kind: "exportRtcl" })}
-            >
-              Export .rtcl
-            </button>
-            <button type="button" className="tip-action" onClick={handleOpenWorkbooksDrawer}>
-              Manage Workbooks
-            </button>
-            <button
-              type="button"
-              className="tip-close"
-              aria-label="Dismiss storage warning"
-              onClick={() => setQuotaBanner(null)}
-            >
-              ×
-            </button>
-          </div>
-        </div>
-      )}
-
-      {swUpdateReady && (
-        <div className="sw-update-banner" role="status" data-testid="sw-update-banner">
-          <span>
-            A new version of Reticula is ready. Confirming flushes all open tabs and reloads safely.
-          </span>
-          <div className="quota-banner-actions">
-            <button
-              type="button"
-              className="tip-action"
-              data-testid="sw-update-btn"
-              disabled={swUpdating}
-              onClick={() => {
-                setSwUpdating(true);
-                void swClientRef.current?.applyUpdate().catch(() => setSwUpdating(false));
-              }}
-            >
-              {swUpdating ? "Updating…" : "Update now"}
-            </button>
-            <button
-              type="button"
-              className="tip-close"
-              aria-label="Dismiss update notification"
-              onClick={() => setSwUpdateReady(false)}
-            >
-              ×
-            </button>
-          </div>
-        </div>
-      )}
-
-      {readySheet?.recalcFrozen && (
-        <div className="frozen-recalc-banner" role="status" data-testid="recalc-frozen-banner">
-          <span>
-            Safe Mode opened this workbook with automatic recalculation paused so you can inspect or
-            edit formulas safely.
-          </span>
-          <button
-            type="button"
-            className="tip-action"
-            data-testid="resume-recalc-btn"
-            onClick={() => clientRef.current?.send({ kind: "resumeRecalc" })}
-          >
-            Resume Recalculation
-          </button>
-        </div>
-      )}
-
-      {showTip && readySheet && readySheet.seed !== 0 && readySheet.sheet === 0 && (
-        <div className="demo-tip" data-testid="demo-tip">
-          <span>
-            Try live recalculation: edit parameter cell <code>V1</code> (e.g. type <code>5%</code>{" "}
-            and press Enter) to recalculate <strong>100,001</strong> dependent formulas.
-          </span>
-          <button
-            type="button"
-            className="tip-action"
-            data-testid="jump-v1"
-            onClick={handleJumpToV1}
-          >
-            Jump to V1
-          </button>
-          <button
-            type="button"
-            className="tip-close"
-            aria-label="Dismiss tip"
-            onClick={() => setShowTip(false)}
-          >
-            ×
-          </button>
-        </div>
-      )}
+      <QuotaBanner
+        message={quotaBanner}
+        onExportRtcl={handleExportRtcl}
+        onOpenWorkbooks={handleOpenWorkbooksDrawer}
+        onDismiss={() => setQuotaBanner(null)}
+      />
+      <UpdateBanner
+        ready={swUpdateReady}
+        onApply={() => swClientRef.current?.applyUpdate()}
+        onDismiss={() => setSwUpdateReady(false)}
+      />
+      <FrozenRecalcBanner
+        sheet={readySheet}
+        onResume={() => clientRef.current?.send({ kind: "resumeRecalc" })}
+      />
+      <DemoTip sheet={readySheet} onJump={handleJumpToV1} />
 
       <FormulaBar
         ref={formulaBarRef}
@@ -3109,10 +2497,10 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
         value={formulaBarValue}
         placeholder={
           effectiveReadOnly
-            ? "Read-only mode"
+            ? t("Read-only mode")
             : selection || editSessionRef.current
-              ? "Enter a value or =formula (Tab to autocomplete, F4 to toggle $)"
-              : "Select a cell to edit"
+              ? t("Enter a value or =formula (Tab to autocomplete, F4 to toggle $)")
+              : t("Select a cell to edit")
         }
         disabled={
           effectiveReadOnly ||
@@ -3140,19 +2528,10 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
         onAcceptCompletion={handleAcceptCompletion}
       />
 
-      {draftPreview && (
-        <div className="history-preview-banner" data-testid="ai-draft-banner" role="status">
-          <span>Viewing AI Draft · Main untouched</span>
-          <button
-            type="button"
-            className="toolbar-btn primary-btn"
-            data-testid="ai-banner-exit-btn"
-            onClick={() => clientRef.current?.sendHost({ kind: "draftExit" })}
-          >
-            Back to Main
-          </button>
-        </div>
-      )}
+      <AiDraftBanner
+        active={draftPreview}
+        onExit={() => clientRef.current?.sendHost({ kind: "draftExit" })}
+      />
 
       {aiOpen && (
         <Suspense fallback={null}>
@@ -3184,7 +2563,7 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
             onExitDraft={() => clientRef.current?.sendHost({ kind: "draftExit" })}
             onSetAiPresence={(p) =>
               gridRef.current?.setRemotePresences(
-                p ? [...collabPresencesRef.current, p] : collabPresencesRef.current,
+                withPersonTexts([...collabPresencesRef.current, ...(p ? [p] : [])]),
               )
             }
             onSetDiffHighlights={(m) => gridRef.current?.setDiffHighlights(m)}
@@ -3200,498 +2579,86 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
         </Suspense>
       )}
 
-      {historyPreviewSeq !== null && (
-        <div className="history-preview-banner" data-testid="history-preview-banner" role="status">
-          <span>Previewing history #{historyPreviewSeq} (read-only)</span>
-          <button
-            type="button"
-            className="toolbar-btn primary-btn"
-            data-testid="history-banner-return-live-btn"
-            onClick={() => clientRef.current?.sendHost({ kind: "historyExit" })}
-          >
-            Return to Live
-          </button>
-        </div>
-      )}
-
-      {rejectedReason && (
-        <div className="rejected-banner" role="alert" data-testid="rejected-banner">
-          <span>{rejectedReason}</span>
-          <button
-            type="button"
-            className="tip-close"
-            aria-label="Dismiss error"
-            onClick={() => setRejectedReason(null)}
-          >
-            ×
-          </button>
-        </div>
-      )}
+      <HistoryPreviewBanner
+        seq={historyPreviewSeq}
+        onReturn={() => clientRef.current?.sendHost({ kind: "historyExit" })}
+      />
+      <RejectedBanner reason={rejectedReason} onDismiss={() => setRejectedReason(null)} />
 
       <div className="sheet">
         <div ref={hostRef} className="grid" data-testid="grid" />
         {lockOverlay && (
-          <div className="lock-overlay" role="dialog" aria-modal="true" data-testid="lock-overlay">
-            <div className="lock-card">
-              <h2>
-                {lockOverlay.kind === "blocked"
-                  ? "This local workbook is open in another tab"
-                  : lockOverlay.kind === "takingOver"
-                    ? "Moving workbook to this tab…"
-                    : "Workbook moved to another tab"}
-              </h2>
-              <p data-testid="lock-overlay-message">
-                {lockOverlay.kind === "blocked"
-                  ? `“${lockOverlay.title}” is exclusively locked by another browser tab to keep its OPFS edit log consistent.`
-                  : lockOverlay.kind === "takingOver"
-                    ? lockOverlay.waitingForFile
-                      ? "Waiting for the other tab to release the file — if the other tab is unresponsive, please close it."
-                      : "Asking the other tab to flush and release the workbook…"
-                    : lockOverlay.evicted
-                      ? "Another tab took over this workbook because this tab did not release it in time."
-                      : "This tab flushed its changes and handed the workbook over to another tab."}
-              </p>
-              {lockOverlay.kind !== "takingOver" && (
-                <div className="lock-actions">
-                  <button
-                    type="button"
-                    className="toolbar-btn primary-btn"
-                    data-testid="take-over-btn"
-                    onClick={() => handleTakeOver(lockOverlay.docId)}
-                  >
-                    Open here (Take over)
-                  </button>
-                  <button
-                    type="button"
-                    className="toolbar-btn"
-                    data-testid="new-workbook-from-lock-btn"
-                    onClick={() => handleCreateNewWorkbook("Untitled workbook", "empty")}
-                  >
-                    New local workbook
-                  </button>
-                </div>
-              )}
-            </div>
-          </div>
+          <LockOverlay
+            lock={lockOverlay}
+            onTakeOver={handleTakeOver}
+            onNewWorkbook={() => handleCreateNewWorkbook("Untitled workbook", "empty")}
+          />
         )}
         {engine.status === "failed" && (
           <div className="failure" role="alert">
-            <p>The engine has stopped. Reload the page to start again.</p>
+            <p>{t("The engine has stopped. Reload the page to start again.")}</p>
             <p className="detail" data-testid="engine-error">
-              {engine.message}
+              {translateEngineText(engine.message)}
             </p>
           </div>
         )}
       </div>
 
       {readySheet && (
-        <div className="sheetbar" role="tablist" aria-label="Worksheets" data-testid="sheet-tabs">
-          {readySheet.sheets.map((tab) => {
-            const isActive = tab.id === readySheet.sheet;
-            const isRenaming = renamingSheet?.id === tab.id;
-            if (isRenaming) {
-              return (
-                <input
-                  key={tab.id}
-                  type="text"
-                  className="sheet-rename-input"
-                  data-testid="rename-sheet-input"
-                  value={renamingSheet.draft}
-                  maxLength={31}
-                  // biome-ignore lint/a11y/noAutofocus: inline tab rename requires immediate focus
-                  autoFocus
-                  onChange={(e) => setRenamingSheet({ id: tab.id, draft: e.target.value })}
-                  onBlur={() => {
-                    const trimmed = renamingSheet.draft.trim();
-                    setRenamingSheet(null);
-                    if (trimmed && trimmed !== tab.name) {
-                      notePersistenceMutation();
-                      pendingActionVerbRef.current = "renamed sheet";
-                      clientRef.current?.send({
-                        kind: "renameSheet",
-                        sheet: tab.id,
-                        name: trimmed,
-                      });
-                    }
-                  }}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter") {
-                      e.preventDefault();
-                      const trimmed = renamingSheet.draft.trim();
-                      setRenamingSheet(null);
-                      if (trimmed && trimmed !== tab.name) {
-                        notePersistenceMutation();
-                        pendingActionVerbRef.current = "renamed sheet";
-                        clientRef.current?.send({
-                          kind: "renameSheet",
-                          sheet: tab.id,
-                          name: trimmed,
-                        });
-                      }
-                      editorRef.current?.focus();
-                    } else if (e.key === "Escape") {
-                      e.preventDefault();
-                      setRenamingSheet(null);
-                      editorRef.current?.focus();
-                    }
-                  }}
-                />
-              );
-            }
-            return (
-              <button
-                key={tab.id}
-                type="button"
-                role="tab"
-                aria-selected={isActive}
-                className={isActive ? "sheet-tab active" : "sheet-tab"}
-                data-testid={`sheet-tab-${tab.id}`}
-                onClick={() => handleSwitchSheet(tab.id)}
-                onDoubleClick={() => {
-                  if (!effectiveReadOnly) {
-                    setRenamingSheet({ id: tab.id, draft: tab.name });
-                  }
-                }}
-                onContextMenu={(e) => {
-                  e.preventDefault();
-                  setColorPopover(null);
-                  setContextMenu({
-                    kind: "tab",
-                    clientX: e.clientX,
-                    clientY: e.clientY,
-                    tab,
-                  });
-                }}
-              >
-                {tab.name}
-              </button>
-            );
-          })}
-          <button
-            type="button"
-            className="sheet-add-btn"
-            data-testid="add-sheet-btn"
-            disabled={effectiveReadOnly}
-            title="Add worksheet"
-            aria-label="Add worksheet"
-            onClick={() => {
-              if (effectiveReadOnlyRef.current) {
-                return;
-              }
-              notePersistenceMutation();
-              pendingActionVerbRef.current = "added sheet";
-              clientRef.current?.send({
-                kind: "addSheet",
-                afterSheet: readySheet.sheet,
-              });
-              editorRef.current?.focus();
-            }}
-          >
-            +
-          </button>
-        </div>
+        <SheetTabs
+          sheet={readySheet}
+          readOnly={effectiveReadOnly}
+          renaming={renamingSheet}
+          onRenaming={setRenamingSheet}
+          onRename={handleRenameSheet}
+          onLeave={() => editorRef.current?.focus()}
+          onSwitch={handleSwitchSheet}
+          onMenu={(tab, clientX, clientY) => {
+            setColorPopover(null);
+            setContextMenu({ kind: "tab", clientX, clientY, tab });
+          }}
+          onAdd={() => handleAddSheet(readySheet.sheet)}
+        />
       )}
 
-      <footer className="statusbar">
-        <span data-testid="engine-status">
-          {lockOverlay
+      <StatusBar
+        status={
+          lockOverlay
             ? lockOverlay.kind
             : modalMode?.kind === "safeMode"
               ? "safeMode"
-              : engine.status}
-        </span>
-        {engine.status === "starting" && !lockOverlay && !modalMode && (
-          <span>Opening local workbook…</span>
-        )}
-        {readySheet && engine.status === "ready" && (
-          <>
-            {(selection ?? stats?.selection) && (
-              <span data-testid="selection">
-                {(selection ?? stats?.selection)?.name}
-                {(selection ?? stats?.selection)?.text
-                  ? ` · ${(selection ?? stats?.selection)?.text}`
-                  : ""}
-              </span>
-            )}
-            {recalcMessage && (
-              <span className="recalc-pill" data-testid="recalc-status">
-                {recalcMessage}
-              </span>
-            )}
-            <span className="spacer" />
-            {readySheet.seed !== 0 && (
-              <span title="The sample is computed from this seed, not downloaded">
-                seed {readySheet.seed}
-              </span>
-            )}
-            <span data-testid="generation" title="Time the engine took to generate or open">
-              generated in {milliseconds.format(readySheet.generationMs)} ms
-            </span>
-            {stats && stats.frameWork.samples > 0 && (
-              <span
-                data-testid="frame-work"
-                title="Main-thread work per frame: input, receiving pages and issuing draw calls"
-              >
-                frame {milliseconds.format(stats.frameWork.p50)} ms · p99{" "}
-                {milliseconds.format(stats.frameWork.p99)} ms
-              </span>
-            )}
-            <span data-testid="kernel-version">kernel {engine.info.kernelVersion}</span>
-          </>
-        )}
-      </footer>
+              : engine.status
+        }
+        opening={engine.status === "starting" && !lockOverlay && !modalMode}
+        sheet={readySheet}
+        selection={selection}
+        activity={activity}
+        stats={stats}
+        kernelVersion={engine.status === "ready" ? engine.info.kernelVersion : ""}
+      />
 
       {contextMenu && (
-        <div
-          className="context-menu"
-          role="menu"
-          data-testid="context-menu"
-          style={{
-            left: `${Math.min(window.innerWidth - 208, Math.max(8, contextMenu.kind === "grid" ? contextMenu.target.clientX : contextMenu.clientX))}px`,
-            top: `${Math.min(window.innerHeight - 260, Math.max(8, contextMenu.kind === "grid" ? contextMenu.target.clientY : contextMenu.clientY))}px`,
+        <ContextMenu
+          menu={contextMenu}
+          sheet={readySheet}
+          readOnly={effectiveReadOnly}
+          canDeleteRows={canDeleteRows}
+          canDeleteCols={canDeleteCols}
+          onClose={() => setContextMenu(null)}
+          onClipboard={(action) => void handleContextClipboard(action)}
+          onClearContents={handleClearContents}
+          onInsertRow={handleInsertRow}
+          onDeleteRows={handleDeleteSelectedRows}
+          onInsertCol={handleInsertCol}
+          onDeleteCols={handleDeleteSelectedCols}
+          onRenameSheet={(tab) => {
+            if (!effectiveReadOnlyRef.current) {
+              setRenamingSheet({ id: tab.id, draft: tab.name });
+            }
           }}
-        >
-          {contextMenu.kind === "grid" ? (
-            <>
-              <button
-                type="button"
-                role="menuitem"
-                className="ctx-item"
-                data-testid="ctx-cut"
-                disabled={effectiveReadOnly}
-                onClick={() => void handleContextClipboard("cut")}
-              >
-                Cut <kbd>Ctrl+X</kbd>
-              </button>
-              <button
-                type="button"
-                role="menuitem"
-                className="ctx-item"
-                data-testid="ctx-copy"
-                onClick={() => void handleContextClipboard("copy")}
-              >
-                Copy <kbd>Ctrl+C</kbd>
-              </button>
-              <button
-                type="button"
-                role="menuitem"
-                className="ctx-item"
-                data-testid="ctx-paste"
-                disabled={effectiveReadOnly}
-                onClick={() => void handleContextClipboard("paste")}
-              >
-                Paste <kbd>Ctrl+V</kbd>
-              </button>
-              <button
-                type="button"
-                role="menuitem"
-                className="ctx-item"
-                data-testid="ctx-clear"
-                disabled={effectiveReadOnly}
-                onClick={() => {
-                  setContextMenu(null);
-                  const runs = gridRef.current?.selectedCellRuns();
-                  if (runs && !effectiveReadOnlyRef.current) {
-                    notePersistenceMutation();
-                    pendingActionVerbRef.current = "cleared cells";
-                    clientRef.current?.send({
-                      kind: "clearCells",
-                      sheet: activeSheetRef.current,
-                      rows: runs.rows,
-                      cols: runs.cols,
-                    });
-                  }
-                  editorRef.current?.focus();
-                }}
-              >
-                Clear Contents <kbd>Del</kbd>
-              </button>
-              <div className="ctx-sep" />
-              <button
-                type="button"
-                role="menuitem"
-                className="ctx-item"
-                data-testid="ctx-insert-row-above"
-                disabled={effectiveReadOnly}
-                onClick={() => {
-                  setContextMenu(null);
-                  handleInsertRow(false);
-                }}
-              >
-                Insert Row Above
-              </button>
-              <button
-                type="button"
-                role="menuitem"
-                className="ctx-item"
-                data-testid="ctx-insert-row-below"
-                disabled={effectiveReadOnly}
-                onClick={() => {
-                  setContextMenu(null);
-                  handleInsertRow(true);
-                }}
-              >
-                Insert Row Below
-              </button>
-              <button
-                type="button"
-                role="menuitem"
-                className="ctx-item"
-                data-testid="ctx-delete-rows"
-                disabled={!canDeleteRows}
-                onClick={() => {
-                  setContextMenu(null);
-                  handleDeleteSelectedRows();
-                }}
-              >
-                Delete Selected Rows
-              </button>
-              <div className="ctx-sep" />
-              <button
-                type="button"
-                role="menuitem"
-                className="ctx-item"
-                data-testid="ctx-insert-col-left"
-                disabled={effectiveReadOnly}
-                onClick={() => {
-                  setContextMenu(null);
-                  handleInsertCol(false);
-                }}
-              >
-                Insert Column Left
-              </button>
-              <button
-                type="button"
-                role="menuitem"
-                className="ctx-item"
-                data-testid="ctx-insert-col-right"
-                disabled={effectiveReadOnly}
-                onClick={() => {
-                  setContextMenu(null);
-                  handleInsertCol(true);
-                }}
-              >
-                Insert Column Right
-              </button>
-              <button
-                type="button"
-                role="menuitem"
-                className="ctx-item"
-                data-testid="ctx-delete-cols"
-                disabled={!canDeleteCols}
-                onClick={() => {
-                  setContextMenu(null);
-                  handleDeleteSelectedCols();
-                }}
-              >
-                Delete Selected Columns
-              </button>
-            </>
-          ) : (
-            <>
-              <button
-                type="button"
-                role="menuitem"
-                className="ctx-item"
-                data-testid="ctx-rename-sheet"
-                disabled={effectiveReadOnly}
-                onClick={() => {
-                  const { tab } = contextMenu;
-                  setContextMenu(null);
-                  if (!effectiveReadOnlyRef.current) {
-                    setRenamingSheet({ id: tab.id, draft: tab.name });
-                  }
-                }}
-              >
-                Rename Sheet…
-              </button>
-              {readySheet &&
-                (() => {
-                  const idx = readySheet.sheets.findIndex((s) => s.id === contextMenu.tab.id);
-                  const canLeft = !effectiveReadOnly && idx > 0;
-                  const canRight =
-                    !effectiveReadOnly && idx >= 0 && idx < readySheet.sheets.length - 1;
-                  return (
-                    <>
-                      <button
-                        type="button"
-                        role="menuitem"
-                        className="ctx-item"
-                        data-testid="ctx-move-sheet-left"
-                        disabled={!canLeft}
-                        onClick={() => {
-                          const targetTab = contextMenu.tab;
-                          setContextMenu(null);
-                          if (effectiveReadOnlyRef.current) {
-                            return;
-                          }
-                          const afterSheet = idx >= 2 ? readySheet.sheets[idx - 2]?.id : undefined;
-                          notePersistenceMutation();
-                          pendingActionVerbRef.current = "reordered sheets";
-                          clientRef.current?.send({
-                            kind: "moveSheet",
-                            sheet: targetTab.id,
-                            afterSheet,
-                          });
-                        }}
-                      >
-                        Move Left
-                      </button>
-                      <button
-                        type="button"
-                        role="menuitem"
-                        className="ctx-item"
-                        data-testid="ctx-move-sheet-right"
-                        disabled={!canRight}
-                        onClick={() => {
-                          const targetTab = contextMenu.tab;
-                          setContextMenu(null);
-                          if (effectiveReadOnlyRef.current) {
-                            return;
-                          }
-                          const nextTab = readySheet.sheets[idx + 1];
-                          if (nextTab) {
-                            notePersistenceMutation();
-                            pendingActionVerbRef.current = "reordered sheets";
-                            clientRef.current?.send({
-                              kind: "moveSheet",
-                              sheet: targetTab.id,
-                              afterSheet: nextTab.id,
-                            });
-                          }
-                        }}
-                      >
-                        Move Right
-                      </button>
-                      <div className="ctx-sep" />
-                      <button
-                        type="button"
-                        role="menuitem"
-                        className="ctx-item danger"
-                        data-testid="ctx-delete-sheet"
-                        disabled={effectiveReadOnly || readySheet.sheets.length <= 1}
-                        onClick={() => {
-                          const targetTab = contextMenu.tab;
-                          setContextMenu(null);
-                          if (effectiveReadOnlyRef.current) {
-                            return;
-                          }
-                          notePersistenceMutation();
-                          pendingActionVerbRef.current = "deleted sheet";
-                          clientRef.current?.send({
-                            kind: "deleteSheet",
-                            sheet: targetTab.id,
-                          });
-                        }}
-                      >
-                        Delete Sheet
-                      </button>
-                    </>
-                  );
-                })()}
-            </>
-          )}
-        </div>
+          onMoveSheet={handleMoveSheet}
+          onDeleteSheet={handleDeleteSheet}
+        />
       )}
 
       {modalMode && (

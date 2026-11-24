@@ -71,7 +71,7 @@ test.describe("M2b sync simulator (/sim) and lazy WASM split", () => {
     await expect(page.getByTestId("sim-convergence-badge")).toHaveText("All Replicas Converged");
   });
 
-  test("5-replica deterministic auto-run verifies all 10 protocol invariants for seed 42", async ({
+  test("5-replica deterministic auto-run verifies all 11 protocol invariants for seed 42", async ({
     page,
   }) => {
     test.setTimeout(45_000);
@@ -82,12 +82,12 @@ test.describe("M2b sync simulator (/sim) and lazy WASM split", () => {
     await page.getByTestId("sim-seed-input").fill("42");
     await page.getByTestId("sim-autorun-btn").click();
 
-    await expect(page.getByTestId("sim-autorun-status")).toHaveText("10 Invariants Verified", {
+    await expect(page.getByTestId("sim-autorun-status")).toHaveText("11 Invariants Verified", {
       timeout: 30_000,
     });
     const invariantItems = page.locator('[data-testid="sim-invariants-list"] > li');
-    await expect(invariantItems).toHaveCount(10);
-    for (let i = 0; i < 10; i += 1) {
+    await expect(invariantItems).toHaveCount(11);
+    for (let i = 0; i < 11; i += 1) {
       await expect(invariantItems.nth(i)).toContainText("Verified");
     }
   });

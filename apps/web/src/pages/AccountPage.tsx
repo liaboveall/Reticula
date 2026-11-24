@@ -9,11 +9,33 @@ import {
   logout,
 } from "@reticula/protocol/collab-api";
 import { useCallback, useEffect, useState } from "react";
-import { apiErrorMessage, formatBytes } from "./helpers.ts";
+import { fmtBytes, fmtInt, t } from "../i18n/index.ts";
+import { tx } from "../i18n/react.ts";
+import { apiErrorMessage } from "./helpers.ts";
+import { LanguageSwitch } from "./LanguageSwitch.tsx";
+import { PageNav } from "./PageNav.tsx";
+import "../collab/collab.css";
 import "./pages.css";
 
 export interface AccountPageProps {
   readonly onNavigate: (path: string) => void;
+}
+
+/** Kept as it happened, for the language may be switched while it is shown. */
+interface Failure {
+  readonly cause: unknown;
+  readonly what: "load" | "signIn" | "delete";
+}
+
+function failureText({ cause, what }: Failure): string {
+  switch (what) {
+    case "load":
+      return apiErrorMessage(cause, t("Could not load account summary"));
+    case "signIn":
+      return apiErrorMessage(cause, t("Sign-in failed"));
+    case "delete":
+      return apiErrorMessage(cause, t("Could not delete account"));
+  }
 }
 
 export default function AccountPage({ onNavigate }: AccountPageProps) {
@@ -21,7 +43,7 @@ export default function AccountPage({ onNavigate }: AccountPageProps) {
   const [loading, setLoading] = useState(true);
   const [confirmText, setConfirmText] = useState("");
   const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<Failure | null>(null);
 
   const loadAccount = useCallback(async () => {
     setLoading(true);
@@ -32,7 +54,7 @@ export default function AccountPage({ onNavigate }: AccountPageProps) {
       if (err instanceof ApiError && err.status === 401) {
         setSummary(null);
       } else {
-        setError(apiErrorMessage(err, "Could not load account summary"));
+        setError({ cause: err, what: "load" });
       }
     } finally {
       setLoading(false);
@@ -50,7 +72,7 @@ export default function AccountPage({ onNavigate }: AccountPageProps) {
       await devLogin({ account: acct });
       await loadAccount();
     } catch (err) {
-      setError(apiErrorMessage(err, "Sign-in failed"));
+      setError({ cause: err, what: "signIn" });
     } finally {
       setBusy(false);
     }
@@ -87,7 +109,7 @@ export default function AccountPage({ onNavigate }: AccountPageProps) {
       }
       onNavigate("/");
     } catch (err) {
-      setError(apiErrorMessage(err, "Could not delete account"));
+      setError({ cause: err, what: "delete" });
     } finally {
       setBusy(false);
     }
@@ -100,65 +122,30 @@ export default function AccountPage({ onNavigate }: AccountPageProps) {
 
   return (
     <div className="page-shell" data-testid="account-page">
-      <nav className="page-nav">
-        <a
-          href="/"
-          className="page-brand"
-          onClick={(e) => {
-            e.preventDefault();
-            onNavigate("/");
-          }}
-        >
-          Reticula
-        </a>
-        <div className="page-nav-links">
-          <a
-            href="/workbooks"
-            className="toolbar-btn"
-            onClick={(e) => {
-              e.preventDefault();
-              onNavigate("/workbooks");
-            }}
-          >
-            Workbooks
-          </a>
-          <a
-            href="/app"
-            className="toolbar-btn"
-            onClick={(e) => {
-              e.preventDefault();
-              onNavigate("/app");
-            }}
-          >
-            Editor
-          </a>
-          <a
-            href="/privacy"
-            className="toolbar-btn"
-            onClick={(e) => {
-              e.preventDefault();
-              onNavigate("/privacy");
-            }}
-          >
-            Privacy
-          </a>
-        </div>
-      </nav>
+      <PageNav
+        onNavigate={onNavigate}
+        links={[
+          ["/workbooks", t("Workbooks")],
+          ["/app", t("Editor")],
+          ["/privacy", t("Privacy")],
+        ]}
+      />
 
       <main className="page-main">
         <div className="page-card">
-          <h1>Account &amp; Storage</h1>
+          <h1>{t("Account & Storage")}</h1>
+          <LanguageSwitch />
           {error && (
             <div className="collab-error" role="alert">
-              {error}
+              {failureText(error)}
             </div>
           )}
           {loading ? (
-            <p className="page-muted">Loading account…</p>
+            <p className="page-muted">{t("Loading account…")}</p>
           ) : !summary ? (
             <div className="collab-section">
               <p className="page-muted">
-                Not signed in. Sign in to view cloud storage usage or manage data.
+                {t("Not signed in. Sign in to view cloud storage usage or manage data.")}
               </p>
               <div className="collab-row">
                 {(["alice", "bob", "carol"] as const).map((acct) => (
@@ -169,11 +156,11 @@ export default function AccountPage({ onNavigate }: AccountPageProps) {
                     disabled={busy}
                     onClick={() => void handleDevSignIn(acct)}
                   >
-                    Dev: {acct}
+                    {t("Dev: {account}", { account: acct })}
                   </button>
                 ))}
                 <a className="toolbar-btn primary-btn" href={githubLoginUrl("/account")}>
-                  Sign in with GitHub
+                  {t("Sign in with GitHub")}
                 </a>
               </div>
             </div>
@@ -183,8 +170,10 @@ export default function AccountPage({ onNavigate }: AccountPageProps) {
                 <div>
                   <strong>{summary.user.name}</strong>
                   <div className="page-muted">
-                    Owned workbooks: {summary.ownedWorkbooks} · Shared workbooks:{" "}
-                    {summary.sharedWorkbooks}
+                    {t("Owned workbooks: {owned} · Shared workbooks: {shared}", {
+                      owned: summary.ownedWorkbooks,
+                      shared: summary.sharedWorkbooks,
+                    })}
                   </div>
                 </div>
                 <button
@@ -193,56 +182,68 @@ export default function AccountPage({ onNavigate }: AccountPageProps) {
                   disabled={busy}
                   onClick={() => void handleLogout()}
                 >
-                  Sign Out
+                  {t("Sign Out")}
                 </button>
               </div>
 
               <div className="collab-section">
-                <p className="collab-section-title">Cloud Storage Usage</p>
+                <p className="collab-section-title">{t("Cloud Storage Usage")}</p>
                 <div className="page-quota-bar">
                   <div className="page-quota-fill" style={{ width: `${pct}%` }} />
                 </div>
                 <span className="page-muted" data-testid="account-storage-usage">
-                  {formatBytes(summary.storageBytes)} used of {formatBytes(summary.quotaBytes)} (
-                  {pct}%)
+                  {t("{used} used of {quota} ({percent}%)", {
+                    used: fmtBytes(summary.storageBytes),
+                    quota: fmtBytes(summary.quotaBytes),
+                    percent: pct,
+                  })}
                 </span>
                 {summary.diskOverHardLimit && (
                   <div className="collab-error" role="alert">
-                    Server disk volume is full; creating or importing new cloud workbooks is paused.
+                    {t(
+                      "Server disk volume is full; creating or importing new cloud workbooks is paused.",
+                    )}
                   </div>
                 )}
                 {!summary.diskOverHardLimit && summary.diskOverSoftLimit && (
                   <p className="page-muted">
-                    Server storage volume is above the 80% warning threshold.
+                    {t("Server storage volume is above the 80% warning threshold.")}
                   </p>
                 )}
               </div>
 
               <div className="collab-section" data-testid="account-ai-quota">
-                <p className="collab-section-title">Daily AI Analyst Quota</p>
+                <p className="collab-section-title">{t("Daily AI Analyst Quota")}</p>
                 <span className="page-muted">
-                  Status:{" "}
-                  {summary.aiEnabled ? "Enabled" : "Demo replays only (cloud LLM not configured)"} ·{" "}
-                  Runs today: {summary.aiRunsToday} / {summary.aiRunLimitDaily} · Tokens today:{" "}
-                  {summary.aiTokensUsedToday.toLocaleString()} /{" "}
-                  {summary.aiTokenLimitDaily.toLocaleString()}
+                  {t(
+                    "Status: {status} · Runs today: {runs} / {runLimit} · Tokens today: {tokens} / {tokenLimit}",
+                    {
+                      status: summary.aiEnabled
+                        ? t("Enabled")
+                        : t("Demo replays only (cloud LLM not configured)"),
+                      runs: summary.aiRunsToday,
+                      runLimit: summary.aiRunLimitDaily,
+                      tokens: fmtInt(summary.aiTokensUsedToday),
+                      tokenLimit: fmtInt(summary.aiTokenLimitDaily),
+                    },
+                  )}
                 </span>
               </div>
 
               <div className="page-card page-danger">
-                <h2>Delete Account</h2>
+                <h2>{t("Delete Account")}</h2>
                 <p className="page-muted">
-                  Permanently deletes your user profile, sessions, GitHub link, and all cloud
-                  workbooks you own (including snapshots). Contributions you made inside workbooks
-                  owned by others remain intact under &ldquo;Deleted user&rdquo; so collaborator
-                  history stays valid. Type <code>DELETE</code> below to confirm.
+                  {tx(
+                    "Permanently deletes your user profile, sessions, GitHub link, and all cloud workbooks you own (including snapshots). Contributions you made inside workbooks owned by others remain intact under “Deleted user” so collaborator history stays valid. Type <0>DELETE</0> below to confirm.",
+                    { 0: <code /> },
+                  )}
                 </p>
                 <div className="collab-row">
                   <input
                     type="text"
                     className="collab-input"
                     data-testid="delete-account-confirm-input"
-                    placeholder='Type "DELETE"'
+                    placeholder={t('Type "DELETE"')}
                     value={confirmText}
                     onChange={(e) => setConfirmText(e.target.value)}
                   />
@@ -253,7 +254,7 @@ export default function AccountPage({ onNavigate }: AccountPageProps) {
                     disabled={busy || confirmText.trim() !== "DELETE"}
                     onClick={() => void handleDeleteAccount()}
                   >
-                    Permanently Delete Account
+                    {t("Permanently Delete Account")}
                   </button>
                 </div>
               </div>

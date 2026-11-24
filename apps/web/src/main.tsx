@@ -2,6 +2,7 @@ import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import { App } from "./App.tsx";
 import { LoadProblem } from "./ErrorBoundary.tsx";
+import { initLocale } from "./i18n/index.ts";
 import { normalizeAppRoute } from "./routes.ts";
 import { loadPage } from "./routes-load.ts";
 import { startRecovery } from "./routes-recovery.ts";
@@ -15,13 +16,14 @@ if (!container) {
 const root = createRoot(container);
 const recovery = startRecovery(import.meta.url);
 
-// The first page is loaded before React renders anything. Rendering first and
-// suspending would cost the shell up to 300 ms: React holds a retried commit
-// back that long. Awaiting it here at the top level is not an option either,
-// because the pages' chunks import this one.
+// The first page is loaded before React renders anything, and so are its texts
+// unless they are in English. Rendering first and suspending would cost the
+// shell up to 300 ms: React holds a retried commit back that long. Awaiting it
+// here at the top level is not an option either, because the pages' chunks
+// import this one.
 const route = normalizeAppRoute(window.location.pathname);
-loadPage(route).then(
-  (Page) =>
+Promise.all([loadPage(route), initLocale(route)]).then(
+  ([Page]) =>
     root.render(
       <StrictMode>
         <App first={{ route, Page }} recovery={recovery} />

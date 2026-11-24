@@ -1,6 +1,9 @@
 import { useEffect, useRef, useState } from "react";
 import type { SafeModeInfo } from "./engine/client.ts";
 import { readRawDocFilesFromOpfs, type WorkbookCatalogEntry } from "./engine/storage.ts";
+import { translateEngineText } from "./i18n/engine-text.ts";
+import { fmtDateTime, fmtInt, t } from "./i18n/index.ts";
+import { tx } from "./i18n/react.ts";
 
 const MAX_CSV_RAW_BYTES = 256 * 1024 * 1024;
 
@@ -183,7 +186,8 @@ export default function LocalModals({
   const backdropRef = useRef<HTMLDivElement>(null);
   const [editingDoc, setEditingDoc] = useState<{ id: string; draft: string } | null>(null);
   const [skipCountOverride, setSkipCountOverride] = useState<number | null>(null);
-  const [rawExportMessage, setRawExportMessage] = useState<string | null>(null);
+  /** How many raw files were downloaded, or `null` while nobody has asked for them. */
+  const [rawFileCount, setRawFileCount] = useState<number | null>(null);
 
   useEffect(() => {
     if (mode.kind !== "workbooks") {
@@ -225,20 +229,21 @@ export default function LocalModals({
           data-testid="safe-mode-modal"
         >
           <div className="modal-header">
-            <h2 id="safe-mode-heading">Safe Mode — {info.title}</h2>
+            <h2 id="safe-mode-heading">{t("Safe Mode — {title}", { title: info.title })}</h2>
           </div>
 
           <p className="safe-detail" data-testid="safe-mode-detail">
-            {info.detail}
+            {translateEngineText(info.detail)}
           </p>
 
           <div className="safe-actions">
             <section className="safe-option">
               <div>
-                <strong>1. Open without recalculation</strong>
+                <strong>{t("1. Open without recalculation")}</strong>
                 <p>
-                  Loads the workbook with automatic formula evaluation paused so you can inspect or
-                  fix heavy/problematic formulas or export CSV.
+                  {t(
+                    "Loads the workbook with automatic formula evaluation paused so you can inspect or fix heavy/problematic formulas or export CSV.",
+                  )}
                 </p>
               </div>
               <button
@@ -247,28 +252,30 @@ export default function LocalModals({
                 data-testid="safe-open-frozen"
                 onClick={() => onSafeModeOpenFrozen(info.docId)}
               >
-                Open Paused
+                {t("Open Paused")}
               </button>
             </section>
 
             <section className="safe-option">
               <div>
                 <strong>
-                  2.{" "}
                   {info.salvageableMid
-                    ? "Recover intact prefix & skip tail transactions"
-                    : "Skip recent tail transactions"}
+                    ? t("2. Recover intact prefix & skip tail transactions")
+                    : t("2. Skip recent tail transactions")}
                 </strong>
                 <p>
                   {maxSkip > 0
-                    ? `Discard the last ${effectiveSkip} transaction(s) from the edit log and save a clean snapshot.`
+                    ? t(
+                        "Discard the last {n} transaction(s) from the edit log and save a clean snapshot.",
+                        { n: effectiveSkip },
+                      )
                     : info.salvageableMid
-                      ? "Salvage verified transactions before the corrupted log record."
-                      : "No tail edit-log transactions are available to skip on this workbook."}
+                      ? t("Salvage verified transactions before the corrupted log record.")
+                      : t("No tail edit-log transactions are available to skip on this workbook.")}
                 </p>
                 {maxSkip > 0 && (
                   <div className="safe-skip-controls">
-                    <label htmlFor="safe-skip-input">Transactions to skip:</label>
+                    <label htmlFor="safe-skip-input">{t("Transactions to skip:")}</label>
                     <input
                       id="safe-skip-input"
                       type="number"
@@ -278,14 +285,16 @@ export default function LocalModals({
                       data-testid="safe-skip-count"
                       onChange={(e) => setSkipCountOverride(Number(e.target.value) || 0)}
                     />
-                    <span className="safe-muted">of {maxSkip} recent record(s)</span>
+                    <span className="safe-muted">
+                      {t("of {max} recent record(s)", { max: maxSkip })}
+                    </span>
                   </div>
                 )}
                 {info.tailTxns.length > 0 && (
                   <ul className="safe-txn-list" data-testid="safe-txn-list">
                     {info.tailTxns.slice(-6).map((txn) => (
                       <li key={txn.seq}>
-                        <code>#{txn.seq}</code> <span>{txn.label}</span>
+                        <code>#{txn.seq}</code> <span>{translateEngineText(txn.label)}</span>
                       </li>
                     ))}
                   </ul>
@@ -298,20 +307,23 @@ export default function LocalModals({
                 disabled={maxSkip === 0 && !info.salvageableMid}
                 onClick={() => onSafeModeSkipTail(info.docId, effectiveSkip, info.salvageableMid)}
               >
-                Recover &amp; Open
+                {t("Recover & Open")}
               </button>
             </section>
 
             <section className="safe-option">
               <div>
-                <strong>3. Export raw snapshot &amp; edit log</strong>
+                <strong>{t("3. Export raw snapshot & edit log")}</strong>
                 <p>
-                  Reads the raw OPFS files directly via browser file handles without running the
-                  WebAssembly decoder, downloading them to your disk.
+                  {t(
+                    "Reads the raw OPFS files directly via browser file handles without running the WebAssembly decoder, downloading them to your disk.",
+                  )}
                 </p>
-                {rawExportMessage && (
+                {rawFileCount !== null && (
                   <p className="safe-export-note" data-testid="safe-export-note">
-                    {rawExportMessage}
+                    {rawFileCount === 0
+                      ? t("No raw OPFS files were found for this workbook.")
+                      : t("Downloaded {n} raw file(s) as .zip.", { n: rawFileCount })}
                   </p>
                 )}
               </div>
@@ -321,16 +333,13 @@ export default function LocalModals({
                 data-testid="safe-export-raw"
                 onClick={async () => {
                   const files = await readRawDocFilesFromOpfs(info.docId);
-                  if (files.length === 0) {
-                    setRawExportMessage("No raw OPFS files were found for this workbook.");
-                    return;
+                  if (files.length > 0) {
+                    triggerBrowserDownload(`${info.docId}-raw-backup.zip`, packStoreZip(files));
                   }
-                  const zipBytes = packStoreZip(files);
-                  triggerBrowserDownload(`${info.docId}-raw-backup.zip`, zipBytes);
-                  setRawExportMessage(`Downloaded ${files.length} raw file(s) as .zip.`);
+                  setRawFileCount(files.length);
                 }}
               >
-                Export Raw Files
+                {t("Export Raw Files")}
               </button>
             </section>
           </div>
@@ -342,7 +351,7 @@ export default function LocalModals({
               data-testid="safe-new-blank"
               onClick={() => onCreateDoc("Untitled workbook", "empty")}
             >
-              Open New Blank Workbook Instead
+              {t("Open New Blank Workbook Instead")}
             </button>
           </div>
         </div>
@@ -364,13 +373,19 @@ export default function LocalModals({
         const buf = await file.arrayBuffer();
         const result = await importXlsxBytes(new Uint8Array(buf));
         if (result.report.unsupported.length > 0 || result.report.preservedFormulaCount > 0) {
-          const items = result.report.unsupported.map((u) => u.detail);
+          const items = result.report.unsupported.map((u) => translateEngineText(u.detail));
           if (result.report.preservedFormulaCount > 0) {
             items.push(
-              `${result.report.preservedFormulaCount} external/unknown formula(s) preserved with cached values`,
+              t("{n} external/unknown formula(s) preserved with cached values", {
+                n: result.report.preservedFormulaCount,
+              }),
             );
           }
-          onImportNotice?.(`Imported with Excel compatibility notes: ${items.join("; ")}`);
+          onImportNotice?.(
+            t("Imported with Excel compatibility notes: {notes}", {
+              notes: items.join(t("; |separator")),
+            }),
+          );
         }
         onImportRtcl(baseTitle, result.snapshot);
       } catch (err) {
@@ -380,7 +395,9 @@ export default function LocalModals({
     }
     if (file.size > MAX_CSV_RAW_BYTES) {
       onImportRejected(
-        `CSV file (${formatBytes(file.size)}) exceeds the 256 MiB local workbook limit.`,
+        t("CSV file ({size}) exceeds the 256 MiB local workbook limit.", {
+          size: formatBytes(file.size),
+        }),
       );
       return;
     }
@@ -398,15 +415,18 @@ export default function LocalModals({
         data-testid="workbooks-drawer"
       >
         <div className="modal-header">
-          <h2 id="workbooks-heading">Local Workbooks</h2>
-          <button type="button" className="tip-close" aria-label="Close" onClick={onClose}>
+          <h2 id="workbooks-heading">{t("Local Workbooks")}</h2>
+          <button type="button" className="tip-close" aria-label={t("Close")} onClick={onClose}>
             ×
           </button>
         </div>
 
         <p className="drawer-storage-note">
-          Local browser storage only · {storageUsedMb} MB used · Export <code>.rtcl</code> to keep a
-          portable backup on disk.
+          {tx(
+            "Local browser storage only · {size} MB used · Export <0>.rtcl</0> to keep a portable backup on disk.",
+            { 0: <code /> },
+            { size: storageUsedMb },
+          )}
         </p>
 
         <div className="drawer-toolbar">
@@ -416,7 +436,7 @@ export default function LocalModals({
             data-testid="new-blank-workbook-btn"
             onClick={() => onCreateDoc(`Workbook ${docs.length + 1}`, "empty")}
           >
-            + Blank Workbook
+            {t("+ Blank Workbook")}
           </button>
           <button
             type="button"
@@ -424,7 +444,7 @@ export default function LocalModals({
             data-testid="new-sample-workbook-btn"
             onClick={() => onCreateDoc(`Sample 1M (${docs.length + 1})`, "sample")}
           >
-            + 1M Sample
+            {t("+ 1M Sample")}
           </button>
           <button
             type="button"
@@ -432,7 +452,7 @@ export default function LocalModals({
             data-testid="import-file-btn"
             onClick={() => fileInputRef.current?.click()}
           >
-            Import .rtcl / .csv / .xlsx
+            {t("Import .rtcl / .csv / .xlsx")}
           </button>
           <input
             ref={fileInputRef}
@@ -455,7 +475,7 @@ export default function LocalModals({
             data-testid="drawer-export-rtcl"
             onClick={onExportRtcl}
           >
-            Export .rtcl
+            {t("Export .rtcl")}
           </button>
           <button
             type="button"
@@ -463,7 +483,7 @@ export default function LocalModals({
             data-testid="drawer-export-csv"
             onClick={onExportCsv}
           >
-            Export .csv
+            {t("Export .csv")}
           </button>
           <button
             type="button"
@@ -471,15 +491,17 @@ export default function LocalModals({
             data-testid="drawer-export-xlsx"
             onClick={onExportXlsx}
           >
-            Export .xlsx
+            {t("Export .xlsx")}
           </button>
         </div>
 
         {csvProgress && (
           <div className="csv-progress-box" data-testid="csv-import-progress">
             <span>
-              Importing CSV: {csvProgress.rowsParsed.toLocaleString("en-US")} rows (
-              {csvProgress.percent}%)
+              {t("Importing CSV: {rows} rows ({percent}%)", {
+                rows: fmtInt(csvProgress.rowsParsed),
+                percent: csvProgress.percent,
+              })}
             </span>
             <progress max={100} value={csvProgress.percent} />
           </div>
@@ -487,7 +509,7 @@ export default function LocalModals({
 
         <div className="drawer-list" data-testid="workbooks-list">
           {docs.length === 0 ? (
-            <p className="drawer-empty">No saved local workbooks yet.</p>
+            <p className="drawer-empty">{t("No saved local workbooks yet.")}</p>
           ) : (
             docs.map((doc) => {
               const isCurrent = doc.id === activeDocId;
@@ -534,11 +556,13 @@ export default function LocalModals({
                     >
                       <span className="drawer-doc-title">
                         {doc.title}
-                        {isCurrent && <span className="drawer-current-pill">Open</span>}
+                        {isCurrent && (
+                          <span className="drawer-current-pill">{t("Open|state")}</span>
+                        )}
                       </span>
                       <span className="drawer-doc-meta">
                         {formatBytes(doc.sizeBytes)} ·{" "}
-                        {new Date(doc.updatedAt).toLocaleTimeString([], {
+                        {fmtDateTime(doc.updatedAt, {
                           hour: "2-digit",
                           minute: "2-digit",
                         })}
@@ -548,19 +572,19 @@ export default function LocalModals({
                   <button
                     type="button"
                     className="fmt-btn"
-                    title="Rename workbook"
+                    title={t("Rename workbook")}
                     onClick={() => setEditingDoc({ id: doc.id, draft: doc.title })}
                   >
-                    Rename
+                    {t("Rename")}
                   </button>
                   <button
                     type="button"
                     className="fmt-btn"
                     data-testid={`delete-doc-${doc.id}`}
-                    title="Delete local workbook"
+                    title={t("Delete local workbook")}
                     onClick={() => onDeleteDoc(doc.id)}
                   >
-                    Delete
+                    {t("Delete")}
                   </button>
                 </div>
               );

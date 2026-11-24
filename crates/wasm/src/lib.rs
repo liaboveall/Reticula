@@ -14,6 +14,7 @@
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use reticula_core::axis::AxisError;
 use reticula_core::csv::{CsvError, CsvReader, export_sheet_delimited};
 use reticula_core::format::parse_format_code;
 use reticula_core::id::{ColId, IdRun, RowId, SheetId};
@@ -31,6 +32,7 @@ use reticula_formula::lang_service::{
     self, CompletionItem, CompletionKind, FormulaAnalysis, FormulaDiagnostic, FormulaRefHighlight,
     SignatureHelp, SyntaxTokenKind, SyntaxTokenSpan,
 };
+use reticula_formula::lexer::LexError;
 use reticula_formula::parser::ParseError;
 use reticula_wire::convert_v3::ops_from_wire_txn_v3;
 use reticula_wire::snapshot::{
@@ -1617,46 +1619,23 @@ fn inspect_wal_inner(
                 tail_txns,
             }
         }
-        Err(corr) => match corr {
-            WalCorruptionV3::InvalidHeader => WireWalInspection::Corrupted {
-                reason: String::from("WAL header magic or CRC-32 checksum is corrupted."),
-                salvageable_count: 0,
-                salvageable_tail_txns: Vec::new(),
-            },
-            WalCorruptionV3::BaseSeqMismatch { found, expected } => WireWalInspection::Corrupted {
-                reason: format!(
-                    "WAL base snapshot sequence mismatch (found {found:?}, expected {expected})."
-                ),
-                salvageable_count: 0,
-                salvageable_tail_txns: Vec::new(),
-            },
-            WalCorruptionV3::NonContiguousSeq {
-                offset,
-                expected_seq,
-                found_seq,
-            } => WireWalInspection::Corrupted {
-                reason: format!(
-                    "Non-contiguous WAL sequence at byte {offset} (expected {expected_seq}, found {found_seq})."
-                ),
-                salvageable_count: 0,
-                salvageable_tail_txns: Vec::new(),
-            },
-            WalCorruptionV3::MidFileCorruption {
-                offset,
-                last_valid_seq,
-                salvageable_records,
-            } => {
-                let count = u32::try_from(salvageable_records.len()).unwrap_or(u32::MAX);
-                let tail = summarize_tail_records(&salvageable_records, 25);
-                WireWalInspection::Corrupted {
-                    reason: format!(
-                        "Mid-file WAL corruption at byte {offset} after sequence {last_valid_seq}."
-                    ),
-                    salvageable_count: count,
-                    salvageable_tail_txns: tail,
-                }
+        Err(corr) => {
+            let reason = format_wal_corruption(&corr);
+            let salvageable: &[WireWalRecordV3] = match &corr {
+                WalCorruptionV3::MidFileCorruption {
+                    salvageable_records,
+                    ..
+                } => salvageable_records,
+                WalCorruptionV3::InvalidHeader
+                | WalCorruptionV3::BaseSeqMismatch { .. }
+                | WalCorruptionV3::NonContiguousSeq { .. } => &[],
+            };
+            WireWalInspection::Corrupted {
+                reason,
+                salvageable_count: u32::try_from(salvageable.len()).unwrap_or(u32::MAX),
+                salvageable_tail_txns: summarize_tail_records(salvageable, 25),
             }
-        },
+        }
     }
 }
 
@@ -1976,7 +1955,8 @@ impl Engine {
                     ..
                 }) if salvage_corrupt_mid => salvageable_records,
                 Err(corr) => {
-                    return Err(JsError::new(&format!("WAL corruption detected: {corr:?}")));
+                    let corr = format_wal_corruption(&corr);
+                    return Err(JsError::new(&format!("WAL corruption detected: {corr}")));
                 }
             };
 
@@ -3781,8 +3761,9 @@ impl Engine {
         ) {
             Ok(f) => f,
             Err(err) => {
+                let err = format_parse_error(err);
                 return EngineEvent::Rejected {
-                    reason: format!("Invalid named range formula: {err:?}"),
+                    reason: format!("Invalid named range formula: {err}"),
                 };
             }
         };
@@ -4031,25 +4012,83 @@ fn format_csv_error(err: CsvError) -> String {
 
 fn format_edit_error(err: EditError) -> String {
     match err {
-        EditError::Parse(p) => match p {
-            ParseError::MissingEquals => String::from("Formula cannot be empty after '='."),
-            ParseError::FormulaTooLong => {
-                String::from("Formula exceeds maximum length of 8,192 characters.")
-            }
-            ParseError::NestingTooDeep => {
-                String::from("Formula exceeds maximum nesting depth of 64 levels.")
-            }
-            ParseError::TooManyArguments => {
-                String::from("Function call exceeds maximum of 255 arguments.")
-            }
-            ParseError::Lex(lex) => format!("Invalid token in formula ({lex:?})."),
-            ParseError::UnexpectedToken => String::from("Formula syntax error."),
-            ParseError::InvalidRange => String::from("Invalid cell or range reference."),
-            ParseError::InvalidArrayLiteral => {
-                String::from("Invalid array literal (must be rectangular constant literals).")
-            }
-        },
+        EditError::Parse(p) => format_parse_error(p),
         EditError::Op(op) => format_op_error(op),
+    }
+}
+
+fn format_parse_error(err: ParseError) -> String {
+    match err {
+        ParseError::MissingEquals => String::from("Formula cannot be empty after '='."),
+        ParseError::FormulaTooLong => {
+            String::from("Formula exceeds maximum length of 8,192 characters.")
+        }
+        ParseError::NestingTooDeep => {
+            String::from("Formula exceeds maximum nesting depth of 64 levels.")
+        }
+        ParseError::TooManyArguments => {
+            String::from("Function call exceeds maximum of 255 arguments.")
+        }
+        ParseError::Lex(lex) => {
+            let lex = describe_lex_error(lex);
+            format!("Invalid token in formula ({lex}).")
+        }
+        ParseError::UnexpectedToken => String::from("Formula syntax error."),
+        ParseError::InvalidRange => String::from("Invalid cell or range reference."),
+        ParseError::InvalidArrayLiteral => {
+            String::from("Invalid array literal (must be rectangular constant literals).")
+        }
+    }
+}
+
+fn describe_lex_error(err: LexError) -> &'static str {
+    match err {
+        LexError::FormulaTooLong => "formula too long",
+        LexError::UnterminatedString => "unterminated text",
+        LexError::UnterminatedSheetQuote => "unterminated worksheet name",
+        LexError::InvalidErrorLiteral => "unknown error value",
+        LexError::InvalidNumber => "malformed number",
+        LexError::UnexpectedChar => "unexpected character",
+    }
+}
+
+fn describe_axis_error(err: AxisError) -> &'static str {
+    match err {
+        AxisError::InvalidRun => "invalid run of rows or columns",
+        AxisError::LimitExceeded => "too many rows or columns",
+        AxisError::AnchorNotFound => "insertion point not found",
+        AxisError::DuplicateId => "row or column already exists",
+        AxisError::TargetNotFound => "row or column not found",
+        AxisError::InvalidInverse => "nothing to restore",
+        AxisError::InvalidMove => "destination within the moved rows or columns",
+    }
+}
+
+fn format_wal_corruption(corr: &WalCorruptionV3) -> String {
+    match corr {
+        WalCorruptionV3::InvalidHeader => {
+            String::from("WAL header magic or CRC-32 checksum is corrupted.")
+        }
+        WalCorruptionV3::BaseSeqMismatch {
+            found: Some(found),
+            expected,
+        } => format!("WAL base snapshot sequence mismatch (found {found}, expected {expected})."),
+        WalCorruptionV3::BaseSeqMismatch {
+            found: None,
+            expected,
+        } => format!("WAL base snapshot sequence is unreadable (expected {expected})."),
+        WalCorruptionV3::NonContiguousSeq {
+            offset,
+            expected_seq,
+            found_seq,
+        } => format!(
+            "Non-contiguous WAL sequence at byte {offset} (expected {expected_seq}, found {found_seq})."
+        ),
+        WalCorruptionV3::MidFileCorruption {
+            offset,
+            last_valid_seq,
+            ..
+        } => format!("Mid-file WAL corruption at byte {offset} after sequence {last_valid_seq}."),
     }
 }
 
@@ -4066,7 +4105,10 @@ fn format_op_error(err: OpError) -> String {
         OpError::TooManyEdits => String::from("Operation exceeds per-transaction cell limit."),
         OpError::DuplicateCellTarget => String::from("Operation contains duplicate target cells."),
         OpError::TargetNotFound => String::from("Target row or column no longer exists."),
-        OpError::Axis(axis_err) => format!("Axis limit or target error ({axis_err:?})."),
+        OpError::Axis(axis_err) => {
+            let axis_err = describe_axis_error(axis_err);
+            format!("Axis limit or target error ({axis_err}).")
+        }
         OpError::InvalidDimensionOrFormat => {
             String::from("Dimension, freeze count, or format is out of bounds.")
         }
@@ -5167,5 +5209,90 @@ mod tests {
         let _ = copy_fill(&mut eng, (1, 3), (1, 3), FillDirection::Right);
         let shown: Vec<String> = (1..6).map(|row| cell(&eng, row, 3).1).collect();
         assert_eq!(shown, ["Item-7", "", "Item-7", "", "Item-7"]);
+    }
+
+    #[test]
+    fn rejections_name_the_error_in_words() {
+        let mut eng = Engine::new();
+        let rejection = |event: Option<EngineEvent>| match event {
+            Some(EngineEvent::Rejected { reason }) => reason,
+            other => panic!("expected Rejected, got {other:?}"),
+        };
+        assert_eq!(
+            rejection(eng.handle_command(EngineCommand::EditCell {
+                sheet: 0,
+                row_id: 0,
+                col_id: 0,
+                raw: String::from("=\"open"),
+            })),
+            "Invalid token in formula (unterminated text)."
+        );
+        assert_eq!(
+            rejection(eng.handle_command(EngineCommand::DefineNamedRange {
+                scope: None,
+                name: String::from("Rates"),
+                formula: String::from("=1+"),
+                comment: None,
+                hidden: None,
+            })),
+            "Invalid named range formula: Formula syntax error."
+        );
+        assert_eq!(
+            rejection(eng.handle_command(EngineCommand::MoveRows {
+                sheet: 0,
+                rows: vec![WireIdRun {
+                    first_id: 1,
+                    len: 2
+                }],
+                after_row_id: Some(2),
+            })),
+            "Axis limit or target error (destination within the moved rows or columns)."
+        );
+        // Formats of the code would begin with a capital or name a field.
+        for err in [
+            LexError::FormulaTooLong,
+            LexError::UnterminatedString,
+            LexError::UnterminatedSheetQuote,
+            LexError::InvalidErrorLiteral,
+            LexError::InvalidNumber,
+            LexError::UnexpectedChar,
+        ] {
+            assert!(describe_lex_error(err).starts_with(|c: char| c.is_ascii_lowercase()));
+        }
+        for err in [
+            AxisError::InvalidRun,
+            AxisError::LimitExceeded,
+            AxisError::AnchorNotFound,
+            AxisError::DuplicateId,
+            AxisError::TargetNotFound,
+            AxisError::InvalidInverse,
+            AxisError::InvalidMove,
+        ] {
+            assert!(describe_axis_error(err).starts_with(|c: char| c.is_ascii_lowercase()));
+        }
+    }
+
+    #[test]
+    fn wal_corruption_is_told_in_words() {
+        let reason = |wal: &[u8], base: u64| match inspect_wal_inner(wal, base, base) {
+            WireWalInspection::Corrupted { reason, .. } => reason,
+            other @ WireWalInspection::Valid { .. } => panic!("expected Corrupted, got {other:?}"),
+        };
+        let wal = encode_wal_init_v3(3).unwrap();
+        assert_eq!(
+            reason(b"not a log", 3),
+            "WAL header magic or CRC-32 checksum is corrupted."
+        );
+        assert_eq!(
+            reason(&wal, 5),
+            "WAL base snapshot sequence mismatch (found 3, expected 5)."
+        );
+        assert_eq!(
+            format_wal_corruption(&WalCorruptionV3::BaseSeqMismatch {
+                found: None,
+                expected: 5
+            }),
+            "WAL base snapshot sequence is unreadable (expected 5)."
+        );
     }
 }

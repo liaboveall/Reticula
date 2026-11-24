@@ -7,6 +7,7 @@ import {
   type BranchDiff,
   branchDiff,
   cancelAgentRun,
+  type ErrorBody,
   getAgentRun,
   listAgentRuns,
   type MergeConflictBody,
@@ -17,8 +18,12 @@ import {
   startAgentRun,
 } from "@reticula/protocol/collab-api";
 import { useCallback, useEffect, useRef, useState } from "react";
+import { personText } from "../collab/labels.ts";
+import { translateEngineText } from "../i18n/engine-text.ts";
+import { t } from "../i18n/index.ts";
 import "./ai.css";
 import { DiffReviewDrawer } from "./DiffReviewDrawer.tsx";
+import { runStatusText, runSummaryText, stepKindText, stepText } from "./labels.ts";
 import {
   buildLocalReplayMergeTxns,
   decodeBase64,
@@ -49,7 +54,7 @@ export interface AiPanelProps {
 function presenceFromHint(h: ReplayPresenceHint): RemotePresenceOverlay {
   return {
     replica: 0x00ff_ffff,
-    displayName: "AI Analyst",
+    displayName: personText("AI Analyst"),
     colorSlot: 0x80 | 5,
     cursorRow: h.row,
     cursorCol: h.col,
@@ -63,6 +68,13 @@ function presenceFromHint(h: ReplayPresenceHint): RemotePresenceOverlay {
           }
         : null,
   };
+}
+
+function failureText(err: unknown): string {
+  if (err instanceof ApiError) {
+    return t("Reticula API returned {status}", { status: err.status });
+  }
+  return err instanceof Error ? translateEngineText(err.message) : String(err);
 }
 
 export default function AiPanel({
@@ -117,7 +129,7 @@ export default function AiPanel({
     if (tab !== "demos" || demos.length > 0) return;
     fetchReplayIndex()
       .then((idx) => setDemos(idx.items))
-      .catch((err) => setReplayMsg(err instanceof Error ? err.message : String(err)));
+      .catch((err) => setReplayMsg(failureText(err)));
   }, [tab, demos.length]);
 
   const closeSse = useCallback(() => {
@@ -146,7 +158,7 @@ export default function AiPanel({
       const d = await branchDiff(docId, branchId);
       setCloudDiff(d);
     } catch (err) {
-      setCloudError(err instanceof Error ? err.message : String(err));
+      setCloudError(failureText(err));
     }
   }, []);
 
@@ -213,7 +225,7 @@ export default function AiPanel({
               void loadCloudReview(docId, run.branchId);
             }
           } else if (d.error) {
-            setCloudError(d.error);
+            setCloudError(translateEngineText(d.error));
           }
           es.close();
           if (sseRef.current === es) sseRef.current = null;
@@ -241,12 +253,15 @@ export default function AiPanel({
     } catch (err) {
       if (err instanceof ApiError && err.status === 503) {
         setCloudError(
-          "Cloud AI is not configured on this server yet. Try the 10 built-in interactive demos below.",
+          t(
+            "Cloud AI is not configured on this server yet. Try the 10 built-in interactive demos below.",
+          ),
         );
       } else if (err instanceof ApiError && err.body && typeof err.body === "object") {
-        setCloudError(String((err.body as { error?: string }).error ?? err.message));
+        const { error } = err.body as Partial<ErrorBody>;
+        setCloudError(typeof error === "string" ? translateEngineText(error) : failureText(err));
       } else {
-        setCloudError(err instanceof Error ? err.message : String(err));
+        setCloudError(failureText(err));
       }
     } finally {
       setCloudBusy(false);
@@ -316,9 +331,13 @@ export default function AiPanel({
       ) {
         const conflict = err.body as Partial<MergeConflictBody>;
         if (conflict.diff) setCloudDiff(conflict.diff);
-        setCloudError(conflict.error ?? "Merge conflict detected; review updated diff.");
+        setCloudError(
+          typeof conflict.error === "string"
+            ? translateEngineText(conflict.error)
+            : t("Merge conflict detected; review updated diff."),
+        );
       } else {
-        setCloudError(err instanceof Error ? err.message : String(err));
+        setCloudError(failureText(err));
       }
     } finally {
       setCloudBusy(false);
@@ -356,7 +375,7 @@ export default function AiPanel({
       setReplayIdx(-1);
       onOpenReplayDraft(decodeBase64(loaded.baseSnapshotB64));
     } catch (err) {
-      setReplayMsg(err instanceof Error ? err.message : String(err));
+      setReplayMsg(failureText(err));
     }
   };
 
@@ -424,7 +443,10 @@ export default function AiPanel({
       onExitDraft();
       setReplayReview(false);
       setReplayMsg(
-        `Previewed "${bundle.title}" merge selection; returned to your cloud workbook without overwriting it.`,
+        t(
+          'Previewed "{title}" merge selection; returned to your cloud workbook without overwriting it.',
+          { title: bundle.title },
+        ),
       );
       return;
     }
@@ -436,7 +458,9 @@ export default function AiPanel({
     );
     onCommitLocalMerge(decodeBase64(bundle.baseSnapshotB64), txns);
     setReplayReview(false);
-    setReplayMsg(`Merged selected changes from "${bundle.title}" into your sheet.`);
+    setReplayMsg(
+      t('Merged selected changes from "{title}" into your sheet.', { title: bundle.title }),
+    );
   };
 
   const handleReplayDiscard = async () => {
@@ -450,11 +474,11 @@ export default function AiPanel({
   };
 
   return (
-    <aside className="ai-panel" data-testid="ai-panel" aria-label="AI Analyst">
+    <aside className="ai-panel" data-testid="ai-panel" aria-label={t("AI Analyst")}>
       <div className="ai-panel-head">
         <div className="ai-panel-title">
-          <span className="ai-badge">AI</span>
-          <span>Analyst</span>
+          <span className="ai-badge">{t("AI")}</span>
+          <span>{t("Analyst")}</span>
         </div>
         <div className="ai-row">
           <label style={{ display: "flex", gap: 4, alignItems: "center", fontSize: 11 }}>
@@ -463,7 +487,7 @@ export default function AiPanel({
               checked={followCursor}
               onChange={(e) => setFollowCursor(e.target.checked)}
             />
-            Follow cursor
+            {t("Follow cursor")}
           </label>
           <button type="button" className="ai-btn" data-testid="ai-close-btn" onClick={onClose}>
             ✕
@@ -479,7 +503,7 @@ export default function AiPanel({
             data-testid="ai-tab-cloud"
             onClick={() => setTab("cloud")}
           >
-            Cloud Draft
+            {t("Cloud Draft")}
           </button>
         )}
         <button
@@ -488,7 +512,7 @@ export default function AiPanel({
           data-testid="ai-tab-demos"
           onClick={() => setTab("demos")}
         >
-          10 Recorded Demos
+          {t("10 Recorded Demos")}
         </button>
       </div>
 
@@ -499,7 +523,9 @@ export default function AiPanel({
               <textarea
                 className="ai-textarea"
                 data-testid="ai-prompt-input"
-                placeholder="Ask AI Analyst to inspect, build formulas, audit errors, or sort on an isolated draft branch..."
+                placeholder={t(
+                  "Ask AI Analyst to inspect, build formulas, audit errors, or sort on an isolated draft branch...",
+                )}
                 value={prompt}
                 onChange={(e) => setPrompt(e.target.value)}
                 maxLength={4000}
@@ -511,7 +537,7 @@ export default function AiPanel({
                   data-testid="ai-run-btn"
                   disabled={cloudBusy || !prompt.trim() || activeRun?.status === "running"}
                 >
-                  Run on Draft Branch
+                  {t("Run on Draft Branch")}
                 </button>
                 {activeRun?.status === "running" && (
                   <button
@@ -520,7 +546,7 @@ export default function AiPanel({
                     data-testid="ai-stop-btn"
                     onClick={() => void handleStopRun()}
                   >
-                    Stop
+                    {t("Stop")}
                   </button>
                 )}
               </div>
@@ -535,7 +561,9 @@ export default function AiPanel({
             {activeRun && (
               <div className="ai-card" data-testid="ai-run-status">
                 <div className="ai-row">
-                  <strong>Status: {activeRun.status}</strong>
+                  <strong>
+                    {t("Status: {status}", { status: runStatusText(activeRun.status) })}
+                  </strong>
                   <span className="ai-muted">{activeRun.model}</span>
                 </div>
                 {streamText && (
@@ -550,18 +578,8 @@ export default function AiPanel({
               <div className="ai-step-list" data-testid="ai-step-list">
                 {steps.map((s) => (
                   <div key={s.idx} className="ai-step">
-                    <div className="ai-step-kind">{s.kind}</div>
-                    <div>
-                      {typeof s.payload === "object" && s.payload !== null
-                        ? String(
-                            (s.payload as Record<string, unknown>).name ??
-                              (s.payload as Record<string, unknown>).summary ??
-                              (s.payload as Record<string, unknown>).text ??
-                              (s.payload as Record<string, unknown>).prompt ??
-                              JSON.stringify(s.payload).slice(0, 140),
-                          )
-                        : String(s.payload)}
-                    </div>
+                    <div className="ai-step-kind">{stepKindText(s.kind)}</div>
+                    <div>{stepText(s.payload)}</div>
                   </div>
                 ))}
               </div>
@@ -571,7 +589,7 @@ export default function AiPanel({
               <DiffReviewDrawer
                 diff={cloudDiff}
                 activeSheetId={activeSheetId}
-                summaryText={activeRun.summary}
+                summaryText={runSummaryText(activeRun.summary)}
                 busy={cloudBusy}
                 errorText={cloudError}
                 onPreview={handleCloudPreview}
@@ -584,7 +602,7 @@ export default function AiPanel({
 
             {runs.length > 0 && !cloudDiff && (
               <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-                <strong style={{ fontSize: 12 }}>Recent Runs</strong>
+                <strong style={{ fontSize: 12 }}>{t("Recent Runs")}</strong>
                 {runs.slice(0, 5).map((r) => (
                   <button
                     key={r.id}
@@ -593,8 +611,8 @@ export default function AiPanel({
                     onClick={() => void handleOpenExistingRun(r)}
                   >
                     <div className="ai-row">
-                      <strong>{r.status}</strong>
-                      <span className="ai-muted">{r.stepCount} steps</span>
+                      <strong>{runStatusText(r.status)}</strong>
+                      <span className="ai-muted">{t("{n} steps", { n: r.stepCount })}</span>
                     </div>
                     <span className="ai-muted">{r.prompt.slice(0, 80)}</span>
                   </button>
@@ -605,8 +623,9 @@ export default function AiPanel({
         ) : (
           <>
             <div className="ai-muted">
-              Pure-client interactive replays running the real WASM FormulaEngine. No sign-in or API
-              key required.
+              {t(
+                "Pure-client interactive replays running the real WASM FormulaEngine. No sign-in or API key required.",
+              )}
             </div>
             {replayMsg && <div className="ai-card">{replayMsg}</div>}
 
@@ -626,11 +645,15 @@ export default function AiPanel({
                     <strong>{d.title}</strong>
                     <span className="ai-muted">{d.description}</span>
                     <div className="ai-tags">
-                      {d.hasConflictDemo && <span className="ai-tag warn">3-Way Conflict</span>}
-                      {d.hasClosureDemo && <span className="ai-tag warn">Closure Guard</span>}
-                      {d.tags.map((t) => (
-                        <span key={t} className="ai-tag">
-                          {t}
+                      {d.hasConflictDemo && (
+                        <span className="ai-tag warn">{t("3-Way Conflict")}</span>
+                      )}
+                      {d.hasClosureDemo && (
+                        <span className="ai-tag warn">{t("Closure Guard")}</span>
+                      )}
+                      {d.tags.map((tag) => (
+                        <span key={tag} className="ai-tag">
+                          {tag}
                         </span>
                       ))}
                     </div>
@@ -647,11 +670,11 @@ export default function AiPanel({
                       className="ai-btn"
                       onClick={() => void handleReplayDiscard()}
                     >
-                      All Demos
+                      {t("All Demos")}
                     </button>
                   </div>
                   <div className="ai-muted" style={{ marginTop: 4 }}>
-                    Prompt: “{bundle.prompt}”
+                    {t("Prompt: “{prompt}”", { prompt: bundle.prompt })}
                   </div>
                   <div className="ai-row" style={{ marginTop: 8 }}>
                     <button
@@ -666,7 +689,7 @@ export default function AiPanel({
                         }
                       }}
                     >
-                      {playing ? "Pause" : replayIdx < 0 ? "Play Replay" : "Resume"}
+                      {playing ? t("Pause") : replayIdx < 0 ? t("Play Replay") : t("Resume")}
                     </button>
                     <button
                       type="button"
@@ -675,7 +698,10 @@ export default function AiPanel({
                       disabled={playing}
                       onClick={() => void stepReplayOnce()}
                     >
-                      Step ({Math.max(0, replayIdx + 1)}/{bundle.steps.length})
+                      {t("Step ({done}/{total})", {
+                        done: Math.max(0, replayIdx + 1),
+                        total: bundle.steps.length,
+                      })}
                     </button>
                     <button
                       type="button"
@@ -693,7 +719,7 @@ export default function AiPanel({
                         setReplayReview(true);
                       }}
                     >
-                      Review Changes
+                      {t("Review Changes")}
                     </button>
                   </div>
                 </div>

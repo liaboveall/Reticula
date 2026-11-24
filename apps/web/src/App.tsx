@@ -1,5 +1,7 @@
 import { startTransition, useCallback, useEffect, useRef, useState } from "react";
 import { ErrorBoundary } from "./ErrorBoundary.tsx";
+import { enterRoute, t } from "./i18n/index.ts";
+import { useLocale } from "./i18n/react.ts";
 import { prefetchEditorWhenIdle, preloadEditor } from "./preload.ts";
 import { type AppRoute, normalizeAppRoute } from "./routes.ts";
 import { loadPage, type Page } from "./routes-load.ts";
@@ -31,6 +33,8 @@ function resolveTarget(path: string): string {
 }
 
 export function App({ first, recovery }: AppProps) {
+  // The pages are rendered again in another language from here.
+  useLocale();
   const [shown, setShown] = useState(first);
   const [pending, setPending] = useState(false);
   const latest = useRef(0);
@@ -44,8 +48,8 @@ export function App({ first, recovery }: AppProps) {
         preloadEditor();
       }
       setPending(true);
-      loadPage(route).then(
-        (Page) => {
+      Promise.all([loadPage(route), enterRoute(route)]).then(
+        ([Page]) => {
           if (turn !== latest.current) {
             return;
           }
@@ -73,6 +77,10 @@ export function App({ first, recovery }: AppProps) {
   );
 
   useEffect(() => {
+    document.title = t("Reticula|title");
+  });
+
+  useEffect(() => {
     const onPopState = () => show(normalizeAppRoute(window.location.pathname), null);
     window.addEventListener("popstate", onPopState);
     return () => window.removeEventListener("popstate", onPopState);
@@ -94,7 +102,7 @@ export function App({ first, recovery }: AppProps) {
   const { Page } = shown;
   return (
     <>
-      {pending && <div className="route-pending" role="status" aria-label="Loading page" />}
+      {pending && <div className="route-pending" role="status" aria-label={t("Loading page")} />}
       <ErrorBoundary key={shown.route} recovery={recovery}>
         <Page onNavigate={navigate} />
       </ErrorBoundary>

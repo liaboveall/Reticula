@@ -1,4 +1,8 @@
 import { useEffect, useState } from "react";
+import { fmtInt, t } from "../i18n/index.ts";
+import { tx } from "../i18n/react.ts";
+import { errorText } from "./errors.ts";
+import { PageLink, PageNav } from "./PageNav.tsx";
 import "./pages.css";
 
 interface EngineMetricSet {
@@ -173,7 +177,7 @@ interface BenchTableRow {
 }
 
 function fmtMs(v: number | null | undefined, digits = 2): string {
-  return v === null || v === undefined ? "—" : `${v.toFixed(digits)} ms`;
+  return v === null || v === undefined ? "—" : t("{ms} ms", { ms: v.toFixed(digits) });
 }
 
 function fmtPct(ratio: number): string {
@@ -188,20 +192,17 @@ export default function BenchmarksPage({ onNavigate }: BenchmarksPageProps) {
   useEffect(() => {
     let active = true;
     fetch("/data/benchmarks-history.json")
-      .then((res) => {
-        if (!res.ok) {
-          throw new Error(`HTTP ${res.status} loading benchmark archive`);
-        }
-        return res.json() as Promise<BenchmarksHistory>;
-      })
-      .then((json) => {
-        if (active) {
+      .then(async (res) => {
+        const json = res.ok ? ((await res.json()) as BenchmarksHistory) : null;
+        if (active && json) {
           setData(json);
+        } else if (active) {
+          setError(t("HTTP {status} loading benchmark archive", { status: res.status }));
         }
       })
       .catch((err: unknown) => {
         if (active) {
-          setError(err instanceof Error ? err.message : "Failed to load benchmark archive");
+          setError(errorText(err, t("Failed to load benchmark archive")));
         }
       });
     return () => {
@@ -222,33 +223,33 @@ export default function BenchmarksPage({ onNavigate }: BenchmarksPageProps) {
   if (data) {
     for (const run of data.engineRuns) {
       const pairs: readonly [string, EngineMetricSet, Exclude<TableFilter, "all">, string][] = [
-        ["Native", run.native, "native", `${run.date} (${run.cpu})`],
-        ["Chrome WASM", run.wasmChrome, "wasm", `${run.date} (${run.browser})`],
+        [t("Native"), run.native, "native", `${run.date} (${run.cpu})`],
+        [t("Chrome WASM"), run.wasmChrome, "wasm", `${run.date} (${run.browser})`],
       ];
       for (const [env, m, category, detail] of pairs) {
         const items: readonly [string, string][] = [
-          ["B1 Load 20M + 1M formulas (p50)", fmtMs(m.b1Load20mMs, 1)],
-          ["B11 Save 20M snapshot (p50)", fmtMs(m.b11Save20mMs, 1)],
-          ["B2 SUM 1M cells (p50)", fmtMs(m.b2Sum1mMs, 2)],
-          ["B3 Full recalc 1M (p50)", fmtMs(m.b3FullRecalc1mMs, 1)],
+          [t("B1 Load 20M + 1M formulas (p50)"), fmtMs(m.b1Load20mMs, 1)],
+          [t("B11 Save 20M snapshot (p50)"), fmtMs(m.b11Save20mMs, 1)],
+          [t("B2 SUM 1M cells (p50)"), fmtMs(m.b2Sum1mMs, 2)],
+          [t("B3 Full recalc 1M (p50)"), fmtMs(m.b3FullRecalc1mMs, 1)],
           [
-            "B4 Incremental 100k (p50 / p95)",
+            t("B4 Incremental 100k (p50 / p95)"),
             `${fmtMs(m.b4Incremental100kP50Ms)} / ${fmtMs(m.b4Incremental100kP95Ms)}`,
           ],
-          ["B5 Chain 1M formulas (p50)", fmtMs(m.b5Chain1mMs, 1)],
+          [t("B5 Chain 1M formulas (p50)"), fmtMs(m.b5Chain1mMs, 1)],
           [
-            "B7a Top-row local insert",
-            m.b7aInsertTopUs !== null ? `${m.b7aInsertTopUs.toFixed(1)} µs` : "—",
+            t("B7a Top-row local insert"),
+            m.b7aInsertTopUs !== null ? t("{us} µs", { us: m.b7aInsertTopUs.toFixed(1) }) : "—",
           ],
-          ["B7a Cross-range insert (p50)", fmtMs(m.b7aInsertCrossP50Ms, 2)],
+          [t("B7a Cross-range insert (p50)"), fmtMs(m.b7aInsertCrossP50Ms, 2)],
           [
-            "B12 50M load / save / 100k recalc",
+            t("B12 50M load / save / 100k recalc"),
             `${fmtMs(m.b12Load50mMs, 1)} / ${fmtMs(m.b12Save50mMs, 1)} / ${fmtMs(m.b12Recalc100kMs, 1)}`,
           ],
         ];
-        for (const [metric, value] of items) {
+        for (const [index, [metric, value]] of items.entries()) {
           tableRows.push({
-            id: `${run.commit}-${env}-${metric}`,
+            id: `${run.commit}-${category}-${index}`,
             category,
             env,
             suite: run.suite,
@@ -265,20 +266,20 @@ export default function BenchmarksPage({ onNavigate }: BenchmarksPageProps) {
         {
           id: `${run.commit}-sync-native`,
           category: "native",
-          env: "Native",
+          env: t("Native"),
           suite: `${run.suite} (${run.stage})`,
           commit: run.commit,
-          metric: "B9a 1,000 pending replay (p50) / B9b 100k block",
+          metric: t("B9a 1,000 pending replay (p50) / B9b 100k block"),
           value: `${fmtMs(run.nativeB9aTotalP50Ms)} / ${fmtMs(run.nativeB9bTotalP50Ms)}`,
           detail: run.date,
         },
         {
           id: `${run.commit}-sync-wasm`,
           category: "wasm",
-          env: "Chrome WASM",
+          env: t("Chrome WASM"),
           suite: `${run.suite} (${run.stage})`,
           commit: run.commit,
-          metric: "B9a 1,000 pending replay (p50 / p95) / B9b 100k",
+          metric: t("B9a 1,000 pending replay (p50 / p95) / B9b 100k"),
           value: `${fmtMs(run.wasmB9aTotalP50Ms)} / ${fmtMs(run.wasmB9aTotalP95Ms)} / ${fmtMs(run.wasmB9bTotalP50Ms)}`,
           detail: run.date,
         },
@@ -289,22 +290,33 @@ export default function BenchmarksPage({ onNavigate }: BenchmarksPageProps) {
         {
           id: `${run.commit}-load-tps`,
           category: "compose",
-          env: "Compose + PG18",
+          env: t("Compose + PG18"),
           suite: run.suite,
           commit: run.commit,
-          metric: `${run.clients} clients · ${(run.populatedCells / 1_000_000).toFixed(2)}M cells · sustained throughput`,
-          value: `${run.achievedTxnsPerSec.toFixed(0)} / ${run.targetTxnsPerSec.toFixed(0)} txns/s`,
-          detail: `digests match: ${run.allDigestsMatch ? "YES" : "NO"}, lost=${run.lostTxns}`,
+          metric: t("{clients} clients · {millions}M cells · sustained throughput", {
+            clients: run.clients,
+            millions: (run.populatedCells / 1_000_000).toFixed(2),
+          }),
+          value: t("{achieved} / {target} txns/s", {
+            achieved: run.achievedTxnsPerSec.toFixed(0),
+            target: run.targetTxnsPerSec.toFixed(0),
+          }),
+          detail: run.allDigestsMatch
+            ? t("digests match: YES, lost={lost}", { lost: run.lostTxns })
+            : t("digests match: NO, lost={lost}", { lost: run.lostTxns }),
         },
         {
           id: `${run.commit}-load-lat`,
           category: "compose",
-          env: "Compose + PG18",
+          env: t("Compose + PG18"),
           suite: run.suite,
           commit: run.commit,
-          metric: "Remote visibility latency (loopback / 50 ms RTT p50→p95)",
+          metric: t("Remote visibility latency (loopback / 50 ms RTT p50→p95)"),
           value: `${fmtMs(run.loopbackP50Ms)}→${fmtMs(run.loopbackP95Ms)} / ${fmtMs(run.rtt50P50Ms)}→${fmtMs(run.rtt50P95Ms)}`,
-          detail: `Server ${run.serverPeakMiB ?? 0} MiB · Postgres ${run.postgresPeakMiB ?? 0} MiB`,
+          detail: t("Server {server} MiB · Postgres {postgres} MiB", {
+            server: run.serverPeakMiB ?? 0,
+            postgres: run.postgresPeakMiB ?? 0,
+          }),
         },
       );
     }
@@ -312,10 +324,10 @@ export default function BenchmarksPage({ onNavigate }: BenchmarksPageProps) {
       tableRows.push({
         id: `${run.commit}-startup`,
         category: "startup",
-        env: "Chrome Reference Net",
+        env: t("Chrome Reference Net"),
         suite: run.suite,
         commit: run.commit,
-        metric: "B10 Cold start shell / firstScreen (p50)",
+        metric: t("B10 Cold start shell / firstScreen (p50)"),
         value: `${fmtMs(run.shellP50Ms, 1)} / ${fmtMs(run.firstScreenP50Ms, 1)}`,
         detail: `${run.date} · ${run.networkLabel}`,
       });
@@ -327,8 +339,14 @@ export default function BenchmarksPage({ onNavigate }: BenchmarksPageProps) {
         env: run.browser,
         suite: run.suite,
         commit: run.commit,
-        metric: "S1/S2 Canvas2D scroll work p99 (vs Firefox headed jump)",
-        value: `${fmtMs(run.scrollWorkP99Ms)} (${run.firefoxJumpP99Ms !== null ? `FF ${fmtMs(run.firefoxJumpP99Ms)}` : "Chrome only"})`,
+        metric: t("S1/S2 Canvas2D scroll work p99 (vs Firefox headed jump)"),
+        value:
+          run.firefoxJumpP99Ms !== null
+            ? t("{chrome} (FF {firefox})", {
+                chrome: fmtMs(run.scrollWorkP99Ms),
+                firefox: fmtMs(run.firefoxJumpP99Ms),
+              })
+            : t("{chrome} (Chrome only)", { chrome: fmtMs(run.scrollWorkP99Ms) }),
         detail: run.date,
       });
     }
@@ -338,50 +356,15 @@ export default function BenchmarksPage({ onNavigate }: BenchmarksPageProps) {
 
   return (
     <div className="page-shell" data-testid="benchmarks-page">
-      <nav className="page-nav">
-        <a
-          href="/"
-          className="page-brand"
-          onClick={(e) => {
-            e.preventDefault();
-            onNavigate("/");
-          }}
-        >
-          Reticula Benchmarks
-        </a>
-        <div className="page-nav-links">
-          <a
-            href="/app"
-            className="toolbar-btn"
-            onClick={(e) => {
-              e.preventDefault();
-              onNavigate("/app");
-            }}
-          >
-            Open Editor
-          </a>
-          <a
-            href="/sim"
-            className="toolbar-btn"
-            onClick={(e) => {
-              e.preventDefault();
-              onNavigate("/sim");
-            }}
-          >
-            Sync Simulator
-          </a>
-          <a
-            href="/workbooks"
-            className="toolbar-btn"
-            onClick={(e) => {
-              e.preventDefault();
-              onNavigate("/workbooks");
-            }}
-          >
-            Workbooks
-          </a>
-        </div>
-      </nav>
+      <PageNav
+        onNavigate={onNavigate}
+        brand={t("Reticula Benchmarks")}
+        links={[
+          ["/app", t("Open Editor")],
+          ["/sim", t("Sync Simulator")],
+          ["/workbooks", t("Workbooks")],
+        ]}
+      />
 
       <main className="page-main">
         <section className="page-card" data-testid="bench-overview">
@@ -389,90 +372,117 @@ export default function BenchmarksPage({ onNavigate }: BenchmarksPageProps) {
             style={{ display: "flex", justifyContent: "space-between", flexWrap: "wrap", gap: 8 }}
           >
             <div>
-              <h1>Performance &amp; Differential Verification</h1>
+              <h1>{t("Performance & Differential Verification")}</h1>
               <p className="page-muted">
-                Archived reproducible measurements from <code>bench/results/</code> — zero external
-                analytics, unauthenticated static JSON.
+                {tx(
+                  "Archived reproducible measurements from <0>bench/results/</0> — zero external analytics, unauthenticated static JSON.",
+                  { 0: <code /> },
+                )}
               </p>
             </div>
             {latestEngine && (
               <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
-                <span className="bench-badge">Baseline {latestEngine.commit}</span>
+                <span className="bench-badge">
+                  {t("Baseline {commit}", { commit: latestEngine.commit })}
+                </span>
                 <span className="bench-badge">{latestEngine.date}</span>
                 <span className="bench-badge">{latestEngine.browser}</span>
               </div>
             )}
           </div>
 
-          {error && <p className="page-muted">Error loading benchmark history: {error}</p>}
-          {!data && !error && <p className="page-muted">Loading archived benchmark results…</p>}
+          {error && (
+            <p className="page-muted">{t("Error loading benchmark history: {error}", { error })}</p>
+          )}
+          {!data && !error && (
+            <p className="page-muted">{t("Loading archived benchmark results…")}</p>
+          )}
 
           {data && (
             <>
               <div className="bench-kpi-grid">
                 <div className="bench-kpi">
-                  <span className="bench-kpi-label">Built-in Functions</span>
+                  <span className="bench-kpi-label">{t("Built-in Functions")}</span>
                   <strong className="bench-kpi-value">
-                    {data.qualitySummary.builtInFunctions} ({data.qualitySummary.catalogEntries}{" "}
-                    entries)
+                    {t("{functions} ({entries} entries)", {
+                      functions: data.qualitySummary.builtInFunctions,
+                      entries: data.qualitySummary.catalogEntries,
+                    })}
                   </strong>
-                  <span className="bench-kpi-sub">15-sig-fig IEEE 754 + Excel 1900 rules</span>
+                  <span className="bench-kpi-sub">
+                    {t("15-sig-fig IEEE 754 + Excel 1900 rules")}
+                  </span>
                 </div>
                 <div className="bench-kpi">
-                  <span className="bench-kpi-label">B4 Incremental 100k</span>
+                  <span className="bench-kpi-label">{t("B4 Incremental 100k")}</span>
                   <strong className="bench-kpi-value">
                     {fmtMs(latestEngine?.wasmChrome.b4Incremental100kP50Ms)}
                   </strong>
-                  <span className="bench-kpi-sub">Chrome WASM p50 (budget ≤ 50 ms)</span>
+                  <span className="bench-kpi-sub">{t("Chrome WASM p50 (budget ≤ 50 ms)")}</span>
                 </div>
                 <div className="bench-kpi">
-                  <span className="bench-kpi-label">B7a Top-Row Insert</span>
+                  <span className="bench-kpi-label">{t("B7a Top-Row Insert")}</span>
                   <strong className="bench-kpi-value">
-                    {latestEngine?.wasmChrome.b7aInsertTopUs?.toFixed(1) ?? "—"} µs
+                    {t("{us} µs", {
+                      us: latestEngine?.wasmChrome.b7aInsertTopUs?.toFixed(1) ?? "—",
+                    })}
                   </strong>
-                  <span className="bench-kpi-sub">Run-encoded O(runs) identity axis</span>
+                  <span className="bench-kpi-sub">{t("Run-encoded O(runs) identity axis")}</span>
                 </div>
                 <div className="bench-kpi">
-                  <span className="bench-kpi-label">B9a Collab Replay (1k edits)</span>
+                  <span className="bench-kpi-label">{t("B9a Collab Replay (1k edits)")}</span>
                   <strong className="bench-kpi-value">
                     {fmtMs(latestSync?.wasmB9aTotalP50Ms)}
                   </strong>
                   <span className="bench-kpi-sub">
-                    Down from 981.71 ms via M2b worker incremental
+                    {t("Down from 981.71 ms via M2b worker incremental")}
                   </span>
                 </div>
                 <div className="bench-kpi">
-                  <span className="bench-kpi-label">50-Client Compose Load</span>
+                  <span className="bench-kpi-label">{t("50-Client Compose Load")}</span>
                   <strong className="bench-kpi-value">
-                    {latestLoad ? `${latestLoad.achievedTxnsPerSec.toFixed(0)} txns/s` : "—"}
+                    {latestLoad
+                      ? t("{achieved} txns/s", {
+                          achieved: latestLoad.achievedTxnsPerSec.toFixed(0),
+                        })
+                      : "—"}
                   </strong>
                   <span className="bench-kpi-sub">
-                    {latestLoad ? `${latestLoad.serverPeakMiB} MiB server · 0 lost` : ""}
+                    {latestLoad
+                      ? t("{server} MiB server · 0 lost", {
+                          server: latestLoad.serverPeakMiB ?? "—",
+                        })
+                      : ""}
                   </span>
                 </div>
                 <div className="bench-kpi">
-                  <span className="bench-kpi-label">LibreOffice Differential</span>
+                  <span className="bench-kpi-label">{t("LibreOffice Differential")}</span>
                   <strong className="bench-kpi-value">
                     {diff ? fmtPct(diff.agreementRatio) : "—"}
                   </strong>
                   <span className="bench-kpi-sub">
                     {diff
-                      ? `${diff.totalFormulas.toLocaleString()} formulas · ${diff.unclassifiedCount} unclassified`
+                      ? t("{formulas} formulas · {n} unclassified", {
+                          formulas: fmtInt(diff.totalFormulas),
+                          n: diff.unclassifiedCount,
+                        })
                       : ""}
                   </span>
                 </div>
               </div>
 
               <p className="bench-note">
-                <strong>Hardware &amp; Cross-Browser Methodology:</strong> Measured on{" "}
-                <code>{latestEngine?.cpu ?? "i9-13980HX"}</code> (
-                {latestEngine?.browser ?? "Chrome"}). Canvas2D scroll work stays at{" "}
-                <strong>{fmtMs(latestRender?.scrollWorkP99Ms)}</strong> p99 in Chrome (
-                <code>margin=2</code> prefetch: {fmtMs(latestRender?.chromeMargin2P99Ms)}), whereas
-                headed Firefox Canvas2D jump frame work measured{" "}
-                <strong>{fmtMs(firefoxP99 ?? earliestRender?.firefoxJumpP99Ms)}</strong> p99 due to
-                Gecko software 2D text upload overhead — both strictly inside the 16.7 ms 60 Hz
-                frame budget.
+                {tx(
+                  "<0>Hardware & Cross-Browser Methodology:</0> Measured on <1>{cpu}</1> ({browser}). Canvas2D scroll work stays at <0>{scroll}</0> p99 in Chrome (<1>margin=2</1> prefetch: {margin}), whereas headed Firefox Canvas2D jump frame work measured <0>{firefox}</0> p99 due to Gecko software 2D text upload overhead — both strictly inside the 16.7 ms 60 Hz frame budget.",
+                  { 0: <strong />, 1: <code /> },
+                  {
+                    cpu: latestEngine?.cpu ?? "i9-13980HX",
+                    browser: latestEngine?.browser ?? "Chrome",
+                    scroll: fmtMs(latestRender?.scrollWorkP99Ms),
+                    margin: fmtMs(latestRender?.chromeMargin2P99Ms),
+                    firefox: fmtMs(firefoxP99 ?? earliestRender?.firefoxJumpP99Ms),
+                  },
+                )}
               </p>
             </>
           )}
@@ -480,19 +490,19 @@ export default function BenchmarksPage({ onNavigate }: BenchmarksPageProps) {
 
         {data && (
           <section className="page-card">
-            <h2>Cross-Milestone SVG Trends</h2>
+            <h2>{t("Cross-Milestone SVG Trends")}</h2>
             <div className="bench-charts-grid">
               <div className="bench-chart-card">
-                <h3>Engine &amp; Startup Latency (ms, Chrome WASM p50)</h3>
+                <h3>{t("Engine & Startup Latency (ms, Chrome WASM p50)")}</h3>
                 <EngineTrendSvg engineRuns={data.engineRuns} startupRuns={data.startupRuns} />
               </div>
               <div className="bench-chart-card">
-                <h3>B9 Collaborative Sync Evolution (p50 ms)</h3>
+                <h3>{t("B9 Collaborative Sync Evolution (p50 ms)")}</h3>
                 <SyncEvolutionSvg syncRuns={data.syncRuns} />
               </div>
               {diff && (
                 <div className="bench-chart-card">
-                  <h3>LibreOffice Stratified Agreement by Family</h3>
+                  <h3>{t("LibreOffice Stratified Agreement by Family")}</h3>
                   <DiffFamilySvg families={diff.byFamily} />
                 </div>
               )}
@@ -505,15 +515,15 @@ export default function BenchmarksPage({ onNavigate }: BenchmarksPageProps) {
             <div
               style={{ display: "flex", justifyContent: "space-between", flexWrap: "wrap", gap: 8 }}
             >
-              <h2>Filterable Benchmark Matrix</h2>
+              <h2>{t("Filterable Benchmark Matrix")}</h2>
               <div className="bench-filters">
                 {(
                   [
-                    ["all", "All"],
-                    ["native", "Native"],
-                    ["wasm", "Chrome WASM"],
-                    ["compose", "Compose Load"],
-                    ["startup", "Startup & Render"],
+                    ["all", t("All|runs")],
+                    ["native", t("Native")],
+                    ["wasm", t("Chrome WASM")],
+                    ["compose", t("Compose Load")],
+                    ["startup", t("Startup & Render")],
                   ] as const
                 ).map(([key, label]) => (
                   <button
@@ -531,12 +541,12 @@ export default function BenchmarksPage({ onNavigate }: BenchmarksPageProps) {
               <table className="bench-table" data-testid="bench-table">
                 <thead>
                   <tr>
-                    <th>Environment</th>
-                    <th>Suite</th>
-                    <th>Commit</th>
-                    <th>Metric</th>
-                    <th className="bench-num">Measured</th>
-                    <th>Conditions</th>
+                    <th>{t("Environment")}</th>
+                    <th>{t("Suite")}</th>
+                    <th>{t("Commit")}</th>
+                    <th>{t("Metric")}</th>
+                    <th className="bench-num">{t("Measured")}</th>
+                    <th>{t("Conditions")}</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -562,37 +572,42 @@ export default function BenchmarksPage({ onNavigate }: BenchmarksPageProps) {
 
         {data && diff && (
           <section className="page-card" data-testid="bench-diff-section">
-            <h2>Formula Correctness &amp; Differential Pipeline</h2>
+            <h2>{t("Formula Correctness & Differential Pipeline")}</h2>
             <p className="page-muted">
-              Verified against <strong>{diff.libreofficeVersion}</strong> (
-              <code>{diff.containerImage}</code>) over{" "}
-              <strong>{diff.totalFormulas.toLocaleString()}</strong> stratified formulas (
-              {diff.deterministicFunctionsCovered} catalog / {diff.uniqueFunctionsCovered} unique
-              functions, ≥ {diff.minSamplesPerFunction} samples/fn,{" "}
-              {diff.totalCellsCompared.toLocaleString()} compared cells),{" "}
-              <strong>{fmtPct(diff.nonErrorRatio)}</strong> non-error,{" "}
-              <strong>{fmtPct(diff.agreementRatio)}</strong> agreement,{" "}
-              <strong>{diff.unclassifiedCount} unclassified</strong>. Also cross-checked on{" "}
-              {diff.rustReference.totalFormulas.toLocaleString()} formulas vs{" "}
-              <code>ironcalc_base</code> ({diff.rustReference.ironcalcMatches.toLocaleString()}{" "}
-              match) and <code>formualizer-eval</code> (
-              {diff.rustReference.formualizerMatches.toLocaleString()} match), plus{" "}
-              {data.qualitySummary.simCiSeeds.toLocaleString()}/
-              {data.qualitySummary.simNightlySeeds.toLocaleString()} simulation seeds and{" "}
-              <code>{data.qualitySummary.compatGenerations.join(", ")}</code> wire compatibility
-              fixtures.
+              {tx(
+                "Verified against <0>{libreoffice}</0> (<1>{image}</1>) over <0>{formulas}</0> stratified formulas ({catalog} catalog / {unique} unique functions, ≥ {samples} samples/fn, {cells} compared cells), <0>{nonError}</0> non-error, <0>{agreement}</0> agreement, <0>{unclassified} unclassified</0>. Also cross-checked on {rustFormulas} formulas vs <1>ironcalc_base</1> ({ironcalc} match) and <1>formualizer-eval</1> ({formualizer} match), plus {ciSeeds}/{nightlySeeds} simulation seeds and <1>{generations}</1> wire compatibility fixtures.",
+                { 0: <strong />, 1: <code /> },
+                {
+                  libreoffice: diff.libreofficeVersion,
+                  image: diff.containerImage,
+                  formulas: fmtInt(diff.totalFormulas),
+                  catalog: diff.deterministicFunctionsCovered,
+                  unique: diff.uniqueFunctionsCovered,
+                  samples: diff.minSamplesPerFunction,
+                  cells: fmtInt(diff.totalCellsCompared),
+                  nonError: fmtPct(diff.nonErrorRatio),
+                  agreement: fmtPct(diff.agreementRatio),
+                  unclassified: diff.unclassifiedCount,
+                  rustFormulas: fmtInt(diff.rustReference.totalFormulas),
+                  ironcalc: fmtInt(diff.rustReference.ironcalcMatches),
+                  formualizer: fmtInt(diff.rustReference.formualizerMatches),
+                  ciSeeds: fmtInt(data.qualitySummary.simCiSeeds),
+                  nightlySeeds: fmtInt(data.qualitySummary.simNightlySeeds),
+                  generations: data.qualitySummary.compatGenerations.join(", "),
+                },
+              )}
             </p>
 
             <div className="bench-table-wrap">
               <table className="bench-table">
                 <thead>
                   <tr>
-                    <th>Family</th>
-                    <th className="bench-num">Formulas</th>
-                    <th className="bench-num">Non-Error</th>
-                    <th className="bench-num">Matched</th>
-                    <th className="bench-num">Agreement</th>
-                    <th className="bench-num">Unclassified</th>
+                    <th>{t("Family")}</th>
+                    <th className="bench-num">{t("Formulas|count")}</th>
+                    <th className="bench-num">{t("Non-Error")}</th>
+                    <th className="bench-num">{t("Matched")}</th>
+                    <th className="bench-num">{t("Agreement")}</th>
+                    <th className="bench-num">{t("Unclassified")}</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -601,9 +616,9 @@ export default function BenchmarksPage({ onNavigate }: BenchmarksPageProps) {
                       <td>
                         <code>{fam.family}</code>
                       </td>
-                      <td className="bench-num">{fam.total.toLocaleString()}</td>
-                      <td className="bench-num">{fam.nonError.toLocaleString()}</td>
-                      <td className="bench-num">{fam.matches.toLocaleString()}</td>
+                      <td className="bench-num">{fmtInt(fam.total)}</td>
+                      <td className="bench-num">{fmtInt(fam.nonError)}</td>
+                      <td className="bench-num">{fmtInt(fam.matches)}</td>
                       <td className="bench-num">{fmtPct(fam.agreementRatio)}</td>
                       <td className="bench-num">{fam.unclassified}</td>
                     </tr>
@@ -613,20 +628,22 @@ export default function BenchmarksPage({ onNavigate }: BenchmarksPageProps) {
             </div>
 
             <h3>
-              Public Known Divergences ({diff.clusters.length} LibreOffice +{" "}
-              {diff.rustReference.clusters.length} Rust Clusters)
+              {t("Public Known Divergences ({libreoffice} LibreOffice + {rust} Rust Clusters)", {
+                libreoffice: diff.clusters.length,
+                rust: diff.rustReference.clusters.length,
+              })}
             </h3>
             <div className="bench-table-wrap">
               <table className="bench-table" data-testid="bench-divergences-table">
                 <thead>
                   <tr>
-                    <th>Engine</th>
-                    <th>Function / Category</th>
-                    <th>Disposition</th>
-                    <th className="bench-num">Count</th>
-                    <th>Sample</th>
-                    <th>Reticula vs Reference</th>
-                    <th>Explanation</th>
+                    <th>{t("Engine")}</th>
+                    <th>{t("Function / Category")}</th>
+                    <th>{t("Disposition")}</th>
+                    <th className="bench-num">{t("Count")}</th>
+                    <th>{t("Sample")}</th>
+                    <th>{t("Reticula vs Reference")}</th>
+                    <th>{t("Explanation")}</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -644,7 +661,11 @@ export default function BenchmarksPage({ onNavigate }: BenchmarksPageProps) {
                         <code>{c.sampleFormula}</code>
                       </td>
                       <td>
-                        <code>{c.reticulaResult}</code> vs <code>{c.libreofficeResult}</code>
+                        {tx(
+                          "<0>{reticula}</0> vs <0>{reference}</0>",
+                          { 0: <code /> },
+                          { reticula: c.reticulaResult, reference: c.libreofficeResult },
+                        )}
                       </td>
                       <td>{c.reason}</td>
                     </tr>
@@ -663,9 +684,13 @@ export default function BenchmarksPage({ onNavigate }: BenchmarksPageProps) {
                         <code>{c.sampleFormula}</code>
                       </td>
                       <td>
-                        <code>{c.reticulaResult}</code> vs <code>{c.referenceResult}</code>
+                        {tx(
+                          "<0>{reticula}</0> vs <0>{reference}</0>",
+                          { 0: <code /> },
+                          { reticula: c.reticulaResult, reference: c.referenceResult },
+                        )}
                       </td>
-                      <td>Intentional Excel 1900 calendar / 15-sig-fig / half-away rule</td>
+                      <td>{t("Intentional Excel 1900 calendar / 15-sig-fig / half-away rule")}</td>
                     </tr>
                   ))}
                 </tbody>
@@ -675,21 +700,18 @@ export default function BenchmarksPage({ onNavigate }: BenchmarksPageProps) {
         )}
 
         <section className="page-card" data-testid="bench-ai-eval-section">
-          <h2>AI Analyst — Self-Hosted Evaluation Harness</h2>
+          <h2>{t("AI Analyst — Self-Hosted Evaluation Harness")}</h2>
           <p className="page-muted">
-            The repository ships a reproducible headless evaluation CLI (
-            <code>cargo xtask eval</code>) for SpreadsheetBench Verified (400 tasks, CC BY-SA 4.0)
-            using dual-path XLSX export (<code>patch_xlsx</code> default, <code>export_xlsx</code>{" "}
-            fallback on structural edits), pinned <code>reticula-libreoffice:26.8.2</code> container
-            grading, 95% Wilson confidence intervals, and three-way root-cause attribution (
-            <code>kernel_gap</code>, <code>agent_strategy</code>, <code>model_capability</code>).
+            {tx(
+              "The repository ships a reproducible headless evaluation CLI (<0>cargo xtask eval</0>) for SpreadsheetBench Verified (400 tasks, CC BY-SA 4.0) using dual-path XLSX export (<0>patch_xlsx</0> default, <0>export_xlsx</0> fallback on structural edits), pinned <0>reticula-libreoffice:26.8.2</0> container grading, 95% Wilson confidence intervals, and three-way root-cause attribution (<0>kernel_gap</0>, <0>agent_strategy</0>, <0>model_capability</0>).",
+              { 0: <code /> },
+            )}
           </p>
           <p className="page-muted">
-            <strong>Published Score Status:</strong> Public paid-model leaderboard runs are
-            intentionally omitted; bring your own OpenAI-compatible key via <code>.env.local</code>{" "}
-            to run <code>cargo xtask spike s6</code> or <code>cargo xtask eval</code> locally, or
-            try all 10 deterministic interactive AI replays directly in the{" "}
-            <a href="/app">Editor</a>.
+            {tx(
+              "<0>Published Score Status:</0> Public paid-model leaderboard runs are intentionally omitted; bring your own OpenAI-compatible key via <1>.env.local</1> to run <1>cargo xtask spike s6</1> or <1>cargo xtask eval</1> locally, or try all 10 deterministic interactive AI replays directly in the <2>Editor</2>.",
+              { 0: <strong />, 1: <code />, 2: <PageLink to="/app" onNavigate={onNavigate} /> },
+            )}
           </p>
         </section>
       </main>
@@ -710,31 +732,31 @@ function EngineTrendSvg({
   const bars = [
     {
       id: "b2",
-      label: "B2 Sum",
+      label: t("B2 Sum"),
       cur: latest?.wasmChrome.b2Sum1mMs ?? 0,
       prev: prev?.wasmChrome.b2Sum1mMs ?? 0,
     },
     {
       id: "b4",
-      label: "B4 100k",
+      label: t("B4 100k"),
       cur: latest?.wasmChrome.b4Incremental100kP50Ms ?? 0,
       prev: prev?.wasmChrome.b4Incremental100kP50Ms ?? 0,
     },
     {
       id: "b3",
-      label: "B3 1M",
+      label: t("B3 1M"),
       cur: latest?.wasmChrome.b3FullRecalc1mMs ?? 0,
       prev: prev?.wasmChrome.b3FullRecalc1mMs ?? 0,
     },
     {
       id: "b5",
-      label: "B5 Chain",
+      label: t("B5 Chain"),
       cur: latest?.wasmChrome.b5Chain1mMs ?? 0,
       prev: prev?.wasmChrome.b5Chain1mMs ?? 0,
     },
     {
       id: "b10",
-      label: "B10 1stScr",
+      label: t("B10 1stScr"),
       cur: latestStart?.firstScreenP50Ms ?? 0,
       prev: startupRuns[0]?.firstScreenP50Ms ?? 0,
     },
@@ -742,7 +764,7 @@ function EngineTrendSvg({
   const maxVal = Math.max(100, ...bars.flatMap((b) => [b.cur, b.prev]));
   return (
     <svg viewBox="0 0 360 170" className="bench-svg" role="img" data-testid="bench-svg-engine">
-      <title>Chrome WASM Engine and Startup Latency Comparison</title>
+      <title>{t("Chrome WASM Engine and Startup Latency Comparison")}</title>
       {bars.map((b, i) => {
         const x = 18 + i * 68;
         const hPrev = Math.max(2, (b.prev / maxVal) * 110);
@@ -758,7 +780,7 @@ function EngineTrendSvg({
               textAnchor="middle"
               fill="currentColor"
             >
-              {b.cur.toFixed(0)}ms
+              {t("{ms}ms", { ms: b.cur.toFixed(0) })}
             </text>
             <text x={x + 20} y={148} fontSize="10" textAnchor="middle" fill="currentColor">
               {b.label}
@@ -768,11 +790,11 @@ function EngineTrendSvg({
       })}
       <rect x={18} y={156} width={8} height={8} fill="#94a3b8" />
       <text x={30} y={163} fontSize="9" fill="currentColor">
-        Baseline ({prev?.commit ?? "—"})
+        {t("Baseline ({commit})", { commit: prev?.commit ?? "—" })}
       </text>
       <rect x={140} y={156} width={8} height={8} fill="#0f766e" />
       <text x={152} y={163} fontSize="9" fill="currentColor">
-        Latest ({latest?.commit ?? "—"})
+        {t("Latest ({commit})", { commit: latest?.commit ?? "—" })}
       </text>
     </svg>
   );
@@ -796,7 +818,7 @@ function SyncEvolutionSvg({ syncRuns }: { readonly syncRuns: readonly SyncRun[] 
 
   return (
     <svg viewBox={`0 0 ${w} ${h}`} className="bench-svg" role="img" data-testid="bench-svg-b9">
-      <title>B9 Collaborative Sync Replay Latency Evolution</title>
+      <title>{t("B9 Collaborative Sync Replay Latency Evolution")}</title>
       <line x1={38} y1={132} x2={330} y2={132} stroke="#cbd5e1" strokeWidth={1} />
       {syncRuns.length > 1 && (
         <>
@@ -819,7 +841,7 @@ function SyncEvolutionSvg({ syncRuns }: { readonly syncRuns: readonly SyncRun[] 
             <circle cx={x} cy={yw} r={4} fill="#0f766e" />
             <circle cx={x} cy={yn} r={3.5} fill="#2563eb" />
             <text x={x} y={Math.max(12, yw - 8)} fontSize="9" textAnchor="middle" fill="#0f766e">
-              {(r.wasmB9aTotalP50Ms ?? 0).toFixed(1)}ms
+              {t("{ms}ms", { ms: (r.wasmB9aTotalP50Ms ?? 0).toFixed(1) })}
             </text>
             <text x={x} y={148} fontSize="9" textAnchor="middle" fill="currentColor">
               {r.stage}
@@ -829,11 +851,11 @@ function SyncEvolutionSvg({ syncRuns }: { readonly syncRuns: readonly SyncRun[] 
       })}
       <rect x={42} y={156} width={10} height={3} fill="#0f766e" />
       <text x={56} y={162} fontSize="9" fill="currentColor">
-        WASM p50
+        {t("WASM p50")}
       </text>
       <rect x={125} y={156} width={10} height={3} fill="#2563eb" />
       <text x={139} y={162} fontSize="9" fill="currentColor">
-        Native p50
+        {t("Native p50")}
       </text>
     </svg>
   );
@@ -848,7 +870,7 @@ function DiffFamilySvg({ families }: { readonly families: readonly DiffFamilyRow
       role="img"
       data-testid="bench-svg-diff"
     >
-      <title>LibreOffice Differential Agreement Ratio by Function Family</title>
+      <title>{t("LibreOffice Differential Agreement Ratio by Function Family")}</title>
       {families.map((fam, idx) => {
         const y = 10 + idx * 20;
         const pct = Math.max(0, Math.min(1, fam.agreementRatio));

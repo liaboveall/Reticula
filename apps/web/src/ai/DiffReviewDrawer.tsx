@@ -1,4 +1,4 @@
-import type { DiffHighlightKind, DiffHighlightMap } from "@reticula/grid";
+import type { DiffHighlightMap } from "@reticula/grid";
 import type {
   BranchDiff,
   ClosureIssue,
@@ -8,6 +8,11 @@ import type {
   MergeSelection,
 } from "@reticula/protocol/collab-api";
 import { useEffect, useMemo, useState } from "react";
+import { translateEngineText } from "../i18n/engine-text.ts";
+import { t } from "../i18n/index.ts";
+import { tx } from "../i18n/react.ts";
+import { buildHighlights } from "./diff-highlights.ts";
+import { closureSource, contentText, hunkKindText } from "./labels.ts";
 
 export interface DiffReviewDrawerProps {
   readonly diff: BranchDiff;
@@ -20,29 +25,6 @@ export interface DiffReviewDrawerProps {
   readonly onDiscard: () => Promise<void>;
   readonly onJumpToCell: (sheetId: number, row: number, col: number) => void;
   readonly onSetHighlights: (map: DiffHighlightMap | null) => void;
-}
-
-function buildHighlights(
-  hunks: readonly DiffHunk[],
-  accepted: ReadonlySet<string>,
-  activeSheetId: number,
-): DiffHighlightMap {
-  const map = new Map<string, DiffHighlightKind>();
-  for (const h of hunks) {
-    if (Number(h.sheetId) !== activeSheetId) continue;
-    const isDelete = h.label.toLowerCase().includes("delete");
-    for (const c of h.cells) {
-      const kind: DiffHighlightKind = c.conflict
-        ? "conflict"
-        : isDelete
-          ? "deleted"
-          : accepted.has(h.id)
-            ? "added"
-            : "deleted";
-      map.set(`${c.rowPos}:${c.colPos}`, kind);
-    }
-  }
-  return map;
 }
 
 function defaultAcceptedIds(hunks: readonly DiffHunk[]): Set<string> {
@@ -134,22 +116,25 @@ export function DiffReviewDrawer({
     <div data-testid="ai-diff-review" style={{ display: "flex", flexDirection: "column", gap: 8 }}>
       {summaryText && (
         <div className="ai-card">
-          <strong>AI Summary</strong>
+          <strong>{t("AI Summary")}</strong>
           <div style={{ marginTop: 4 }}>{summaryText}</div>
         </div>
       )}
 
       <div className="ai-row">
-        <strong>Review Changes ({diff.hunks.length} hunks)</strong>
+        <strong>{t("Review Changes ({n} hunks)", { n: diff.hunks.length })}</strong>
         <span className="ai-muted">
-          {diff.summary.changedCells} cells · {diff.summary.conflictCells} conflicts
+          {t("{cells} cells · {conflicts} conflicts", {
+            cells: diff.summary.changedCells,
+            conflicts: diff.summary.conflictCells,
+          })}
         </span>
       </div>
 
       {conflicts.length > 0 && (
         <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
           <strong style={{ color: "#b45309", fontSize: 12 }}>
-            Conflicts ({conflicts.length}) — Choose Main or AI Draft
+            {t("Conflicts ({n}) — Choose Main or AI Draft", { n: conflicts.length })}
           </strong>
           {conflicts.map((h) => (
             <div key={h.id} className="ai-card conflict" data-testid={`diff-hunk-${h.id}`}>
@@ -160,13 +145,13 @@ export function DiffReviewDrawer({
                     checked={accepted.has(h.id)}
                     onChange={() => toggleHunk(h.id)}
                   />
-                  {h.label}
+                  {translateEngineText(h.label)}
                 </label>
-                <span className="ai-tag warn">Conflict</span>
+                <span className="ai-tag warn">{t("Conflict")}</span>
               </div>
               {h.conflictReason && (
                 <div className="ai-muted" style={{ marginTop: 4, color: "#b45309" }}>
-                  {h.conflictReason}
+                  {translateEngineText(h.conflictReason)}
                 </div>
               )}
               {h.cells.map((c) => (
@@ -179,13 +164,21 @@ export function DiffReviewDrawer({
                     {c.sheetName}!{c.address}
                   </button>
                   <div className="ai-muted">
-                    Base: {c.baseFormula ?? (c.baseValue || "(empty)")}
+                    {t("Base: {value}", { value: contentText(c.baseFormula, c.baseValue) })}
                   </div>
                   <div>
-                    <strong>Main:</strong> {c.mainFormula ?? (c.mainValue || "(empty)")}
+                    {tx(
+                      "<0>Main:</0> {value}",
+                      { 0: <strong /> },
+                      { value: contentText(c.mainFormula, c.mainValue) },
+                    )}
                   </div>
                   <div>
-                    <strong>AI Draft:</strong> {c.draftFormula ?? (c.draftValue || "(empty)")}
+                    {tx(
+                      "<0>AI Draft:</0> {value}",
+                      { 0: <strong /> },
+                      { value: contentText(c.draftFormula, c.draftValue) },
+                    )}
                   </div>
                   {h.kind === "cell_block" && (
                     <div className="ai-row" style={{ marginTop: 4, justifyContent: "flex-start" }}>
@@ -195,7 +188,7 @@ export function DiffReviewDrawer({
                         data-testid={`conflict-keep-main-${c.address}`}
                         onClick={() => setChoice(c.cellKey, "keep_main")}
                       >
-                        Keep Main
+                        {t("Keep Main")}
                       </button>
                       <button
                         type="button"
@@ -203,7 +196,7 @@ export function DiffReviewDrawer({
                         data-testid={`conflict-take-draft-${c.address}`}
                         onClick={() => setChoice(c.cellKey, "take_draft")}
                       >
-                        Use AI Draft
+                        {t("Use AI Draft")}
                       </button>
                     </div>
                   )}
@@ -224,14 +217,17 @@ export function DiffReviewDrawer({
                 checked={accepted.has(h.id)}
                 onChange={() => toggleHunk(h.id)}
               />
-              {h.label}
+              {translateEngineText(h.label)}
             </label>
-            <span className="ai-tag">{h.kind}</span>
+            <span className="ai-tag">{hunkKindText(h.kind)}</span>
           </div>
           {h.sortSummary && (
             <div className="ai-muted" style={{ marginTop: 4 }}>
-              Sorted {h.sortSummary.range} ({h.sortSummary.rowCount} rows × {h.sortSummary.colCount}{" "}
-              cols)
+              {t("Sorted {range} ({rows} rows × {cols} cols)", {
+                range: h.sortSummary.range,
+                rows: h.sortSummary.rowCount,
+                cols: h.sortSummary.colCount,
+              })}
             </div>
           )}
           {h.cells.slice(0, 6).map((c) => (
@@ -249,7 +245,9 @@ export function DiffReviewDrawer({
             </div>
           ))}
           {h.cells.length > 6 && (
-            <div className="ai-muted">+{h.cells.length - 6} more cells in this block</div>
+            <div className="ai-muted">
+              {t("+{n} more cells in this block", { n: h.cells.length - 6 })}
+            </div>
           )}
         </div>
       ))}
@@ -257,20 +255,23 @@ export function DiffReviewDrawer({
       {closureIssues.length > 0 && (
         <div className="ai-card alert" data-testid="ai-closure-warning">
           <strong style={{ color: "#dc2626" }}>
-            Reference Closure Alert ({closureIssues.length})
+            {t("Reference Closure Alert ({n})", { n: closureIssues.length })}
           </strong>
           <div style={{ marginTop: 4, fontSize: 12 }}>
-            Accepted formula(s) reference a structural insert you unchecked:
+            {t("Accepted formula(s) reference a structural insert you unchecked:")}
           </div>
-          {closureIssues.map((iss) => (
-            <div
-              key={`${iss.sourceCell}-${iss.targetHunkId}`}
-              style={{ fontSize: 11, marginTop: 3 }}
-            >
-              <code>{iss.sourceCell}</code> ({iss.formulaText}) →{" "}
-              <strong>{iss.targetHunkLabel}</strong>
-            </div>
-          ))}
+          {closureIssues.map((iss) => {
+            const source = closureSource(iss);
+            return (
+              <div
+                key={`${iss.sourceCell}-${iss.targetHunkId}`}
+                style={{ fontSize: 11, marginTop: 3 }}
+              >
+                <code>{source.cell}</code> ({source.formula}) →{" "}
+                <strong>{translateEngineText(iss.targetHunkLabel)}</strong>
+              </div>
+            );
+          })}
           <div className="ai-row" style={{ marginTop: 8 }}>
             <button
               type="button"
@@ -278,7 +279,7 @@ export function DiffReviewDrawer({
               data-testid="ai-closure-accept-together"
               onClick={() => acceptClosureTargets(closureIssues)}
             >
-              Accept insert together
+              {t("Accept insert together")}
             </button>
             <label style={{ display: "flex", gap: 4, alignItems: "center", fontSize: 11 }}>
               <input
@@ -287,7 +288,7 @@ export function DiffReviewDrawer({
                 checked={allowRef}
                 onChange={(e) => setAllowRef(e.target.checked)}
               />
-              Merge with #REF!
+              {t("Merge with #REF!")}
             </label>
           </div>
         </div>
@@ -302,7 +303,7 @@ export function DiffReviewDrawer({
       <div className="ai-diff-footer" style={{ padding: 0, borderTop: "none" }}>
         {unresolvedCount > 0 && (
           <div className="ai-muted" style={{ color: "#b45309" }}>
-            Resolve {unresolvedCount} conflict(s) above before applying.
+            {t("Resolve {n} conflict(s) above before applying.", { n: unresolvedCount })}
           </div>
         )}
         <div className="ai-row">
@@ -313,7 +314,7 @@ export function DiffReviewDrawer({
             disabled={!canApply}
             onClick={() => void onApply(selection)}
           >
-            Apply Selected Changes
+            {t("Apply Selected Changes")}
           </button>
           <button
             type="button"
@@ -322,7 +323,7 @@ export function DiffReviewDrawer({
             disabled={busy}
             onClick={() => void onDiscard()}
           >
-            Discard Draft
+            {t("Discard Draft")}
           </button>
         </div>
       </div>

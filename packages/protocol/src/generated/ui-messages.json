@@ -1,0 +1,2151 @@
+{
+  "functions": [
+    {
+      "name": "ABS",
+      "params": [
+        "number"
+      ],
+      "summary": "Absolute value of a number."
+    },
+    {
+      "name": "ACOS",
+      "params": [
+        "number"
+      ],
+      "summary": "Arccosine of a number in radians."
+    },
+    {
+      "name": "ADDRESS",
+      "params": [
+        "row_num",
+        "column_num",
+        "[abs_num]",
+        "[a1]",
+        "[sheet_text]"
+      ],
+      "summary": "Creates a cell address as text from row and column numbers."
+    },
+    {
+      "name": "AGGREGATE",
+      "params": [
+        "function_num",
+        "options",
+        "ref1",
+        "[ref2]",
+        "..."
+      ],
+      "summary": "Applies an aggregate function with options to ignore hidden rows or errors."
+    },
+    {
+      "name": "AND",
+      "params": [
+        "logical1",
+        "[logical2]",
+        "..."
+      ],
+      "summary": "Returns TRUE if every argument is true."
+    },
+    {
+      "name": "AREAS",
+      "params": [
+        "reference"
+      ],
+      "summary": "Returns the number of areas in a reference."
+    },
+    {
+      "name": "ASIN",
+      "params": [
+        "number"
+      ],
+      "summary": "Arcsine of a number in radians."
+    },
+    {
+      "name": "ATAN",
+      "params": [
+        "number"
+      ],
+      "summary": "Arctangent of a number in radians."
+    },
+    {
+      "name": "ATAN2",
+      "params": [
+        "x_num",
+        "y_num"
+      ],
+      "summary": "Arctangent from x and y coordinates in radians."
+    },
+    {
+      "name": "AVERAGE",
+      "params": [
+        "number1",
+        "[number2]",
+        "..."
+      ],
+      "summary": "Arithmetic mean of numeric arguments."
+    },
+    {
+      "name": "AVERAGEIF",
+      "params": [
+        "range",
+        "criteria",
+        "[average_range]"
+      ],
+      "summary": "Average of cells matching a condition."
+    },
+    {
+      "name": "AVERAGEIFS",
+      "params": [
+        "average_range",
+        "criteria_range1",
+        "criteria1",
+        "[criteria_range2]",
+        "[criteria2]",
+        "..."
+      ],
+      "summary": "Average of cells matching multiple criteria."
+    },
+    {
+      "name": "CEILING",
+      "params": [
+        "number",
+        "significance"
+      ],
+      "summary": "Rounds a number up to the nearest multiple of significance."
+    },
+    {
+      "name": "CHAR",
+      "params": [
+        "number"
+      ],
+      "summary": "Returns the single-byte character specified by code 1..255."
+    },
+    {
+      "name": "CHOOSE",
+      "params": [
+        "index_num",
+        "value1",
+        "[value2]",
+        "..."
+      ],
+      "summary": "Selects a value from a list by 1-based index."
+    },
+    {
+      "name": "CHOOSECOLS",
+      "params": [
+        "array",
+        "col_num1",
+        "[col_num2]",
+        "..."
+      ],
+      "summary": "Returns the specified columns from an array."
+    },
+    {
+      "name": "CHOOSEROWS",
+      "params": [
+        "array",
+        "row_num1",
+        "[row_num2]",
+        "..."
+      ],
+      "summary": "Returns the specified rows from an array."
+    },
+    {
+      "name": "CLEAN",
+      "params": [
+        "text"
+      ],
+      "summary": "Removes all nonprintable ASCII control characters from text."
+    },
+    {
+      "name": "CODE",
+      "params": [
+        "text"
+      ],
+      "summary": "Returns a numeric code for the first character in text."
+    },
+    {
+      "name": "COLUMN",
+      "params": [
+        "[reference]"
+      ],
+      "summary": "1-based column number of a reference or the current cell."
+    },
+    {
+      "name": "COLUMNS",
+      "params": [
+        "array"
+      ],
+      "summary": "Number of columns in a reference or array."
+    },
+    {
+      "name": "COMBIN",
+      "params": [
+        "number",
+        "number_chosen"
+      ],
+      "summary": "Number of combinations for a given number of items."
+    },
+    {
+      "name": "CONCAT",
+      "params": [
+        "text1",
+        "[text2]",
+        "..."
+      ],
+      "summary": "Joins text from multiple strings or ranges."
+    },
+    {
+      "name": "CONCATENATE",
+      "params": [
+        "text1",
+        "[text2]",
+        "..."
+      ],
+      "summary": "Joins several text items into one text string."
+    },
+    {
+      "name": "CORREL",
+      "params": [
+        "array1",
+        "array2"
+      ],
+      "summary": "Correlation coefficient between two cell ranges or arrays."
+    },
+    {
+      "name": "COS",
+      "params": [
+        "number"
+      ],
+      "summary": "Cosine of the given angle in radians."
+    },
+    {
+      "name": "COSH",
+      "params": [
+        "number"
+      ],
+      "summary": "Hyperbolic cosine of a number."
+    },
+    {
+      "name": "COUNT",
+      "params": [
+        "value1",
+        "[value2]",
+        "..."
+      ],
+      "summary": "Counts cells or values that contain numbers."
+    },
+    {
+      "name": "COUNTA",
+      "params": [
+        "value1",
+        "[value2]",
+        "..."
+      ],
+      "summary": "Counts non-empty cells and values."
+    },
+    {
+      "name": "COUNTBLANK",
+      "params": [
+        "range"
+      ],
+      "summary": "Counts empty cells in a range."
+    },
+    {
+      "name": "COUNTIF",
+      "params": [
+        "range",
+        "criteria"
+      ],
+      "summary": "Counts cells in a range matching a criteria string or value."
+    },
+    {
+      "name": "COUNTIFS",
+      "params": [
+        "criteria_range1",
+        "criteria1",
+        "[criteria_range2]",
+        "[criteria2]",
+        "..."
+      ],
+      "summary": "Counts cells matching multiple criteria."
+    },
+    {
+      "name": "DATE",
+      "params": [
+        "year",
+        "month",
+        "day"
+      ],
+      "summary": "Constructs an Excel 1900 date serial number."
+    },
+    {
+      "name": "DATEDIF",
+      "params": [
+        "start_date",
+        "end_date",
+        "unit"
+      ],
+      "summary": "Calculates the number of days, months, or years between two dates."
+    },
+    {
+      "name": "DATEVALUE",
+      "params": [
+        "date_text"
+      ],
+      "summary": "Converts a date string into an Excel 1900 date serial."
+    },
+    {
+      "name": "DAY",
+      "params": [
+        "serial_number"
+      ],
+      "summary": "Day of month (1..31) for a date serial."
+    },
+    {
+      "name": "DAYS",
+      "params": [
+        "end_date",
+        "start_date"
+      ],
+      "summary": "Number of days between two dates."
+    },
+    {
+      "name": "DAYS360",
+      "params": [
+        "start_date",
+        "end_date",
+        "[method]"
+      ],
+      "summary": "Days between two dates based on a 360-day year."
+    },
+    {
+      "name": "DEGREES",
+      "params": [
+        "angle"
+      ],
+      "summary": "Converts radians into degrees."
+    },
+    {
+      "name": "DOLLAR",
+      "params": [
+        "number",
+        "[decimals]"
+      ],
+      "summary": "Converts a number to currency-formatted text."
+    },
+    {
+      "name": "DROP",
+      "params": [
+        "array",
+        "[rows]",
+        "[columns]"
+      ],
+      "summary": "Excludes rows or columns from the start or end of an array."
+    },
+    {
+      "name": "EDATE",
+      "params": [
+        "start_date",
+        "months"
+      ],
+      "summary": "Date serial shifted by a whole number of months."
+    },
+    {
+      "name": "EOMONTH",
+      "params": [
+        "start_date",
+        "months"
+      ],
+      "summary": "Last day of the month shifted by a whole number of months."
+    },
+    {
+      "name": "ERROR.TYPE",
+      "params": [
+        "error_val"
+      ],
+      "summary": "Returns a number corresponding to an error value."
+    },
+    {
+      "name": "EVEN",
+      "params": [
+        "number"
+      ],
+      "summary": "Rounds a number away from zero to the nearest even integer."
+    },
+    {
+      "name": "EXACT",
+      "params": [
+        "text1",
+        "text2"
+      ],
+      "summary": "Case-sensitive comparison of two text values."
+    },
+    {
+      "name": "EXP",
+      "params": [
+        "number"
+      ],
+      "summary": "Returns e raised to the power of number."
+    },
+    {
+      "name": "FACT",
+      "params": [
+        "number"
+      ],
+      "summary": "Returns the factorial of a non-negative integer."
+    },
+    {
+      "name": "FALSE",
+      "params": [],
+      "summary": "Logical value FALSE."
+    },
+    {
+      "name": "FILTER",
+      "params": [
+        "array",
+        "include",
+        "[if_empty]"
+      ],
+      "summary": "Filters an array or range based on criteria."
+    },
+    {
+      "name": "FIND",
+      "params": [
+        "find_text",
+        "within_text",
+        "[start_num]"
+      ],
+      "summary": "Case-sensitive 1-based position of substring in text."
+    },
+    {
+      "name": "FIXED",
+      "params": [
+        "number",
+        "[decimals]",
+        "[no_commas]"
+      ],
+      "summary": "Formats a number as text with a fixed number of decimals."
+    },
+    {
+      "name": "FLOOR",
+      "params": [
+        "number",
+        "significance"
+      ],
+      "summary": "Rounds a number down toward zero/negative infinity by significance."
+    },
+    {
+      "name": "FREQUENCY",
+      "params": [
+        "data_array",
+        "bins_array"
+      ],
+      "summary": "Calculates how often values occur within bins as a vertical array."
+    },
+    {
+      "name": "FV",
+      "params": [
+        "rate",
+        "nper",
+        "pmt",
+        "[pv]",
+        "[type]"
+      ],
+      "summary": "Returns the future value of an investment."
+    },
+    {
+      "name": "GCD",
+      "params": [
+        "number1",
+        "[number2]",
+        "..."
+      ],
+      "summary": "Returns the greatest common divisor."
+    },
+    {
+      "name": "HLOOKUP",
+      "params": [
+        "lookup_value",
+        "table_array",
+        "row_index_num",
+        "[range_lookup]"
+      ],
+      "summary": "Horizontal lookup along the first row of a table."
+    },
+    {
+      "name": "HOUR",
+      "params": [
+        "serial_number"
+      ],
+      "summary": "Returns the hour component (0..23) of a time serial."
+    },
+    {
+      "name": "HSTACK",
+      "params": [
+        "array1",
+        "[array2]",
+        "..."
+      ],
+      "summary": "Appends arrays horizontally into a single array."
+    },
+    {
+      "name": "IF",
+      "params": [
+        "logical_test",
+        "value_if_true",
+        "[value_if_false]"
+      ],
+      "summary": "Short-circuiting conditional branch."
+    },
+    {
+      "name": "IFERROR",
+      "params": [
+        "value",
+        "value_if_error"
+      ],
+      "summary": "Returns value_if_error if value evaluates to an error."
+    },
+    {
+      "name": "IFNA",
+      "params": [
+        "value",
+        "value_if_na"
+      ],
+      "summary": "Returns value_if_na if value evaluates to #N/A."
+    },
+    {
+      "name": "IFS",
+      "params": [
+        "logical_test1",
+        "value_if_true1",
+        "..."
+      ],
+      "summary": "Checks multiple conditions sequentially and returns the first matching value."
+    },
+    {
+      "name": "INDEX",
+      "params": [
+        "array",
+        "row_num",
+        "[column_num]"
+      ],
+      "summary": "Returns the cell or slice at 1-based coordinates."
+    },
+    {
+      "name": "INDIRECT",
+      "params": [
+        "ref_text",
+        "[a1]"
+      ],
+      "summary": "Returns the reference specified by a text string."
+    },
+    {
+      "name": "INT",
+      "params": [
+        "number"
+      ],
+      "summary": "Rounds a number down to the nearest integer."
+    },
+    {
+      "name": "IRR",
+      "params": [
+        "values",
+        "[guess]"
+      ],
+      "summary": "Returns the internal rate of return for periodic cash flows."
+    },
+    {
+      "name": "ISBLANK",
+      "params": [
+        "value"
+      ],
+      "summary": "TRUE if the value or cell is blank."
+    },
+    {
+      "name": "ISERR",
+      "params": [
+        "value"
+      ],
+      "summary": "TRUE if the value is any error other than #N/A."
+    },
+    {
+      "name": "ISERROR",
+      "params": [
+        "value"
+      ],
+      "summary": "TRUE if the value is any error."
+    },
+    {
+      "name": "ISEVEN",
+      "params": [
+        "number"
+      ],
+      "summary": "TRUE if the truncated integer value is even."
+    },
+    {
+      "name": "ISFORMULA",
+      "params": [
+        "reference"
+      ],
+      "summary": "TRUE if the referenced cell contains a formula."
+    },
+    {
+      "name": "ISLOGICAL",
+      "params": [
+        "value"
+      ],
+      "summary": "TRUE if the value is a boolean."
+    },
+    {
+      "name": "ISNA",
+      "params": [
+        "value"
+      ],
+      "summary": "TRUE if the value is the #N/A error."
+    },
+    {
+      "name": "ISNONTEXT",
+      "params": [
+        "value"
+      ],
+      "summary": "TRUE if the value is not text."
+    },
+    {
+      "name": "ISNUMBER",
+      "params": [
+        "value"
+      ],
+      "summary": "TRUE if the value is numeric."
+    },
+    {
+      "name": "ISODD",
+      "params": [
+        "number"
+      ],
+      "summary": "TRUE if the truncated integer value is odd."
+    },
+    {
+      "name": "ISOWEEKNUM",
+      "params": [
+        "date"
+      ],
+      "summary": "Returns the ISO 8601 week number of the year for a date."
+    },
+    {
+      "name": "ISREF",
+      "params": [
+        "value"
+      ],
+      "summary": "TRUE if the value is a cell or range reference."
+    },
+    {
+      "name": "ISTEXT",
+      "params": [
+        "value"
+      ],
+      "summary": "TRUE if the value is text."
+    },
+    {
+      "name": "LARGE",
+      "params": [
+        "array",
+        "k"
+      ],
+      "summary": "Returns the k-th largest value in a data set."
+    },
+    {
+      "name": "LCM",
+      "params": [
+        "number1",
+        "[number2]",
+        "..."
+      ],
+      "summary": "Returns the least common multiple."
+    },
+    {
+      "name": "LEFT",
+      "params": [
+        "text",
+        "[num_chars]"
+      ],
+      "summary": "Leading characters from a text string."
+    },
+    {
+      "name": "LEN",
+      "params": [
+        "text"
+      ],
+      "summary": "Number of Unicode characters in a text string."
+    },
+    {
+      "name": "LN",
+      "params": [
+        "number"
+      ],
+      "summary": "Returns the natural logarithm of a number."
+    },
+    {
+      "name": "LOG",
+      "params": [
+        "number",
+        "[base]"
+      ],
+      "summary": "Returns the logarithm of a number to a specified base."
+    },
+    {
+      "name": "LOG10",
+      "params": [
+        "number"
+      ],
+      "summary": "Returns the base-10 logarithm of a number."
+    },
+    {
+      "name": "LOOKUP",
+      "params": [
+        "lookup_value",
+        "lookup_vector",
+        "[result_vector]"
+      ],
+      "summary": "Finds a value in a sorted vector or array."
+    },
+    {
+      "name": "LOWER",
+      "params": [
+        "text"
+      ],
+      "summary": "Converts text to lowercase."
+    },
+    {
+      "name": "MATCH",
+      "params": [
+        "lookup_value",
+        "lookup_array",
+        "[match_type]"
+      ],
+      "summary": "1-based index of lookup_value inside a vector."
+    },
+    {
+      "name": "MAX",
+      "params": [
+        "number1",
+        "[number2]",
+        "..."
+      ],
+      "summary": "Largest numeric value among arguments."
+    },
+    {
+      "name": "MAXIFS",
+      "params": [
+        "max_range",
+        "criteria_range1",
+        "criteria1",
+        "[criteria_range2]",
+        "[criteria2]",
+        "..."
+      ],
+      "summary": "Maximum value among cells satisfying multiple criteria."
+    },
+    {
+      "name": "MEDIAN",
+      "params": [
+        "number1",
+        "[number2]",
+        "..."
+      ],
+      "summary": "Returns the median of the given numbers."
+    },
+    {
+      "name": "MID",
+      "params": [
+        "text",
+        "start_num",
+        "num_chars"
+      ],
+      "summary": "Substring starting at 1-based start_num."
+    },
+    {
+      "name": "MIN",
+      "params": [
+        "number1",
+        "[number2]",
+        "..."
+      ],
+      "summary": "Smallest numeric value among arguments."
+    },
+    {
+      "name": "MINIFS",
+      "params": [
+        "min_range",
+        "criteria_range1",
+        "criteria1",
+        "[criteria_range2]",
+        "[criteria2]",
+        "..."
+      ],
+      "summary": "Minimum value among cells satisfying multiple criteria."
+    },
+    {
+      "name": "MINUTE",
+      "params": [
+        "serial_number"
+      ],
+      "summary": "Returns the minute component (0..59) of a time serial."
+    },
+    {
+      "name": "MOD",
+      "params": [
+        "number",
+        "divisor"
+      ],
+      "summary": "Remainder after division with the sign of divisor."
+    },
+    {
+      "name": "MODE",
+      "params": [
+        "number1",
+        "[number2]",
+        "..."
+      ],
+      "summary": "Returns the most frequently occurring value in a data set."
+    },
+    {
+      "name": "MODE.SNGL",
+      "params": [
+        "number1",
+        "[number2]",
+        "..."
+      ],
+      "summary": "Returns the most frequently occurring value in a data set."
+    },
+    {
+      "name": "MONTH",
+      "params": [
+        "serial_number"
+      ],
+      "summary": "Month of year (1..12) for a date serial."
+    },
+    {
+      "name": "MROUND",
+      "params": [
+        "number",
+        "multiple"
+      ],
+      "summary": "Rounds a number to the nearest specified multiple."
+    },
+    {
+      "name": "N",
+      "params": [
+        "value"
+      ],
+      "summary": "Converts a value to a number."
+    },
+    {
+      "name": "NA",
+      "params": [],
+      "summary": "Returns the #N/A error value."
+    },
+    {
+      "name": "NETWORKDAYS",
+      "params": [
+        "start_date",
+        "end_date",
+        "[holidays]"
+      ],
+      "summary": "Number of whole workdays between two dates."
+    },
+    {
+      "name": "NOT",
+      "params": [
+        "logical"
+      ],
+      "summary": "Reverses the logic of its argument."
+    },
+    {
+      "name": "NOW",
+      "params": [],
+      "summary": "Current date and time serial from EvalEnv."
+    },
+    {
+      "name": "NPER",
+      "params": [
+        "rate",
+        "pmt",
+        "pv",
+        "[fv]",
+        "[type]"
+      ],
+      "summary": "Returns the number of periods for an investment."
+    },
+    {
+      "name": "NPV",
+      "params": [
+        "rate",
+        "value1",
+        "[value2]",
+        "..."
+      ],
+      "summary": "Net present value of an investment using discount rate and future cash flows."
+    },
+    {
+      "name": "NUMBERVALUE",
+      "params": [
+        "text",
+        "[decimal_separator]",
+        "[group_separator]"
+      ],
+      "summary": "Converts locale-neutral text to a number using explicit separators."
+    },
+    {
+      "name": "ODD",
+      "params": [
+        "number"
+      ],
+      "summary": "Rounds a number away from zero to the nearest odd integer."
+    },
+    {
+      "name": "OFFSET",
+      "params": [
+        "reference",
+        "rows",
+        "cols",
+        "[height]",
+        "[width]"
+      ],
+      "summary": "Returns a reference shifted from a starting reference."
+    },
+    {
+      "name": "OR",
+      "params": [
+        "logical1",
+        "[logical2]",
+        "..."
+      ],
+      "summary": "Returns TRUE if any argument is true."
+    },
+    {
+      "name": "PERCENTILE",
+      "params": [
+        "array",
+        "k"
+      ],
+      "summary": "Returns the k-th percentile of values in a range."
+    },
+    {
+      "name": "PERCENTILE.EXC",
+      "params": [
+        "array",
+        "k"
+      ],
+      "summary": "Returns the k-th exclusive percentile (0 < k < 1)."
+    },
+    {
+      "name": "PERCENTILE.INC",
+      "params": [
+        "array",
+        "k"
+      ],
+      "summary": "Returns the k-th inclusive percentile (0 <= k <= 1)."
+    },
+    {
+      "name": "PERMUT",
+      "params": [
+        "number",
+        "number_chosen"
+      ],
+      "summary": "Number of ordered permutations for a given number of items."
+    },
+    {
+      "name": "PI",
+      "params": [],
+      "summary": "Returns the mathematical constant pi."
+    },
+    {
+      "name": "PMT",
+      "params": [
+        "rate",
+        "nper",
+        "pv",
+        "[fv]",
+        "[type]"
+      ],
+      "summary": "Calculates the constant periodic payment for a loan."
+    },
+    {
+      "name": "POWER",
+      "params": [
+        "number",
+        "power"
+      ],
+      "summary": "Raises a number to a power."
+    },
+    {
+      "name": "PRODUCT",
+      "params": [
+        "number1",
+        "[number2]",
+        "..."
+      ],
+      "summary": "Multiplies all numbers given as arguments."
+    },
+    {
+      "name": "PROPER",
+      "params": [
+        "text"
+      ],
+      "summary": "Capitalizes the first letter in each word of a text value."
+    },
+    {
+      "name": "PV",
+      "params": [
+        "rate",
+        "nper",
+        "pmt",
+        "[fv]",
+        "[type]"
+      ],
+      "summary": "Returns the present value of an investment."
+    },
+    {
+      "name": "QUARTILE",
+      "params": [
+        "array",
+        "quart"
+      ],
+      "summary": "Returns the quartile of a data set."
+    },
+    {
+      "name": "QUARTILE.EXC",
+      "params": [
+        "array",
+        "quart"
+      ],
+      "summary": "Returns the exclusive quartile of a data set (1..3)."
+    },
+    {
+      "name": "QUARTILE.INC",
+      "params": [
+        "array",
+        "quart"
+      ],
+      "summary": "Returns the inclusive quartile of a data set (0..4)."
+    },
+    {
+      "name": "QUOTIENT",
+      "params": [
+        "numerator",
+        "denominator"
+      ],
+      "summary": "Returns the integer portion of a division."
+    },
+    {
+      "name": "RADIANS",
+      "params": [
+        "angle"
+      ],
+      "summary": "Converts degrees to radians."
+    },
+    {
+      "name": "RAND",
+      "params": [],
+      "summary": "Uniform random number in [0, 1)."
+    },
+    {
+      "name": "RANDARRAY",
+      "params": [
+        "[rows]",
+        "[columns]",
+        "[min]",
+        "[max]",
+        "[whole_number]"
+      ],
+      "summary": "Returns a dynamic array of random numbers."
+    },
+    {
+      "name": "RANDBETWEEN",
+      "params": [
+        "bottom",
+        "top"
+      ],
+      "summary": "Uniform random integer in [bottom, top]."
+    },
+    {
+      "name": "RANK",
+      "params": [
+        "number",
+        "ref",
+        "[order]"
+      ],
+      "summary": "Returns the rank of a number in a list of numbers."
+    },
+    {
+      "name": "RANK.AVG",
+      "params": [
+        "number",
+        "ref",
+        "[order]"
+      ],
+      "summary": "Returns the average rank of tied numbers in a list."
+    },
+    {
+      "name": "RANK.EQ",
+      "params": [
+        "number",
+        "ref",
+        "[order]"
+      ],
+      "summary": "Returns the rank of a number with top rank for ties."
+    },
+    {
+      "name": "RATE",
+      "params": [
+        "nper",
+        "pmt",
+        "pv",
+        "[fv]",
+        "[type]",
+        "[guess]"
+      ],
+      "summary": "Returns the interest rate per period of an annuity."
+    },
+    {
+      "name": "REPLACE",
+      "params": [
+        "old_text",
+        "start_num",
+        "num_chars",
+        "new_text"
+      ],
+      "summary": "Replaces a character slice in text."
+    },
+    {
+      "name": "REPT",
+      "params": [
+        "text",
+        "number_times"
+      ],
+      "summary": "Repeats text a given number of times."
+    },
+    {
+      "name": "RIGHT",
+      "params": [
+        "text",
+        "[num_chars]"
+      ],
+      "summary": "Trailing characters from a text string."
+    },
+    {
+      "name": "ROUND",
+      "params": [
+        "number",
+        "num_digits"
+      ],
+      "summary": "Rounds a number half away from zero at decimal position num_digits."
+    },
+    {
+      "name": "ROUNDDOWN",
+      "params": [
+        "number",
+        "num_digits"
+      ],
+      "summary": "Rounds a number toward zero."
+    },
+    {
+      "name": "ROUNDUP",
+      "params": [
+        "number",
+        "num_digits"
+      ],
+      "summary": "Rounds a number away from zero."
+    },
+    {
+      "name": "ROW",
+      "params": [
+        "[reference]"
+      ],
+      "summary": "1-based row number of a reference or the current cell."
+    },
+    {
+      "name": "ROWS",
+      "params": [
+        "array"
+      ],
+      "summary": "Number of rows in a reference or array."
+    },
+    {
+      "name": "SEARCH",
+      "params": [
+        "find_text",
+        "within_text",
+        "[start_num]"
+      ],
+      "summary": "Case-insensitive 1-based wildcard search in text."
+    },
+    {
+      "name": "SECOND",
+      "params": [
+        "serial_number"
+      ],
+      "summary": "Returns the second component (0..59) of a time serial."
+    },
+    {
+      "name": "SEQUENCE",
+      "params": [
+        "rows",
+        "[columns]",
+        "[start]",
+        "[step]"
+      ],
+      "summary": "Generates an arithmetic sequence inside a dynamic array."
+    },
+    {
+      "name": "SIGN",
+      "params": [
+        "number"
+      ],
+      "summary": "Returns the sign of a number (-1, 0, or 1)."
+    },
+    {
+      "name": "SIN",
+      "params": [
+        "number"
+      ],
+      "summary": "Sine of the given angle in radians."
+    },
+    {
+      "name": "SINH",
+      "params": [
+        "number"
+      ],
+      "summary": "Hyperbolic sine of a number."
+    },
+    {
+      "name": "SLN",
+      "params": [
+        "cost",
+        "salvage",
+        "life"
+      ],
+      "summary": "Straight-line depreciation of an asset for one period."
+    },
+    {
+      "name": "SMALL",
+      "params": [
+        "array",
+        "k"
+      ],
+      "summary": "Returns the k-th smallest value in a data set."
+    },
+    {
+      "name": "SORT",
+      "params": [
+        "array",
+        "[sort_index]",
+        "[sort_order]",
+        "[by_col]"
+      ],
+      "summary": "Sorts the contents of a range or array."
+    },
+    {
+      "name": "SORTBY",
+      "params": [
+        "array",
+        "by_array1",
+        "[sort_order1]",
+        "[by_array2]",
+        "[sort_order2]",
+        "..."
+      ],
+      "summary": "Sorts a range or array by one or more corresponding ranges."
+    },
+    {
+      "name": "SQRT",
+      "params": [
+        "number"
+      ],
+      "summary": "Positive square root of a number."
+    },
+    {
+      "name": "STDEV",
+      "params": [
+        "number1",
+        "[number2]",
+        "..."
+      ],
+      "summary": "Sample standard deviation of numeric arguments."
+    },
+    {
+      "name": "STDEV.P",
+      "params": [
+        "number1",
+        "[number2]",
+        "..."
+      ],
+      "summary": "Population standard deviation of numeric arguments."
+    },
+    {
+      "name": "STDEV.S",
+      "params": [
+        "number1",
+        "[number2]",
+        "..."
+      ],
+      "summary": "Sample standard deviation of numeric arguments."
+    },
+    {
+      "name": "SUBSTITUTE",
+      "params": [
+        "text",
+        "old_text",
+        "new_text",
+        "[instance_num]"
+      ],
+      "summary": "Substitutes occurrences of old_text with new_text."
+    },
+    {
+      "name": "SUBTOTAL",
+      "params": [
+        "function_num",
+        "ref1",
+        "[ref2]",
+        "..."
+      ],
+      "summary": "Calculates a subtotal ignoring nested subtotals and optionally hidden rows."
+    },
+    {
+      "name": "SUM",
+      "params": [
+        "number1",
+        "[number2]",
+        "..."
+      ],
+      "summary": "Adds all numeric arguments and ranges."
+    },
+    {
+      "name": "SUMIF",
+      "params": [
+        "range",
+        "criteria",
+        "[sum_range]"
+      ],
+      "summary": "Sums cells matching a condition."
+    },
+    {
+      "name": "SUMIFS",
+      "params": [
+        "sum_range",
+        "criteria_range1",
+        "criteria1",
+        "[criteria_range2]",
+        "[criteria2]",
+        "..."
+      ],
+      "summary": "Sums cells matching multiple criteria."
+    },
+    {
+      "name": "SUMPRODUCT",
+      "params": [
+        "array1",
+        "[array2]",
+        "..."
+      ],
+      "summary": "Multiplies corresponding components of arrays and returns their sum."
+    },
+    {
+      "name": "SUMSQ",
+      "params": [
+        "number1",
+        "[number2]",
+        "..."
+      ],
+      "summary": "Returns the sum of the squares of the arguments."
+    },
+    {
+      "name": "SWITCH",
+      "params": [
+        "expression",
+        "value1",
+        "result1",
+        "[value2_or_default]",
+        "..."
+      ],
+      "summary": "Matches an expression against values and returns the first matching result."
+    },
+    {
+      "name": "T",
+      "params": [
+        "value"
+      ],
+      "summary": "Returns text if value is text, otherwise empty string."
+    },
+    {
+      "name": "TAKE",
+      "params": [
+        "array",
+        "[rows]",
+        "[columns]"
+      ],
+      "summary": "Returns contiguous rows or columns from the start or end of an array."
+    },
+    {
+      "name": "TAN",
+      "params": [
+        "number"
+      ],
+      "summary": "Tangent of the given angle in radians."
+    },
+    {
+      "name": "TANH",
+      "params": [
+        "number"
+      ],
+      "summary": "Hyperbolic tangent of a number."
+    },
+    {
+      "name": "TEXT",
+      "params": [
+        "value",
+        "format_text"
+      ],
+      "summary": "Formats a number or date as text using an Excel format code."
+    },
+    {
+      "name": "TEXTAFTER",
+      "params": [
+        "text",
+        "delimiter",
+        "[instance_num]",
+        "[match_mode]",
+        "[match_end]",
+        "[if_not_found]"
+      ],
+      "summary": "Returns text occurring after a given delimiter."
+    },
+    {
+      "name": "TEXTBEFORE",
+      "params": [
+        "text",
+        "delimiter",
+        "[instance_num]",
+        "[match_mode]",
+        "[match_end]",
+        "[if_not_found]"
+      ],
+      "summary": "Returns text occurring before a given delimiter."
+    },
+    {
+      "name": "TEXTJOIN",
+      "params": [
+        "delimiter",
+        "ignore_empty",
+        "text1",
+        "[text2]",
+        "..."
+      ],
+      "summary": "Joins text items with a delimiter and optional empty-cell skipping."
+    },
+    {
+      "name": "TEXTSPLIT",
+      "params": [
+        "text",
+        "col_delimiter",
+        "[row_delimiter]",
+        "[ignore_empty]",
+        "[match_mode]",
+        "[pad_with]"
+      ],
+      "summary": "Splits text into a dynamic array by column and row delimiters."
+    },
+    {
+      "name": "TIME",
+      "params": [
+        "hour",
+        "minute",
+        "second"
+      ],
+      "summary": "Returns a decimal time serial between 0 and 1."
+    },
+    {
+      "name": "TIMEVALUE",
+      "params": [
+        "time_text"
+      ],
+      "summary": "Converts a time string into a fractional day serial."
+    },
+    {
+      "name": "TODAY",
+      "params": [],
+      "summary": "Current local date serial from EvalEnv."
+    },
+    {
+      "name": "TRANSPOSE",
+      "params": [
+        "array"
+      ],
+      "summary": "Swaps rows and columns of an array or range."
+    },
+    {
+      "name": "TRIM",
+      "params": [
+        "text"
+      ],
+      "summary": "Removes leading, trailing, and repeated internal ASCII spaces."
+    },
+    {
+      "name": "TRUE",
+      "params": [],
+      "summary": "Logical value TRUE."
+    },
+    {
+      "name": "TRUNC",
+      "params": [
+        "number",
+        "[num_digits]"
+      ],
+      "summary": "Truncates a number toward zero."
+    },
+    {
+      "name": "TYPE",
+      "params": [
+        "value"
+      ],
+      "summary": "Returns an integer code indicating the data type of a value."
+    },
+    {
+      "name": "UNICHAR",
+      "params": [
+        "number"
+      ],
+      "summary": "Returns the Unicode character for the given code point."
+    },
+    {
+      "name": "UNICODE",
+      "params": [
+        "text"
+      ],
+      "summary": "Returns the Unicode code point of the first character in text."
+    },
+    {
+      "name": "UNIQUE",
+      "params": [
+        "array",
+        "[by_col]",
+        "[exactly_once]"
+      ],
+      "summary": "Returns unique rows or columns from a range or array."
+    },
+    {
+      "name": "UPPER",
+      "params": [
+        "text"
+      ],
+      "summary": "Converts text to uppercase."
+    },
+    {
+      "name": "VALUE",
+      "params": [
+        "text"
+      ],
+      "summary": "Converts a numeric or date string to a number."
+    },
+    {
+      "name": "VAR",
+      "params": [
+        "number1",
+        "[number2]",
+        "..."
+      ],
+      "summary": "Sample variance of numeric arguments."
+    },
+    {
+      "name": "VAR.P",
+      "params": [
+        "number1",
+        "[number2]",
+        "..."
+      ],
+      "summary": "Population variance of numeric arguments."
+    },
+    {
+      "name": "VAR.S",
+      "params": [
+        "number1",
+        "[number2]",
+        "..."
+      ],
+      "summary": "Sample variance of numeric arguments."
+    },
+    {
+      "name": "VLOOKUP",
+      "params": [
+        "lookup_value",
+        "table_array",
+        "col_index_num",
+        "[range_lookup]"
+      ],
+      "summary": "Vertical lookup along the first column of a table."
+    },
+    {
+      "name": "VSTACK",
+      "params": [
+        "array1",
+        "[array2]",
+        "..."
+      ],
+      "summary": "Appends arrays vertically into a single array."
+    },
+    {
+      "name": "WEEKDAY",
+      "params": [
+        "serial_number",
+        "[return_type]"
+      ],
+      "summary": "Day of the week corresponding to a date serial."
+    },
+    {
+      "name": "WEEKNUM",
+      "params": [
+        "serial_number",
+        "[return_type]"
+      ],
+      "summary": "Week number of a specific date within the year."
+    },
+    {
+      "name": "WORKDAY",
+      "params": [
+        "start_date",
+        "days",
+        "[holidays]"
+      ],
+      "summary": "Date serial after adding or subtracting working days."
+    },
+    {
+      "name": "XLOOKUP",
+      "params": [
+        "lookup_value",
+        "lookup_array",
+        "return_array",
+        "[if_not_found]",
+        "[match_mode]",
+        "[search_mode]"
+      ],
+      "summary": "Searches a range or array and returns the corresponding item."
+    },
+    {
+      "name": "XMATCH",
+      "params": [
+        "lookup_value",
+        "lookup_array",
+        "[match_mode]",
+        "[search_mode]"
+      ],
+      "summary": "Returns the relative 1-based position of an item in an array."
+    },
+    {
+      "name": "XOR",
+      "params": [
+        "logical1",
+        "[logical2]",
+        "..."
+      ],
+      "summary": "Returns logical exclusive OR of all arguments."
+    },
+    {
+      "name": "YEAR",
+      "params": [
+        "serial_number"
+      ],
+      "summary": "4-digit year (1900..9999) for a date serial."
+    },
+    {
+      "name": "YEARFRAC",
+      "params": [
+        "start_date",
+        "end_date",
+        "[basis]"
+      ],
+      "summary": "Fraction of the year between two dates according to day-count basis."
+    }
+  ],
+  "messages": {
+    "crates/agent/src/diff.rs": [
+      "Main branch deleted rows or columns inside the sorted range",
+      "Main branch modified cells inside the sorted range",
+      "Target worksheet was deleted on main",
+      "Sort {sheet_name}!{range_str} ({rows} rows)",
+      "<deleted on main>",
+      "Conflict at {sheet_name}!{address}",
+      "Main branch deleted this cell's row, column, or worksheet since the fork point",
+      "Both main and AI draft modified this cell since the fork point",
+      "Edit {sheet_name}!{span} ({cluster} cells)",
+      "Format {sheet_name} ({format_items} cells)",
+      "Workbook",
+      "Define named range {name} = {rhs}",
+      "Delete named range {canonical_name}",
+      "Named range modified concurrently on main",
+      "cannot apply draft edit at {sheet_name}!{address}: target row, column, or worksheet was deleted on main",
+      "cannot initialize merge IdAllocator",
+      "exhausted ID space during merge remap",
+      "{sname} row {pos}",
+      "{sname} row#{row}",
+      "{sname} col {letters}",
+      "{sname} col#{col}",
+      "sheet '{sname}'",
+      "Add worksheet '{name}'",
+      "Main branch edited cells on '{sname}' after fork; deleting sheet will discard them",
+      "Delete worksheet '{sname}'",
+      "Rename worksheet '{old}' -> '{name}'",
+      "Reorder worksheet '{sname}'",
+      "Worksheet '{sname}' was deleted on main",
+      "at row {p}",
+      "after anchor row",
+      "at top",
+      "Insert {ids} row(s) on {sname} {pos_hint}",
+      "Insert {ids} column(s) on {sname}",
+      "Main branch modified cells on rows deleted by the AI draft",
+      "<deleted row>",
+      "Delete {del_rows} row(s) on {sname}",
+      "Main branch modified cells on columns deleted by the AI draft",
+      "Delete {del_cols} column(s) on {sname}",
+      "Move {count} row(s) on {sname}",
+      "Move {count} column(s) on {sname}",
+      "Structural update"
+    ],
+    "crates/agent/src/lib.rs": [
+      "LLM provider error: {0}",
+      "workbook operation failed: {0}",
+      "step store error: {0}",
+      "agent run cancelled",
+      "agent run timed out after {0}s",
+      "agent run exceeded budget: {0}",
+      "merge planning error: {0}"
+    ],
+    "crates/agent/src/llm.rs": [
+      "upstream HTTP {status} after {retries} retries: {snippet}",
+      "upstream HTTP {status}: {snippet}",
+      "failed reading body: {e}",
+      "invalid JSON response: {e}; snippet={text_body}",
+      "upstream error: {msg}",
+      "SSE chunk read error: {e}",
+      "network error after {retries} retries: {err}",
+      "SSE upstream error: {msg}",
+      "response missing `choices[0]`",
+      "response missing `choices[0].message`"
+    ],
+    "crates/agent/src/runner.rs": [
+      "reached max_steps ({max_steps})",
+      "reached max_tokens ({max_tokens})",
+      "Completed analysis with no workbook changes.",
+      "aborted after {identical_repeat_count} identical consecutive `{name}` calls"
+    ],
+    "crates/formula/src/lang_service.rs": [
+      "Formula exceeds maximum length of {MAX_FORMULA_CHARS} characters.",
+      "Expected expression after '='.",
+      "Unterminated string literal (missing closing '\"').",
+      "Unterminated worksheet reference (expected closing \"'!\" ).",
+      "Unrecognised error literal '{slice}'.",
+      "Invalid numeric literal.",
+      "Unexpected character in formula.",
+      "Unknown worksheet '{name}'.",
+      "Invalid range endpoints around ':'.",
+      "Unmatched closing ')'.",
+      "Unclosed '(' (missing ')').",
+      "Unknown function '{upper_name}'.",
+      "{name} expects {min_args} argument, got {got}.",
+      "{name} expects {min_args} arguments, got {got}.",
+      "{name} expects at least {min_args} argument(s), got {got}.",
+      "{name} expects {min_args} to {max_args} arguments, got {got}.",
+      "Expected cell or row/column coordinate after ':'.",
+      "Expected expression after separator.",
+      "Expected operand after operator.",
+      "Incomplete range reference around ':'.",
+      "Worksheet",
+      "Reference cells on this worksheet.",
+      "Named range"
+    ],
+    "crates/formula/src/search.rs": [
+      "Search query cannot be empty",
+      "Regular expression exceeded per-cell evaluation step limit",
+      "Regular expression exceeds {MAX_REGEX_LEN} characters",
+      "Unexpected closing parenthesis ')'",
+      "Regular expression nesting too deep",
+      "Unexpected end of regular expression",
+      "Quantifier '{ch}' without preceding atom",
+      "Unclosed group '('",
+      "Trailing backslash '\\' in regular expression",
+      "Unclosed character class '['",
+      "Unclosed character range",
+      "Invalid character class range endpoint",
+      "Character class range out of order",
+      "Quantifier repeat count exceeds {MAX_QUANTIFIER_REPEAT}",
+      "Quantifier min exceeds max in {m,n}",
+      "Regular expression exceeds NFA state budget"
+    ],
+    "crates/server/src/agent.rs": [
+      "AI analyst is not configured on this server",
+      "an AI analyst run is already in progress for your account",
+      "server AI analyst capacity or memory budget is saturated",
+      "missing agent replica metadata",
+      "draft branch is no longer active",
+      "workbook log_epoch advanced since run started; cannot resume safely",
+      "AI analyst is disabled on restart",
+      "maximum crash recovery resume limit (2) exceeded",
+      "run interrupted mid-mutating tool call; cannot resume idempotently",
+      "agent concurrency slots saturated on startup",
+      "failed to load draft branch state on recovery",
+      "shared memory budget saturated on startup",
+      "missing agent replica watermark on recovery",
+      "draft engine initialization failed: {err}",
+      "failed to initialize draft IdAllocator",
+      "prompt must contain between 1 and {MAX_PROMPT_CHARS} characters",
+      "prompt contains unsupported control characters"
+    ],
+    "crates/server/src/docs.rs": [
+      "Main changed while you were reviewing; review the updated diff and resolve any conflicts.",
+      "{unresolved_conflicts} conflict cell(s) require an explicit Keep Main or Use AI Draft choice",
+      "{closure_issues} formula reference(s) depend on rejected structural inserts",
+      "{issues} formula reference(s) depend on rejected structural inserts",
+      "{conflicts} conflict cell(s) require an explicit resolution"
+    ],
+    "crates/server/src/http.rs": [
+      "authentication required",
+      "access denied",
+      "not found",
+      "rate limit exceeded",
+      "server document budget busy",
+      "GitHub authentication failed",
+      "internal server error",
+      "title must contain 1 to 120 printable characters",
+      "X-Workbook-Title header is required",
+      "X-Workbook-Title is not valid UTF-8",
+      "link lifetime must be between 1 second and 1 year",
+      "invalid version sequence",
+      "account deletion requires confirm = \"DELETE\""
+    ],
+    "crates/server/src/http/agent.rs": [
+      "branch kind must be `user` or `ai_draft`",
+      "branch title must contain 1 to 120 printable characters",
+      "cannot abandon the main branch",
+      "diff requires a non-main branch",
+      "cannot merge main into itself",
+      "branch is already {status}",
+      "cannot merge branch while an AI analyst run is still in progress",
+      "Merge AI draft",
+      "Merge: {title}",
+      "merge conflict",
+      "server storage capacity reached",
+      "merge rejected: {reason}",
+      "AI analyst is not configured on this server"
+    ],
+    "crates/server/src/http/sync.rs": [
+      "Viewer"
+    ],
+    "crates/server/src/store.rs": [
+      "workbook title",
+      "server storage capacity reached",
+      "user storage quota exceeded",
+      "snapshot payload exceeds import byte limit",
+      "invalid or oversized snapshot",
+      "create an active viewer share link before enabling link view"
+    ],
+    "crates/server/src/store/agent.rs": [
+      "replica ID space exhausted",
+      "branch kind must be `ai_draft` or `user`",
+      "server storage capacity reached",
+      "owner storage quota exceeded",
+      "cannot abandon the main branch",
+      "daily AI run limit reached ({used_runs}/{max_runs})",
+      "daily AI token limit reached ({used_tokens}/{max_tokens})"
+    ],
+    "crates/server/src/store/collaboration.rs": [
+      "cannot assign deleted user",
+      "only editor or viewer roles can be assigned",
+      "cannot demote the sole workbook owner",
+      "cannot remove the sole workbook owner",
+      "share links can grant editor or viewer access",
+      "share link label must be at most 120 printable characters"
+    ],
+    "crates/server/src/store/history.rs": [
+      "version name",
+      "version sequence exceeds workbook head",
+      "a named version with this title already exists",
+      "{field} must be between 1 and 120 characters",
+      "{field} must not contain control characters"
+    ],
+    "crates/sim-wasm/src/lib.rs": [
+      "unsupported link mode `{raw}`",
+      "replica index out of range",
+      "missing SheetId(0)",
+      "replica count must be 2 or 3, got {replica_count}",
+      "row index {row} out of range",
+      "column index {col} out of range",
+      "failed to inspect prior cell",
+      "invalid cell input: {err}",
+      "Edit R{row}C{col}",
+      "invalid row position",
+      "row index {idx} out of range",
+      "row ID space exhausted",
+      "Insert Row {after_row_idx}",
+      "row index {row_idx} out of range",
+      "Delete Row {row_idx}",
+      "nothing to undo on this replica",
+      "Undo {label}",
+      "OPFS snapshot encode failed: {err}",
+      "OPFS pending WAL encode failed: {err}",
+      "OPFS snapshot decode failed: {err}",
+      "OPFS pending WAL scan failed: {err}",
+      "Restarted from persisted OPFS state",
+      "deliverAll exceeded step bound",
+      "Fetch snapshot #{snap_seq}",
+      "local edit rejected: {err}",
+      "online drain exceeded step bound",
+      "Rescued {txns} terminally rejected edit(s)",
+      "Server epoch changed {old_epoch} -> {new_epoch}",
+      "Digest mismatch detected at #{seq}; resyncing",
+      "failed to decode client frame: {err}",
+      "failed to decode server frame: {err}",
+      "missing snapshot #{snap_seq}",
+      "failed to decode snapshot #{snap_seq}: {err}",
+      "server snapshot encode failed: {err}",
+      "step {cursor} ({event}): {err}",
+      "Hello (seq #{last_applied_seq})",
+      "Welcome (r{replica}, head #{head_seq}, snap #{snapshot_seq})",
+      "Welcome (r{replica}, head #{head_seq}, {txns} txn)",
+      "Welcome (r{replica}, head #{head_seq})",
+      "Push {txns} txn(s) from #{client_seq}",
+      "Push (empty)",
+      "Commit #{seq} (r{replica})",
+      "Ack r{replica} c#{client_seq} -> #{seq}",
+      "Reject c#{client_seq}: {reason}",
+      "Digest #{seq}",
+      "Presence",
+      "Ping #{n}",
+      "Pong #{n}"
+    ],
+    "crates/wasm/src/clipboard.rs": [
+      "Target sheet does not exist.",
+      "Fill range exceeds worksheet dimensions.",
+      "Fill range must align with source rows or source columns.",
+      "Fill exceeds 2,000,000-cell transaction limit.",
+      "Select at least one cell to copy.",
+      "Copy range exceeds worksheet dimensions.",
+      "Clipboard copy is capped at {MAX_CLIPBOARD_CELLS} cells (use Export CSV for larger ranges).",
+      "Paste target exceeds worksheet bounds.",
+      "Paste exceeds 2,000,000-cell transaction limit.",
+      "Pasted table exceeds worksheet bounds."
+    ],
+    "crates/wasm/src/collab.rs": [
+      "Collaborative checkpoint metadata is missing.",
+      "Invalid collaborative replica metadata.",
+      "Could not decode collaborative checkpoint: {error}",
+      "Could not recover pending transactions: {error}",
+      "Pending transactions do not belong to this collaborative replica.",
+      "This collaborative workbook is read-only.",
+      "Collaborative edits require a verified replica.",
+      "This transaction cannot be encoded for sync.",
+      "This collaborative transaction exceeds the sync frame limit.",
+      "Could not encode collaborative output.",
+      "The collaborative workbook is still catching up.",
+      "Could not encode collaborative checkpoint: {error}",
+      "Invalid collaborative document or branch identifier.",
+      "No collaborative workbook is open.",
+      "Collaborative session has failed.",
+      "Could not preserve rejected collaborative edits."
+    ],
+    "crates/wasm/src/history.rs": [
+      "snapshot decode failed: {err}",
+      "snapshot #{seq} is not in LRU cache",
+      "missing cached snapshot",
+      "could not decode history transaction batch",
+      "non-contiguous history sequence: expected {max_seq}, got {seq}",
+      "no base snapshot loaded",
+      "history target #{target_seq} outside loaded span #{base_seq}..=#{max_seq}",
+      "sequence offset overflow",
+      "worksheet {sheet_id} does not exist at #{current_seq}",
+      "Return to the live workbook before editing.",
+      "missing transaction in history slice",
+      "failed to decode history txn #{seq}: {err}",
+      "failed to apply history txn #{seq}: {err}",
+      "base snapshot #{base_seq} evicted before fallback replay"
+    ],
+    "crates/wasm/src/lib.rs": [
+      "engine panic: {info}",
+      "WAL header encode failed: {e}",
+      "encodeSeedStub failed: {e}",
+      "encodeSnapshotFull failed: {e}",
+      "No active snapshot stream.",
+      "Snapshot step failed: {e}",
+      "Snapshot decode failed: {e}",
+      "WAL corruption detected: {corr}",
+      "WAL replay failed: {e}",
+      "invalid WireTxnV3: {e}",
+      "invalid WireTxnV3 ops: {e}",
+      "apply op failed: {e}",
+      "CSV file exceeds the 256 MiB local import limit.",
+      "No active CSV import.",
+      "Target sheet does not exist.",
+      "Target worksheet does not exist.",
+      "Edit {addr_label}",
+      "Clear cells",
+      "Row count must be at least 1.",
+      "Identifier counter exhausted.",
+      "Insert row",
+      "Insert {count} rows",
+      "Select at least one row to delete.",
+      "Delete rows",
+      "Column count must be at least 1.",
+      "Insert column",
+      "Insert {count} columns",
+      "Select at least one column to delete.",
+      "Delete columns",
+      "Select at least one row to move.",
+      "Move rows",
+      "Select at least one column to move.",
+      "Move columns",
+      "Resize rows",
+      "Resize columns",
+      "Freeze panes",
+      "Unsupported number format code: {code}",
+      "Format cells",
+      "Fill range falls outside visible rows.",
+      "Auto-fill",
+      "Fill down",
+      "Fill right",
+      "Paste target falls outside visible rows.",
+      "Paste",
+      "Collaborative worksheet identifier limit reached.",
+      "Add sheet",
+      "Rename sheet",
+      "Delete sheet",
+      "Move sheet",
+      "Undo: {label}",
+      "Redo: {label}",
+      "Cannot apply AutoFilter to the selected range.",
+      "Column filter outside active AutoFilter bounds.",
+      "Target sheet not found.",
+      "Sort",
+      "Replace All",
+      "Invalid named range identifier '{trimmed}'.",
+      "Invalid named range formula: {err}",
+      "Define {trimmed}",
+      "Named range '{name}' was not found.",
+      "Delete {name}",
+      "Engine halted after an unrecoverable internal panic; reload to recover.",
+      "Sequence number must be a safe non-negative integer.",
+      "CSV file is not valid UTF-8 text.",
+      "CSV file contains an unclosed double-quoted field.",
+      "CSV dimensions exceed worksheet limits (2,000,000 rows × 16,384 cols).",
+      "Formula cannot be empty after '='.",
+      "Formula exceeds maximum length of 8,192 characters.",
+      "Formula exceeds maximum nesting depth of 64 levels.",
+      "Function call exceeds maximum of 255 arguments.",
+      "Invalid token in formula ({lex}).",
+      "Formula syntax error.",
+      "Invalid cell or range reference.",
+      "Invalid array literal (must be rectangular constant literals).",
+      "formula too long",
+      "unterminated text",
+      "unterminated worksheet name",
+      "unknown error value",
+      "malformed number",
+      "unexpected character",
+      "invalid run of rows or columns",
+      "too many rows or columns",
+      "insertion point not found",
+      "row or column already exists",
+      "row or column not found",
+      "nothing to restore",
+      "destination within the moved rows or columns",
+      "WAL header magic or CRC-32 checksum is corrupted.",
+      "WAL base snapshot sequence mismatch (found {found}, expected {expected}).",
+      "WAL base snapshot sequence is unreadable (expected {expected}).",
+      "Non-contiguous WAL sequence at byte {offset} (expected {expected_seq}, found {found_seq}).",
+      "Mid-file WAL corruption at byte {offset} after sequence {last_valid_seq}.",
+      "Sheet ID already exists in this workbook.",
+      "Maximum sheet count (256) reached.",
+      "Sheet name must be 1–31 characters and cannot contain : \\ / ? * [ or ].",
+      "Cannot delete the last visible worksheet.",
+      "Invalid worksheet operation.",
+      "Operation exceeds per-transaction cell limit.",
+      "Operation contains duplicate target cells.",
+      "Target row or column no longer exists.",
+      "Axis limit or target error ({axis_err}).",
+      "Dimension, freeze count, or format is out of bounds.",
+      "Numeric value must be finite.",
+      "Cell text exceeds 32,767 UTF-16 code units.",
+      "Formula failed validation.",
+      "String table capacity exhausted.",
+      "Local workbook memory limit (1 GiB) exceeded.",
+      "This workbook is read-only.",
+      "Named range identifier or comment is invalid.",
+      "Maximum named range count reached.",
+      "Row sort permutation is invalid.",
+      "Cut-and-paste source and destination ranges are invalid."
+    ],
+    "crates/wasm/src/query.rs": [
+      "Copy selection falls outside visible rows."
+    ],
+    "crates/xlsx-wasm/src/lib.rs": [
+      "snapshot bytes were already consumed",
+      "xlsx bytes were already consumed"
+    ],
+    "crates/xlsx/src/export.rs": [
+      "Skipped {truncated_count} cell(s) exceeding Excel's 1,048,576 x 16,384 worksheet limits"
+    ],
+    "crates/xlsx/src/import.rs": [
+      "workbook has zero worksheets",
+      "worksheet count {sheets} exceeds maximum {MAX_SHEETS}"
+    ],
+    "crates/xlsx/src/lib.rs": [
+      "XLSX input ({bytes} bytes) exceeds 64 MiB limit ({MAX_XLSX_INPUT_BYTES} bytes)",
+      "XLSX decompressed XML ({bytes} bytes) exceeds 256 MiB limit ({MAX_XLSX_UNCOMPRESSED_BYTES} bytes)",
+      "invalid XLSX archive: {msg}",
+      "invalid OOXML XML: {msg}",
+      "XLSX read error: {msg}",
+      "XLSX write error: {msg}",
+      "snapshot codec error: {msg}",
+      "workbook construction error: {msg}",
+      "worksheet not found for patch: {name}"
+    ],
+    "crates/xlsx/src/patch.rs": [
+      "Skipped {truncated_count} patched cell(s) exceeding Excel's 1,048,576 x 16,384 worksheet limits"
+    ],
+    "crates/xlsx/src/xml_scan.rs": [
+      "missing xl/workbook.xml",
+      "missing worksheet entry {zip_path}",
+      "{merged_cells_count} merged range(s) on `{name}`",
+      "{conditional_fmt_count} conditional formatting block(s) on `{name}`",
+      "{drawing_count} drawing/shape reference(s) on `{name}`",
+      "VBA macro project (xl/vbaProject.bin) is not executed or re-emitted on fresh export",
+      "{charts} embedded chart XML part(s)",
+      "{drawings} drawing/media archive asset(s)",
+      "{pivots} pivot table definition(s)",
+      "{comments} worksheet comment stream(s)",
+      "{external_links} external workbook/data connection part(s)",
+      "failed reading {name} as UTF-8: {e}",
+      "workbook.xml.rels: {e}",
+      "workbook.xml: {e}",
+      "metadata.xml: {e}",
+      "sharedStrings.xml: {e}",
+      "styles.xml: {e}"
+    ]
+  },
+  "values": {
+    "error": [
+      "cancelled"
+    ],
+    "reason": [
+      "Forbidden",
+      "InvalidOp",
+      "NonContiguousClientSeq { expected: {expected} }",
+      "QuotaExceeded",
+      "EpochMismatch { server_epoch: {server_epoch} }",
+      "UpgradeRequired",
+      "PayloadTooLarge"
+    ],
+    "status": [
+      "active",
+      "merged",
+      "abandoned"
+    ]
+  }
+}

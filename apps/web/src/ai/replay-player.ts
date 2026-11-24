@@ -4,6 +4,7 @@ import type {
   ConflictResolution,
   MergePreviewResponse,
 } from "@reticula/protocol/collab-api";
+import { t } from "../i18n/index.ts";
 
 export interface ReplayIndexEntry {
   readonly id: string;
@@ -68,13 +69,19 @@ export interface ReplayBundle {
 
 export async function fetchReplayIndex(): Promise<ReplayIndex> {
   const resp = await fetch("/data/ai-replays/index.json");
-  if (!resp.ok) throw new Error(`Could not load AI demos (${resp.status})`);
+  if (!resp.ok) {
+    const message = t("Could not load AI demos ({status})", { status: resp.status });
+    throw new Error(message);
+  }
   return resp.json();
 }
 
 export async function fetchReplayBundle(id: string): Promise<ReplayBundle> {
   const resp = await fetch(`/data/ai-replays/${encodeURIComponent(id)}.json`);
-  if (!resp.ok) throw new Error(`Could not load demo "${id}" (${resp.status})`);
+  if (!resp.ok) {
+    const message = t('Could not load demo "{id}" ({status})', { id, status: resp.status });
+    throw new Error(message);
+  }
   return resp.json();
 }
 

@@ -7,7 +7,10 @@ import {
   type VersionEntry,
 } from "@reticula/protocol/collab-api";
 import { type FormEvent, useCallback, useEffect, useState } from "react";
+import { translateEngineText } from "../i18n/engine-text.ts";
+import { fmtDateTime, t } from "../i18n/index.ts";
 import { apiErrorMessage, pickNearestSnapshotSeq } from "../pages/helpers.ts";
+import { personText } from "./labels.ts";
 
 export interface HistoryDrawerProps {
   readonly docId: string;
@@ -26,7 +29,7 @@ function formatTimestamp(iso: string): string {
   if (Number.isNaN(date.getTime())) {
     return iso;
   }
-  return date.toLocaleString();
+  return fmtDateTime(date);
 }
 
 export function HistoryDrawer(props: HistoryDrawerProps) {
@@ -73,7 +76,7 @@ export function HistoryDrawer(props: HistoryDrawerProps) {
         setVersions(versionList);
       } catch (err) {
         if (!signal?.aborted) {
-          setError(apiErrorMessage(err, "Failed to load workbook history."));
+          setError(apiErrorMessage(err, t("Failed to load workbook history.")));
         }
       } finally {
         if (!signal?.aborted) {
@@ -134,7 +137,7 @@ export function HistoryDrawer(props: HistoryDrawerProps) {
         return [...prev, ...page.entries.filter((item) => !seen.has(item.seq))];
       });
     } catch (err) {
-      setError(apiErrorMessage(err, "Failed to load older history entries."));
+      setError(apiErrorMessage(err, t("Failed to load older history entries.")));
     } finally {
       setBusy(false);
     }
@@ -156,7 +159,7 @@ export function HistoryDrawer(props: HistoryDrawerProps) {
       setVersions((prev) => [created, ...prev]);
       setVersionName("");
     } catch (err) {
-      setError(apiErrorMessage(err, "Failed to save named version."));
+      setError(apiErrorMessage(err, t("Failed to save named version.")));
     } finally {
       setBusy(false);
     }
@@ -172,7 +175,7 @@ export function HistoryDrawer(props: HistoryDrawerProps) {
       await deleteVersion(docId, versionId);
       setVersions((prev) => prev.filter((item) => item.id !== versionId));
     } catch (err) {
-      setError(apiErrorMessage(err, "Failed to delete named version."));
+      setError(apiErrorMessage(err, t("Failed to delete named version.")));
     } finally {
       setBusy(false);
     }
@@ -186,13 +189,22 @@ export function HistoryDrawer(props: HistoryDrawerProps) {
   );
 
   return (
-    <aside className="history-drawer" data-testid="history-drawer" aria-label="Version History">
+    <aside
+      className="history-drawer"
+      data-testid="history-drawer"
+      aria-label={t("Version History")}
+    >
       <div className="history-drawer-header">
         <div>
-          <h3 className="history-drawer-title">Version History</h3>
+          <h3 className="history-drawer-title">{t("Version History")}</h3>
           <div className="history-drawer-subtitle">
-            Revision #{activeSeq} of #{headSeq}
-            {previewElapsedMs !== null ? ` (${Math.round(previewElapsedMs)} ms)` : ""}
+            {previewElapsedMs === null
+              ? t("Revision #{seq} of #{head}", { seq: activeSeq, head: headSeq })
+              : t("Revision #{seq} of #{head} ({ms} ms)", {
+                  seq: activeSeq,
+                  head: headSeq,
+                  ms: Math.round(previewElapsedMs),
+                })}
           </div>
         </div>
         <div className="history-drawer-header-actions">
@@ -203,7 +215,7 @@ export function HistoryDrawer(props: HistoryDrawerProps) {
               data-testid="history-return-live-btn"
               onClick={onExit}
             >
-              Return to Live
+              {t("Return to Live")}
             </button>
           )}
           <button
@@ -213,7 +225,7 @@ export function HistoryDrawer(props: HistoryDrawerProps) {
             disabled={loading || busy}
             onClick={() => void loadHistory()}
           >
-            Refresh
+            {t("Refresh")}
           </button>
           <button
             type="button"
@@ -221,7 +233,7 @@ export function HistoryDrawer(props: HistoryDrawerProps) {
             data-testid="history-close-btn"
             onClick={onClose}
           >
-            Close
+            {t("Close")}
           </button>
         </div>
       </div>
@@ -247,7 +259,7 @@ export function HistoryDrawer(props: HistoryDrawerProps) {
             type="range"
             className="history-range"
             data-testid="history-scrubber"
-            aria-label="History sequence scrubber"
+            aria-label={t("History sequence scrubber")}
             min={0}
             max={headMax}
             step={1}
@@ -276,7 +288,7 @@ export function HistoryDrawer(props: HistoryDrawerProps) {
             type="text"
             className="collab-input"
             data-testid="history-version-name-input"
-            placeholder={`Save #${activeSeq} as version...`}
+            placeholder={t("Save #{seq} as version...", { seq: activeSeq })}
             maxLength={120}
             value={versionName}
             disabled={busy || activeSeq === "0"}
@@ -288,15 +300,17 @@ export function HistoryDrawer(props: HistoryDrawerProps) {
             data-testid="history-save-version-btn"
             disabled={busy || activeSeq === "0" || versionName.trim().length === 0}
           >
-            Save
+            {t("Save")}
           </button>
         </form>
       )}
 
       <div className="history-section">
-        <h4 className="collab-section-title">Named Versions ({versions.length})</h4>
+        <h4 className="collab-section-title">
+          {t("Named Versions ({n})", { n: versions.length })}
+        </h4>
         {versions.length === 0 ? (
-          <p className="history-empty">No named versions saved yet.</p>
+          <p className="history-empty">{t("No named versions saved yet.")}</p>
         ) : (
           <ul className="history-list" data-testid="history-versions-list">
             {versions.map((ver) => (
@@ -314,7 +328,7 @@ export function HistoryDrawer(props: HistoryDrawerProps) {
                 >
                   <span className="history-item-title">{ver.name}</span>
                   <span className="history-item-meta">
-                    #{ver.seq} · {ver.createdByName} · {formatTimestamp(ver.createdAt)}
+                    #{ver.seq} · {personText(ver.createdByName)} · {formatTimestamp(ver.createdAt)}
                   </span>
                 </button>
                 {!readOnly && (
@@ -325,7 +339,7 @@ export function HistoryDrawer(props: HistoryDrawerProps) {
                     disabled={busy}
                     onClick={() => void handleDeleteVersion(ver.id)}
                   >
-                    Delete
+                    {t("Delete")}
                   </button>
                 )}
               </li>
@@ -335,11 +349,11 @@ export function HistoryDrawer(props: HistoryDrawerProps) {
       </div>
 
       <div className="history-section history-section-scroll">
-        <h4 className="collab-section-title">Revisions ({entries.length})</h4>
+        <h4 className="collab-section-title">{t("Revisions ({n})", { n: entries.length })}</h4>
         {loading && entries.length === 0 ? (
-          <p className="history-empty">Loading history...</p>
+          <p className="history-empty">{t("Loading history...")}</p>
         ) : entries.length === 0 ? (
-          <p className="history-empty">No transactions recorded yet.</p>
+          <p className="history-empty">{t("No transactions recorded yet.")}</p>
         ) : (
           <ul className="history-list" data-testid="history-entries-list">
             {entries.map((entry) => (
@@ -356,10 +370,14 @@ export function HistoryDrawer(props: HistoryDrawerProps) {
                   onClick={() => seekSeq(entry.seq)}
                 >
                   <span className="history-item-title">
-                    #{entry.seq} {entry.label}
+                    #{entry.seq} {translateEngineText(entry.label)}
                   </span>
                   <span className="history-item-meta">
-                    {entry.authorName} (r{entry.replica}) · {formatTimestamp(entry.createdAt)}
+                    {t("{author} (r{replica}) · {time}", {
+                      author: personText(entry.authorName),
+                      replica: entry.replica,
+                      time: formatTimestamp(entry.createdAt),
+                    })}
                   </span>
                 </button>
               </li>
@@ -374,7 +392,7 @@ export function HistoryDrawer(props: HistoryDrawerProps) {
             disabled={busy || loading}
             onClick={() => void handleLoadOlder()}
           >
-            Load older revisions
+            {t("Load older revisions")}
           </button>
         )}
       </div>

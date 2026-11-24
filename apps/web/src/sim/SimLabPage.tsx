@@ -9,6 +9,21 @@ import {
 } from "@reticula/protocol/sim";
 import simWasmUrl from "@reticula/protocol/sim-wasm?url";
 import { type FormEvent, useCallback, useEffect, useRef, useState } from "react";
+import { translateEngineText } from "../i18n/engine-text.ts";
+import { t } from "../i18n/index.ts";
+import { tx } from "../i18n/react.ts";
+import { errorText } from "../pages/errors.ts";
+import { roleName } from "../pages/labels.ts";
+import { PageNav } from "../pages/PageNav.tsx";
+import {
+  connectionName,
+  type InvariantStatus,
+  invariantStatusName,
+  invariants,
+  labText,
+  parseSeed,
+} from "./labels.ts";
+import "../collab/collab.css";
 import "../pages/pages.css";
 import "./sim.css";
 
@@ -34,23 +49,21 @@ const DEFAULT_SUBSCRIPTION: Subscription = {
   resend: false,
 };
 
-const TEN_INVARIANTS: readonly string[] = [
-  "1. Quiescent StateDigest converges across all online writers & viewers",
-  "2. Logical content & formula digests match across all converged replicas",
-  "3. Re-evaluating from scratch matches incremental & sliced formula engine",
-  "4. Server periodic Digest frames never mismatch any synced replica",
-  "5. Durable-before-send & OPFS tail-loss recovery preserves watermark monotonicity",
-  "6. Crash & restart restores pending WAL without duplicating or losing ops",
-  "7. Epoch increment on backup restore re-identifies & preserves unreconciled work",
-  "8. Row/Col/Sheet ID ownership & structural move-anchor handoffs remain valid",
-  "9. Full epoch log replay and latest snapshot + tail replay agree bit-for-bit",
-  "10. Every terminally rejected client txn is rescued into unsynced local archive",
-];
+const INVARIANT_BADGES: Readonly<Record<InvariantStatus, string>> = {
+  idle: "sim-badge",
+  checking: "sim-badge",
+  verified: "sim-badge sim-badge-ok",
+  failed: "sim-badge sim-badge-warn",
+};
 
 let initPromise: Promise<void> | null = null;
 function ensureSimWasm(): Promise<void> {
   if (!initPromise) {
     initPromise = init({ module_or_path: simWasmUrl }).then(() => undefined);
+    // The next visit to the page tries again.
+    initPromise.catch(() => {
+      initPromise = null;
+    });
   }
   return initPromise;
 }
@@ -173,7 +186,7 @@ export default function SimLabPage({ onNavigate }: SimLabPageProps) {
       })
       .catch((err) => {
         if (active) {
-          setLabError(err instanceof Error ? err.message : "Could not load simulator WASM.");
+          setLabError(errorText(err, t("Could not load simulator WASM.")));
         }
       });
     return () => {
@@ -216,7 +229,7 @@ export default function SimLabPage({ onNavigate }: SimLabPageProps) {
       setLabState(nextState);
       syncAllReplicas(lab, false);
     } catch (err) {
-      setLabError(err instanceof Error ? err.message : String(err));
+      setLabError(labText(err instanceof Error ? err.message : String(err)));
     }
   };
 
@@ -242,17 +255,12 @@ export default function SimLabPage({ onNavigate }: SimLabPageProps) {
     }
     stopAutoRunner();
     setAutoError(null);
-    let parsedSeed: bigint;
-    try {
-      parsedSeed = BigInt(seedInput.trim() || "42");
-      if (parsedSeed < 0n) {
-        throw new Error("Seed must be an unsigned 64-bit integer.");
-      }
-    } catch (err) {
-      setAutoError(err instanceof Error ? err.message : "Invalid unsigned integer seed.");
+    const seed = parseSeed(seedInput.trim() || "42");
+    if (seed === null) {
+      setAutoError(t("Seed must be an unsigned 64-bit integer."));
       return;
     }
-    const runner = new AutoSimRunner(parsedSeed);
+    const runner = new AutoSimRunner(seed);
     runnerRef.current = runner;
     setAutoRunning(true);
 
@@ -285,49 +293,32 @@ export default function SimLabPage({ onNavigate }: SimLabPageProps) {
       ? Math.min(100, Math.round((autoProgress.completedSteps / autoProgress.totalSteps) * 100))
       : 0;
 
+  const invariantStatus: InvariantStatus = !autoProgress
+    ? "idle"
+    : !autoProgress.finished
+      ? "checking"
+      : autoProgress.passed
+        ? "verified"
+        : "failed";
+
   return (
-    <div className="page-shell" data-testid="sim-lab-page">
-      <nav className="page-nav">
-        <a
-          href="/"
-          className="page-brand"
-          onClick={(e) => {
-            e.preventDefault();
-            onNavigate("/");
-          }}
-        >
-          Reticula
-        </a>
-        <div className="page-nav-links">
-          <a
-            href="/app"
-            className="toolbar-btn"
-            onClick={(e) => {
-              e.preventDefault();
-              onNavigate("/app");
-            }}
-          >
-            Open Editor
-          </a>
-          <a
-            href="/workbooks"
-            className="toolbar-btn"
-            onClick={(e) => {
-              e.preventDefault();
-              onNavigate("/workbooks");
-            }}
-          >
-            Workbooks
-          </a>
-        </div>
-      </nav>
+    <div className="page-shell sim-shell" data-testid="sim-lab-page">
+      <PageNav
+        onNavigate={onNavigate}
+        links={[
+          ["/app", t("Open Editor")],
+          ["/workbooks", t("Workbooks")],
+        ]}
+      />
 
       <header className="page-header">
         <div>
-          <h1>Sync &amp; CRDT Simulator Lab</h1>
+          <h1>{t("Sync & CRDT Simulator Lab")}</h1>
           <p className="page-muted">
-            Dedicated <code>reticula-sim-wasm</code> engine loaded on demand: step offline replica
-            merges interactively or run the 5-replica fault injector inside your browser.
+            {tx(
+              "Dedicated <0>reticula-sim-wasm</0> engine loaded on demand: step offline replica merges interactively or run the 5-replica fault injector inside your browser.",
+              { 0: <code /> },
+            )}
           </p>
         </div>
         <div className="page-tabs">
@@ -340,7 +331,7 @@ export default function SimLabPage({ onNavigate }: SimLabPageProps) {
               setMode("interactive");
             }}
           >
-            Interactive Replicas
+            {t("Interactive Replicas")}
           </button>
           <button
             type="button"
@@ -348,14 +339,20 @@ export default function SimLabPage({ onNavigate }: SimLabPageProps) {
             data-testid="sim-mode-autorun"
             onClick={() => setMode("autorun")}
           >
-            5-Replica Auto-Run
+            {t("5-Replica Auto-Run")}
           </button>
         </div>
       </header>
 
       {!wasmReady ? (
         <div className="page-card">
-          <p>Loading simulator WebAssembly module…</p>
+          {labError ? (
+            <div className="page-error" role="alert" data-testid="sim-lab-error">
+              {labError}
+            </div>
+          ) : (
+            <p>{t("Loading simulator WebAssembly module…")}</p>
+          )}
         </div>
       ) : mode === "interactive" ? (
         <>
@@ -367,7 +364,7 @@ export default function SimLabPage({ onNavigate }: SimLabPageProps) {
 
           <div className="sim-controls-bar">
             <div className="collab-row">
-              <label htmlFor="sim-replica-count">Replicas:</label>
+              <label htmlFor="sim-replica-count">{t("Replicas:")}</label>
               <select
                 id="sim-replica-count"
                 className="collab-select"
@@ -375,8 +372,8 @@ export default function SimLabPage({ onNavigate }: SimLabPageProps) {
                 value={replicaCount}
                 onChange={(e) => setReplicaCount(e.target.value === "3" ? 3 : 2)}
               >
-                <option value="2">2 Replicas (Alice &amp; Bob)</option>
-                <option value="3">3 Replicas (Alice, Bob &amp; Carol)</option>
+                <option value="2">{t("2 Replicas (Alice & Bob)")}</option>
+                <option value="3">{t("3 Replicas (Alice, Bob & Carol)")}</option>
               </select>
               <button
                 type="button"
@@ -384,7 +381,7 @@ export default function SimLabPage({ onNavigate }: SimLabPageProps) {
                 data-testid="sim-reset-btn"
                 onClick={() => resetLab(replicaCount)}
               >
-                Reset Lab
+                {t("Reset Lab")}
               </button>
             </div>
             <div className="collab-row">
@@ -395,7 +392,7 @@ export default function SimLabPage({ onNavigate }: SimLabPageProps) {
                 disabled={!labState || labState.queue.length === 0}
                 onClick={() => runInteractiveOp((lab) => lab.deliverNext())}
               >
-                Deliver 1
+                {t("Deliver 1")}
               </button>
               <button
                 type="button"
@@ -404,7 +401,7 @@ export default function SimLabPage({ onNavigate }: SimLabPageProps) {
                 disabled={!labState || labState.queue.length === 0}
                 onClick={() => runInteractiveOp((lab) => lab.deliverAll())}
               >
-                Deliver All ({labState?.queue.length ?? 0})
+                {t("Deliver All ({n})", { n: labState?.queue.length ?? 0 })}
               </button>
             </div>
           </div>
@@ -412,11 +409,11 @@ export default function SimLabPage({ onNavigate }: SimLabPageProps) {
           {labState && (
             <div className="sim-server-banner">
               <div className="collab-row">
-                <strong>Server State</strong>
-                <span>headSeq #{labState.serverHeadSeq}</span>
-                <span>epoch {labState.serverEpoch}</span>
+                <strong>{t("Server State")}</strong>
+                <span>{t("headSeq #{seq}", { seq: labState.serverHeadSeq })}</span>
+                <span>{t("epoch {epoch}", { epoch: labState.serverEpoch })}</span>
                 <span className="sim-digest-code" title={labState.serverDigest}>
-                  digest {labState.serverDigest.slice(0, 16)}…
+                  {t("digest {digest}…", { digest: labState.serverDigest.slice(0, 16) })}
                 </span>
               </div>
               <span
@@ -425,7 +422,7 @@ export default function SimLabPage({ onNavigate }: SimLabPageProps) {
                   labState.allConverged ? "sim-badge sim-badge-ok" : "sim-badge sim-badge-warn"
                 }
               >
-                {labState.allConverged ? "All Replicas Converged" : "Diverged / Pending Sync"}
+                {labState.allConverged ? t("All Replicas Converged") : t("Diverged / Pending Sync")}
               </span>
             </div>
           )}
@@ -441,21 +438,27 @@ export default function SimLabPage({ onNavigate }: SimLabPageProps) {
                   data-testid={`sim-replica-card-${idx}`}
                 >
                   <div className="sim-replica-header">
-                    <strong>{rep ? `${rep.name} (${rep.role})` : `Replica ${idx + 1}`}</strong>
+                    <strong>
+                      {rep
+                        ? t("{name} ({role})", { name: rep.name, role: roleName(rep.role) })
+                        : t("Replica {n}", { n: idx + 1 })}
+                    </strong>
                     <span
                       data-testid={`sim-replica-status-${idx}`}
                       className={
                         rep?.converged ? "sim-badge sim-badge-ok" : "sim-badge sim-badge-warn"
                       }
                     >
-                      {rep?.converged ? "Converged" : (rep?.connection ?? "initializing")}
+                      {rep?.converged
+                        ? t("Converged")
+                        : connectionName(rep?.connection ?? "initializing")}
                     </span>
                   </div>
                   {rep && (
                     <div className="sim-replica-meta">
-                      <span>seq #{rep.confirmedSeq}</span>
-                      <span>pending {rep.pendingLen}</span>
-                      <span>rep {rep.replicaId ?? "—"}</span>
+                      <span>{t("seq #{seq}", { seq: rep.confirmedSeq })}</span>
+                      <span>{t("pending {n}", { n: rep.pendingLen })}</span>
+                      <span>{t("rep {id}", { id: rep.replicaId ?? "—" })}</span>
                       <span className="sim-digest-code" title={rep.digest}>
                         {rep.digest.slice(0, 12)}…
                       </span>
@@ -476,7 +479,7 @@ export default function SimLabPage({ onNavigate }: SimLabPageProps) {
                       min={0}
                       className="sim-num-input"
                       data-testid={`sim-row-${idx}`}
-                      aria-label={`Replica ${idx} row`}
+                      aria-label={t("Replica {n} row", { n: idx })}
                       value={draft.row}
                       onChange={(e) =>
                         setDrafts((prev) => ({
@@ -490,7 +493,7 @@ export default function SimLabPage({ onNavigate }: SimLabPageProps) {
                       min={0}
                       className="sim-num-input"
                       data-testid={`sim-col-${idx}`}
-                      aria-label={`Replica ${idx} column`}
+                      aria-label={t("Replica {n} column", { n: idx })}
                       value={draft.col}
                       onChange={(e) =>
                         setDrafts((prev) => ({
@@ -503,8 +506,8 @@ export default function SimLabPage({ onNavigate }: SimLabPageProps) {
                       type="text"
                       className="collab-input"
                       data-testid={`sim-value-${idx}`}
-                      aria-label={`Replica ${idx} cell input`}
-                      placeholder="Value or =formula"
+                      aria-label={t("Replica {n} cell input", { n: idx })}
+                      placeholder={t("Value or =formula")}
                       value={draft.value}
                       onChange={(e) =>
                         setDrafts((prev) => ({
@@ -518,7 +521,7 @@ export default function SimLabPage({ onNavigate }: SimLabPageProps) {
                       className="toolbar-btn primary-btn"
                       data-testid={`sim-apply-${idx}`}
                     >
-                      Apply
+                      {t("Apply")}
                     </button>
                   </form>
 
@@ -529,7 +532,7 @@ export default function SimLabPage({ onNavigate }: SimLabPageProps) {
                       data-testid={`sim-insert-row-${idx}`}
                       onClick={() => runInteractiveOp((lab) => lab.insertRow(idx, -1))}
                     >
-                      + Row Top
+                      + {t("Row Top")}
                     </button>
                     <button
                       type="button"
@@ -538,21 +541,21 @@ export default function SimLabPage({ onNavigate }: SimLabPageProps) {
                       disabled={!rep?.canUndo}
                       onClick={() => runInteractiveOp((lab) => lab.undo(idx))}
                     >
-                      Undo
+                      {t("Undo")}
                     </button>
                     <select
                       className="collab-select"
                       data-testid={`sim-link-${idx}`}
-                      aria-label={`Replica ${idx} network link`}
+                      aria-label={t("Replica {n} network link", { n: idx })}
                       value={rep?.linkMode ?? "online"}
                       onChange={(e) => {
                         const val = e.target.value;
                         runInteractiveOp((lab) => lab.setLinkState(idx, val));
                       }}
                     >
-                      <option value="online">Link: Online</option>
-                      <option value="delayed">Link: Delayed</option>
-                      <option value="dropped">Link: Dropped</option>
+                      <option value="online">{t("Link: Online")}</option>
+                      <option value="delayed">{t("Link: Delayed")}</option>
+                      <option value="dropped">{t("Link: Dropped")}</option>
                     </select>
                     <button
                       type="button"
@@ -560,21 +563,26 @@ export default function SimLabPage({ onNavigate }: SimLabPageProps) {
                       data-testid={`sim-crash-${idx}`}
                       onClick={() => runInteractiveOp((lab) => lab.crashAndRestart(idx))}
                     >
-                      Crash &amp; Restart
+                      {t("Crash & Restart")}
                     </button>
                   </div>
-                  {rep?.lastNotice && <p className="page-muted">{rep.lastNotice}</p>}
+                  {rep?.lastNotice && <p className="page-muted">{labText(rep.lastNotice)}</p>}
                 </section>
               );
             })}
           </div>
 
           <section className="page-card" data-testid="sim-wire-inspector">
-            <h2>Wire Queue Inspector ({labState?.queue.length ?? 0} frames queued)</h2>
+            <h2>
+              {t("Wire Queue Inspector ({n} frames queued)", {
+                n: labState?.queue.length ?? 0,
+              })}
+            </h2>
             {!labState || labState.queue.length === 0 ? (
               <p className="page-muted">
-                No queued network frames. Switch a replica link to Delayed to hold frames for
-                step-by-step inspection.
+                {t(
+                  "No queued network frames. Switch a replica link to Delayed to hold frames for step-by-step inspection.",
+                )}
               </p>
             ) : (
               <ul className="sim-queue-list">
@@ -588,7 +596,8 @@ export default function SimLabPage({ onNavigate }: SimLabPageProps) {
                       <li key={`${base}-${occ}`} className="sim-queue-item">
                         <span>
                           <strong>{item.replicaName}</strong> ·{" "}
-                          <code>{item.direction.toUpperCase()}</code> · {item.summary}
+                          <code>{item.direction.toUpperCase()}</code> ·{" "}
+                          {translateEngineText(item.summary)}
                         </span>
                       </li>
                     );
@@ -602,12 +611,12 @@ export default function SimLabPage({ onNavigate }: SimLabPageProps) {
         <section className="page-card">
           {autoError && (
             <div className="page-error" role="alert" data-testid="sim-autorun-error">
-              {autoError}
+              {translateEngineText(autoError)}
             </div>
           )}
 
           <div className="sim-edit-row" style={{ marginBottom: "12px" }}>
-            <label htmlFor="sim-seed-input">Deterministic Seed:</label>
+            <label htmlFor="sim-seed-input">{t("Deterministic Seed:")}</label>
             <input
               id="sim-seed-input"
               type="text"
@@ -625,7 +634,7 @@ export default function SimLabPage({ onNavigate }: SimLabPageProps) {
               disabled={autoRunning}
               onClick={handleStartAutoRun}
             >
-              {autoRunning ? "Running…" : "Run Seed"}
+              {autoRunning ? t("Running…") : t("Run Seed")}
             </button>
             <button
               type="button"
@@ -636,7 +645,7 @@ export default function SimLabPage({ onNavigate }: SimLabPageProps) {
                 setAutoError(null);
               }}
             >
-              Reset
+              {t("Reset")}
             </button>
           </div>
 
@@ -649,13 +658,14 @@ export default function SimLabPage({ onNavigate }: SimLabPageProps) {
               <div className="sim-server-banner">
                 <div className="collab-row">
                   <span>
-                    Steps:{" "}
-                    <strong>
-                      {autoProgress.completedSteps} / {autoProgress.totalSteps}
-                    </strong>
+                    {tx(
+                      "Steps: <0>{done} / {total}</0>",
+                      { 0: <strong /> },
+                      { done: autoProgress.completedSteps, total: autoProgress.totalSteps },
+                    )}
                   </span>
-                  <span>server headSeq #{autoProgress.headSeq}</span>
-                  <span>epoch {autoProgress.epoch}</span>
+                  <span>{t("server headSeq #{seq}", { seq: autoProgress.headSeq })}</span>
+                  <span>{t("epoch {epoch}", { epoch: autoProgress.epoch })}</span>
                   <span className="sim-digest-code" title={autoProgress.serverDigest}>
                     {autoProgress.serverDigest}
                   </span>
@@ -672,104 +682,92 @@ export default function SimLabPage({ onNavigate }: SimLabPageProps) {
                 >
                   {autoProgress.finished
                     ? autoProgress.passed
-                      ? "10 Invariants Verified"
-                      : "Verification Failed"
-                    : "Running…"}
+                      ? t("{n} Invariants Verified", { n: invariants().length })
+                      : t("Verification Failed")
+                    : t("Running…")}
                 </span>
               </div>
 
-              <h3>Fault &amp; Operation Telemetry</h3>
+              <h3>{t("Fault & Operation Telemetry")}</h3>
               <div className="sim-fault-grid" style={{ marginBottom: "14px" }}>
                 <div className="sim-fault-cell">
-                  <span className="page-muted">Local edits</span>
+                  <span className="page-muted">{t("Local edits")}</span>
                   <strong>{autoProgress.faults.localEdits}</strong>
                 </div>
                 <div className="sim-fault-cell">
-                  <span className="page-muted">SetCellsIf / Formula</span>
+                  <span className="page-muted">{t("SetCellsIf / Formula")}</span>
                   <strong>
                     {autoProgress.faults.setCellsIfOps} / {autoProgress.faults.formulaOps}
                   </strong>
                 </div>
                 <div className="sim-fault-cell">
-                  <span className="page-muted">Client crashes / OPFS loss</span>
+                  <span className="page-muted">{t("Client crashes / OPFS loss")}</span>
                   <strong>
                     {autoProgress.faults.clientCrashes} / {autoProgress.faults.opfsTailLosses}
                   </strong>
                 </div>
                 <div className="sim-fault-cell">
-                  <span className="page-muted">Server crashes / Epoch bumps</span>
+                  <span className="page-muted">{t("Server crashes / Epoch bumps")}</span>
                   <strong>
                     {autoProgress.faults.serverCrashes} / {autoProgress.faults.epochBackupRestores}
                   </strong>
                 </div>
                 <div className="sim-fault-cell">
-                  <span className="page-muted">Snapshot catchups / Rejects</span>
+                  <span className="page-muted">{t("Snapshot catchups / Rejects")}</span>
                   <strong>
                     {autoProgress.faults.snapshotRequiredCatchups} /{" "}
                     {autoProgress.faults.terminalRejects}
                   </strong>
                 </div>
                 <div className="sim-fault-cell">
-                  <span className="page-muted">Rogue frames rejected</span>
+                  <span className="page-muted">{t("Rogue frames rejected")}</span>
                   <strong>{autoProgress.faults.rogueAttemptsRejected}</strong>
                 </div>
               </div>
 
-              <h3>5 Simulated Collaborators</h3>
-              <table className="sim-table" style={{ marginBottom: "14px" }}>
-                <thead>
-                  <tr>
-                    <th>Replica</th>
-                    <th>Role</th>
-                    <th>Replica ID</th>
-                    <th>Connection</th>
-                    <th>Confirmed Seq</th>
-                    <th>Pending</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {autoProgress.replicas.map((r) => (
-                    <tr key={r.index}>
-                      <td>#{r.index}</td>
-                      <td>{r.role}</td>
-                      <td>{r.replica ?? "—"}</td>
-                      <td>{r.connection}</td>
-                      <td>#{r.confirmedSeq}</td>
-                      <td>{r.pendingLen}</td>
+              <h3>{t("5 Simulated Collaborators")}</h3>
+              <div className="sim-table-wrap">
+                <table className="sim-table">
+                  <thead>
+                    <tr>
+                      <th>{t("Replica")}</th>
+                      <th>{t("Role")}</th>
+                      <th>{t("Replica ID")}</th>
+                      <th>{t("Connection")}</th>
+                      <th>{t("Confirmed Seq")}</th>
+                      <th>{t("Pending")}</th>
                     </tr>
-                  ))}
-                </tbody>
-              </table>
+                  </thead>
+                  <tbody>
+                    {autoProgress.replicas.map((r) => (
+                      <tr key={r.index}>
+                        <td>#{r.index}</td>
+                        <td>{roleName(r.role)}</td>
+                        <td>{r.replica ?? "—"}</td>
+                        <td>{connectionName(r.connection)}</td>
+                        <td>#{r.confirmedSeq}</td>
+                        <td>{r.pendingLen}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
             </>
           )}
 
-          <h3>Protocol Invariants (1–10)</h3>
+          <h3>{t("Protocol Invariants (1–{n})", { n: invariants().length })}</h3>
           <ul className="sim-invariants-grid" data-testid="sim-invariants-list">
-            {TEN_INVARIANTS.map((label) => {
-              const status = !autoProgress
-                ? "Idle"
-                : !autoProgress.finished
-                  ? "Checking…"
-                  : autoProgress.passed
-                    ? "Verified"
-                    : "Failed";
-              return (
-                <li key={label} className="sim-invariant-item">
-                  <span>{label}</span>
-                  <span
-                    className={
-                      status === "Verified"
-                        ? "sim-badge sim-badge-ok"
-                        : status === "Failed"
-                          ? "sim-badge sim-badge-warn"
-                          : "sim-badge"
-                    }
-                  >
-                    {status}
-                  </span>
-                </li>
-              );
-            })}
+            {invariants().map((text, index) => (
+              // biome-ignore lint/suspicious/noArrayIndexKey: an invariant is known by its number
+              <li key={index} className="sim-invariant-item">
+                <span>
+                  {index + 1}. {text}
+                </span>
+                <span className={INVARIANT_BADGES[invariantStatus]}>
+                  {invariantStatusName(invariantStatus)}
+                </span>
+              </li>
+            ))}
           </ul>
         </section>
       )}

@@ -344,6 +344,12 @@ body {
   font-size: 11px;
 }
 
+/* The parameters have Chinese names then, for which the generic monospace font is too coarse. */
+.formula-assist:lang(zh) .sig-param,
+.formula-assist:lang(zh) .completion-sig {
+  font-family: ui-monospace, "Cascadia Mono", Consolas, system-ui, monospace;
+}
+
 .completion-summary {
   flex: 1;
   min-width: 0;
@@ -1326,6 +1332,11 @@ body {
   font-size: 12px;
 }
 
+/* Chinese may break anywhere, and a label next to a wide input would. */
+.m3a-field > span:first-child {
+  white-space: nowrap;
+}
+
 .m3a-field input,
 .m3a-field select {
   padding: 4px 7px;
@@ -1350,6 +1361,7 @@ body {
 }
 
 .m3a-match {
+  box-sizing: border-box;
   display: flex;
   justify-content: space-between;
   align-items: center;

@@ -13,6 +13,7 @@ import type {
   WireSortKey,
 } from "@reticula/protocol";
 import { useEffect, useState } from "react";
+import { t } from "./i18n/index.ts";
 
 export type M3aToolMode =
   | { readonly kind: "find"; readonly replace: boolean }
@@ -44,6 +45,31 @@ export type M3aModalEvent =
       readonly sheet: SheetInfo;
     }
   | { readonly kind: "namedRangesListed"; readonly items: readonly WireNamedRangeInfo[] };
+
+/** What came of the latest search or replacement, or `null` for an event about something else. */
+function searchOutcome(event: M3aModalEvent): string | null {
+  switch (event.kind) {
+    case "searchResults":
+      return event.truncated
+        ? t("Found {n} match(es) (showing first page).", { n: event.total })
+        : t("Found {n} match(es).", { n: event.total });
+    case "searchNavigated":
+      return event.found
+        ? t("Jumped to {cell}", {
+            cell: `${event.found.sheetName}!${columnName(event.found.col)}${event.found.physicalRow + 1}`,
+          })
+        : t("No matching cell found.");
+    case "replaceCompleted":
+      return event.skippedInvalidFormulas > 0
+        ? t("Replaced {n} cell(s), skipped {skipped} invalid formula(s).", {
+            n: event.replacedCells,
+            skipped: event.skippedInvalidFormulas,
+          })
+        : t("Replaced {n} cell(s).", { n: event.replacedCells });
+    default:
+      return null;
+  }
+}
 
 export interface M3aToolsModalProps {
   readonly mode: M3aToolMode;
@@ -160,7 +186,7 @@ function FindReplacePanel({
   const [useRegex, setUseRegex] = useState(false);
   const [skipHidden, setSkipHidden] = useState(true);
   const [matches, setMatches] = useState<readonly WireSearchMatch[]>([]);
-  const [status, setStatus] = useState("");
+  const [outcome, setOutcome] = useState<M3aModalEvent | null>(null);
 
   useEffect(() => {
     setShowReplace(initialReplace);
@@ -172,22 +198,13 @@ function FindReplacePanel({
     }
     if (lastEvent.kind === "searchResults") {
       setMatches(lastEvent.matches);
-      setStatus(
-        `Found ${lastEvent.total} match(es)${lastEvent.truncated ? " (showing first page)" : ""}.`,
-      );
-    } else if (lastEvent.kind === "searchNavigated") {
-      setStatus(
-        lastEvent.found
-          ? `Jumped to ${lastEvent.found.sheetName}!${columnName(lastEvent.found.col)}${lastEvent.found.physicalRow + 1}`
-          : "No matching cell found.",
-      );
-    } else if (lastEvent.kind === "replaceCompleted") {
-      setStatus(
-        `Replaced ${lastEvent.replacedCells} cell(s)${lastEvent.skippedInvalidFormulas > 0 ? `, skipped ${lastEvent.skippedInvalidFormulas} invalid formula(s)` : ""}.`,
-      );
+    }
+    if (searchOutcome(lastEvent) !== null) {
+      setOutcome(lastEvent);
     }
   }, [lastEvent]);
 
+  const status = outcome && searchOutcome(outcome);
   const opts: WireFindOptions = {
     query,
     scope,
@@ -204,30 +221,30 @@ function FindReplacePanel({
   return (
     <div data-testid="m3a-find-modal" style={{ display: "flex", flexDirection: "column", gap: 10 }}>
       <div className="modal-header">
-        <h2>{showReplace ? "Find & Replace" : "Find"}</h2>
-        <button type="button" className="tip-close" aria-label="Close" onClick={onClose}>
+        <h2>{showReplace ? t("Find & Replace") : t("Find")}</h2>
+        <button type="button" className="tip-close" aria-label={t("Close")} onClick={onClose}>
           ×
         </button>
       </div>
       <div className="m3a-row">
         <label className="m3a-field" style={{ flex: 1 }}>
-          <span>Find</span>
+          <span>{t("Find")}</span>
           <input
             type="text"
             data-testid="find-query"
             value={query}
             onChange={(e) => setQuery(e.target.value)}
-            placeholder="Text, pattern, or =formula"
+            placeholder={t("Text, pattern, or =formula")}
             style={{ width: "100%" }}
           />
         </label>
         <button type="button" className="toolbar-btn" onClick={() => setShowReplace((v) => !v)}>
-          {showReplace ? "Hide Replace" : "Replace…"}
+          {showReplace ? t("Hide Replace") : t("Replace…")}
         </button>
       </div>
       {showReplace && (
         <label className="m3a-field">
-          <span>Replace</span>
+          <span>{t("Replace")}</span>
           <input
             type="text"
             data-testid="replace-input"
@@ -239,25 +256,25 @@ function FindReplacePanel({
       )}
       <div className="m3a-row">
         <label className="m3a-field">
-          <span>Scope</span>
+          <span>{t("Scope")}</span>
           <select
             data-testid="find-scope"
             value={scope}
             onChange={(e) => setScope(e.target.value as WireSearchScope)}
           >
-            <option value="activeSheet">Active sheet</option>
-            <option value="wholeWorkbook">Whole workbook</option>
+            <option value="activeSheet">{t("Active sheet")}</option>
+            <option value="wholeWorkbook">{t("Whole workbook")}</option>
           </select>
         </label>
         <label className="m3a-field">
-          <span>Look in</span>
+          <span>{t("Look in")}</span>
           <select
             data-testid="find-in"
             value={searchIn}
             onChange={(e) => setSearchIn(e.target.value as WireSearchIn)}
           >
-            <option value="displayValues">Values</option>
-            <option value="formulas">Formulas</option>
+            <option value="displayValues">{t("Values")}</option>
+            <option value="formulas">{t("Formulas")}</option>
           </select>
         </label>
       </div>
@@ -268,7 +285,7 @@ function FindReplacePanel({
             checked={caseSensitive}
             onChange={(e) => setCaseSensitive(e.target.checked)}
           />
-          <span>Case sensitive</span>
+          <span>{t("Case sensitive")}</span>
         </label>
         <label className="m3a-field">
           <input
@@ -276,7 +293,7 @@ function FindReplacePanel({
             checked={wholeCell}
             onChange={(e) => setWholeCell(e.target.checked)}
           />
-          <span>Entire cell</span>
+          <span>{t("Entire cell")}</span>
         </label>
         <label className="m3a-field">
           <input
@@ -285,7 +302,7 @@ function FindReplacePanel({
             checked={useRegex}
             onChange={(e) => setUseRegex(e.target.checked)}
           />
-          <span>Regex</span>
+          <span>{t("Regex")}</span>
         </label>
         <label className="m3a-field">
           <input
@@ -293,7 +310,7 @@ function FindReplacePanel({
             checked={skipHidden}
             onChange={(e) => setSkipHidden(e.target.checked)}
           />
-          <span>Skip filtered rows</span>
+          <span>{t("Skip filtered rows")}</span>
         </label>
       </div>
       <div className="m3a-row">
@@ -313,7 +330,7 @@ function FindReplacePanel({
             })
           }
         >
-          Find Next
+          {t("Find Next")}
         </button>
         <button
           type="button"
@@ -331,7 +348,7 @@ function FindReplacePanel({
             })
           }
         >
-          Previous
+          {t("Previous")}
         </button>
         <button
           type="button"
@@ -342,7 +359,7 @@ function FindReplacePanel({
             onSend({ kind: "findAll", sheet: sheet.sheet, options: opts, maxResults: 200 })
           }
         >
-          Find All
+          {t("Find All")}
         </button>
         {showReplace && (
           <button
@@ -355,7 +372,7 @@ function FindReplacePanel({
               onSend({ kind: "replaceAll", sheet: sheet.sheet, options: opts, replacement });
             }}
           >
-            Replace All
+            {t("Replace All")}
           </button>
         )}
       </div>
@@ -433,14 +450,14 @@ function SortPanel({
   return (
     <div data-testid="m3a-sort-modal" style={{ display: "flex", flexDirection: "column", gap: 10 }}>
       <div className="modal-header">
-        <h2>Sort Range</h2>
-        <button type="button" className="tip-close" aria-label="Close" onClick={onClose}>
+        <h2>{t("Sort Range")}</h2>
+        <button type="button" className="tip-close" aria-label={t("Close")} onClick={onClose}>
           ×
         </button>
       </div>
       <div className="m3a-row">
         <label className="m3a-field">
-          <span>Rows (1-based)</span>
+          <span>{t("Rows (1-based)")}</span>
           <input
             type="number"
             min={1}
@@ -450,7 +467,7 @@ function SortPanel({
             onChange={(e) => setFirstRow1(Math.max(1, Number(e.target.value) || 1))}
             style={{ width: 72 }}
           />
-          <span>to</span>
+          <span>{t("to|range")}</span>
           <input
             type="number"
             min={1}
@@ -462,7 +479,7 @@ function SortPanel({
           />
         </label>
         <label className="m3a-field">
-          <span>Cols (1-based)</span>
+          <span>{t("Cols (1-based)")}</span>
           <input
             type="number"
             min={1}
@@ -471,7 +488,7 @@ function SortPanel({
             onChange={(e) => setFirstCol1(Math.max(1, Number(e.target.value) || 1))}
             style={{ width: 58 }}
           />
-          <span>to</span>
+          <span>{t("to|range")}</span>
           <input
             type="number"
             min={1}
@@ -484,15 +501,15 @@ function SortPanel({
       </div>
       <div className="m3a-row">
         <label className="m3a-field">
-          <span>Header row</span>
+          <span>{t("Header row")}</span>
           <select
             data-testid="sort-header-mode"
             value={headerMode}
             onChange={(e) => setHeaderMode(e.target.value as "auto" | "yes" | "no")}
           >
-            <option value="auto">Auto-detect</option>
-            <option value="yes">Data has header</option>
-            <option value="no">No header</option>
+            <option value="auto">{t("Auto-detect")}</option>
+            <option value="yes">{t("Data has header")}</option>
+            <option value="no">{t("No header")}</option>
           </select>
         </label>
         <button
@@ -513,14 +530,14 @@ function SortPanel({
             ]);
           }}
         >
-          + Add Level
+          {t("+ Add Level")}
         </button>
       </div>
       <div className="m3a-list">
         {keys.map((k, idx) => (
           <div key={k.id} className="m3a-row">
             <select
-              aria-label={`Sort column ${idx + 1}`}
+              aria-label={t("Sort column {n}", { n: idx + 1 })}
               data-testid={`sort-key-col-${idx}`}
               value={Math.min(k.colOffset, colCount - 1)}
               onChange={(e) => {
@@ -534,13 +551,13 @@ function SortPanel({
                 const colIdx = firstCol1 - 1 + offset;
                 return (
                   <option key={colIdx} value={offset}>
-                    Column {columnName(colIdx)}
+                    {t("Column {name}", { name: columnName(colIdx) })}
                   </option>
                 );
               })}
             </select>
             <select
-              aria-label={`Sort order ${idx + 1}`}
+              aria-label={t("Sort order {n}", { n: idx + 1 })}
               data-testid={`sort-key-dir-${idx}`}
               value={k.ascending ? "asc" : "desc"}
               onChange={(e) => {
@@ -550,8 +567,8 @@ function SortPanel({
                 );
               }}
             >
-              <option value="asc">A → Z / Smallest</option>
-              <option value="desc">Z → A / Largest</option>
+              <option value="asc">{t("A → Z / Smallest")}</option>
+              <option value="desc">{t("Z → A / Largest")}</option>
             </select>
             {keys.length > 1 && (
               <button
@@ -559,7 +576,7 @@ function SortPanel({
                 className="toolbar-btn"
                 onClick={() => setKeys((prev) => prev.filter((item) => item.id !== k.id))}
               >
-                Remove
+                {t("Remove")}
               </button>
             )}
           </div>
@@ -567,7 +584,7 @@ function SortPanel({
       </div>
       <div className="m3a-row" style={{ justifyContent: "flex-end" }}>
         <button type="button" className="toolbar-btn" onClick={onClose}>
-          Cancel
+          {t("Cancel")}
         </button>
         <button
           type="button"
@@ -599,7 +616,7 @@ function SortPanel({
             onClose();
           }}
         >
-          Apply Sort
+          {t("Apply Sort")}
         </button>
       </div>
     </div>
@@ -683,14 +700,14 @@ function FilterPanel({
       style={{ display: "flex", flexDirection: "column", gap: 10 }}
     >
       <div className="modal-header">
-        <h2>AutoFilter — Column {columnName(col)}</h2>
-        <button type="button" className="tip-close" aria-label="Close" onClick={onClose}>
+        <h2>{t("AutoFilter — Column {name}", { name: columnName(col) })}</h2>
+        <button type="button" className="tip-close" aria-label={t("Close")} onClick={onClose}>
           ×
         </button>
       </div>
       <div className="m3a-row">
         <label className="m3a-field">
-          <span>Column</span>
+          <span>{t("Column")}</span>
           <select value={col} onChange={(e) => setCol(Number(e.target.value))}>
             {Array.from({ length: Math.max(1, colMax - colMin + 1) }, (_, idx) => {
               const c = colMin + idx;
@@ -705,10 +722,10 @@ function FilterPanel({
         <div className="m3a-row">
           {(
             [
-              ["values", "Values"],
-              ["text", "Text"],
-              ["number", "Number"],
-              ["topN", "Top N"],
+              ["values", t("Values")],
+              ["text", t("Text")],
+              ["number", t("Number")],
+              ["topN", t("Top N")],
             ] as const
           ).map(([id, label]) => (
             <button
@@ -734,7 +751,7 @@ function FilterPanel({
                 setIncludeBlanks(true);
               }}
             >
-              Select All
+              {t("Select All")}
             </button>
             <button
               type="button"
@@ -745,7 +762,7 @@ function FilterPanel({
                 setIncludeBlanks(false);
               }}
             >
-              Unselect All
+              {t("Unselect All")}
             </button>
           </div>
           <div className="m3a-list" data-testid="filter-values-list">
@@ -780,7 +797,7 @@ function FilterPanel({
                 checked={includeBlanks}
                 onChange={(e) => setIncludeBlanks(e.target.checked)}
               />
-              <span>(Blanks) ({blankCount})</span>
+              <span>{t("(Blanks) ({n})", { n: blankCount })}</span>
             </label>
           </div>
         </>
@@ -789,16 +806,16 @@ function FilterPanel({
       {modeTab === "text" && (
         <div className="m3a-row">
           <select value={textOp} onChange={(e) => setTextOp(e.target.value as typeof textOp)}>
-            <option value="contains">Contains</option>
-            <option value="startsWith">Begins with</option>
-            <option value="endsWith">Ends with</option>
+            <option value="contains">{t("Contains")}</option>
+            <option value="startsWith">{t("Begins with")}</option>
+            <option value="endsWith">{t("Ends with")}</option>
           </select>
           <input
             type="text"
             data-testid="filter-text-needle"
             value={textNeedle}
             onChange={(e) => setTextNeedle(e.target.value)}
-            placeholder="Text…"
+            placeholder={t("Text…")}
           />
         </div>
       )}
@@ -807,11 +824,11 @@ function FilterPanel({
         <div className="m3a-row">
           <select value={numOp} onChange={(e) => setNumOp(e.target.value as WireFilterCmpOp)}>
             <option value="eq">=</option>
-            <option value="ne">&lt;&gt;</option>
-            <option value="gt">&gt;</option>
-            <option value="ge">&gt;=</option>
-            <option value="lt">&lt;</option>
-            <option value="le">&lt;=</option>
+            <option value="ne">{"<>"}</option>
+            <option value="gt">{">"}</option>
+            <option value="ge">{">="}</option>
+            <option value="lt">{"<"}</option>
+            <option value="le">{"<="}</option>
           </select>
           <input
             type="number"
@@ -828,8 +845,8 @@ function FilterPanel({
             value={topDir ? "top" : "bottom"}
             onChange={(e) => setTopDir(e.target.value === "top")}
           >
-            <option value="top">Top</option>
-            <option value="bottom">Bottom</option>
+            <option value="top">{t("Top|filter")}</option>
+            <option value="bottom">{t("Bottom|filter")}</option>
           </select>
           <input
             type="number"
@@ -852,7 +869,7 @@ function FilterPanel({
               onClose();
             }}
           >
-            Clear Column
+            {t("Clear Column")}
           </button>
           <button
             type="button"
@@ -863,7 +880,7 @@ function FilterPanel({
               onClose();
             }}
           >
-            Turn Off AutoFilter
+            {t("Turn Off AutoFilter")}
           </button>
         </div>
         <button
@@ -872,7 +889,7 @@ function FilterPanel({
           data-testid="filter-apply-btn"
           onClick={applyCriterion}
         >
-          Apply Filter
+          {t("Apply Filter")}
         </button>
       </div>
     </div>
@@ -920,14 +937,14 @@ function NamesPanel({
       style={{ display: "flex", flexDirection: "column", gap: 10 }}
     >
       <div className="modal-header">
-        <h2>Name Manager</h2>
-        <button type="button" className="tip-close" aria-label="Close" onClick={onClose}>
+        <h2>{t("Name Manager")}</h2>
+        <button type="button" className="tip-close" aria-label={t("Close")} onClick={onClose}>
           ×
         </button>
       </div>
       <div className="m3a-row">
         <label className="m3a-field">
-          <span>Name</span>
+          <span>{t("Name")}</span>
           <input
             type="text"
             data-testid="name-input"
@@ -937,7 +954,7 @@ function NamesPanel({
           />
         </label>
         <label className="m3a-field" style={{ flex: 1 }}>
-          <span>Refers to</span>
+          <span>{t("Refers to")}</span>
           <input
             type="text"
             data-testid="name-formula-input"
@@ -952,7 +969,7 @@ function NamesPanel({
             checked={useSheetScope}
             onChange={(e) => setUseSheetScope(e.target.checked)}
           />
-          <span>{sheet.sheetName} only</span>
+          <span>{t("{sheet} only", { sheet: sheet.sheetName })}</span>
         </label>
         <button
           type="button"
@@ -973,16 +990,17 @@ function NamesPanel({
             onSend({ kind: "listNamedRanges" });
           }}
         >
-          Define
+          {t("Define")}
         </button>
       </div>
       <div className="m3a-list" data-testid="names-list">
-        {items.length === 0 && <p className="m3a-status">No defined named ranges yet.</p>}
+        {items.length === 0 && <p className="m3a-status">{t("No defined named ranges yet.")}</p>}
         {items.map((item) => {
           const scopeName =
             item.scope === undefined
-              ? "Workbook"
-              : (sheet.sheets.find((s) => s.id === item.scope)?.name ?? `Sheet ${item.scope}`);
+              ? t("Workbook|scope")
+              : (sheet.sheets.find((s) => s.id === item.scope)?.name ??
+                t("Sheet {id}", { id: item.scope }));
           return (
             <div key={`${item.scope ?? "wb"}-${item.name}`} className="m3a-match">
               <span>
@@ -999,7 +1017,7 @@ function NamesPanel({
                   onSend({ kind: "listNamedRanges" });
                 }}
               >
-                Delete
+                {t("Delete")}
               </button>
             </div>
           );

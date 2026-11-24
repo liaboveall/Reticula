@@ -1,4 +1,7 @@
 import { ApiError } from "@reticula/protocol/collab-api";
+import { translateEngineText } from "../i18n/engine-text.ts";
+import { t } from "../i18n/index.ts";
+import { errorText } from "./errors.ts";
 
 export function pickNearestSnapshotSeq(
   snapshotSeqs: readonly string[],
@@ -15,44 +18,29 @@ export function pickNearestSnapshotSeq(
   return best === null ? null : best.toString();
 }
 
-export function formatBytes(bytes: number): string {
-  if (!Number.isFinite(bytes) || bytes <= 0) {
-    return "0 B";
-  }
-  if (bytes < 1024) {
-    return `${Math.round(bytes)} B`;
-  }
-  if (bytes < 1024 * 1024) {
-    return `${(bytes / 1024).toFixed(1)} KB`;
-  }
-  if (bytes < 1024 * 1024 * 1024) {
-    return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
-  }
-  return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
-}
-
+/** What to tell the user about a failed request. `fallback` is in the language shown. */
 export function apiErrorMessage(err: unknown, fallback: string): string {
   if (err instanceof ApiError) {
     switch (err.status) {
       case 401:
-        return "Sign in required to perform this action.";
+        return t("Sign in required to perform this action.");
       case 403:
-        return "Access denied or account storage quota reached.";
+        return t("Access denied or account storage quota reached.");
       case 409:
-        return "A duplicate item with that name already exists.";
+        return t("A duplicate item with that name already exists.");
       case 413:
-        return "Uploaded file exceeds the 32 MiB collaborative import limit.";
+        return t("Uploaded file exceeds the 32 MiB collaborative import limit.");
       case 422:
-        return "Workbook exceeds collaborative limits (2M cells / 64 MiB) or invalid input.";
+        return t("Workbook exceeds collaborative limits (2M cells / 64 MiB) or invalid input.");
       case 429:
-        return "Too many requests right now. Please try again in a moment.";
+        return t("Too many requests right now. Please try again in a moment.");
       case 503:
-        return "Server document memory budget is temporarily busy.";
+        return t("Server document memory budget is temporarily busy.");
       case 507:
-        return "Server storage volume is full; delete unused workbooks or try later.";
+        return t("Server storage volume is full; delete unused workbooks or try later.");
       default:
-        return `${fallback} (HTTP ${err.status})`;
+        return t("{message} (HTTP {status})", { message: fallback, status: err.status });
     }
   }
-  return err instanceof Error ? err.message : fallback;
+  return translateEngineText(errorText(err, fallback));
 }

@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 
-use crate::util::{self, Result};
+use crate::util::{self, Result, node};
 
 /// The manifest's name for the document, and so for the entry chunk.
 const ENTRY: &str = "index.html";
@@ -27,19 +27,23 @@ const PAGES: [(&str, &str); 7] = [
 /// The set with what the engine's worker needs.
 const ENGINE: &str = "engine";
 
+/// The module with the rule for the language and the texts each page needs.
+const LOCALE_MODULE: &str = "apps/web/src/i18n/locale-rule.ts";
+
 /// Where `index.html` wants the inline script.
 const BOOT_MARKER: &str = "<!-- boot -->";
 
 /// The inline script. It takes two tables of file names: the sets of the
-/// pages, one of which is loaded at once, and further sets. It decides between
-/// the pages as `normalizeAppRoute` does. A set that depends on something else
-/// than the page, such as the language, belongs in the second table, with its
-/// own call of `load` next to the last one.
+/// pages, one of which is loaded at once, and further sets, which depend on
+/// something else than the page alone. It decides between the pages as
+/// `normalizeAppRoute` does, and on the language in the very words of the app,
+/// which take the place of `LOCALE_MARKER`.
 ///
 /// Everything is requested the way it will be requested again (module scripts
 /// and the worker's `fetch` are CORS requests without credentials for other
 /// origins), so that nothing is downloaded twice.
-const BOOT_SCRIPT: &str = r#"((p,x)=>{const s={},load=window.__reticulaPreload=k=>{for(const f of p[k]||x[k]||[])if(!s[f]){s[f]=1;const l=document.createElement("link");if(f.endsWith(".wasm")){l.rel="preload";l.as="fetch";l.type="application/wasm"}else l.rel="modulepreload";l.crossOrigin="";l.href="/assets/"+f;document.head.append(l)}},[,a,b]=location.pathname.split("/"),r=a=="join"&&b!=null?"app":Object.hasOwn(p,a)?a:"landing";load(r);if(r=="app")load("engine")})"#;
+const BOOT_SCRIPT: &str = r#"((p,x)=>{const s={},load=window.__reticulaPreload=k=>{for(const f of p[k]||x[k]||[])if(!s[f]){s[f]=1;const l=document.createElement("link");if(f.endsWith(".wasm")){l.rel="preload";l.as="fetch";l.type="application/wasm"}else l.rel="modulepreload";l.crossOrigin="";l.href="/assets/"+f;document.head.append(l)}},[,a,b]=location.pathname.split("/"),r=a=="join"&&b!=null?"app":Object.hasOwn(p,a)?a:"landing";load(r);if(r=="app")load("engine");if(__LOCALE__!="en")load("zh:"+r)})"#;
+const LOCALE_MARKER: &str = "__LOCALE__";
 
 /// Brotli-compressed sizes the build must not exceed, in bytes.
 const MAX_EDITOR_JS: u64 = 180_000;
@@ -187,6 +191,57 @@ fn has_extension(name: &str, extension: &str) -> bool {
         .is_some_and(|found| found.eq_ignore_ascii_case(extension))
 }
 
+/// What the app's own module says about languages. Nothing of it is written
+/// down a second time here.
+struct Languages {
+    /// The source of the function that decides on the language.
+    rule: String,
+    /// The key under which the browser keeps the user's choice.
+    key: String,
+    /// The modules with the Chinese texts each page waits for.
+    catalogues: BTreeMap<String, Vec<String>>,
+}
+
+impl Languages {
+    /// Has Node.js read the module, which takes the types out of it.
+    fn read() -> Result<Self> {
+        const SCRIPT: &str = "\
+const { pathToFileURL } = require('node:url');
+import(pathToFileURL(process.argv[1])).then(({ detectLocale, LOCALE_KEY, CATALOGUES }) =>
+  console.log(JSON.stringify([detectLocale.toString(), LOCALE_KEY, CATALOGUES])));";
+        Self::parse(&node().args(["--eval", SCRIPT, LOCALE_MODULE]).output()?)
+    }
+
+    fn parse(json: &str) -> Result<Self> {
+        let (rule, key, catalogues) =
+            serde_json::from_str(json).map_err(|e| format!("cannot read {LOCALE_MODULE}: {e}"))?;
+        Ok(Self {
+            rule,
+            key,
+            catalogues,
+        })
+    }
+
+    /// An expression for the language, on one line.
+    fn expression(&self) -> Result<String> {
+        let rule = self.rule.split_whitespace().collect::<Vec<_>>().join(" ");
+        for (what, text) in [
+            ("a comment", "//"),
+            ("a comment", "/*"),
+            ("an end tag", "</"),
+        ] {
+            if rule.contains(text) {
+                return Err(format!(
+                    "the rule in {LOCALE_MODULE} has {what}, which the inline script cannot contain"
+                ));
+            }
+        }
+        let key = serde_json::to_string(&self.key)
+            .map_err(|e| format!("serialize the key of the language: {e}"))?;
+        Ok(format!("({rule})(self,{key})"))
+    }
+}
+
 /// What a build's pages need, worked out from its manifest and its files.
 pub struct Closures {
     /// The entry chunk and what it imports, which every page starts with.
@@ -195,6 +250,9 @@ pub struct Closures {
     pages: BTreeMap<&'static str, BTreeSet<String>>,
     worker: BTreeSet<String>,
     engine_wasm: String,
+    /// The chunks with the Chinese texts of each page, by the page's name.
+    texts: BTreeMap<&'static str, BTreeSet<String>>,
+    languages: Languages,
 }
 
 impl Closures {
@@ -209,15 +267,22 @@ impl Closures {
 
         let assets = dist.join("assets");
         let names = file_names(&assets)?;
-        Self::new(&Manifest::parse(&json)?, &names, |name| {
-            let path = assets.join(name);
-            fs::read_to_string(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))
-        })
+        Self::new(
+            &Manifest::parse(&json)?,
+            &names,
+            Languages::read()?,
+            |name| {
+                let path = assets.join(name);
+                fs::read_to_string(&path)
+                    .map_err(|e| format!("cannot read {}: {e}", path.display()))
+            },
+        )
     }
 
     fn new(
         manifest: &Manifest,
         names: &[String],
+        languages: Languages,
         read: impl FnMut(&str) -> Result<String>,
     ) -> Result<Self> {
         let loaded_on_demand = &manifest.chunk(ENTRY)?.dynamic_imports;
@@ -228,7 +293,9 @@ impl Closures {
                 "`{module}` is missing in the list of pages: nothing would preload it"
             ));
         }
+        let entry = manifest.closure(ENTRY)?;
         let mut pages = BTreeMap::new();
+        let mut texts = BTreeMap::new();
         for (page, module) in PAGES {
             if !loaded_on_demand.iter().any(|key| key == module) {
                 return Err(format!(
@@ -236,13 +303,23 @@ impl Closures {
                 ));
             }
             pages.insert(page, manifest.closure(module)?);
+            let Some(catalogues) = languages.catalogues.get(page) else {
+                return Err(format!("{LOCALE_MODULE} has no texts for the {page} page"));
+            };
+            let mut files = BTreeSet::new();
+            for catalogue in catalogues {
+                files.extend(manifest.closure(&format!("src/i18n/{catalogue}.ts"))?);
+            }
+            texts.insert(page, files.difference(&entry).cloned().collect());
         }
         let worker = only(names, "worker-", "js")?;
         Ok(Self {
-            entry: manifest.closure(ENTRY)?,
+            entry,
             pages,
             worker: script_closure(worker, read)?,
             engine_wasm: only(names, "reticula_wasm_bg", "wasm")?.to_owned(),
+            texts,
+            languages,
         })
     }
 
@@ -272,16 +349,16 @@ impl Closures {
             .collect();
         let mut engine: Vec<&String> = self.worker.iter().collect();
         engine.push(&self.engine_wasm);
-        let others = BTreeMap::from([(ENGINE, engine)]);
+        let mut others = BTreeMap::from([(String::from(ENGINE), engine)]);
+        for (page, files) in &self.texts {
+            others.insert(format!("zh:{page}"), files.iter().collect());
+        }
 
-        let json = |table: &BTreeMap<&str, Vec<&String>>| {
-            serde_json::to_string(table).map_err(|e| format!("serialize preload sets: {e}"))
-        };
-        Ok(format!(
-            "<script>{BOOT_SCRIPT}({},{})</script>",
-            json(&pages)?,
-            json(&others)?
-        ))
+        let error = |e| format!("serialize preload sets: {e}");
+        let pages = serde_json::to_string(&pages).map_err(error)?;
+        let others = serde_json::to_string(&others).map_err(error)?;
+        let code = BOOT_SCRIPT.replace(LOCALE_MARKER, &self.languages.expression()?);
+        Ok(format!("<script>{code}({pages},{others})</script>"))
     }
 }
 
@@ -473,7 +550,9 @@ mod tests {
     use super::*;
 
     /// A build in which the editor shares a chunk with the landing page, loads
-    /// a dialog on demand, and has a worker with an import of its own.
+    /// a dialog on demand, and has a worker with an import of its own. The
+    /// Chinese texts are loaded on demand, and there are more of them for the
+    /// pages other than the editor.
     const MANIFEST: &str = r#"{
         "_shared-S.js": { "file": "assets/shared-S.js", "imports": ["index.html"] },
         "index.html": {
@@ -502,23 +581,58 @@ mod tests {
         "src/pages/AccountPage.tsx": { "file": "assets/AccountPage-A.js" },
         "src/pages/PrivacyPage.tsx": { "file": "assets/PrivacyPage-P.js" },
         "src/sim/SimLabPage.tsx": { "file": "assets/SimLabPage-X.js" },
-        "src/pages/BenchmarksPage.tsx": { "file": "assets/BenchmarksPage-B.js" }
+        "src/pages/BenchmarksPage.tsx": { "file": "assets/BenchmarksPage-B.js" },
+        "src/i18n/zh-core.ts": {
+            "file": "assets/zh-core-Z.js", "imports": ["_runtime-R.js"]
+        },
+        "src/i18n/zh-pages.ts": { "file": "assets/zh-pages-Z.js" }
     }"#;
 
+    fn languages() -> Languages {
+        let catalogues = PAGES
+            .iter()
+            .map(|&(page, _)| {
+                let names: &[&str] = if page == EDITOR {
+                    &["zh-core"]
+                } else {
+                    &["zh-core", "zh-pages"]
+                };
+                (
+                    page.to_owned(),
+                    names.iter().map(|&name| name.to_owned()).collect(),
+                )
+            })
+            .collect();
+        Languages {
+            rule: String::from("function rule(host          , key)  {\n  return \"en\";\n}"),
+            key: String::from("locale"),
+            catalogues,
+        }
+    }
+
     fn built(manifest: &str) -> Result<Closures> {
+        built_with(manifest, languages())
+    }
+
+    fn built_with(manifest: &str, languages: Languages) -> Result<Closures> {
         let names = [
             "reticula_wasm_bg-K.wasm",
             "reticula_sim_wasm_bg-K.wasm",
             "worker-W.js",
         ]
         .map(String::from);
-        Closures::new(&Manifest::parse(manifest)?, &names, |name| match name {
-            "worker-W.js" => Ok(String::from(
-                "import{a as b}from\"./codec-C.js\";b(()=>import(`./on-demand-O.js`))",
-            )),
-            "codec-C.js" => Ok(String::from("export{a};")),
-            other => Err(format!("`{other}` is not needed to start the worker")),
-        })
+        Closures::new(
+            &Manifest::parse(manifest)?,
+            &names,
+            languages,
+            |name| match name {
+                "worker-W.js" => Ok(String::from(
+                    "import{a as b}from\"./codec-C.js\";b(()=>import(`./on-demand-O.js`))",
+                )),
+                "codec-C.js" => Ok(String::from("export{a};")),
+                other => Err(format!("`{other}` is not needed to start the worker")),
+            },
+        )
     }
 
     fn names(files: &[&str]) -> BTreeSet<String> {
@@ -672,12 +786,56 @@ mod tests {
             "{script}"
         );
         assert!(
-            script.contains(r#"{"engine":["codec-C.js","worker-W.js","reticula_wasm_bg-K.wasm"]}"#),
+            script.contains(r#"{"engine":["codec-C.js","worker-W.js","reticula_wasm_bg-K.wasm"],"#),
+            "{script}"
+        );
+        assert!(script.contains(r#""zh:app":["zh-core-Z.js"]"#), "{script}");
+        assert!(
+            script.contains(r#""zh:landing":["zh-core-Z.js","zh-pages-Z.js"]"#),
             "{script}"
         );
         // The entry and what it imports are in the document itself.
         assert!(!script.contains("index-I.js") && !script.contains("runtime-R.js"));
         assert!(!script.contains("on-demand") && !script.contains("LocalModals"));
+    }
+
+    #[test]
+    fn the_boot_script_decides_on_the_language_as_the_app_does() {
+        let script = built(MANIFEST).unwrap().boot_script().unwrap();
+        assert!(
+            script.contains(
+                r#"if((function rule(host , key) { return "en"; })(self,"locale")!="en")load("zh:"+r)"#
+            ),
+            "{script}"
+        );
+        assert!(!script.contains(LOCALE_MARKER), "{script}");
+
+        for rule in [
+            "function rule() { // why\n}",
+            "function rule() { /* why */ }",
+            "function rule() { return \"</script>\"; }",
+        ] {
+            let languages = Languages {
+                rule: rule.to_owned(),
+                ..languages()
+            };
+            let closures = built_with(MANIFEST, languages).unwrap();
+            assert!(closures.boot_script().is_err(), "{rule}");
+        }
+    }
+
+    #[test]
+    fn every_page_has_its_texts() {
+        let mut incomplete = languages();
+        incomplete.catalogues.remove("sim");
+        assert!(built_with(MANIFEST, incomplete).is_err_and(|e| e.contains("sim")));
+        let mut unknown = languages();
+        unknown
+            .catalogues
+            .insert(String::from("sim"), vec![String::from("zh-gone")]);
+        assert!(built_with(MANIFEST, unknown).is_err_and(|e| e.contains("zh-gone")));
+        assert!(Languages::parse(r#"["rule","key"]"#).is_err());
+        assert!(Languages::parse(r#"["rule","key",{"app":["zh-core"]}]"#).is_ok());
     }
 
     #[test]

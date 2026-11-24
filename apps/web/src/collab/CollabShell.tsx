@@ -25,7 +25,12 @@ import {
   workbook,
 } from "@reticula/protocol/collab-api";
 import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { translateEngineText } from "../i18n/engine-text.ts";
+import { t } from "../i18n/index.ts";
+import { tx } from "../i18n/react.ts";
 import { apiErrorMessage } from "../pages/helpers.ts";
+import { roleName } from "../pages/labels.ts";
+import { LINK_VIEW_LABEL, personText, shareLinkText } from "./labels.ts";
 import "./collab.css";
 
 const LazyHistoryDrawer = lazy(() =>
@@ -173,13 +178,13 @@ function statusPillLabel(
   connection: "offline" | "connecting" | "catchingUp" | "online",
   pendingCount: number,
 ): string {
-  if (connection === "online") {
-    return pendingCount > 0 ? `Syncing (${pendingCount})` : "Synced";
+  if (connection === "offline") {
+    return pendingCount > 0 ? t("Offline · {n} unsent", { n: pendingCount }) : t("Offline");
   }
-  if (connection === "connecting" || connection === "catchingUp") {
-    return pendingCount > 0 ? `Syncing (${pendingCount})` : "Connecting…";
+  if (pendingCount > 0) {
+    return t("Syncing ({n})", { n: pendingCount });
   }
-  return pendingCount > 0 ? `Offline · ${pendingCount} unsent` : "Offline";
+  return connection === "online" ? t("Synced") : t("Connecting…");
 }
 
 export default function CollabShell(props: CollabShellProps) {
@@ -262,9 +267,9 @@ export default function CollabShell(props: CollabShellProps) {
         } catch (err) {
           pendingJoinTokenRef.current = null;
           if (err instanceof ApiError) {
-            setJoinError(`Share link rejected (HTTP ${err.status}).`);
+            setJoinError(t("Share link rejected (HTTP {status}).", { status: err.status }));
           } else {
-            setJoinError("Could not redeem share link right now.");
+            setJoinError(t("Could not redeem share link right now."));
           }
           onRequestOpenModal();
         } finally {
@@ -299,7 +304,7 @@ export default function CollabShell(props: CollabShellProps) {
             }
           }
           if (err instanceof ApiError && (err.status === 403 || err.status === 404)) {
-            setAccessError("You do not have permission to open this collaborative workbook.");
+            setAccessError(t("You do not have permission to open this collaborative workbook."));
             onRequestOpenModal();
           } else if (err instanceof ApiError && err.status === 401) {
             setUser(null);
@@ -310,7 +315,7 @@ export default function CollabShell(props: CollabShellProps) {
               onOpenCollab(makeTarget(signedInUser, cached));
               onCloseModal();
             } else {
-              setAccessError("Could not load collaborative workbook metadata.");
+              setAccessError(t("Could not load collaborative workbook metadata."));
               onRequestOpenModal();
             }
           }
@@ -389,8 +394,8 @@ export default function CollabShell(props: CollabShellProps) {
                 setLoadingAuth(false);
                 setAccessError(
                   shareErr instanceof ApiError
-                    ? "This share link is invalid, expired, or no longer public."
-                    : "Could not load shared workbook right now.",
+                    ? t("This share link is invalid, expired, or no longer public.")
+                    : t("Could not load shared workbook right now."),
                 );
                 requestModal();
               }
@@ -407,14 +412,14 @@ export default function CollabShell(props: CollabShellProps) {
         // Network error / offline: allow cached offline collaborative open.
         const cache = readCache();
         if (pendingJoinTokenRef.current) {
-          setJoinError("Offline: a network connection is required to redeem a share link.");
+          setJoinError(t("Offline: a network connection is required to redeem a share link."));
           requestModal();
         } else if (collabId && cache.user && cache.workbooks[collabId]) {
           setUser(cache.user);
           openCollab(makeTarget(cache.user, cache.workbooks[collabId]));
         } else if (collabId) {
           setAccessError(
-            "Offline: this collaborative workbook has not been opened on this device yet.",
+            t("Offline: this collaborative workbook has not been opened on this device yet."),
           );
           requestModal();
         }
@@ -448,11 +453,11 @@ export default function CollabShell(props: CollabShellProps) {
     } catch (err) {
       if (err instanceof ApiError && err.status === 404) {
         setDevLoginAvailable(false);
-        setAuthError("Loopback dev sign-in is disabled on this server. Use GitHub sign-in.");
+        setAuthError(t("Loopback dev sign-in is disabled on this server. Use GitHub sign-in."));
       } else if (err instanceof ApiError) {
-        setAuthError(`Sign-in failed (HTTP ${err.status}).`);
+        setAuthError(t("Sign-in failed (HTTP {status}).", { status: err.status }));
       } else {
-        setAuthError("Sign-in failed.");
+        setAuthError(t("Sign-in failed."));
       }
     } finally {
       setBusy(false);
@@ -496,8 +501,8 @@ export default function CollabShell(props: CollabShellProps) {
     } catch (err) {
       setAuthError(
         err instanceof ApiError
-          ? `Failed to create cloud workbook (HTTP ${err.status}).`
-          : "Failed to create cloud workbook.",
+          ? t("Failed to create cloud workbook (HTTP {status}).", { status: err.status })
+          : t("Failed to create cloud workbook."),
       );
     } finally {
       setBusy(false);
@@ -524,7 +529,7 @@ export default function CollabShell(props: CollabShellProps) {
       setShareUrl(`${window.location.origin}${created.url}`);
       setShareLabel("");
     } catch (err) {
-      setAuthError(apiErrorMessage(err, "Could not create share link."));
+      setAuthError(apiErrorMessage(err, t("Could not create share link.")));
     } finally {
       setBusy(false);
     }
@@ -552,7 +557,7 @@ export default function CollabShell(props: CollabShellProps) {
         if (!hasActiveViewer) {
           const created = await share(activeTarget.docId, {
             role: "viewer",
-            label: "Link-view access",
+            label: LINK_VIEW_LABEL,
             singleUse: false,
           });
           autoShareUrl = `${window.location.origin}${created.url}`;
@@ -565,7 +570,7 @@ export default function CollabShell(props: CollabShellProps) {
         setShareUrl(autoShareUrl);
       }
     } catch (err) {
-      setAuthError(apiErrorMessage(err, "Could not update workbook visibility."));
+      setAuthError(apiErrorMessage(err, t("Could not update workbook visibility.")));
     } finally {
       setBusy(false);
     }
@@ -581,7 +586,7 @@ export default function CollabShell(props: CollabShellProps) {
       await updateMember(activeTarget.docId, memberId, { role });
       await refreshGovernance(activeTarget.docId, activeTarget.role);
     } catch (err) {
-      setAuthError(apiErrorMessage(err, "Could not update member role."));
+      setAuthError(apiErrorMessage(err, t("Could not update member role.")));
     } finally {
       setBusy(false);
     }
@@ -601,7 +606,7 @@ export default function CollabShell(props: CollabShellProps) {
         await refreshGovernance(activeTarget.docId, activeTarget.role);
       }
     } catch (err) {
-      setAuthError(apiErrorMessage(err, "Could not remove member."));
+      setAuthError(apiErrorMessage(err, t("Could not remove member.")));
     } finally {
       setBusy(false);
     }
@@ -617,7 +622,7 @@ export default function CollabShell(props: CollabShellProps) {
       await revokeShareLink(activeTarget.docId, linkId);
       await refreshGovernance(activeTarget.docId, activeTarget.role);
     } catch (err) {
-      setAuthError(apiErrorMessage(err, "Could not revoke share link."));
+      setAuthError(apiErrorMessage(err, t("Could not revoke share link.")));
     } finally {
       setBusy(false);
     }
@@ -661,7 +666,7 @@ export default function CollabShell(props: CollabShellProps) {
           )}
           {activeTarget && readOnly && (
             <span className="collab-badge-readonly" data-testid="collab-readonly-badge">
-              Read-only
+              {t("Read-only")}
             </span>
           )}
           {remotePresences.length > 0 && (
@@ -676,14 +681,14 @@ export default function CollabShell(props: CollabShellProps) {
                     className="collab-peer-dot"
                     style={{ background: PEER_COLORS[peer.colorSlot % PEER_COLORS.length] }}
                   />
-                  {peer.displayName}
+                  {personText(peer.displayName)}
                 </span>
               ))}
             </div>
           )}
           {notice && (
             <span className="collab-notice" data-testid="collab-notice">
-              {notice}
+              {translateEngineText(notice)}
             </span>
           )}
         </div>
@@ -708,8 +713,9 @@ export default function CollabShell(props: CollabShellProps) {
       {unsyncedRescue && (
         <div className="collab-unsynced-banner" data-testid="unsynced-banner" role="alert">
           <span>
-            Server rejected incompatible pending edits; a local backup &ldquo;
-            {unsyncedRescue.title}&rdquo; was saved.
+            {t("Server rejected incompatible pending edits; a local backup “{title}” was saved.", {
+              title: unsyncedRescue.title,
+            })}
           </span>
           <button
             type="button"
@@ -717,7 +723,7 @@ export default function CollabShell(props: CollabShellProps) {
             data-testid="open-unsynced-btn"
             onClick={() => onOpenLocalRescue(unsyncedRescue.localDocId, unsyncedRescue.title)}
           >
-            Open Local Copy
+            {t("Open Local Copy")}
           </button>
         </div>
       )}
@@ -728,15 +734,15 @@ export default function CollabShell(props: CollabShellProps) {
             className="modal-card collab-modal"
             role="dialog"
             aria-modal="true"
-            aria-label="Cloud Collaboration"
+            aria-label={t("Cloud Collaboration")}
             data-testid="collab-modal"
           >
             <div className="modal-header">
-              <h2>Cloud Collaboration</h2>
+              <h2>{t("Cloud Collaboration")}</h2>
               <button
                 type="button"
                 className="tip-close"
-                aria-label="Close"
+                aria-label={t("Close")}
                 onClick={() => {
                   setJoinError(null);
                   setAccessError(null);
@@ -766,14 +772,14 @@ export default function CollabShell(props: CollabShellProps) {
             )}
 
             {loadingAuth ? (
-              <p className="collab-notice">Checking sign-in status…</p>
+              <p className="collab-notice">{t("Checking sign-in status…")}</p>
             ) : !user ? (
               <div className="collab-section" data-testid="collab-auth-panel">
-                <p className="collab-section-title">Sign In Required</p>
+                <p className="collab-section-title">{t("Sign In Required")}</p>
                 <p className="collab-notice">
                   {pendingJoinTokenRef.current
-                    ? "Sign in to redeem this editor invite link."
-                    : "Sign in to create or open collaborative cloud workbooks."}
+                    ? t("Sign in to redeem this editor invite link.")
+                    : t("Sign in to create or open collaborative cloud workbooks.")}
                 </p>
                 {devLoginAvailable && (
                   <div className="collab-row">
@@ -784,7 +790,7 @@ export default function CollabShell(props: CollabShellProps) {
                       disabled={busy}
                       onClick={() => void handleDevSignIn("alice")}
                     >
-                      Dev Sign In as Alice
+                      {t("Dev Sign In as {name}", { name: "Alice" })}
                     </button>
                     <button
                       type="button"
@@ -793,7 +799,7 @@ export default function CollabShell(props: CollabShellProps) {
                       disabled={busy}
                       onClick={() => void handleDevSignIn("bob")}
                     >
-                      Dev Sign In as Bob
+                      {t("Dev Sign In as {name}", { name: "Bob" })}
                     </button>
                     <button
                       type="button"
@@ -802,7 +808,7 @@ export default function CollabShell(props: CollabShellProps) {
                       disabled={busy}
                       onClick={() => void handleDevSignIn("carol")}
                     >
-                      Dev Sign In as Carol
+                      {t("Dev Sign In as {name}", { name: "Carol" })}
                     </button>
                   </div>
                 )}
@@ -812,7 +818,7 @@ export default function CollabShell(props: CollabShellProps) {
                     data-testid="github-login-link"
                     href={githubLoginUrl(window.location.pathname + window.location.search)}
                   >
-                    Sign in with GitHub
+                    {t("Sign in with GitHub")}
                   </a>
                 </div>
               </div>
@@ -821,7 +827,7 @@ export default function CollabShell(props: CollabShellProps) {
                 <div className="collab-section">
                   <div className="collab-row" style={{ justifyContent: "space-between" }}>
                     <span data-testid="collab-user-badge">
-                      Signed in as <strong>{user.name}</strong>
+                      {tx("Signed in as <0>{name}</0>", { 0: <strong /> }, { name: user.name })}
                     </span>
                     <div className="collab-row">
                       <button
@@ -833,7 +839,7 @@ export default function CollabShell(props: CollabShellProps) {
                           onNavigate("/workbooks");
                         }}
                       >
-                        Workbooks
+                        {t("Workbooks")}
                       </button>
                       <button
                         type="button"
@@ -844,7 +850,7 @@ export default function CollabShell(props: CollabShellProps) {
                           onNavigate("/account");
                         }}
                       >
-                        Account
+                        {t("Account")}
                       </button>
                       <button
                         type="button"
@@ -853,14 +859,14 @@ export default function CollabShell(props: CollabShellProps) {
                         disabled={busy}
                         onClick={() => void handleLogout()}
                       >
-                        Sign Out
+                        {t("Sign Out")}
                       </button>
                     </div>
                   </div>
                 </div>
 
                 <div className="collab-section">
-                  <p className="collab-section-title">New Cloud Workbook</p>
+                  <p className="collab-section-title">{t("New Cloud Workbook")}</p>
                   <div className="collab-row">
                     <input
                       type="text"
@@ -868,7 +874,7 @@ export default function CollabShell(props: CollabShellProps) {
                       data-testid="new-cloud-title-input"
                       value={newTitle}
                       onChange={(e) => setNewTitle(e.target.value)}
-                      placeholder="Workbook title"
+                      placeholder={t("Workbook title")}
                     />
                     <button
                       type="button"
@@ -877,17 +883,17 @@ export default function CollabShell(props: CollabShellProps) {
                       disabled={busy}
                       onClick={() => void handleCreateCloudSheet()}
                     >
-                      + New Cloud Sheet
+                      {t("+ New Cloud Sheet")}
                     </button>
                   </div>
                 </div>
 
                 {activeTarget && (
                   <div className="collab-section">
-                    <p className="collab-section-title">Current Cloud Sheet</p>
+                    <p className="collab-section-title">{t("Current Cloud Sheet")}</p>
                     <div className="collab-row" style={{ justifyContent: "space-between" }}>
                       <span>
-                        <strong>{activeTarget.title}</strong> ({activeTarget.role})
+                        <strong>{activeTarget.title}</strong> ({roleName(activeTarget.role)})
                       </span>
                       {activeTarget.role === "owner" && (
                         <label className="collab-checkbox">
@@ -898,7 +904,7 @@ export default function CollabShell(props: CollabShellProps) {
                             checked={(activeTarget.visibility ?? "private") === "link_view"}
                             onChange={() => void handleToggleVisibility()}
                           />
-                          Allow link-only viewing
+                          {t("Allow link-only viewing")}
                         </label>
                       )}
                     </div>
@@ -909,20 +915,20 @@ export default function CollabShell(props: CollabShellProps) {
                           <select
                             className="collab-select"
                             data-testid="share-role-select"
-                            aria-label="Share link role"
+                            aria-label={t("Share link role")}
                             value={shareRole}
                             onChange={(e) =>
                               setShareRole(e.target.value === "viewer" ? "viewer" : "editor")
                             }
                           >
-                            <option value="editor">Editor invite</option>
-                            <option value="viewer">Viewer link</option>
+                            <option value="editor">{t("Editor invite")}</option>
+                            <option value="viewer">{t("Viewer link")}</option>
                           </select>
                           <input
                             type="text"
                             className="collab-input"
                             data-testid="share-label-input"
-                            placeholder="Label (optional)"
+                            placeholder={t("Label (optional)")}
                             maxLength={80}
                             value={shareLabel}
                             onChange={(e) => setShareLabel(e.target.value)}
@@ -930,14 +936,14 @@ export default function CollabShell(props: CollabShellProps) {
                           <select
                             className="collab-select"
                             data-testid="share-ttl-select"
-                            aria-label="Share link expiry"
+                            aria-label={t("Share link expiry")}
                             value={shareTtlSeconds}
                             onChange={(e) => setShareTtlSeconds(e.target.value)}
                           >
-                            <option value="">No expiry</option>
-                            <option value="3600">1 hour</option>
-                            <option value="86400">24 hours</option>
-                            <option value="604800">7 days</option>
+                            <option value="">{t("No expiry")}</option>
+                            <option value="3600">{t("1 hour")}</option>
+                            <option value="86400">{t("24 hours")}</option>
+                            <option value="604800">{t("7 days")}</option>
                           </select>
                         </div>
                         <div className="collab-row">
@@ -948,7 +954,7 @@ export default function CollabShell(props: CollabShellProps) {
                               checked={singleUseShare}
                               onChange={(e) => setSingleUseShare(e.target.checked)}
                             />
-                            Single-use link
+                            {t("Single-use link")}
                           </label>
                           <button
                             type="button"
@@ -957,7 +963,9 @@ export default function CollabShell(props: CollabShellProps) {
                             disabled={busy}
                             onClick={() => void handleCreateShareLink()}
                           >
-                            {shareRole === "viewer" ? "Create Viewer Link" : "Share Editor Link"}
+                            {shareRole === "viewer"
+                              ? t("Create Viewer Link")
+                              : t("Share Editor Link")}
                           </button>
                         </div>
                         {shareUrl && (
@@ -976,7 +984,7 @@ export default function CollabShell(props: CollabShellProps) {
                               data-testid="copy-share-link-btn"
                               onClick={() => void handleCopyShareUrl()}
                             >
-                              {copiedShare ? "Copied" : "Copy"}
+                              {copiedShare ? t("Copied") : t("Copy")}
                             </button>
                           </div>
                         )}
@@ -984,20 +992,18 @@ export default function CollabShell(props: CollabShellProps) {
                           <ul className="collab-list" data-testid="share-links-list">
                             {shareLinks.map((link) => {
                               const statusText = link.revokedAt
-                                ? "Revoked"
+                                ? t("Revoked|link")
                                 : link.singleUse && link.consumed
-                                  ? "Used"
-                                  : "Active";
+                                  ? t("Used|link")
+                                  : t("Active|link");
                               const active = !link.revokedAt && !(link.singleUse && link.consumed);
                               return (
                                 <li key={link.id} className="collab-member-row">
                                   <div className="collab-member-meta">
-                                    <strong>
-                                      {link.label ||
-                                        (link.role === "viewer" ? "Viewer link" : "Editor invite")}
-                                    </strong>
+                                    <strong>{shareLinkText(link)}</strong>
                                     <span className="collab-member-sub">
-                                      {link.role} · {link.singleUse ? "single-use" : "multi-use"} ·{" "}
+                                      {roleName(link.role)} ·{" "}
+                                      {link.singleUse ? t("single-use") : t("multi-use")} ·{" "}
                                       {statusText}
                                     </span>
                                   </div>
@@ -1009,7 +1015,7 @@ export default function CollabShell(props: CollabShellProps) {
                                       disabled={busy}
                                       onClick={() => void handleRevokeShareLink(link.id)}
                                     >
-                                      Revoke
+                                      {t("Revoke")}
                                     </button>
                                   )}
                                 </li>
@@ -1022,7 +1028,9 @@ export default function CollabShell(props: CollabShellProps) {
 
                     {members.length > 0 && (
                       <>
-                        <p className="collab-section-title">Members ({members.length})</p>
+                        <p className="collab-section-title">
+                          {t("Members ({n})", { n: members.length })}
+                        </p>
                         <ul className="collab-list" data-testid="members-list">
                           {members.map((member) => {
                             const isSelf = member.userId === user.id;
@@ -1034,10 +1042,11 @@ export default function CollabShell(props: CollabShellProps) {
                               <li key={member.userId} className="collab-member-row">
                                 <div className="collab-member-meta">
                                   <strong>
-                                    {member.name}
-                                    {isSelf ? " (you)" : ""}
+                                    {isSelf
+                                      ? t("{name} (you)", { name: member.name })
+                                      : member.name}
                                   </strong>
-                                  <span className="collab-member-sub">{member.role}</span>
+                                  <span className="collab-member-sub">{roleName(member.role)}</span>
                                 </div>
                                 <div className="collab-row">
                                   {canManage && (
@@ -1045,7 +1054,7 @@ export default function CollabShell(props: CollabShellProps) {
                                       <select
                                         className="collab-select"
                                         data-testid={`member-role-${member.userId}`}
-                                        aria-label={`Role for ${member.name}`}
+                                        aria-label={t("Role for {name}", { name: member.name })}
                                         disabled={busy}
                                         value={member.role === "viewer" ? "viewer" : "editor"}
                                         onChange={(e) =>
@@ -1055,8 +1064,8 @@ export default function CollabShell(props: CollabShellProps) {
                                           )
                                         }
                                       >
-                                        <option value="editor">editor</option>
-                                        <option value="viewer">viewer</option>
+                                        <option value="editor">{t("editor|role")}</option>
+                                        <option value="viewer">{t("viewer|role")}</option>
                                       </select>
                                       <button
                                         type="button"
@@ -1067,7 +1076,7 @@ export default function CollabShell(props: CollabShellProps) {
                                           void handleRemoveMember(member.userId, false)
                                         }
                                       >
-                                        Remove
+                                        {t("Remove")}
                                       </button>
                                     </>
                                   )}
@@ -1079,7 +1088,7 @@ export default function CollabShell(props: CollabShellProps) {
                                       disabled={busy}
                                       onClick={() => void handleRemoveMember(member.userId, true)}
                                     >
-                                      Leave
+                                      {t("Leave")}
                                     </button>
                                   )}
                                 </div>
@@ -1102,7 +1111,7 @@ export default function CollabShell(props: CollabShellProps) {
                   data-testid="back-to-local-btn"
                   onClick={handleBackToLocal}
                 >
-                  Back to Local Sheets
+                  {t("Back to Local Sheets")}
                 </button>
               )}
               <button
@@ -1115,7 +1124,7 @@ export default function CollabShell(props: CollabShellProps) {
                   onCloseModal();
                 }}
               >
-                Close
+                {t("Close")}
               </button>
             </div>
           </div>
