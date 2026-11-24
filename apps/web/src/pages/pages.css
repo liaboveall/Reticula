@@ -63,7 +63,7 @@
 .page-tab {
   padding: 6px 12px;
   border-radius: 6px;
-  border: 1px solid var(--shell-line, #e2e8f0);
+  border: 1px solid var(--shell-control);
   background: var(--shell-surface, #ffffff);
   color: inherit;
   font: inherit;
@@ -73,8 +73,14 @@
 
 .page-tab.active {
   background: var(--shell-accent, #0f766e);
-  color: #ffffff;
+  color: var(--shell-on-accent);
   border-color: var(--shell-accent, #0f766e);
+}
+
+.page-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
 }
 
 .page-language {
@@ -232,6 +238,9 @@
 
 .bench-filters {
   display: flex;
+  margin: 0;
+  padding: 0;
+  border: 0;
   gap: 6px;
   flex-wrap: wrap;
 }

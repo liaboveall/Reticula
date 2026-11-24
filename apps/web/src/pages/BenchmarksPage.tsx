@@ -516,7 +516,7 @@ export default function BenchmarksPage({ onNavigate }: BenchmarksPageProps) {
               style={{ display: "flex", justifyContent: "space-between", flexWrap: "wrap", gap: 8 }}
             >
               <h2>{t("Filterable Benchmark Matrix")}</h2>
-              <div className="bench-filters">
+              <fieldset className="bench-filters" aria-label={t("Filter by")}>
                 {(
                   [
                     ["all", t("All|runs")],
@@ -530,12 +530,13 @@ export default function BenchmarksPage({ onNavigate }: BenchmarksPageProps) {
                     key={key}
                     type="button"
                     className={filter === key ? "page-tab active" : "page-tab"}
+                    aria-pressed={filter === key}
                     onClick={() => setFilter(key)}
                   >
                     {label}
                   </button>
                 ))}
-              </div>
+              </fieldset>
             </div>
             <div className="bench-table-wrap">
               <table className="bench-table" data-testid="bench-table">

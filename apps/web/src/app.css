@@ -4,10 +4,17 @@
   --shell-text: #1f2328;
   --shell-muted: #59636e;
   --shell-line: #d1d5da;
+  /* Around controls, which have to be told from what they are on. */
+  --shell-control: #7f8791;
   --shell-accent: #1a5fd0;
   --shell-accent-soft: #e8f0fe;
+  --shell-on-accent: #ffffff;
+  --shell-focus: #1a5fd0;
   --shell-danger: #b42318;
   --shell-danger-soft: #fef3f2;
+  --shell-success: #1f7a4a;
+  --shell-warning: #92400e;
+  --shell-warning-soft: #fdf0d8;
 
   color-scheme: light dark;
   font-family: "Segoe UI", system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
@@ -22,10 +29,16 @@
     --shell-text: #e3e6ea;
     --shell-muted: #9aa3ad;
     --shell-line: #363b44;
+    --shell-control: #7a8492;
     --shell-accent: #6ea1ff;
     --shell-accent-soft: #1d3157;
+    --shell-on-accent: #0d1117;
+    --shell-focus: #6ea1ff;
     --shell-danger: #ff8a7a;
     --shell-danger-soft: #3a1d1d;
+    --shell-success: #5fcf93;
+    --shell-warning: #fbbf24;
+    --shell-warning-soft: #3a2d12;
   }
 }
 
@@ -90,7 +103,7 @@ body {
 
 .toolbar-btn {
   padding: 4px 10px;
-  border: 1px solid var(--shell-line);
+  border: 1px solid var(--shell-control);
   border-radius: 5px;
   background: var(--shell-surface);
   color: var(--shell-text);
@@ -100,7 +113,7 @@ body {
   white-space: nowrap;
 }
 
-.toolbar-btn:hover:not(:disabled) {
+.toolbar-btn:hover:not(:disabled, [aria-disabled="true"]) {
   border-color: var(--shell-accent);
 }
 
@@ -382,7 +395,7 @@ body {
 .fmt-select {
   height: 24px;
   padding: 0 6px;
-  border: 1px solid var(--shell-line);
+  border: 1px solid var(--shell-control);
   border-radius: 4px;
   background: var(--shell-surface);
   color: var(--shell-text);
@@ -463,7 +476,7 @@ body {
   width: 100%;
   margin-bottom: 6px;
   padding: 4px 8px;
-  border: 1px solid var(--shell-line);
+  border: 1px solid var(--shell-control);
   border-radius: 4px;
   background: var(--shell-background);
   color: var(--shell-text);
@@ -482,7 +495,7 @@ body {
   width: 22px;
   height: 22px;
   padding: 0;
-  border: 1px solid var(--shell-line);
+  border: 1px solid var(--shell-control);
   border-radius: 4px;
   cursor: pointer;
 }
@@ -498,7 +511,7 @@ body {
   justify-content: space-between;
   gap: 12px;
   padding: 8px 12px;
-  background: var(--shell-bg);
+  background: var(--shell-background);
   border: 1px solid var(--shell-accent);
   border-radius: 8px;
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.14);
@@ -514,6 +527,19 @@ body {
   padding: 5px 12px;
   border-bottom: 1px solid var(--shell-accent);
   background: var(--shell-accent-soft);
+  font-size: 12px;
+}
+
+/* Says that a draft or the history is in view, with or without a server. What
+   ends that is at the start: the panels on the right cover the other end. */
+.history-preview-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 5px 12px;
+  border-bottom: 1px solid color-mix(in srgb, var(--shell-accent) 45%, var(--shell-line));
+  background: color-mix(in srgb, var(--shell-accent) 12%, var(--shell-background));
+  color: var(--shell-text);
   font-size: 12px;
 }
 
@@ -562,7 +588,6 @@ body {
   color: var(--shell-text);
   font: inherit;
   font-size: 12px;
-  outline: none;
 }
 
 .sheet-add-btn {
@@ -672,42 +697,21 @@ body {
 .primary-btn {
   border-color: var(--shell-accent);
   background: var(--shell-accent);
-  color: #ffffff;
+  color: var(--shell-on-accent);
   font-weight: 600;
 }
 
-@media (prefers-color-scheme: dark) {
-  .primary-btn {
-    color: #0d1117;
-  }
-}
-
-.lock-overlay,
-.modal-backdrop {
+.lock-overlay {
   position: fixed;
   inset: 0;
   z-index: 80;
   display: grid;
+  place-items: center;
   padding: 20px;
   background: rgba(15, 23, 42, 0.45);
 }
 
-.lock-overlay {
-  place-items: center;
-}
-
-/* Anchor modals to a fixed top inset rather than vertical center so
-   asynchronously loaded sections below (members, share links, filter
-   values, named ranges, doc lists) do not shift buttons under a pointer. */
-.modal-backdrop {
-  justify-items: center;
-  align-items: start;
-  padding: clamp(24px, 8vh, 72px) 20px 24px;
-  overflow-y: auto;
-}
-
-.lock-card,
-.modal-card {
+.lock-card {
   width: min(620px, 100%);
   max-height: calc(100vh - 48px);
   display: flex;
@@ -722,12 +726,7 @@ body {
   overflow-y: auto;
 }
 
-.modal-card {
-  max-height: calc(100vh - clamp(24px, 8vh, 72px) - 24px);
-}
-
-.lock-card h2,
-.modal-header h2 {
+.lock-card h2 {
   margin: 0;
   font-size: 16px;
 }
@@ -744,12 +743,6 @@ body {
   flex-wrap: wrap;
   align-items: center;
   gap: 8px;
-}
-
-.modal-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
 }
 
 .drawer-storage-note {
@@ -824,7 +817,7 @@ body {
   padding: 1px 6px;
   border-radius: 999px;
   background: var(--shell-accent);
-  color: #ffffff;
+  color: var(--shell-on-accent);
   font-size: 10px;
 }
 
@@ -879,7 +872,7 @@ body {
 .safe-skip-controls input {
   width: 56px;
   padding: 2px 6px;
-  border: 1px solid var(--shell-line);
+  border: 1px solid var(--shell-control);
   border-radius: 4px;
   background: var(--shell-surface);
   color: var(--shell-text);
@@ -896,11 +889,6 @@ body {
 .safe-export-note {
   color: var(--shell-accent);
   font-weight: 600;
-}
-
-.modal-footer {
-  display: flex;
-  justify-content: flex-end;
 }
 
 .rejected-banner {
@@ -963,7 +951,63 @@ body {
   flex: 1;
 }
 
+/* What does not fit is cut off before the zoom is, which is for using. */
+.statusbar > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .recalc-pill {
+  color: var(--shell-accent);
+  font-weight: 600;
+}
+
+.zoom-control {
+  flex: none;
+  display: flex;
+  align-items: center;
+  margin: 0;
+  padding: 0;
+  border: none;
+}
+
+.zoom-btn {
+  min-width: 20px;
+  padding: 0 4px;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-variant-numeric: inherit;
+  cursor: pointer;
+}
+
+.zoom-value {
+  min-width: 44px;
+}
+
+.zoom-btn:hover:not([aria-disabled="true"]) {
+  border-color: var(--shell-line);
+  background: var(--shell-surface);
+  color: var(--shell-text);
+}
+
+.zoom-btn[aria-disabled="true"] {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.zoom-menu {
+  min-width: 72px;
+  /* The bar it opens above is all that is below it. */
+  max-height: calc(100vh - 48px);
+  overflow-y: auto;
+  font-variant-numeric: tabular-nums;
+}
+
+.zoom-menu .ctx-item[aria-checked="true"] {
   color: var(--shell-accent);
   font-weight: 600;
 }
@@ -1070,23 +1114,17 @@ body {
   padding: 11px 20px;
   border-radius: 7px;
   background: var(--shell-accent);
-  color: #ffffff;
+  color: var(--shell-on-accent);
   font-size: 14px;
   font-weight: 600;
   text-decoration: none;
-}
-
-@media (prefers-color-scheme: dark) {
-  .landing-cta {
-    color: #0d1117;
-  }
 }
 
 .landing-secondary {
   display: inline-flex;
   align-items: center;
   padding: 11px 18px;
-  border: 1px solid var(--shell-line);
+  border: 1px solid var(--shell-control);
   border-radius: 7px;
   color: var(--shell-text);
   font-size: 14px;
@@ -1297,7 +1335,7 @@ body {
 
 .mobile-anyway {
   padding: 6px 12px;
-  border: 1px solid var(--shell-line);
+  border: 1px solid var(--shell-control);
   border-radius: 5px;
   background: transparent;
   color: var(--shell-muted);
@@ -1340,12 +1378,18 @@ body {
 .m3a-field input,
 .m3a-field select {
   padding: 4px 7px;
-  border: 1px solid var(--shell-line);
+  border: 1px solid var(--shell-control);
   border-radius: 4px;
   background: var(--shell-background);
   color: var(--shell-text);
   font: inherit;
   font-size: 12px;
+}
+
+.m3a-choice {
+  margin: 0;
+  padding: 0;
+  border: 0;
 }
 
 .m3a-list {

@@ -8,6 +8,7 @@ import {
 import type {
   CollabEvent,
   EngineCommand,
+  SheetInfo,
   SheetTabInfo,
   WireCellStyle,
   WireCompletionItem,
@@ -42,6 +43,8 @@ import type {
   SheetRename,
 } from "./editor/types.ts";
 import { useOverlays } from "./editor/use-overlays.ts";
+import { ViewMemory } from "./editor/view-state.ts";
+import { ZoomSignal } from "./editor/ZoomControl.tsx";
 import {
   type EngineClient,
   type HostCommand,
@@ -62,7 +65,9 @@ import { translateEngineText } from "./i18n/engine-text.ts";
 import { t } from "./i18n/index.ts";
 import type { LocalModalMode } from "./LocalModals.tsx";
 import type { M3aModalEvent, M3aToolMode } from "./M3aToolsModal.tsx";
+import { rendererPreference } from "./renderer.ts";
 import type { SwClientHandle } from "./sw-client.ts";
+import { useOpener } from "./ui/opener.ts";
 
 const LazyMobileFallback = lazy(() => import("./editor/MobileFallback.tsx"));
 const LazyLocalModals = lazy(() => import("./LocalModals.tsx"));
@@ -320,6 +325,7 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
   const [storageUsedMb, setStorageUsedMb] = useState<string>("0.0");
 
   const [stats, setStats] = useState<GridStats | null>(null);
+  const [zoomSignal] = useState(() => new ZoomSignal());
   const [selection, setSelection] = useState<Selection | null>(null);
   const [inspected, setInspected] = useState<InspectedState | null>(null);
   const [editingText, setEditingText] = useState<string | null>(null);
@@ -430,6 +436,16 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
   }, []);
 
   const handleCloseM3aTool = useCallback(() => setM3aTool(null), []);
+
+  const focusGrid = useCallback(() => editorRef.current?.focus(), []);
+  const modalOpener = useOpener(modalMode !== null);
+  const toolOpener = useOpener(m3aTool !== null);
+  const cloudOpener = useOpener(collabMenuOpen);
+  const historyOpener = useOpener(historyOpen);
+  const aiOpener = useOpener(aiOpen);
+  // Closing the panel only hides it: a review and a run in it go on.
+  const aiShown = useRef(false);
+  aiShown.current ||= aiOpen;
 
   const handleJumpMatch = useCallback((m: WireSearchMatch) => {
     const grid = gridRef.current;
@@ -735,12 +751,23 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
         return true;
       },
       onFilterButtonClick: (col) => setM3aTool({ kind: "filter", col }),
+      zoom: true,
+      onZoomChange: zoomSignal.set,
       onContextMenu: (target) => {
         setColorPopover(null);
         setContextMenu({ kind: "grid", target });
       },
     });
     gridRef.current = grid;
+
+    const views = new ViewMemory(grid);
+    /** Whether the sheets are those of a past version or a draft. */
+    let isPreview = false;
+    /** Opens a sheet where it was left. */
+    const openSheet = (sheet: SheetInfo) => {
+      grid.setSheet(sheet, views.open(activeDocIdRef.current, sheet.sheet, isPreview));
+    };
+    grid.watchFrames(() => views.touch());
 
     const editor = new CellEditor(grid, element, {
       isReadOnly: () => effectiveReadOnlyRef.current,
@@ -1202,7 +1229,8 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
               lastInspectKey = "";
               inspectedRef.current = null;
               setInspected(null);
-              grid.setSheet(message.sheet);
+              isPreview = true;
+              openSheet(message.sheet);
               setEngine((prev) =>
                 prev.status === "ready" ? { ...prev, sheet: message.sheet } : prev,
               );
@@ -1224,7 +1252,8 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
               lastInspectKey = "";
               inspectedRef.current = null;
               setInspected(null);
-              grid.setSheet(message.sheet);
+              isPreview = message.kind === "draftReady";
+              openSheet(message.sheet);
               setEngine((prev) =>
                 prev.status === "ready" ? { ...prev, sheet: message.sheet } : prev,
               );
@@ -1250,7 +1279,10 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
               lastInspectKey = "";
               inspectedRef.current = null;
               setInspected(null);
-              grid.setSheet(message.sheet);
+              isPreview = false;
+              // A draft is of the workbook that was open before.
+              setDraftPreview(false);
+              openSheet(message.sheet);
               setEngine({ status: "ready", info: message.info, sheet: message.sheet });
               break;
             case "sheetChanged": {
@@ -1261,7 +1293,7 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
                 lastInspectKey = "";
                 inspectedRef.current = null;
                 setInspected(null);
-                grid.setSheet(message.sheet);
+                openSheet(message.sheet);
                 grid.setActiveSpillRange(null);
                 if (collabTargetRef.current) {
                   sendPresenceNow(message.sheet.sheet);
@@ -1683,6 +1715,7 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
       }
       if (frame.missing === 0 && (frame.cells > 0 || grid.stats().pagesHeld > 0)) {
         if (!swClient && swStartTimer === 0) {
+          grid.setRenderer(rendererPreference());
           // Defer Service Worker registration until after first-screen paint so
           // cold-start B10 latency is completely unaffected (`14-m1b.md` 7.4).
           swStartTimer = window.setTimeout(() => {
@@ -1749,6 +1782,7 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
     // SyncAccessHandle) on navigation or BFCache freeze, and transparently
     // reopen if restored from BFCache.
     const onPageHide = () => {
+      views.save();
       window.clearTimeout(yieldWatchdog);
       window.clearTimeout(presenceTimerRef.current);
       presenceTimerRef.current = 0;
@@ -1788,6 +1822,7 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
     window.addEventListener("pageshow", onPageShow);
 
     return () => {
+      views.save();
       window.removeEventListener("pagehide", onPageHide);
       window.removeEventListener("pageshow", onPageShow);
       window.clearInterval(timer);
@@ -1821,6 +1856,7 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
     setColorPopover,
     setContextMenu,
     syncGridFormulaRefs,
+    zoomSignal,
   ]);
 
   const cellEditorName = t("Cell editor");
@@ -1841,7 +1877,11 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
       if (grid && editor) {
         clearEditState(grid, editor);
       }
-      editor?.cancelExternal();
+      // Whoever is in a drawer or a toolbar stays there.
+      const focused = document.activeElement ?? document.body;
+      editor?.cancelExternal(
+        focused === document.body || focused.closest(".formulabar, .reticula-grid") !== null,
+      );
       setColorPopover(null);
       setRenamingSheet(null);
     }
@@ -2386,6 +2426,9 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
             activeTarget={collabTarget}
             readOnly={effectiveReadOnly}
             historyOpen={historyOpen}
+            modalOpener={cloudOpener}
+            historyOpener={historyOpener}
+            onFocusGrid={focusGrid}
             historyPreviewSeq={historyPreviewSeq}
             historyPreviewElapsedMs={historySeekMs}
             connection={collabConn}
@@ -2533,18 +2576,17 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
         onExit={() => clientRef.current?.sendHost({ kind: "draftExit" })}
       />
 
-      {aiOpen && (
+      {aiShown.current && (
         <Suspense fallback={null}>
           <LazyAiPanel
+            open={aiOpen}
+            opener={aiOpener}
+            onFocusGrid={focusGrid}
             collabDocId={collabTarget?.docId ?? null}
             canWriteCloud={collabTarget !== null && collabTarget.role !== "viewer"}
             activeSheetId={engine.status === "ready" ? engine.sheet.sheet : 0}
             draftActive={draftPreview}
-            onClose={() => {
-              setAiOpen(false);
-              if (draftPreview) clientRef.current?.sendHost({ kind: "draftExit" });
-              gridRef.current?.setDiffHighlights(null);
-            }}
+            onClose={() => setAiOpen(false)}
             onOpenCloudDraft={(docId, branchId) =>
               clientRef.current?.sendHost({ kind: "draftOpenCloud", docId, branchId })
             }
@@ -2585,7 +2627,7 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
       />
       <RejectedBanner reason={rejectedReason} onDismiss={() => setRejectedReason(null)} />
 
-      <div className="sheet">
+      <main className="sheet">
         <div ref={hostRef} className="grid" data-testid="grid" />
         {lockOverlay && (
           <LockOverlay
@@ -2602,7 +2644,7 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
             </p>
           </div>
         )}
-      </div>
+      </main>
 
       {readySheet && (
         <SheetTabs
@@ -2635,6 +2677,12 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
         activity={activity}
         stats={stats}
         kernelVersion={engine.status === "ready" ? engine.info.kernelVersion : ""}
+        zoom={{
+          zoom: zoomSignal,
+          onStep: (direction) =>
+            direction > 0 ? gridRef.current?.zoomIn() : gridRef.current?.zoomOut(),
+          onZoom: (zoom) => gridRef.current?.setZoom(zoom),
+        }}
       />
 
       {contextMenu && (
@@ -2665,6 +2713,8 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
         <Suspense fallback={null}>
           <LazyLocalModals
             mode={modalMode}
+            opener={modalOpener}
+            onFocusGrid={focusGrid}
             activeDocId={docId}
             docs={catalogDocs}
             storageUsedMb={storageUsedMb}
@@ -2741,6 +2791,8 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
         <Suspense fallback={null}>
           <LazyM3aToolsModal
             mode={m3aTool}
+            opener={toolOpener}
+            onFocusGrid={focusGrid}
             sheet={readySheet}
             selection={selection}
             readOnly={effectiveReadOnly}

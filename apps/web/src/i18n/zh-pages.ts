@@ -4,10 +4,9 @@
  */
 const zhPages: Readonly<Record<string, string>> = {
   // Links between the pages
+  Pages: "页面",
   Editor: "编辑器",
   "Open Editor": "打开编辑器",
-  "Sync Simulator": "同步仿真器",
-  Privacy: "隐私",
 
   Language: "语言",
 
@@ -29,11 +28,11 @@ const zhPages: Readonly<Record<string, string>> = {
   "role: {role} · visibility: {visibility} · head #{seq} · {size} · updated {time}":
     "角色：{role} · 可见范围：{visibility} · 最新修订 #{seq} · {size} · 更新于 {time}",
   "Open|verb": "打开",
+  "Open {title}": "打开 {title}",
   "id: {id} · {size}": "ID：{id} · {size}",
   "Open Local": "在本地打开",
   "Convert to Cloud": "转为云端工作簿",
   "Delete Local": "删除本地工作簿",
-  'Deleted "{title}".': "已删除“{title}”。",
   'Packing "{title}" and uploading to cloud…': "正在打包“{title}”并上传到云端…",
   "Failed to load workbooks": "无法加载工作簿",
   "Could not create cloud workbook": "无法创建云端工作簿",

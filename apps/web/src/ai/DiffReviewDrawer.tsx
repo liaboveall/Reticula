@@ -11,6 +11,7 @@ import { useEffect, useMemo, useState } from "react";
 import { translateEngineText } from "../i18n/engine-text.ts";
 import { t } from "../i18n/index.ts";
 import { tx } from "../i18n/react.ts";
+import { ActionButton } from "../ui/ActionButton.tsx";
 import { buildHighlights } from "./diff-highlights.ts";
 import { closureSource, contentText, hunkKindText } from "./labels.ts";
 
@@ -133,7 +134,7 @@ export function DiffReviewDrawer({
 
       {conflicts.length > 0 && (
         <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-          <strong style={{ color: "#b45309", fontSize: 12 }}>
+          <strong className="ai-warning" style={{ fontSize: 12 }}>
             {t("Conflicts ({n}) — Choose Main or AI Draft", { n: conflicts.length })}
           </strong>
           {conflicts.map((h) => (
@@ -150,7 +151,7 @@ export function DiffReviewDrawer({
                 <span className="ai-tag warn">{t("Conflict")}</span>
               </div>
               {h.conflictReason && (
-                <div className="ai-muted" style={{ marginTop: 4, color: "#b45309" }}>
+                <div className="ai-muted ai-warning" style={{ marginTop: 4 }}>
                   {translateEngineText(h.conflictReason)}
                 </div>
               )}
@@ -181,24 +182,33 @@ export function DiffReviewDrawer({
                     )}
                   </div>
                   {h.kind === "cell_block" && (
-                    <div className="ai-row" style={{ marginTop: 4, justifyContent: "flex-start" }}>
-                      <button
-                        type="button"
-                        className={`ai-btn ${choices[c.cellKey] === "keep_main" ? "primary" : ""}`}
-                        data-testid={`conflict-keep-main-${c.address}`}
-                        onClick={() => setChoice(c.cellKey, "keep_main")}
-                      >
+                    <fieldset
+                      className="ai-choice"
+                      aria-label={t("Version of {cell} to keep", {
+                        cell: `${c.sheetName}!${c.address}`,
+                      })}
+                    >
+                      <label>
+                        <input
+                          type="radio"
+                          name={`conflict-${c.cellKey}`}
+                          checked={choices[c.cellKey] === "keep_main"}
+                          data-testid={`conflict-keep-main-${c.address}`}
+                          onChange={() => setChoice(c.cellKey, "keep_main")}
+                        />
                         {t("Keep Main")}
-                      </button>
-                      <button
-                        type="button"
-                        className={`ai-btn ${choices[c.cellKey] === "take_draft" ? "primary" : ""}`}
-                        data-testid={`conflict-take-draft-${c.address}`}
-                        onClick={() => setChoice(c.cellKey, "take_draft")}
-                      >
+                      </label>
+                      <label>
+                        <input
+                          type="radio"
+                          name={`conflict-${c.cellKey}`}
+                          checked={choices[c.cellKey] === "take_draft"}
+                          data-testid={`conflict-take-draft-${c.address}`}
+                          onChange={() => setChoice(c.cellKey, "take_draft")}
+                        />
                         {t("Use AI Draft")}
-                      </button>
-                    </div>
+                      </label>
+                    </fieldset>
                   )}
                 </div>
               ))}
@@ -253,8 +263,8 @@ export function DiffReviewDrawer({
       ))}
 
       {closureIssues.length > 0 && (
-        <div className="ai-card alert" data-testid="ai-closure-warning">
-          <strong style={{ color: "#dc2626" }}>
+        <div className="ai-card alert" role="alert" data-testid="ai-closure-warning">
+          <strong className="ai-danger">
             {t("Reference Closure Alert ({n})", { n: closureIssues.length })}
           </strong>
           <div style={{ marginTop: 4, fontSize: 12 }}>
@@ -302,29 +312,28 @@ export function DiffReviewDrawer({
 
       <div className="ai-diff-footer" style={{ padding: 0, borderTop: "none" }}>
         {unresolvedCount > 0 && (
-          <div className="ai-muted" style={{ color: "#b45309" }}>
+          <div id="ai-unresolved" className="ai-muted ai-warning">
             {t("Resolve {n} conflict(s) above before applying.", { n: unresolvedCount })}
           </div>
         )}
         <div className="ai-row">
-          <button
-            type="button"
+          <ActionButton
             className="ai-btn primary"
+            aria-describedby={unresolvedCount > 0 ? "ai-unresolved" : undefined}
             data-testid="ai-merge-apply"
-            disabled={!canApply}
+            inactive={!canApply}
             onClick={() => void onApply(selection)}
           >
             {t("Apply Selected Changes")}
-          </button>
-          <button
-            type="button"
+          </ActionButton>
+          <ActionButton
             className="ai-btn danger"
             data-testid="ai-draft-discard"
-            disabled={busy}
+            inactive={busy}
             onClick={() => void onDiscard()}
           >
             {t("Discard Draft")}
-          </button>
+          </ActionButton>
         </div>
       </div>
     </div>

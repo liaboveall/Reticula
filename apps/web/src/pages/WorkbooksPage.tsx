@@ -14,6 +14,7 @@ import {
   type WorkbookLists,
 } from "@reticula/protocol/collab-api";
 import { type ChangeEvent, useCallback, useEffect, useRef, useState } from "react";
+import { flushSync } from "react-dom";
 import { uploadLocalDocToCloud } from "../engine/local-upload.ts";
 import {
   readCatalog,
@@ -22,6 +23,10 @@ import {
   type WorkbookCatalogEntry,
 } from "../engine/storage.ts";
 import { fmtBytes, t } from "../i18n/index.ts";
+import { ActionButton } from "../ui/ActionButton.tsx";
+import { announce } from "../ui/announcer.ts";
+import { isComposing, useKeptFocus } from "../ui/focus.ts";
+import { Tabs } from "../ui/Tabs.tsx";
 import { apiErrorMessage } from "./helpers.ts";
 import { roleName, visibilityName } from "./labels.ts";
 import { PageNav } from "./PageNav.tsx";
@@ -52,6 +57,14 @@ export default function WorkbooksPage({ onNavigate }: WorkbooksPageProps) {
   const [error, setError] = useState<string | null>(null);
   const [statusMsg, setStatusMsg] = useState<string | null>(null);
   const loadSeqRef = useRef(0);
+  const mainRef = useKeptFocus();
+  const importRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    if (statusMsg !== null) {
+      announce(statusMsg);
+    }
+  }, [statusMsg]);
 
   const loadData = useCallback(async () => {
     const seq = ++loadSeqRef.current;
@@ -111,16 +124,22 @@ export default function WorkbooksPage({ onNavigate }: WorkbooksPageProps) {
     }
   };
 
+  /** The row's button for renaming has the focus again. */
+  const endRename = (id: string) => {
+    flushSync(() => setRenameId(null));
+    mainRef.current?.querySelector<HTMLElement>(`[data-rename="${id}"]`)?.focus();
+  };
+
   const handleRenameSubmit = async (id: string) => {
     const trimmed = renameTitle.trim();
-    if (!trimmed) {
+    if (!trimmed || busy) {
       return;
     }
     setBusy(true);
     setError(null);
     try {
       await updateWorkbook(id, { title: trimmed });
-      setRenameId(null);
+      endRename(id);
       await loadData();
     } catch (err) {
       setError(apiErrorMessage(err, t("Could not rename workbook")));
@@ -198,18 +217,30 @@ export default function WorkbooksPage({ onNavigate }: WorkbooksPageProps) {
             <input
               type="text"
               className="collab-input"
+              // biome-ignore lint/a11y/noAutofocus: the button that was pressed asks for a new name
+              autoFocus
+              aria-label={t("New name of {title}", { title: item.title })}
               value={renameTitle}
               onChange={(e) => setRenameTitle(e.target.value)}
+              onKeyDown={(e) => {
+                if (isComposing(e.nativeEvent)) {
+                  return;
+                }
+                if (e.key === "Enter") {
+                  void handleRenameSubmit(item.id);
+                } else if (e.key === "Escape") {
+                  endRename(item.id);
+                }
+              }}
             />
-            <button
-              type="button"
+            <ActionButton
               className="toolbar-btn primary-btn"
-              disabled={busy}
+              inactive={busy}
               onClick={() => void handleRenameSubmit(item.id)}
             >
               {t("Save")}
-            </button>
-            <button type="button" className="toolbar-btn" onClick={() => setRenameId(null)}>
+            </ActionButton>
+            <button type="button" className="toolbar-btn" onClick={() => endRename(item.id)}>
               {t("Cancel")}
             </button>
           </div>
@@ -230,31 +261,33 @@ export default function WorkbooksPage({ onNavigate }: WorkbooksPageProps) {
         <button
           type="button"
           className="toolbar-btn primary-btn"
+          aria-label={t("Open {title}", { title: item.title })}
           onClick={() => onNavigate(`/app?collab=${encodeURIComponent(item.id)}`)}
         >
           {t("Open|verb")}
         </button>
         {owned && (
           <>
-            <button
-              type="button"
+            <ActionButton
               className="toolbar-btn"
-              disabled={busy}
+              aria-label={t("Rename {title}", { title: item.title })}
+              data-rename={item.id}
+              inactive={busy}
               onClick={() => {
                 setRenameId(item.id);
                 setRenameTitle(item.title);
               }}
             >
               {t("Rename")}
-            </button>
-            <button
-              type="button"
+            </ActionButton>
+            <ActionButton
               className="toolbar-btn"
-              disabled={busy}
+              aria-label={t("Delete {title}", { title: item.title })}
+              inactive={busy}
               onClick={() => void handleDeleteCloud(item)}
             >
               {t("Delete")}
-            </button>
+            </ActionButton>
           </>
         )}
       </div>
@@ -273,193 +306,198 @@ export default function WorkbooksPage({ onNavigate }: WorkbooksPageProps) {
         ]}
       />
 
-      <main className="page-main">
+      <main ref={mainRef} className="page-main">
         <div className="page-card">
           <h1>{t("Workbooks")}</h1>
-          <div className="page-tabs">
-            {(
-              [
-                ["owned", t("My Cloud Workbooks")],
-                ["shared", t("Shared with Me")],
-                ["local", t("Local Browser Docs")],
-                ["samples", t("Built-in Examples")],
-              ] as const
-            ).map(([key, label]) => (
-              <button
-                key={key}
-                type="button"
-                className={tab === key ? "page-tab active" : "page-tab"}
-                data-testid={`workbooks-tab-${key}`}
-                onClick={() => setTab(key)}
-              >
-                {label}
-              </button>
-            ))}
-          </div>
-
-          {error && (
-            <div className="collab-error" data-testid="workbooks-error" role="alert">
-              {error}
-            </div>
-          )}
-          {statusMsg && <p className="page-muted">{statusMsg}</p>}
-
-          {(tab === "owned" || tab === "shared") && !user && (
-            <div className="collab-section" data-testid="workbooks-signin">
-              <p className="page-muted">{t("Sign in to manage cloud collaborative workbooks.")}</p>
-              <div className="collab-row">
-                {(["alice", "bob", "carol"] as const).map((acct) => (
-                  <button
-                    key={acct}
-                    type="button"
-                    className="toolbar-btn"
-                    data-testid={`workbooks-dev-${acct}`}
-                    disabled={busy}
-                    onClick={() => void handleDevSignIn(acct)}
-                  >
-                    {t("Dev: {account}", { account: acct })}
-                  </button>
-                ))}
-                <a className="toolbar-btn primary-btn" href={githubLoginUrl("/workbooks")}>
-                  {t("Sign in with GitHub")}
-                </a>
+          <Tabs
+            label={t("Workbooks")}
+            tabs={[
+              {
+                key: "owned",
+                text: t("My Cloud Workbooks"),
+                testId: "workbooks-tab-owned",
+              },
+              { key: "shared", text: t("Shared with Me"), testId: "workbooks-tab-shared" },
+              { key: "local", text: t("Local Browser Docs"), testId: "workbooks-tab-local" },
+              { key: "samples", text: t("Built-in Examples"), testId: "workbooks-tab-samples" },
+            ]}
+            selected={tab}
+            onSelect={setTab}
+            listClassName="page-tabs"
+            tabClassName="page-tab"
+            panelClassName="page-panel"
+          >
+            {error && (
+              <div className="collab-error" data-testid="workbooks-error" role="alert">
+                {error}
               </div>
-            </div>
-          )}
+            )}
+            {statusMsg && <p className="page-muted">{statusMsg}</p>}
 
-          {tab === "owned" && user && (
-            <>
-              <div className="collab-row">
-                <input
-                  type="text"
-                  className="collab-input"
-                  value={newTitle}
-                  onChange={(e) => setNewTitle(e.target.value)}
-                  placeholder={t("New cloud workbook title")}
-                />
-                <button
-                  type="button"
-                  className="toolbar-btn primary-btn"
-                  data-testid="workbooks-create-btn"
-                  disabled={busy}
-                  onClick={() => void handleCreateCloud()}
-                >
-                  + {t("New Cloud Workbook")}
-                </button>
-                <label className="toolbar-btn" style={{ cursor: "pointer" }}>
-                  {t("Import .rtcl")}
+            {(tab === "owned" || tab === "shared") && !user && (
+              <div className="collab-section" data-testid="workbooks-signin">
+                <p className="page-muted">
+                  {t("Sign in to manage cloud collaborative workbooks.")}
+                </p>
+                <div className="collab-row">
+                  {(["alice", "bob", "carol"] as const).map((acct) => (
+                    <ActionButton
+                      key={acct}
+                      className="toolbar-btn"
+                      data-testid={`workbooks-dev-${acct}`}
+                      inactive={busy}
+                      onClick={() => void handleDevSignIn(acct)}
+                    >
+                      {t("Dev: {account}", { account: acct })}
+                    </ActionButton>
+                  ))}
+                  <a className="toolbar-btn primary-btn" href={githubLoginUrl("/workbooks")}>
+                    {t("Sign in with GitHub")}
+                  </a>
+                </div>
+              </div>
+            )}
+
+            {tab === "owned" && user && (
+              <>
+                <div className="collab-row">
                   <input
+                    type="text"
+                    className="collab-input"
+                    aria-label={t("New cloud workbook title")}
+                    value={newTitle}
+                    onChange={(e) => setNewTitle(e.target.value)}
+                    placeholder={t("New cloud workbook title")}
+                  />
+                  <ActionButton
+                    className="toolbar-btn primary-btn"
+                    data-testid="workbooks-create-btn"
+                    inactive={busy}
+                    onClick={() => void handleCreateCloud()}
+                  >
+                    + {t("New Cloud Workbook")}
+                  </ActionButton>
+                  <ActionButton
+                    className="toolbar-btn"
+                    inactive={busy}
+                    onClick={() => importRef.current?.click()}
+                  >
+                    {t("Import .rtcl")}
+                  </ActionButton>
+                  <input
+                    ref={importRef}
                     type="file"
                     accept=".rtcl,.rtclsnap,application/octet-stream"
                     style={{ display: "none" }}
                     onChange={(e) => void handleImportFile(e)}
                   />
-                </label>
-              </div>
+                </div>
+                <div className="page-list">
+                  {(cloudLists?.owned ?? []).length === 0 ? (
+                    <p className="page-muted">{t("No cloud workbooks yet.")}</p>
+                  ) : (
+                    (cloudLists?.owned ?? []).map((item) => renderCloudRow(item, true))
+                  )}
+                </div>
+              </>
+            )}
+
+            {tab === "shared" && user && (
               <div className="page-list">
-                {(cloudLists?.owned ?? []).length === 0 ? (
-                  <p className="page-muted">{t("No cloud workbooks yet.")}</p>
+                {(cloudLists?.shared ?? []).length === 0 ? (
+                  <p className="page-muted">{t("No shared workbooks yet.")}</p>
                 ) : (
-                  (cloudLists?.owned ?? []).map((item) => renderCloudRow(item, true))
+                  (cloudLists?.shared ?? []).map((item) => renderCloudRow(item, false))
                 )}
               </div>
-            </>
-          )}
+            )}
 
-          {tab === "shared" && user && (
-            <div className="page-list">
-              {(cloudLists?.shared ?? []).length === 0 ? (
-                <p className="page-muted">{t("No shared workbooks yet.")}</p>
-              ) : (
-                (cloudLists?.shared ?? []).map((item) => renderCloudRow(item, false))
-              )}
-            </div>
-          )}
-
-          {tab === "local" && (
-            <div className="page-list">
-              {localDocs.length === 0 ? (
-                <p className="page-muted">{t("No local OPFS workbooks found in this browser.")}</p>
-              ) : (
-                localDocs.map((entry) => (
-                  <div key={entry.id} className="page-item" data-testid={`local-wb-${entry.id}`}>
-                    <div className="page-item-meta">
-                      <strong>{entry.title}</strong>
-                      <span className="page-muted">
-                        {t("id: {id} · {size}", {
-                          id: entry.id,
-                          size: fmtBytes(entry.sizeBytes),
-                        })}
-                      </span>
-                    </div>
-                    <div className="collab-row">
-                      <button
-                        type="button"
-                        className="toolbar-btn primary-btn"
-                        onClick={() => onNavigate(`/app?doc=${encodeURIComponent(entry.id)}`)}
-                      >
-                        {t("Open Local")}
-                      </button>
-                      {user && (
+            {tab === "local" && (
+              <div className="page-list">
+                {localDocs.length === 0 ? (
+                  <p className="page-muted">
+                    {t("No local OPFS workbooks found in this browser.")}
+                  </p>
+                ) : (
+                  localDocs.map((entry) => (
+                    <div key={entry.id} className="page-item" data-testid={`local-wb-${entry.id}`}>
+                      <div className="page-item-meta">
+                        <strong>{entry.title}</strong>
+                        <span className="page-muted">
+                          {t("id: {id} · {size}", {
+                            id: entry.id,
+                            size: fmtBytes(entry.sizeBytes),
+                          })}
+                        </span>
+                      </div>
+                      <div className="collab-row">
                         <button
                           type="button"
-                          className="toolbar-btn"
-                          data-testid={`convert-cloud-${entry.id}`}
-                          disabled={busy}
-                          onClick={() => void handleConvertLocal(entry)}
+                          className="toolbar-btn primary-btn"
+                          onClick={() => onNavigate(`/app?doc=${encodeURIComponent(entry.id)}`)}
                         >
-                          {t("Convert to Cloud")}
+                          {t("Open Local")}
                         </button>
-                      )}
-                      {entry.id !== "sample-1m" && (
-                        <button
-                          type="button"
-                          className="toolbar-btn"
-                          disabled={busy}
-                          onClick={() => void handleDeleteLocal(entry)}
-                        >
-                          {t("Delete Local")}
-                        </button>
-                      )}
+                        {user && (
+                          <ActionButton
+                            className="toolbar-btn"
+                            data-testid={`convert-cloud-${entry.id}`}
+                            inactive={busy}
+                            onClick={() => void handleConvertLocal(entry)}
+                          >
+                            {t("Convert to Cloud")}
+                          </ActionButton>
+                        )}
+                        {entry.id !== "sample-1m" && (
+                          <ActionButton
+                            className="toolbar-btn"
+                            aria-label={`${t("Delete Local")}: ${entry.title}`}
+                            inactive={busy}
+                            onClick={() => void handleDeleteLocal(entry)}
+                          >
+                            {t("Delete Local")}
+                          </ActionButton>
+                        )}
+                      </div>
                     </div>
+                  ))
+                )}
+              </div>
+            )}
+
+            {tab === "samples" && (
+              <div className="page-list">
+                <div className="page-item">
+                  <div className="page-item-meta">
+                    <strong>{t("1,000,000-Row Budget Sample")}</strong>
+                    <span className="page-muted">
+                      {t("22 columns · 100,000 bound formulas · runs locally in Web Worker + OPFS")}
+                    </span>
                   </div>
-                ))
-              )}
-            </div>
-          )}
-
-          {tab === "samples" && (
-            <div className="page-list">
-              <div className="page-item">
-                <div className="page-item-meta">
-                  <strong>{t("1,000,000-Row Budget Sample")}</strong>
-                  <span className="page-muted">
-                    {t("22 columns · 100,000 bound formulas · runs locally in Web Worker + OPFS")}
-                  </span>
+                  <button
+                    type="button"
+                    className="toolbar-btn primary-btn"
+                    onClick={() => onNavigate("/app")}
+                  >
+                    {t("Open Sample")}
+                  </button>
                 </div>
-                <button
-                  type="button"
-                  className="toolbar-btn primary-btn"
-                  onClick={() => onNavigate("/app")}
-                >
-                  {t("Open Sample")}
-                </button>
-              </div>
-              <div className="page-item">
-                <div className="page-item-meta">
-                  <strong>{t("Deterministic Sync Simulation Lab")}</strong>
-                  <span className="page-muted">
-                    {t(
-                      "Interactive 2–3 replica offline merge & 5-replica fault injector without sign-in",
-                    )}
-                  </span>
+                <div className="page-item">
+                  <div className="page-item-meta">
+                    <strong>{t("Deterministic Sync Simulation Lab")}</strong>
+                    <span className="page-muted">
+                      {t(
+                        "Interactive 2–3 replica offline merge & 5-replica fault injector without sign-in",
+                      )}
+                    </span>
+                  </div>
+                  <button type="button" className="toolbar-btn" onClick={() => onNavigate("/sim")}>
+                    {t("Open /sim")}
+                  </button>
                 </div>
-                <button type="button" className="toolbar-btn" onClick={() => onNavigate("/sim")}>
-                  {t("Open /sim")}
-                </button>
               </div>
-            </div>
-          )}
+            )}
+          </Tabs>
         </div>
       </main>
     </div>

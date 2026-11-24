@@ -1,0 +1,242 @@
+/* What dialogs, popovers and everything that can have the focus look like. */
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  border: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+/* One sign for where the keyboard is, on every control and in both themes. */
+:focus-visible {
+  outline: 2px solid var(--shell-focus);
+  outline-offset: 1px;
+}
+
+/* On a button in the same color the ring needs a gap. */
+.primary-btn:focus-visible,
+.page-tab.active:focus-visible,
+.landing-cta:focus-visible,
+.ai-btn.primary:focus-visible {
+  outline-offset: 2px;
+}
+
+/* Beside what scrolls or cuts them off, rings would not be seen whole. */
+.drawer-open-btn:focus-visible,
+.m3a-match:focus-visible,
+.history-item-btn:focus-visible,
+.ai-replay-item:focus-visible,
+.listbox-option:focus-visible,
+.ctx-item:focus-visible,
+.sheet-tab:focus-visible,
+[role="tabpanel"]:focus-visible {
+  outline-offset: -2px;
+}
+
+/* They are gone to by the page, not with the Tab key. */
+h1[tabindex="-1"]:focus-visible,
+h2[tabindex="-1"]:focus-visible,
+main[tabindex="-1"]:focus-visible,
+dialog:focus-visible {
+  outline: none;
+}
+
+/* Text fields with an outline of their own around them. */
+.cm-content:focus-visible {
+  outline: none;
+}
+
+[aria-disabled="true"] {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* The first stop of the Tab key on every page. */
+.skip-button {
+  position: fixed;
+  top: 6px;
+  left: 6px;
+  z-index: 100;
+  padding: 6px 12px;
+  border: 1px solid var(--shell-control);
+  border-radius: 5px;
+  background: var(--shell-surface);
+  color: var(--shell-text);
+  font: inherit;
+  cursor: pointer;
+}
+
+.skip-button:not(:focus) {
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  border: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+}
+
+/* --- Dialogs --------------------------------------------------------------
+   Anchored to a fixed top inset rather than the vertical center, so that
+   sections that load later (members, share links, filter values, named ranges,
+   workbook lists) do not shift buttons under a pointer. */
+.dialog {
+  box-sizing: border-box;
+  width: min(620px, calc(100vw - 40px));
+  max-width: none;
+  max-height: calc(100vh - clamp(24px, 8vh, 72px) - 24px);
+  margin: clamp(24px, 8vh, 72px) auto auto;
+  padding: 18px 20px;
+  border: 1px solid var(--shell-line);
+  border-radius: 10px;
+  background: var(--shell-surface);
+  color: var(--shell-text);
+  box-shadow: 0 20px 48px rgba(0, 0, 0, 0.28);
+  overflow-y: auto;
+}
+
+.dialog[open] {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.dialog::backdrop {
+  background: rgba(15, 23, 42, 0.45);
+}
+
+.dialog-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.dialog-header h2 {
+  margin: 0;
+  font-size: 16px;
+}
+
+.dialog-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+/* --- Popovers ------------------------------------------------------------ */
+
+.popover-wrap {
+  position: relative;
+  display: inline-block;
+}
+
+.popover {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  z-index: 40;
+  padding: 8px;
+  border: 1px solid var(--shell-control);
+  border-radius: 6px;
+  background: var(--shell-surface);
+  color: var(--shell-text);
+  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.16);
+}
+
+.listbox {
+  min-width: 100%;
+  max-height: 320px;
+  padding: 4px;
+  overflow-y: auto;
+}
+
+.listbox-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  height: 24px;
+  padding: 0 6px;
+  border: 1px solid var(--shell-control);
+  border-radius: 4px;
+  background: var(--shell-surface);
+  color: var(--shell-text);
+  font: inherit;
+  font-size: 12px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.listbox-button::after {
+  content: "▾";
+  font-size: 10px;
+}
+
+.listbox-option {
+  display: block;
+  width: 100%;
+  padding: 4px 8px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-size: 12px;
+  text-align: start;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.listbox-option:hover,
+.listbox-option:focus {
+  background: var(--shell-accent-soft);
+}
+
+.listbox-option[aria-selected="true"] {
+  color: var(--shell-accent);
+  font-weight: 600;
+}
+
+/* --- Preferences of the user --------------------------------------------- */
+
+/* The system's colors replace backgrounds, so what is told by one needs a
+   border. What a color is the point of keeps it. */
+@media (forced-colors: active) {
+  .primary-btn,
+  .ai-btn.primary,
+  .landing-cta,
+  .page-tab.active,
+  .fmt-btn.active,
+  .sheet-tab.active,
+  .ai-tab.active,
+  .ai-replay-item.selected,
+  .drawer-row.current,
+  .history-item-active,
+  .completion-item.active,
+  .listbox-option[aria-selected="true"] {
+    border: 2px solid Highlight;
+  }
+
+  .sim-progress-fill,
+  .page-quota-fill {
+    background: Highlight;
+  }
+
+  .reticula-scrollbar-thumb {
+    background: ButtonText;
+  }
+
+  .color-swatch,
+  .color-swatch-bar,
+  .collab-peer-dot {
+    forced-color-adjust: none;
+  }
+
+  [aria-disabled="true"] {
+    color: GrayText;
+    opacity: 1;
+  }
+}

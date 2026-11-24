@@ -11,6 +11,8 @@ import {
 import { useCallback, useEffect, useState } from "react";
 import { fmtBytes, fmtInt, t } from "../i18n/index.ts";
 import { tx } from "../i18n/react.ts";
+import { ActionButton } from "../ui/ActionButton.tsx";
+import { useKeptFocus } from "../ui/focus.ts";
 import { apiErrorMessage } from "./helpers.ts";
 import { LanguageSwitch } from "./LanguageSwitch.tsx";
 import { PageNav } from "./PageNav.tsx";
@@ -44,6 +46,7 @@ export default function AccountPage({ onNavigate }: AccountPageProps) {
   const [confirmText, setConfirmText] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<Failure | null>(null);
+  const mainRef = useKeptFocus();
 
   const loadAccount = useCallback(async () => {
     setLoading(true);
@@ -95,7 +98,7 @@ export default function AccountPage({ onNavigate }: AccountPageProps) {
   };
 
   const handleDeleteAccount = async () => {
-    if (confirmText.trim() !== "DELETE") {
+    if (busy || confirmText.trim() !== "DELETE") {
       return;
     }
     setBusy(true);
@@ -131,7 +134,7 @@ export default function AccountPage({ onNavigate }: AccountPageProps) {
         ]}
       />
 
-      <main className="page-main">
+      <main ref={mainRef} className="page-main">
         <div className="page-card">
           <h1>{t("Account & Storage")}</h1>
           <LanguageSwitch />
@@ -149,15 +152,14 @@ export default function AccountPage({ onNavigate }: AccountPageProps) {
               </p>
               <div className="collab-row">
                 {(["alice", "bob", "carol"] as const).map((acct) => (
-                  <button
+                  <ActionButton
                     key={acct}
-                    type="button"
                     className="toolbar-btn"
-                    disabled={busy}
+                    inactive={busy}
                     onClick={() => void handleDevSignIn(acct)}
                   >
                     {t("Dev: {account}", { account: acct })}
-                  </button>
+                  </ActionButton>
                 ))}
                 <a className="toolbar-btn primary-btn" href={githubLoginUrl("/account")}>
                   {t("Sign in with GitHub")}
@@ -176,19 +178,18 @@ export default function AccountPage({ onNavigate }: AccountPageProps) {
                     })}
                   </div>
                 </div>
-                <button
-                  type="button"
+                <ActionButton
                   className="toolbar-btn"
-                  disabled={busy}
+                  inactive={busy}
                   onClick={() => void handleLogout()}
                 >
                   {t("Sign Out")}
-                </button>
+                </ActionButton>
               </div>
 
               <div className="collab-section">
-                <p className="collab-section-title">{t("Cloud Storage Usage")}</p>
-                <div className="page-quota-bar">
+                <h2 className="collab-section-title">{t("Cloud Storage Usage")}</h2>
+                <div className="page-quota-bar" aria-hidden="true">
                   <div className="page-quota-fill" style={{ width: `${pct}%` }} />
                 </div>
                 <span className="page-muted" data-testid="account-storage-usage">
@@ -213,7 +214,7 @@ export default function AccountPage({ onNavigate }: AccountPageProps) {
               </div>
 
               <div className="collab-section" data-testid="account-ai-quota">
-                <p className="collab-section-title">{t("Daily AI Analyst Quota")}</p>
+                <h2 className="collab-section-title">{t("Daily AI Analyst Quota")}</h2>
                 <span className="page-muted">
                   {t(
                     "Status: {status} · Runs today: {runs} / {runLimit} · Tokens today: {tokens} / {tokenLimit}",
@@ -242,20 +243,20 @@ export default function AccountPage({ onNavigate }: AccountPageProps) {
                   <input
                     type="text"
                     className="collab-input"
+                    aria-label={t('Type "DELETE"')}
                     data-testid="delete-account-confirm-input"
                     placeholder={t('Type "DELETE"')}
                     value={confirmText}
                     onChange={(e) => setConfirmText(e.target.value)}
                   />
-                  <button
-                    type="button"
+                  <ActionButton
                     className="toolbar-btn"
                     data-testid="delete-account-btn"
-                    disabled={busy || confirmText.trim() !== "DELETE"}
+                    inactive={busy || confirmText.trim() !== "DELETE"}
                     onClick={() => void handleDeleteAccount()}
                   >
                     {t("Permanently Delete Account")}
-                  </button>
+                  </ActionButton>
                 </div>
               </div>
             </>

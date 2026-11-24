@@ -93,7 +93,7 @@ export async function startCollabServer(): Promise<CollabServerHandle> {
   const dataDir = await mkdtemp(join(tmpdir(), "reticula-e2e-data-"));
   const binName = process.platform === "win32" ? "reticula-server.exe" : "reticula-server";
   const binPath = resolve(process.cwd(), "target/debug", binName);
-  const staticDir = resolve(process.cwd(), "apps/web/dist");
+  const staticDir = resolve(process.cwd(), process.env.RETICULA_E2E_DIST ?? "apps/web/dist");
 
   const logs: string[] = [];
   const child: ChildProcess = spawn(binPath, [], {

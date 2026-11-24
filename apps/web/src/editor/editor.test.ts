@@ -103,6 +103,7 @@ const bar = (props: Partial<StatusBarProps>) =>
       activity: null,
       stats: null,
       kernelVersion: "1.2.3",
+      zoom: null,
       ...props,
     }),
   );

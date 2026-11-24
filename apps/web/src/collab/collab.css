@@ -22,8 +22,8 @@
 }
 
 .collab-status-pill[data-connection="online"] {
-  border-color: color-mix(in srgb, #2e8b57 45%, var(--shell-line));
-  color: #2e8b57;
+  border-color: color-mix(in srgb, var(--shell-success) 45%, var(--shell-line));
+  color: var(--shell-success);
 }
 
 .collab-status-pill[data-connection="connecting"],
@@ -81,10 +81,6 @@
 
 .collab-modal {
   width: min(540px, 94vw);
-  overflow-y: auto;
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
 }
 
 .collab-section {
@@ -117,7 +113,7 @@
   flex: 1;
   min-width: 140px;
   padding: 5px 8px;
-  border: 1px solid var(--shell-line);
+  border: 1px solid var(--shell-control);
   border-radius: 5px;
   background: var(--shell-surface);
   color: var(--shell-text);
@@ -198,7 +194,7 @@
 
 .collab-select {
   padding: 4px 6px;
-  border: 1px solid var(--shell-line);
+  border: 1px solid var(--shell-control);
   border-radius: 5px;
   background: var(--shell-surface);
   color: var(--shell-text);
@@ -210,7 +206,8 @@
   position: fixed;
   top: 0;
   right: 0;
-  bottom: 0;
+  /* Above the status bar, whose zoom is for what is looked at from here too. */
+  bottom: 28px;
   width: min(360px, 92vw);
   z-index: 40;
   display: flex;
@@ -333,16 +330,4 @@
   margin: 0;
   color: var(--shell-muted);
   font-size: 11px;
-}
-
-.history-preview-banner {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-  padding: 5px 12px;
-  border-bottom: 1px solid color-mix(in srgb, var(--shell-accent) 45%, var(--shell-line));
-  background: color-mix(in srgb, var(--shell-accent) 12%, var(--shell-background));
-  color: var(--shell-text);
-  font-size: 12px;
 }

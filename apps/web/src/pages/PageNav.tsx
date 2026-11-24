@@ -1,4 +1,5 @@
 import type { ReactNode } from "react";
+import { t } from "../i18n/index.ts";
 
 export interface PageLinkProps {
   readonly to: string;
@@ -34,7 +35,7 @@ export interface PageNavProps {
 /** The bar at the top of every page but the editor. */
 export function PageNav({ onNavigate, brand = "Reticula", links }: PageNavProps) {
   return (
-    <nav className="page-nav">
+    <nav className="page-nav" aria-label={t("Pages")}>
       <PageLink to="/" className="page-brand" onNavigate={onNavigate}>
         {brand}
       </PageLink>

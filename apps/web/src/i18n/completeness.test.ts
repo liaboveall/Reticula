@@ -38,7 +38,7 @@ const ROUTES = Object.keys(CATALOGUES) as AppRoute[];
 const NOT_OF_THE_APP = /\/generated\/|\/i18n\/(?:zh-\w+|scan|scan-engine|allowlist)\.ts$/;
 
 /** Pages to experiment on, which the app does not contain. */
-const EXPERIMENTS = /^apps\/web\/src\/(?:bench|ime|visual)\//;
+const EXPERIMENTS = /^apps\/web\/src\/(?:bench|ime|visual|ui\/harness)\//;
 /** The engine writes English, and so does what carries its messages. They are translated when shown. */
 const ENGINE = /^apps\/web\/src\/engine\//;
 /** Draws what the cells contain, without any words of its own. */

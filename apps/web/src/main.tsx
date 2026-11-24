@@ -8,6 +8,7 @@ import { loadPage } from "./routes-load.ts";
 import { startRecovery } from "./routes-recovery.ts";
 import "@reticula/grid/grid.css";
 import "./app.css";
+import "./ui/ui.css";
 
 const container = document.getElementById("root");
 if (!container) {

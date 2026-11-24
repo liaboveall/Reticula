@@ -17,10 +17,15 @@ import {
   previewBranchMerge,
   startAgentRun,
 } from "@reticula/protocol/collab-api";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { type RefObject, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { personText } from "../collab/labels.ts";
 import { translateEngineText } from "../i18n/engine-text.ts";
 import { t } from "../i18n/index.ts";
+import { ActionButton } from "../ui/ActionButton.tsx";
+import { announce } from "../ui/announcer.ts";
+import { useDrawer } from "../ui/drawer.ts";
+import { focusIsLost } from "../ui/focus.ts";
+import { type TabItem, Tabs } from "../ui/Tabs.tsx";
 import "./ai.css";
 import { DiffReviewDrawer } from "./DiffReviewDrawer.tsx";
 import { runStatusText, runSummaryText, stepKindText, stepText } from "./labels.ts";
@@ -36,6 +41,11 @@ import {
 } from "./replay-player.ts";
 
 export interface AiPanelProps {
+  /** Hidden otherwise, with everything that is going on in it. */
+  readonly open: boolean;
+  /** What had the focus when it was opened. */
+  readonly opener: RefObject<Element | null>;
+  readonly onFocusGrid: () => void;
   readonly collabDocId: string | null;
   readonly canWriteCloud: boolean;
   readonly activeSheetId: number;
@@ -77,7 +87,12 @@ function failureText(err: unknown): string {
   return err instanceof Error ? translateEngineText(err.message) : String(err);
 }
 
+type TabKey = "cloud" | "demos";
+
 export default function AiPanel({
+  open,
+  opener,
+  onFocusGrid,
   collabDocId,
   canWriteCloud,
   activeSheetId,
@@ -93,7 +108,8 @@ export default function AiPanel({
   onJumpToCell,
 }: AiPanelProps) {
   const cloudAvailable = collabDocId !== null && canWriteCloud;
-  const [tab, setTab] = useState<"cloud" | "demos">(cloudAvailable ? "cloud" : "demos");
+  const [tab, setTab] = useState<TabKey>(cloudAvailable ? "cloud" : "demos");
+  const shownTab = cloudAvailable ? tab : "demos";
   const [followCursor, setFollowCursor] = useState(true);
   const followCursorRef = useRef(followCursor);
   followCursorRef.current = followCursor;
@@ -118,24 +134,97 @@ export default function AiPanel({
   const [replayReview, setReplayReview] = useState(false);
   const [replayMsg, setReplayMsg] = useState<string | null>(null);
 
+  const headingRef = useRef<HTMLHeadingElement>(null);
+  const promptRef = useRef<HTMLTextAreaElement>(null);
+  const playRef = useRef<HTMLButtonElement>(null);
+  const demoListRef = useRef<HTMLDivElement>(null);
+  const firstRef = useRef<HTMLElement>(null);
+  useLayoutEffect(() => {
+    firstRef.current = promptRef.current ?? headingRef.current;
+  });
+  const panelRef = useDrawer({ open, initialFocus: firstRef, opener, onLeave: onFocusGrid });
+
+  // What was pressed to get to a recording or back to the list is gone then.
+  const shownDemoRef = useRef<string | null>(null);
+  const bundleId = bundle?.id ?? null;
+  useLayoutEffect(() => {
+    const shownBefore = shownDemoRef.current;
+    shownDemoRef.current = bundleId;
+    if (bundleId === shownBefore || !focusIsLost()) {
+      return;
+    }
+    if (bundleId !== null) {
+      playRef.current?.focus();
+    } else {
+      demoListRef.current
+        ?.querySelector<HTMLElement>(`[data-testid="ai-demo-${shownBefore}"]`)
+        ?.focus();
+    }
+  }, [bundleId]);
+
+  const runStatus = activeRun?.status;
   useEffect(() => {
-    if (!collabDocId) return;
-    listAgentRuns(collabDocId)
-      .then((list) => setRuns(list))
-      .catch(() => {});
-  }, [collabDocId]);
+    if (runStatus !== undefined) {
+      announce(t("Status: {status}", { status: runStatusText(runStatus) }));
+    }
+  }, [runStatus]);
 
   useEffect(() => {
-    if (tab !== "demos" || demos.length > 0) return;
-    fetchReplayIndex()
-      .then((idx) => setDemos(idx.items))
-      .catch((err) => setReplayMsg(failureText(err)));
-  }, [tab, demos.length]);
+    if (replayMsg !== null) {
+      announce(replayMsg);
+    }
+  }, [replayMsg]);
+
+  const reviewedHunks = replayReview ? bundle?.diff.hunks.length : cloudDiff?.hunks.length;
+  useEffect(() => {
+    if (reviewedHunks !== undefined) {
+      announce(t("Review Changes ({n} hunks)", { n: reviewedHunks }));
+    }
+  }, [reviewedHunks]);
 
   const closeSse = useCallback(() => {
     sseRef.current?.close();
     sseRef.current = null;
   }, []);
+
+  // The panel stays when another workbook is opened; what it shows of a cloud
+  // workbook's runs does not, nor does what was still being waited for.
+  const runsOfRef = useRef(collabDocId);
+  useEffect(() => {
+    if (runsOfRef.current === collabDocId) return;
+    runsOfRef.current = collabDocId;
+    closeSse();
+    setTab(cloudAvailable && shownDemoRef.current === null ? "cloud" : "demos");
+    setRuns([]);
+    setActiveRun(null);
+    setSteps([]);
+    setStreamText("");
+    setCloudDiff(null);
+    setCloudError(null);
+  }, [collabDocId, cloudAvailable, closeSse]);
+
+  const refreshRuns = useCallback((docId: string) => {
+    listAgentRuns(docId)
+      .then((list) => {
+        if (runsOfRef.current === docId) setRuns(list);
+      })
+      .catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    if (open && collabDocId) refreshRuns(collabDocId);
+  }, [open, collabDocId, refreshRuns]);
+
+  // What could not be loaded is asked for again when the panel is opened again.
+  useEffect(() => {
+    if (!open || shownTab !== "demos" || demos.length > 0) return;
+    fetchReplayIndex()
+      .then((idx) => {
+        setDemos(idx.items);
+        setReplayMsg(null);
+      })
+      .catch((err) => setReplayMsg(failureText(err)));
+  }, [open, shownTab, demos.length]);
 
   useEffect(() => () => closeSse(), [closeSse]);
 
@@ -156,9 +245,9 @@ export default function AiPanel({
   const loadCloudReview = useCallback(async (docId: string, branchId: string) => {
     try {
       const d = await branchDiff(docId, branchId);
-      setCloudDiff(d);
+      if (runsOfRef.current === docId) setCloudDiff(d);
     } catch (err) {
-      setCloudError(failureText(err));
+      if (runsOfRef.current === docId) setCloudError(failureText(err));
     }
   }, []);
 
@@ -230,27 +319,36 @@ export default function AiPanel({
           es.close();
           if (sseRef.current === es) sseRef.current = null;
           onSetAiPresence(null);
-          void listAgentRuns(docId)
-            .then(setRuns)
-            .catch(() => {});
+          refreshRuns(docId);
         } catch {
           // ignore
         }
       });
     },
-    [closeSse, loadCloudReview, onExitDraft, onJumpToCell, onOpenCloudDraft, onSetAiPresence],
+    [
+      closeSse,
+      loadCloudReview,
+      onExitDraft,
+      onJumpToCell,
+      onOpenCloudDraft,
+      onSetAiPresence,
+      refreshRuns,
+    ],
   );
+
+  const canRun = !cloudBusy && prompt.trim() !== "" && activeRun?.status !== "running";
 
   const handleStartRun = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!collabDocId || !prompt.trim()) return;
+    if (!collabDocId || !canRun) return;
     setCloudBusy(true);
     setCloudError(null);
     try {
       const run = await startAgentRun(collabDocId, { prompt: prompt.trim() });
       setPrompt("");
-      attachSse(collabDocId, run);
+      if (runsOfRef.current === collabDocId) attachSse(collabDocId, run);
     } catch (err) {
+      if (runsOfRef.current !== collabDocId) return;
       if (err instanceof ApiError && err.status === 503) {
         setCloudError(
           t(
@@ -279,6 +377,7 @@ export default function AiPanel({
     if (!collabDocId) return;
     setCloudError(null);
     const detail = await getAgentRun(collabDocId, r.id);
+    if (runsOfRef.current !== collabDocId) return;
     setActiveRun(detail.run);
     setSteps(detail.steps);
     if (detail.run.status === "running" || detail.run.status === "queued") {
@@ -314,15 +413,15 @@ export default function AiPanel({
     setCloudError(null);
     try {
       await mergeBranch(collabDocId, activeRun.branchId, sel);
+      if (runsOfRef.current !== collabDocId) return;
       setCloudDiff(null);
       setActiveRun((prev) => (prev ? { ...prev, status: "merged" } : prev));
       onSetDiffHighlights(null);
       onSetAiPresence(null);
       onExitDraft();
-      void listAgentRuns(collabDocId)
-        .then(setRuns)
-        .catch(() => {});
+      refreshRuns(collabDocId);
     } catch (err) {
+      if (runsOfRef.current !== collabDocId) return;
       if (
         err instanceof ApiError &&
         err.status === 409 &&
@@ -349,14 +448,13 @@ export default function AiPanel({
     setCloudBusy(true);
     try {
       await abandonBranch(collabDocId, activeRun.branchId);
+      if (runsOfRef.current !== collabDocId) return;
       setCloudDiff(null);
       setActiveRun((prev) => (prev ? { ...prev, status: "rejected" } : prev));
       onSetDiffHighlights(null);
       onSetAiPresence(null);
       onExitDraft();
-      void listAgentRuns(collabDocId)
-        .then(setRuns)
-        .catch(() => {});
+      refreshRuns(collabDocId);
     } finally {
       setCloudBusy(false);
     }
@@ -402,9 +500,12 @@ export default function AiPanel({
       setPlaying(false);
       setReplayReview(true);
       onSetAiPresence(null);
+    } else if (!playing) {
+      // While it plays, the steps follow one another faster than they can be read.
+      announce(`${nextIdx + 1} / ${bundle.steps.length}: ${step.title}`);
     }
     return true;
-  }, [bundle, followCursor, onApplyReplayTxn, onJumpToCell, onSetAiPresence, replayIdx]);
+  }, [bundle, followCursor, onApplyReplayTxn, onJumpToCell, onSetAiPresence, playing, replayIdx]);
 
   useEffect(() => {
     if (!playing || !bundle) return;
@@ -473,13 +574,26 @@ export default function AiPanel({
     onExitDraft();
   };
 
+  const tabs: TabItem<TabKey>[] = [
+    { key: "demos", text: t("10 Recorded Demos"), testId: "ai-tab-demos" },
+  ];
+  if (cloudAvailable) {
+    tabs.unshift({ key: "cloud", text: t("Cloud Draft"), testId: "ai-tab-cloud" });
+  }
+
   return (
-    <aside className="ai-panel" data-testid="ai-panel" aria-label={t("AI Analyst")}>
+    <aside
+      ref={panelRef}
+      className="ai-panel"
+      data-testid="ai-panel"
+      aria-label={t("AI Analyst")}
+      hidden={!open}
+    >
       <div className="ai-panel-head">
-        <div className="ai-panel-title">
+        <h2 ref={headingRef} className="ai-panel-title" tabIndex={-1}>
           <span className="ai-badge">{t("AI")}</span>
           <span>{t("Analyst")}</span>
-        </div>
+        </h2>
         <div className="ai-row">
           <label style={{ display: "flex", gap: 4, alignItems: "center", fontSize: 11 }}>
             <input
@@ -489,39 +603,34 @@ export default function AiPanel({
             />
             {t("Follow cursor")}
           </label>
-          <button type="button" className="ai-btn" data-testid="ai-close-btn" onClick={onClose}>
+          <button
+            type="button"
+            className="ai-btn"
+            aria-label={t("Close")}
+            data-testid="ai-close-btn"
+            onClick={onClose}
+          >
             ✕
           </button>
         </div>
       </div>
 
-      <div className="ai-tabs">
-        {cloudAvailable && (
-          <button
-            type="button"
-            className={`ai-tab ${tab === "cloud" ? "active" : ""}`}
-            data-testid="ai-tab-cloud"
-            onClick={() => setTab("cloud")}
-          >
-            {t("Cloud Draft")}
-          </button>
-        )}
-        <button
-          type="button"
-          className={`ai-tab ${tab === "demos" ? "active" : ""}`}
-          data-testid="ai-tab-demos"
-          onClick={() => setTab("demos")}
-        >
-          {t("10 Recorded Demos")}
-        </button>
-      </div>
-
-      <div className="ai-panel-body">
-        {tab === "cloud" && cloudAvailable ? (
+      <Tabs
+        label={t("AI Analyst")}
+        tabs={tabs}
+        selected={shownTab}
+        onSelect={setTab}
+        listClassName="ai-tabs"
+        tabClassName="ai-tab"
+        panelClassName="ai-panel-body"
+      >
+        {shownTab === "cloud" ? (
           <>
             <form className="ai-form" onSubmit={handleStartRun}>
               <textarea
+                ref={promptRef}
                 className="ai-textarea"
+                aria-label={t("Prompt for the AI Analyst")}
                 data-testid="ai-prompt-input"
                 placeholder={t(
                   "Ask AI Analyst to inspect, build formulas, audit errors, or sort on an isolated draft branch...",
@@ -531,14 +640,14 @@ export default function AiPanel({
                 maxLength={4000}
               />
               <div className="ai-row">
-                <button
+                <ActionButton
                   type="submit"
                   className="ai-btn primary"
                   data-testid="ai-run-btn"
-                  disabled={cloudBusy || !prompt.trim() || activeRun?.status === "running"}
+                  inactive={!canRun}
                 >
                   {t("Run on Draft Branch")}
-                </button>
+                </ActionButton>
                 {activeRun?.status === "running" && (
                   <button
                     type="button"
@@ -602,7 +711,7 @@ export default function AiPanel({
 
             {runs.length > 0 && !cloudDiff && (
               <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-                <strong style={{ fontSize: 12 }}>{t("Recent Runs")}</strong>
+                <h3 className="ai-heading">{t("Recent Runs")}</h3>
                 {runs.slice(0, 5).map((r) => (
                   <button
                     key={r.id}
@@ -631,6 +740,7 @@ export default function AiPanel({
 
             {!bundle ? (
               <div
+                ref={demoListRef}
                 style={{ display: "flex", flexDirection: "column", gap: 6 }}
                 data-testid="ai-demo-list"
               >
@@ -678,6 +788,7 @@ export default function AiPanel({
                   </div>
                   <div className="ai-row" style={{ marginTop: 8 }}>
                     <button
+                      ref={playRef}
                       type="button"
                       className="ai-btn primary"
                       data-testid="ai-replay-play"
@@ -691,18 +802,17 @@ export default function AiPanel({
                     >
                       {playing ? t("Pause") : replayIdx < 0 ? t("Play Replay") : t("Resume")}
                     </button>
-                    <button
-                      type="button"
+                    <ActionButton
                       className="ai-btn"
                       data-testid="ai-replay-step"
-                      disabled={playing}
+                      inactive={playing}
                       onClick={() => void stepReplayOnce()}
                     >
                       {t("Step ({done}/{total})", {
                         done: Math.max(0, replayIdx + 1),
                         total: bundle.steps.length,
                       })}
-                    </button>
+                    </ActionButton>
                     <button
                       type="button"
                       className="ai-btn"
@@ -751,7 +861,7 @@ export default function AiPanel({
             )}
           </>
         )}
-      </div>
+      </Tabs>
     </aside>
   );
 }

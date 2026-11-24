@@ -1,9 +1,13 @@
-import { useEffect, useRef, useState } from "react";
+import { type RefObject, useEffect, useRef, useState } from "react";
+import { flushSync } from "react-dom";
 import type { SafeModeInfo } from "./engine/client.ts";
 import { readRawDocFilesFromOpfs, type WorkbookCatalogEntry } from "./engine/storage.ts";
 import { translateEngineText } from "./i18n/engine-text.ts";
 import { fmtDateTime, fmtInt, t } from "./i18n/index.ts";
 import { tx } from "./i18n/react.ts";
+import { announce } from "./ui/announcer.ts";
+import { Dialog } from "./ui/Dialog.tsx";
+import { isComposing } from "./ui/focus.ts";
 
 const MAX_CSV_RAW_BYTES = 256 * 1024 * 1024;
 
@@ -13,6 +17,9 @@ export type LocalModalMode =
 
 export interface LocalModalsProps {
   readonly mode: LocalModalMode;
+  /** What had the focus when it was opened. */
+  readonly opener: RefObject<Element | null>;
+  readonly onFocusGrid: () => void;
   readonly activeDocId: string;
   readonly docs: readonly WorkbookCatalogEntry[];
   readonly storageUsedMb: string;
@@ -31,6 +38,12 @@ export interface LocalModalsProps {
   readonly onImportRejected: (reason: string) => void;
   readonly onSafeModeOpenFrozen: (docId: string) => void;
   readonly onSafeModeSkipTail: (docId: string, skipCount: number, salvageMid: boolean) => void;
+}
+
+function rawFilesText(count: number): string {
+  return count === 0
+    ? t("No raw OPFS files were found for this workbook.")
+    : t("Downloaded {n} raw file(s) as .zip.", { n: count });
 }
 
 function formatBytes(bytes: number): string {
@@ -161,8 +174,13 @@ export function triggerBrowserDownload(filename: string, bytes: ArrayBuffer | Ui
   setTimeout(() => URL.revokeObjectURL(url), 2_000);
 }
 
+/** At which parts of an import its progress is read out. */
+const ANNOUNCED_PERCENT = 25;
+
 export default function LocalModals({
   mode,
+  opener,
+  onFocusGrid,
   activeDocId,
   docs,
   storageUsedMb,
@@ -183,33 +201,27 @@ export default function LocalModals({
   onSafeModeSkipTail,
 }: LocalModalsProps) {
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const backdropRef = useRef<HTMLDivElement>(null);
+  const firstActionRef = useRef<HTMLButtonElement>(null);
+  const deletingRef = useRef<WorkbookCatalogEntry | null>(null);
   const [editingDoc, setEditingDoc] = useState<{ id: string; draft: string } | null>(null);
   const [skipCountOverride, setSkipCountOverride] = useState<number | null>(null);
   /** How many raw files were downloaded, or `null` while nobody has asked for them. */
   const [rawFileCount, setRawFileCount] = useState<number | null>(null);
 
+  const csvPart = csvProgress === null ? null : Math.floor(csvProgress.percent / ANNOUNCED_PERCENT);
   useEffect(() => {
-    if (mode.kind !== "workbooks") {
-      return;
+    if (csvPart !== null) {
+      announce(t("Importing CSV: {percent}%", { percent: csvPart * ANNOUNCED_PERCENT }));
     }
-    const onMouseDown = (event: MouseEvent) => {
-      if (event.target === backdropRef.current) {
-        onClose();
-      }
-    };
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape" && !editingDoc) {
-        onClose();
-      }
-    };
-    window.addEventListener("mousedown", onMouseDown);
-    window.addEventListener("keydown", onKeyDown);
-    return () => {
-      window.removeEventListener("mousedown", onMouseDown);
-      window.removeEventListener("keydown", onKeyDown);
-    };
-  }, [mode.kind, editingDoc, onClose]);
+  }, [csvPart]);
+
+  useEffect(() => {
+    const deleted = deletingRef.current;
+    if (deleted && !docs.some((doc) => doc.id === deleted.id)) {
+      deletingRef.current = null;
+      announce(t('Deleted "{title}".', { title: deleted.title }));
+    }
+  }, [docs]);
 
   if (mode.kind === "safeMode") {
     const { info } = mode;
@@ -220,142 +232,145 @@ export default function LocalModals({
       maxSkip > 0 ? Math.max(info.salvageableMid ? 0 : 1, Math.min(maxSkip, desiredSkip)) : 0;
 
     return (
-      <div className="modal-backdrop" role="presentation">
-        <div
-          className="modal-card safe-modal"
-          role="dialog"
-          aria-modal="true"
-          aria-labelledby="safe-mode-heading"
-          data-testid="safe-mode-modal"
-        >
-          <div className="modal-header">
-            <h2 id="safe-mode-heading">{t("Safe Mode — {title}", { title: info.title })}</h2>
-          </div>
+      <Dialog
+        key="safeMode"
+        labelledBy="safe-mode-heading"
+        describedBy="safe-mode-detail"
+        closable={false}
+        initialFocus={firstActionRef}
+        opener={opener}
+        fallbackFocus={onFocusGrid}
+        onClose={onClose}
+        className="safe-modal"
+        testId="safe-mode-modal"
+      >
+        <div className="dialog-header">
+          <h2 id="safe-mode-heading">{t("Safe Mode — {title}", { title: info.title })}</h2>
+        </div>
 
-          <p className="safe-detail" data-testid="safe-mode-detail">
-            {translateEngineText(info.detail)}
-          </p>
+        <p id="safe-mode-detail" className="safe-detail" data-testid="safe-mode-detail">
+          {translateEngineText(info.detail)}
+        </p>
 
-          <div className="safe-actions">
-            <section className="safe-option">
-              <div>
-                <strong>{t("1. Open without recalculation")}</strong>
-                <p>
-                  {t(
-                    "Loads the workbook with automatic formula evaluation paused so you can inspect or fix heavy/problematic formulas or export CSV.",
-                  )}
-                </p>
-              </div>
-              <button
-                type="button"
-                className="toolbar-btn primary-btn"
-                data-testid="safe-open-frozen"
-                onClick={() => onSafeModeOpenFrozen(info.docId)}
-              >
-                {t("Open Paused")}
-              </button>
-            </section>
-
-            <section className="safe-option">
-              <div>
-                <strong>
-                  {info.salvageableMid
-                    ? t("2. Recover intact prefix & skip tail transactions")
-                    : t("2. Skip recent tail transactions")}
-                </strong>
-                <p>
-                  {maxSkip > 0
-                    ? t(
-                        "Discard the last {n} transaction(s) from the edit log and save a clean snapshot.",
-                        { n: effectiveSkip },
-                      )
-                    : info.salvageableMid
-                      ? t("Salvage verified transactions before the corrupted log record.")
-                      : t("No tail edit-log transactions are available to skip on this workbook.")}
-                </p>
-                {maxSkip > 0 && (
-                  <div className="safe-skip-controls">
-                    <label htmlFor="safe-skip-input">{t("Transactions to skip:")}</label>
-                    <input
-                      id="safe-skip-input"
-                      type="number"
-                      min={info.salvageableMid ? 0 : 1}
-                      max={maxSkip}
-                      value={effectiveSkip}
-                      data-testid="safe-skip-count"
-                      onChange={(e) => setSkipCountOverride(Number(e.target.value) || 0)}
-                    />
-                    <span className="safe-muted">
-                      {t("of {max} recent record(s)", { max: maxSkip })}
-                    </span>
-                  </div>
+        <div className="safe-actions">
+          <section className="safe-option">
+            <div>
+              <strong>{t("1. Open without recalculation")}</strong>
+              <p>
+                {t(
+                  "Loads the workbook with automatic formula evaluation paused so you can inspect or fix heavy/problematic formulas or export CSV.",
                 )}
-                {info.tailTxns.length > 0 && (
-                  <ul className="safe-txn-list" data-testid="safe-txn-list">
-                    {info.tailTxns.slice(-6).map((txn) => (
-                      <li key={txn.seq}>
-                        <code>#{txn.seq}</code> <span>{translateEngineText(txn.label)}</span>
-                      </li>
-                    ))}
-                  </ul>
-                )}
-              </div>
-              <button
-                type="button"
-                className="toolbar-btn"
-                data-testid="safe-skip-tail-btn"
-                disabled={maxSkip === 0 && !info.salvageableMid}
-                onClick={() => onSafeModeSkipTail(info.docId, effectiveSkip, info.salvageableMid)}
-              >
-                {t("Recover & Open")}
-              </button>
-            </section>
+              </p>
+            </div>
+            <button
+              ref={firstActionRef}
+              type="button"
+              className="toolbar-btn primary-btn"
+              data-testid="safe-open-frozen"
+              onClick={() => onSafeModeOpenFrozen(info.docId)}
+            >
+              {t("Open Paused")}
+            </button>
+          </section>
 
-            <section className="safe-option">
-              <div>
-                <strong>{t("3. Export raw snapshot & edit log")}</strong>
-                <p>
-                  {t(
-                    "Reads the raw OPFS files directly via browser file handles without running the WebAssembly decoder, downloading them to your disk.",
-                  )}
-                </p>
-                {rawFileCount !== null && (
-                  <p className="safe-export-note" data-testid="safe-export-note">
-                    {rawFileCount === 0
-                      ? t("No raw OPFS files were found for this workbook.")
-                      : t("Downloaded {n} raw file(s) as .zip.", { n: rawFileCount })}
-                  </p>
-                )}
-              </div>
-              <button
-                type="button"
-                className="toolbar-btn"
-                data-testid="safe-export-raw"
-                onClick={async () => {
-                  const files = await readRawDocFilesFromOpfs(info.docId);
-                  if (files.length > 0) {
-                    triggerBrowserDownload(`${info.docId}-raw-backup.zip`, packStoreZip(files));
-                  }
-                  setRawFileCount(files.length);
-                }}
-              >
-                {t("Export Raw Files")}
-              </button>
-            </section>
-          </div>
-
-          <div className="modal-footer">
+          <section className="safe-option">
+            <div>
+              <strong>
+                {info.salvageableMid
+                  ? t("2. Recover intact prefix & skip tail transactions")
+                  : t("2. Skip recent tail transactions")}
+              </strong>
+              <p>
+                {maxSkip > 0
+                  ? t(
+                      "Discard the last {n} transaction(s) from the edit log and save a clean snapshot.",
+                      { n: effectiveSkip },
+                    )
+                  : info.salvageableMid
+                    ? t("Salvage verified transactions before the corrupted log record.")
+                    : t("No tail edit-log transactions are available to skip on this workbook.")}
+              </p>
+              {maxSkip > 0 && (
+                <div className="safe-skip-controls">
+                  <label htmlFor="safe-skip-input">{t("Transactions to skip:")}</label>
+                  <input
+                    id="safe-skip-input"
+                    type="number"
+                    min={info.salvageableMid ? 0 : 1}
+                    max={maxSkip}
+                    value={effectiveSkip}
+                    data-testid="safe-skip-count"
+                    onChange={(e) => setSkipCountOverride(Number(e.target.value) || 0)}
+                  />
+                  <span className="safe-muted">
+                    {t("of {max} recent record(s)", { max: maxSkip })}
+                  </span>
+                </div>
+              )}
+              {info.tailTxns.length > 0 && (
+                <ul className="safe-txn-list" data-testid="safe-txn-list">
+                  {info.tailTxns.slice(-6).map((txn) => (
+                    <li key={txn.seq}>
+                      <code>#{txn.seq}</code> <span>{translateEngineText(txn.label)}</span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
             <button
               type="button"
               className="toolbar-btn"
-              data-testid="safe-new-blank"
-              onClick={() => onCreateDoc("Untitled workbook", "empty")}
+              data-testid="safe-skip-tail-btn"
+              disabled={maxSkip === 0 && !info.salvageableMid}
+              onClick={() => onSafeModeSkipTail(info.docId, effectiveSkip, info.salvageableMid)}
             >
-              {t("Open New Blank Workbook Instead")}
+              {t("Recover & Open")}
             </button>
-          </div>
+          </section>
+
+          <section className="safe-option">
+            <div>
+              <strong>{t("3. Export raw snapshot & edit log")}</strong>
+              <p>
+                {t(
+                  "Reads the raw OPFS files directly via browser file handles without running the WebAssembly decoder, downloading them to your disk.",
+                )}
+              </p>
+              {rawFileCount !== null && (
+                <p className="safe-export-note" data-testid="safe-export-note">
+                  {rawFilesText(rawFileCount)}
+                </p>
+              )}
+            </div>
+            <button
+              type="button"
+              className="toolbar-btn"
+              data-testid="safe-export-raw"
+              onClick={async () => {
+                const files = await readRawDocFilesFromOpfs(info.docId);
+                if (files.length > 0) {
+                  triggerBrowserDownload(`${info.docId}-raw-backup.zip`, packStoreZip(files));
+                }
+                setRawFileCount(files.length);
+                announce(rawFilesText(files.length));
+              }}
+            >
+              {t("Export Raw Files")}
+            </button>
+          </section>
         </div>
-      </div>
+
+        <div className="dialog-footer">
+          <button
+            type="button"
+            className="toolbar-btn"
+            data-testid="safe-new-blank"
+            onClick={() => onCreateDoc("Untitled workbook", "empty")}
+          >
+            {t("Open New Blank Workbook Instead")}
+          </button>
+        </div>
+      </Dialog>
     );
   }
 
@@ -405,193 +420,216 @@ export default function LocalModals({
     onImportCsv(baseTitle, baseTitle.slice(0, 31) || "Sheet1", buf);
   };
 
+  const beginRename = (doc: WorkbookCatalogEntry) => {
+    setEditingDoc({ id: doc.id, draft: doc.title });
+  };
+
+  /** The row's button for renaming has the focus again, unless the user went elsewhere. */
+  const endRename = (input: HTMLInputElement, doc: WorkbookCatalogEntry, title: string | null) => {
+    const row = input.parentElement;
+    const stayed = document.activeElement === input;
+    flushSync(() => setEditingDoc(null));
+    if (stayed) {
+      row?.querySelector<HTMLElement>("[data-rename]")?.focus();
+    }
+    const trimmed = title?.trim();
+    if (trimmed && trimmed !== doc.title) {
+      onRenameDoc(doc.id, trimmed);
+    }
+  };
+
   return (
-    <div ref={backdropRef} className="modal-backdrop">
-      <div
-        className="modal-card drawer-modal"
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="workbooks-heading"
-        data-testid="workbooks-drawer"
-      >
-        <div className="modal-header">
-          <h2 id="workbooks-heading">{t("Local Workbooks")}</h2>
-          <button type="button" className="tip-close" aria-label={t("Close")} onClick={onClose}>
-            ×
-          </button>
-        </div>
-
-        <p className="drawer-storage-note">
-          {tx(
-            "Local browser storage only · {size} MB used · Export <0>.rtcl</0> to keep a portable backup on disk.",
-            { 0: <code /> },
-            { size: storageUsedMb },
-          )}
-        </p>
-
-        <div className="drawer-toolbar">
-          <button
-            type="button"
-            className="toolbar-btn primary-btn"
-            data-testid="new-blank-workbook-btn"
-            onClick={() => onCreateDoc(`Workbook ${docs.length + 1}`, "empty")}
-          >
-            {t("+ Blank Workbook")}
-          </button>
-          <button
-            type="button"
-            className="toolbar-btn"
-            data-testid="new-sample-workbook-btn"
-            onClick={() => onCreateDoc(`Sample 1M (${docs.length + 1})`, "sample")}
-          >
-            {t("+ 1M Sample")}
-          </button>
-          <button
-            type="button"
-            className="toolbar-btn"
-            data-testid="import-file-btn"
-            onClick={() => fileInputRef.current?.click()}
-          >
-            {t("Import .rtcl / .csv / .xlsx")}
-          </button>
-          <input
-            ref={fileInputRef}
-            type="file"
-            accept=".rtcl,.rtclsnap,.csv,.tsv,.txt,.xlsx"
-            data-testid="import-file-input"
-            style={{ display: "none" }}
-            onChange={(e) => {
-              const file = e.target.files?.[0];
-              e.target.value = "";
-              if (file) {
-                void handleFilePicked(file);
-              }
-            }}
-          />
-          <span className="titlebar-spacer" />
-          <button
-            type="button"
-            className="toolbar-btn"
-            data-testid="drawer-export-rtcl"
-            onClick={onExportRtcl}
-          >
-            {t("Export .rtcl")}
-          </button>
-          <button
-            type="button"
-            className="toolbar-btn"
-            data-testid="drawer-export-csv"
-            onClick={onExportCsv}
-          >
-            {t("Export .csv")}
-          </button>
-          <button
-            type="button"
-            className="toolbar-btn"
-            data-testid="drawer-export-xlsx"
-            onClick={onExportXlsx}
-          >
-            {t("Export .xlsx")}
-          </button>
-        </div>
-
-        {csvProgress && (
-          <div className="csv-progress-box" data-testid="csv-import-progress">
-            <span>
-              {t("Importing CSV: {rows} rows ({percent}%)", {
-                rows: fmtInt(csvProgress.rowsParsed),
-                percent: csvProgress.percent,
-              })}
-            </span>
-            <progress max={100} value={csvProgress.percent} />
-          </div>
-        )}
-
-        <div className="drawer-list" data-testid="workbooks-list">
-          {docs.length === 0 ? (
-            <p className="drawer-empty">{t("No saved local workbooks yet.")}</p>
-          ) : (
-            docs.map((doc) => {
-              const isCurrent = doc.id === activeDocId;
-              const isRenaming = editingDoc?.id === doc.id;
-              return (
-                <div
-                  key={doc.id}
-                  className={isCurrent ? "drawer-row current" : "drawer-row"}
-                  data-testid={`workbook-row-${doc.id}`}
-                >
-                  {isRenaming ? (
-                    <input
-                      type="text"
-                      className="sheet-rename-input"
-                      value={editingDoc.draft}
-                      // biome-ignore lint/a11y/noAutofocus: inline workbook rename requires immediate focus
-                      autoFocus
-                      onChange={(e) => setEditingDoc({ id: doc.id, draft: e.target.value })}
-                      onBlur={() => {
-                        const trimmed = editingDoc.draft.trim();
-                        setEditingDoc(null);
-                        if (trimmed && trimmed !== doc.title) {
-                          onRenameDoc(doc.id, trimmed);
-                        }
-                      }}
-                      onKeyDown={(e) => {
-                        if (e.key === "Enter") {
-                          const trimmed = editingDoc.draft.trim();
-                          setEditingDoc(null);
-                          if (trimmed && trimmed !== doc.title) {
-                            onRenameDoc(doc.id, trimmed);
-                          }
-                        } else if (e.key === "Escape") {
-                          setEditingDoc(null);
-                        }
-                      }}
-                    />
-                  ) : (
-                    <button
-                      type="button"
-                      className="drawer-open-btn"
-                      data-testid={`open-doc-${doc.id}`}
-                      onClick={() => onOpenDoc(doc.id, doc.title)}
-                    >
-                      <span className="drawer-doc-title">
-                        {doc.title}
-                        {isCurrent && (
-                          <span className="drawer-current-pill">{t("Open|state")}</span>
-                        )}
-                      </span>
-                      <span className="drawer-doc-meta">
-                        {formatBytes(doc.sizeBytes)} ·{" "}
-                        {fmtDateTime(doc.updatedAt, {
-                          hour: "2-digit",
-                          minute: "2-digit",
-                        })}
-                      </span>
-                    </button>
-                  )}
-                  <button
-                    type="button"
-                    className="fmt-btn"
-                    title={t("Rename workbook")}
-                    onClick={() => setEditingDoc({ id: doc.id, draft: doc.title })}
-                  >
-                    {t("Rename")}
-                  </button>
-                  <button
-                    type="button"
-                    className="fmt-btn"
-                    data-testid={`delete-doc-${doc.id}`}
-                    title={t("Delete local workbook")}
-                    onClick={() => onDeleteDoc(doc.id)}
-                  >
-                    {t("Delete")}
-                  </button>
-                </div>
-              );
-            })
-          )}
-        </div>
+    <Dialog
+      key="workbooks"
+      labelledBy="workbooks-heading"
+      closeOnBackdrop
+      initialFocus={firstActionRef}
+      opener={opener}
+      fallbackFocus={onFocusGrid}
+      onClose={onClose}
+      testId="workbooks-drawer"
+    >
+      <div className="dialog-header">
+        <h2 id="workbooks-heading">{t("Local Workbooks")}</h2>
+        <button type="button" className="tip-close" aria-label={t("Close")} onClick={onClose}>
+          ×
+        </button>
       </div>
-    </div>
+
+      <p className="drawer-storage-note">
+        {tx(
+          "Local browser storage only · {size} MB used · Export <0>.rtcl</0> to keep a portable backup on disk.",
+          { 0: <code /> },
+          { size: storageUsedMb },
+        )}
+      </p>
+
+      <div className="drawer-toolbar">
+        <button
+          ref={firstActionRef}
+          type="button"
+          className="toolbar-btn primary-btn"
+          data-testid="new-blank-workbook-btn"
+          onClick={() => onCreateDoc(`Workbook ${docs.length + 1}`, "empty")}
+        >
+          {t("+ Blank Workbook")}
+        </button>
+        <button
+          type="button"
+          className="toolbar-btn"
+          data-testid="new-sample-workbook-btn"
+          onClick={() => onCreateDoc(`Sample 1M (${docs.length + 1})`, "sample")}
+        >
+          {t("+ 1M Sample")}
+        </button>
+        <button
+          type="button"
+          className="toolbar-btn"
+          data-testid="import-file-btn"
+          onClick={() => fileInputRef.current?.click()}
+        >
+          {t("Import .rtcl / .csv / .xlsx")}
+        </button>
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept=".rtcl,.rtclsnap,.csv,.tsv,.txt,.xlsx"
+          data-testid="import-file-input"
+          style={{ display: "none" }}
+          onChange={(e) => {
+            const file = e.target.files?.[0];
+            e.target.value = "";
+            if (file) {
+              void handleFilePicked(file);
+            }
+          }}
+        />
+        <span className="titlebar-spacer" />
+        <button
+          type="button"
+          className="toolbar-btn"
+          data-testid="drawer-export-rtcl"
+          onClick={onExportRtcl}
+        >
+          {t("Export .rtcl")}
+        </button>
+        <button
+          type="button"
+          className="toolbar-btn"
+          data-testid="drawer-export-csv"
+          onClick={onExportCsv}
+        >
+          {t("Export .csv")}
+        </button>
+        <button
+          type="button"
+          className="toolbar-btn"
+          data-testid="drawer-export-xlsx"
+          onClick={onExportXlsx}
+        >
+          {t("Export .xlsx")}
+        </button>
+      </div>
+
+      {csvProgress && (
+        <div className="csv-progress-box" data-testid="csv-import-progress">
+          <span>
+            {t("Importing CSV: {rows} rows ({percent}%)", {
+              rows: fmtInt(csvProgress.rowsParsed),
+              percent: csvProgress.percent,
+            })}
+          </span>
+          <progress aria-label={t("CSV import")} max={100} value={csvProgress.percent} />
+        </div>
+      )}
+
+      <div className="drawer-list" data-testid="workbooks-list">
+        {docs.length === 0 ? (
+          <p className="drawer-empty">{t("No saved local workbooks yet.")}</p>
+        ) : (
+          docs.map((doc) => {
+            const isCurrent = doc.id === activeDocId;
+            const isRenaming = editingDoc?.id === doc.id;
+            return (
+              <div
+                key={doc.id}
+                className={isCurrent ? "drawer-row current" : "drawer-row"}
+                data-testid={`workbook-row-${doc.id}`}
+              >
+                {isRenaming ? (
+                  <input
+                    type="text"
+                    className="sheet-rename-input"
+                    value={editingDoc.draft}
+                    autoFocus
+                    aria-label={t("New name of {title}", { title: doc.title })}
+                    data-testid={`rename-doc-input-${doc.id}`}
+                    onChange={(e) => setEditingDoc({ id: doc.id, draft: e.target.value })}
+                    onBlur={(e) => endRename(e.currentTarget, doc, editingDoc.draft)}
+                    onKeyDown={(e) => {
+                      if (isComposing(e.nativeEvent)) {
+                        return;
+                      }
+                      if (e.key === "Enter") {
+                        e.preventDefault();
+                        endRename(e.currentTarget, doc, editingDoc.draft);
+                      } else if (e.key === "Escape") {
+                        // It takes the editing back and leaves the dialog open.
+                        e.preventDefault();
+                        endRename(e.currentTarget, doc, null);
+                      }
+                    }}
+                  />
+                ) : (
+                  <button
+                    type="button"
+                    className="drawer-open-btn"
+                    aria-current={isCurrent ? "true" : undefined}
+                    data-testid={`open-doc-${doc.id}`}
+                    onClick={() => onOpenDoc(doc.id, doc.title)}
+                  >
+                    <span className="drawer-doc-title">
+                      {doc.title}
+                      {isCurrent && <span className="drawer-current-pill">{t("Open|state")}</span>}
+                    </span>
+                    <span className="drawer-doc-meta">
+                      {formatBytes(doc.sizeBytes)} ·{" "}
+                      {fmtDateTime(doc.updatedAt, {
+                        hour: "2-digit",
+                        minute: "2-digit",
+                      })}
+                    </span>
+                  </button>
+                )}
+                <button
+                  type="button"
+                  className="fmt-btn"
+                  title={t("Rename workbook")}
+                  aria-label={t("Rename {title}", { title: doc.title })}
+                  data-rename=""
+                  data-testid={`rename-doc-${doc.id}`}
+                  onClick={() => beginRename(doc)}
+                >
+                  {t("Rename")}
+                </button>
+                <button
+                  type="button"
+                  className="fmt-btn"
+                  data-testid={`delete-doc-${doc.id}`}
+                  title={t("Delete local workbook")}
+                  aria-label={t("Delete {title}", { title: doc.title })}
+                  onClick={() => {
+                    deletingRef.current = doc;
+                    onDeleteDoc(doc.id);
+                  }}
+                >
+                  {t("Delete")}
+                </button>
+              </div>
+            );
+          })
+        )}
+      </div>
+    </Dialog>
   );
 }

@@ -24,12 +24,25 @@ import {
   type WorkbookVisibility,
   workbook,
 } from "@reticula/protocol/collab-api";
-import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import {
+  lazy,
+  type RefObject,
+  Suspense,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from "react";
 import { translateEngineText } from "../i18n/engine-text.ts";
 import { t } from "../i18n/index.ts";
 import { tx } from "../i18n/react.ts";
 import { apiErrorMessage } from "../pages/helpers.ts";
 import { roleName } from "../pages/labels.ts";
+import { ActionButton } from "../ui/ActionButton.tsx";
+import { announce } from "../ui/announcer.ts";
+import { Dialog } from "../ui/Dialog.tsx";
+import { focusIsLost } from "../ui/focus.ts";
 import { LINK_VIEW_LABEL, personText, shareLinkText } from "./labels.ts";
 import "./collab.css";
 
@@ -60,6 +73,10 @@ export interface CollabShellProps {
   readonly activeTarget: CollabWorkbookTarget | null;
   readonly readOnly: boolean;
   readonly historyOpen: boolean;
+  /** What had the focus when the dialog and the history were opened. */
+  readonly modalOpener: RefObject<Element | null>;
+  readonly historyOpener: RefObject<Element | null>;
+  readonly onFocusGrid: () => void;
   readonly historyPreviewSeq: string | null;
   readonly historyPreviewElapsedMs: number | null;
   readonly connection: "offline" | "connecting" | "catchingUp" | "online";
@@ -196,6 +213,9 @@ export default function CollabShell(props: CollabShellProps) {
     activeTarget,
     readOnly,
     historyOpen,
+    modalOpener,
+    historyOpener,
+    onFocusGrid,
     historyPreviewSeq,
     historyPreviewElapsedMs,
     connection,
@@ -233,6 +253,11 @@ export default function CollabShell(props: CollabShellProps) {
   const [accessError, setAccessError] = useState<string | null>(null);
 
   const pendingJoinTokenRef = useRef<string | null>(initialJoinToken);
+  const headingRef = useRef<HTMLHeadingElement>(null);
+  const firstFieldRef = useRef<HTMLElement>(null);
+  const takeFirstField = useCallback((element: HTMLElement | null) => {
+    firstFieldRef.current = element;
+  }, []);
 
   const refreshGovernance = useCallback(async (docId: string, role: Role, signal?: AbortSignal) => {
     try {
@@ -527,6 +552,7 @@ export default function CollabShell(props: CollabShellProps) {
       });
       await refreshGovernance(activeTarget.docId, activeTarget.role);
       setShareUrl(`${window.location.origin}${created.url}`);
+      announce(t("Share link created."));
       setShareLabel("");
     } catch (err) {
       setAuthError(apiErrorMessage(err, t("Could not create share link.")));
@@ -568,6 +594,7 @@ export default function CollabShell(props: CollabShellProps) {
       await refreshGovernance(activeTarget.docId, activeTarget.role);
       if (autoShareUrl) {
         setShareUrl(autoShareUrl);
+        announce(t("Share link created."));
       }
     } catch (err) {
       setAuthError(apiErrorMessage(err, t("Could not update workbook visibility.")));
@@ -635,6 +662,7 @@ export default function CollabShell(props: CollabShellProps) {
     try {
       await navigator.clipboard.writeText(shareUrl);
       setCopiedShare(true);
+      announce(t("Copied"));
     } catch {
       // Fallback: user can still copy directly from input.
     }
@@ -650,6 +678,28 @@ export default function CollabShell(props: CollabShellProps) {
   };
 
   const showModal = open || Boolean(joinError) || Boolean(accessError);
+
+  const handleCloseModal = () => {
+    setJoinError(null);
+    setAccessError(null);
+    onCloseModal();
+  };
+
+  const noticeText = notice ? translateEngineText(notice) : "";
+  useEffect(() => announce(noticeText), [noticeText]);
+
+  // What there is to do is only known once the sign-in check is done, and is
+  // something else after signing in or out.
+  const modalStage = !showModal ? null : loadingAuth ? "checking" : user ? "signedIn" : "signedOut";
+  useLayoutEffect(() => {
+    if (
+      modalStage !== null &&
+      (focusIsLost() || document.activeElement === headingRef.current) &&
+      firstFieldRef.current !== null
+    ) {
+      firstFieldRef.current.focus();
+    }
+  }, [modalStage]);
 
   return (
     <>
@@ -671,6 +721,7 @@ export default function CollabShell(props: CollabShellProps) {
           )}
           {remotePresences.length > 0 && (
             <div className="collab-peers" data-testid="collab-peers">
+              <span className="visually-hidden">{t("Also here:")}</span>
               {remotePresences.map((peer) => (
                 <span
                   key={peer.replica}
@@ -679,6 +730,7 @@ export default function CollabShell(props: CollabShellProps) {
                 >
                   <span
                     className="collab-peer-dot"
+                    aria-hidden="true"
                     style={{ background: PEER_COLORS[peer.colorSlot % PEER_COLORS.length] }}
                   />
                   {personText(peer.displayName)}
@@ -688,7 +740,7 @@ export default function CollabShell(props: CollabShellProps) {
           )}
           {notice && (
             <span className="collab-notice" data-testid="collab-notice">
-              {translateEngineText(notice)}
+              {noticeText}
             </span>
           )}
         </div>
@@ -703,6 +755,8 @@ export default function CollabShell(props: CollabShellProps) {
             open={historyOpen}
             previewSeq={historyPreviewSeq}
             previewElapsedMs={historyPreviewElapsedMs}
+            opener={historyOpener}
+            onFocusGrid={onFocusGrid}
             onSeek={onHistorySeek}
             onExit={onHistoryExit}
             onClose={onCloseHistory}
@@ -729,406 +783,404 @@ export default function CollabShell(props: CollabShellProps) {
       )}
 
       {showModal && (
-        <div className="modal-backdrop" role="presentation">
-          <div
-            className="modal-card collab-modal"
-            role="dialog"
-            aria-modal="true"
-            aria-label={t("Cloud Collaboration")}
-            data-testid="collab-modal"
-          >
-            <div className="modal-header">
-              <h2>{t("Cloud Collaboration")}</h2>
-              <button
-                type="button"
-                className="tip-close"
-                aria-label={t("Close")}
-                onClick={() => {
-                  setJoinError(null);
-                  setAccessError(null);
-                  onCloseModal();
-                }}
-              >
-                ×
-              </button>
+        <Dialog
+          labelledBy="collab-heading"
+          initialFocus={headingRef}
+          opener={modalOpener}
+          fallbackFocus={onFocusGrid}
+          onClose={handleCloseModal}
+          className="collab-modal"
+          testId="collab-modal"
+        >
+          <div className="dialog-header">
+            <h2 ref={headingRef} id="collab-heading" tabIndex={-1}>
+              {t("Cloud Collaboration")}
+            </h2>
+            <button
+              type="button"
+              className="tip-close"
+              aria-label={t("Close")}
+              onClick={handleCloseModal}
+            >
+              ×
+            </button>
+          </div>
+
+          {joinError && (
+            <div className="collab-error" data-testid="collab-join-error" role="alert">
+              {joinError}
             </div>
+          )}
 
-            {joinError && (
-              <div className="collab-error" data-testid="collab-join-error" role="alert">
-                {joinError}
-              </div>
-            )}
+          {accessError && (
+            <div className="collab-error" data-testid="collab-access-denied" role="alert">
+              {accessError}
+            </div>
+          )}
 
-            {accessError && (
-              <div className="collab-error" data-testid="collab-access-denied" role="alert">
-                {accessError}
-              </div>
-            )}
+          {authError && (
+            <div className="collab-error" data-testid="collab-auth-error" role="alert">
+              {authError}
+            </div>
+          )}
 
-            {authError && (
-              <div className="collab-error" data-testid="collab-auth-error" role="alert">
-                {authError}
-              </div>
-            )}
-
-            {loadingAuth ? (
-              <p className="collab-notice">{t("Checking sign-in status…")}</p>
-            ) : !user ? (
-              <div className="collab-section" data-testid="collab-auth-panel">
-                <p className="collab-section-title">{t("Sign In Required")}</p>
-                <p className="collab-notice">
-                  {pendingJoinTokenRef.current
-                    ? t("Sign in to redeem this editor invite link.")
-                    : t("Sign in to create or open collaborative cloud workbooks.")}
-                </p>
-                {devLoginAvailable && (
-                  <div className="collab-row">
-                    <button
-                      type="button"
-                      className="toolbar-btn primary-btn"
-                      data-testid="dev-login-alice"
-                      disabled={busy}
-                      onClick={() => void handleDevSignIn("alice")}
-                    >
-                      {t("Dev Sign In as {name}", { name: "Alice" })}
-                    </button>
-                    <button
-                      type="button"
-                      className="toolbar-btn"
-                      data-testid="dev-login-bob"
-                      disabled={busy}
-                      onClick={() => void handleDevSignIn("bob")}
-                    >
-                      {t("Dev Sign In as {name}", { name: "Bob" })}
-                    </button>
-                    <button
-                      type="button"
-                      className="toolbar-btn"
-                      data-testid="dev-login-carol"
-                      disabled={busy}
-                      onClick={() => void handleDevSignIn("carol")}
-                    >
-                      {t("Dev Sign In as {name}", { name: "Carol" })}
-                    </button>
-                  </div>
-                )}
+          {loadingAuth ? (
+            <p className="collab-notice" role="status">
+              {t("Checking sign-in status…")}
+            </p>
+          ) : !user ? (
+            <div className="collab-section" data-testid="collab-auth-panel">
+              <h3 className="collab-section-title">{t("Sign In Required")}</h3>
+              <p className="collab-notice">
+                {pendingJoinTokenRef.current
+                  ? t("Sign in to redeem this editor invite link.")
+                  : t("Sign in to create or open collaborative cloud workbooks.")}
+              </p>
+              {devLoginAvailable && (
                 <div className="collab-row">
-                  <a
-                    className="toolbar-btn"
-                    data-testid="github-login-link"
-                    href={githubLoginUrl(window.location.pathname + window.location.search)}
+                  <ActionButton
+                    ref={takeFirstField}
+                    className="toolbar-btn primary-btn"
+                    data-testid="dev-login-alice"
+                    inactive={busy}
+                    onClick={() => void handleDevSignIn("alice")}
                   >
-                    {t("Sign in with GitHub")}
-                  </a>
+                    {t("Dev Sign In as {name}", { name: "Alice" })}
+                  </ActionButton>
+                  <ActionButton
+                    className="toolbar-btn"
+                    data-testid="dev-login-bob"
+                    inactive={busy}
+                    onClick={() => void handleDevSignIn("bob")}
+                  >
+                    {t("Dev Sign In as {name}", { name: "Bob" })}
+                  </ActionButton>
+                  <ActionButton
+                    className="toolbar-btn"
+                    data-testid="dev-login-carol"
+                    inactive={busy}
+                    onClick={() => void handleDevSignIn("carol")}
+                  >
+                    {t("Dev Sign In as {name}", { name: "Carol" })}
+                  </ActionButton>
                 </div>
+              )}
+              <div className="collab-row">
+                <a
+                  ref={devLoginAvailable ? undefined : takeFirstField}
+                  className="toolbar-btn"
+                  data-testid="github-login-link"
+                  href={githubLoginUrl(window.location.pathname + window.location.search)}
+                >
+                  {t("Sign in with GitHub")}
+                </a>
               </div>
-            ) : (
-              <>
-                <div className="collab-section">
-                  <div className="collab-row" style={{ justifyContent: "space-between" }}>
-                    <span data-testid="collab-user-badge">
-                      {tx("Signed in as <0>{name}</0>", { 0: <strong /> }, { name: user.name })}
-                    </span>
-                    <div className="collab-row">
-                      <button
-                        type="button"
-                        className="toolbar-btn"
-                        data-testid="collab-go-workbooks-btn"
-                        onClick={() => {
-                          onCloseModal();
-                          onNavigate("/workbooks");
-                        }}
-                      >
-                        {t("Workbooks")}
-                      </button>
-                      <button
-                        type="button"
-                        className="toolbar-btn"
-                        data-testid="collab-go-account-btn"
-                        onClick={() => {
-                          onCloseModal();
-                          onNavigate("/account");
-                        }}
-                      >
-                        {t("Account")}
-                      </button>
-                      <button
-                        type="button"
-                        className="toolbar-btn"
-                        data-testid="collab-logout-btn"
-                        disabled={busy}
-                        onClick={() => void handleLogout()}
-                      >
-                        {t("Sign Out")}
-                      </button>
-                    </div>
-                  </div>
-                </div>
-
-                <div className="collab-section">
-                  <p className="collab-section-title">{t("New Cloud Workbook")}</p>
+            </div>
+          ) : (
+            <>
+              <div className="collab-section">
+                <div className="collab-row" style={{ justifyContent: "space-between" }}>
+                  <span data-testid="collab-user-badge">
+                    {tx("Signed in as <0>{name}</0>", { 0: <strong /> }, { name: user.name })}
+                  </span>
                   <div className="collab-row">
-                    <input
-                      type="text"
-                      className="collab-input"
-                      data-testid="new-cloud-title-input"
-                      value={newTitle}
-                      onChange={(e) => setNewTitle(e.target.value)}
-                      placeholder={t("Workbook title")}
-                    />
                     <button
                       type="button"
-                      className="toolbar-btn primary-btn"
-                      data-testid="new-cloud-sheet-btn"
-                      disabled={busy}
-                      onClick={() => void handleCreateCloudSheet()}
+                      className="toolbar-btn"
+                      data-testid="collab-go-workbooks-btn"
+                      onClick={() => {
+                        onCloseModal();
+                        onNavigate("/workbooks");
+                      }}
                     >
-                      {t("+ New Cloud Sheet")}
+                      {t("Workbooks")}
                     </button>
+                    <button
+                      type="button"
+                      className="toolbar-btn"
+                      data-testid="collab-go-account-btn"
+                      onClick={() => {
+                        onCloseModal();
+                        onNavigate("/account");
+                      }}
+                    >
+                      {t("Account")}
+                    </button>
+                    <ActionButton
+                      className="toolbar-btn"
+                      data-testid="collab-logout-btn"
+                      inactive={busy}
+                      onClick={() => void handleLogout()}
+                    >
+                      {t("Sign Out")}
+                    </ActionButton>
                   </div>
                 </div>
+              </div>
 
-                {activeTarget && (
-                  <div className="collab-section">
-                    <p className="collab-section-title">{t("Current Cloud Sheet")}</p>
-                    <div className="collab-row" style={{ justifyContent: "space-between" }}>
-                      <span>
-                        <strong>{activeTarget.title}</strong> ({roleName(activeTarget.role)})
-                      </span>
-                      {activeTarget.role === "owner" && (
+              <div className="collab-section">
+                <h3 className="collab-section-title">{t("New Cloud Workbook")}</h3>
+                <div className="collab-row">
+                  <input
+                    ref={takeFirstField}
+                    type="text"
+                    className="collab-input"
+                    aria-label={t("Workbook title")}
+                    data-testid="new-cloud-title-input"
+                    value={newTitle}
+                    onChange={(e) => setNewTitle(e.target.value)}
+                    placeholder={t("Workbook title")}
+                  />
+                  <ActionButton
+                    className="toolbar-btn primary-btn"
+                    data-testid="new-cloud-sheet-btn"
+                    inactive={busy}
+                    onClick={() => void handleCreateCloudSheet()}
+                  >
+                    {t("+ New Cloud Sheet")}
+                  </ActionButton>
+                </div>
+              </div>
+
+              {activeTarget && (
+                <div className="collab-section">
+                  <h3 className="collab-section-title">{t("Current Cloud Sheet")}</h3>
+                  <div className="collab-row" style={{ justifyContent: "space-between" }}>
+                    <span>
+                      <strong>{activeTarget.title}</strong> ({roleName(activeTarget.role)})
+                    </span>
+                    {activeTarget.role === "owner" && (
+                      <label className="collab-checkbox">
+                        <input
+                          type="checkbox"
+                          data-testid="workbook-visibility-toggle"
+                          aria-disabled={busy || undefined}
+                          checked={(activeTarget.visibility ?? "private") === "link_view"}
+                          onChange={() => {
+                            if (!busy) {
+                              void handleToggleVisibility();
+                            }
+                          }}
+                        />
+                        {t("Allow link-only viewing")}
+                      </label>
+                    )}
+                  </div>
+
+                  {activeTarget.role === "owner" && (
+                    <>
+                      <div className="collab-row">
+                        <select
+                          className="collab-select"
+                          data-testid="share-role-select"
+                          aria-label={t("Share link role")}
+                          value={shareRole}
+                          onChange={(e) =>
+                            setShareRole(e.target.value === "viewer" ? "viewer" : "editor")
+                          }
+                        >
+                          <option value="editor">{t("Editor invite")}</option>
+                          <option value="viewer">{t("Viewer link")}</option>
+                        </select>
+                        <input
+                          type="text"
+                          className="collab-input"
+                          aria-label={t("Label (optional)")}
+                          data-testid="share-label-input"
+                          placeholder={t("Label (optional)")}
+                          maxLength={80}
+                          value={shareLabel}
+                          onChange={(e) => setShareLabel(e.target.value)}
+                        />
+                        <select
+                          className="collab-select"
+                          data-testid="share-ttl-select"
+                          aria-label={t("Share link expiry")}
+                          value={shareTtlSeconds}
+                          onChange={(e) => setShareTtlSeconds(e.target.value)}
+                        >
+                          <option value="">{t("No expiry")}</option>
+                          <option value="3600">{t("1 hour")}</option>
+                          <option value="86400">{t("24 hours")}</option>
+                          <option value="604800">{t("7 days")}</option>
+                        </select>
+                      </div>
+                      <div className="collab-row">
                         <label className="collab-checkbox">
                           <input
                             type="checkbox"
-                            data-testid="workbook-visibility-toggle"
-                            disabled={busy}
-                            checked={(activeTarget.visibility ?? "private") === "link_view"}
-                            onChange={() => void handleToggleVisibility()}
+                            data-testid="share-single-use-toggle"
+                            checked={singleUseShare}
+                            onChange={(e) => setSingleUseShare(e.target.checked)}
                           />
-                          {t("Allow link-only viewing")}
+                          {t("Single-use link")}
                         </label>
-                      )}
-                    </div>
-
-                    {activeTarget.role === "owner" && (
-                      <>
-                        <div className="collab-row">
-                          <select
-                            className="collab-select"
-                            data-testid="share-role-select"
-                            aria-label={t("Share link role")}
-                            value={shareRole}
-                            onChange={(e) =>
-                              setShareRole(e.target.value === "viewer" ? "viewer" : "editor")
-                            }
-                          >
-                            <option value="editor">{t("Editor invite")}</option>
-                            <option value="viewer">{t("Viewer link")}</option>
-                          </select>
+                        <ActionButton
+                          className="toolbar-btn"
+                          data-testid="create-share-link-btn"
+                          inactive={busy}
+                          onClick={() => void handleCreateShareLink()}
+                        >
+                          {shareRole === "viewer"
+                            ? t("Create Viewer Link")
+                            : t("Share Editor Link")}
+                        </ActionButton>
+                      </div>
+                      {shareUrl && (
+                        <div className="collab-link-box">
                           <input
                             type="text"
+                            readOnly
                             className="collab-input"
-                            data-testid="share-label-input"
-                            placeholder={t("Label (optional)")}
-                            maxLength={80}
-                            value={shareLabel}
-                            onChange={(e) => setShareLabel(e.target.value)}
+                            aria-label={t("Share link")}
+                            data-testid="share-link-url"
+                            value={shareUrl}
+                            onFocus={(e) => e.currentTarget.select()}
                           />
-                          <select
-                            className="collab-select"
-                            data-testid="share-ttl-select"
-                            aria-label={t("Share link expiry")}
-                            value={shareTtlSeconds}
-                            onChange={(e) => setShareTtlSeconds(e.target.value)}
-                          >
-                            <option value="">{t("No expiry")}</option>
-                            <option value="3600">{t("1 hour")}</option>
-                            <option value="86400">{t("24 hours")}</option>
-                            <option value="604800">{t("7 days")}</option>
-                          </select>
-                        </div>
-                        <div className="collab-row">
-                          <label className="collab-checkbox">
-                            <input
-                              type="checkbox"
-                              data-testid="share-single-use-toggle"
-                              checked={singleUseShare}
-                              onChange={(e) => setSingleUseShare(e.target.checked)}
-                            />
-                            {t("Single-use link")}
-                          </label>
                           <button
                             type="button"
                             className="toolbar-btn"
-                            data-testid="create-share-link-btn"
-                            disabled={busy}
-                            onClick={() => void handleCreateShareLink()}
+                            data-testid="copy-share-link-btn"
+                            onClick={() => void handleCopyShareUrl()}
                           >
-                            {shareRole === "viewer"
-                              ? t("Create Viewer Link")
-                              : t("Share Editor Link")}
+                            {copiedShare ? t("Copied") : t("Copy")}
                           </button>
                         </div>
-                        {shareUrl && (
-                          <div className="collab-link-box">
-                            <input
-                              type="text"
-                              readOnly
-                              className="collab-input"
-                              data-testid="share-link-url"
-                              value={shareUrl}
-                              onFocus={(e) => e.currentTarget.select()}
-                            />
-                            <button
-                              type="button"
-                              className="toolbar-btn"
-                              data-testid="copy-share-link-btn"
-                              onClick={() => void handleCopyShareUrl()}
-                            >
-                              {copiedShare ? t("Copied") : t("Copy")}
-                            </button>
-                          </div>
-                        )}
-                        {shareLinks.length > 0 && (
-                          <ul className="collab-list" data-testid="share-links-list">
-                            {shareLinks.map((link) => {
-                              const statusText = link.revokedAt
-                                ? t("Revoked|link")
-                                : link.singleUse && link.consumed
-                                  ? t("Used|link")
-                                  : t("Active|link");
-                              const active = !link.revokedAt && !(link.singleUse && link.consumed);
-                              return (
-                                <li key={link.id} className="collab-member-row">
-                                  <div className="collab-member-meta">
-                                    <strong>{shareLinkText(link)}</strong>
-                                    <span className="collab-member-sub">
-                                      {roleName(link.role)} ·{" "}
-                                      {link.singleUse ? t("single-use") : t("multi-use")} ·{" "}
-                                      {statusText}
-                                    </span>
-                                  </div>
-                                  {active && (
-                                    <button
-                                      type="button"
-                                      className="toolbar-btn"
-                                      data-testid={`revoke-share-link-${link.id}`}
-                                      disabled={busy}
-                                      onClick={() => void handleRevokeShareLink(link.id)}
-                                    >
-                                      {t("Revoke")}
-                                    </button>
-                                  )}
-                                </li>
-                              );
-                            })}
-                          </ul>
-                        )}
-                      </>
-                    )}
-
-                    {members.length > 0 && (
-                      <>
-                        <p className="collab-section-title">
-                          {t("Members ({n})", { n: members.length })}
-                        </p>
-                        <ul className="collab-list" data-testid="members-list">
-                          {members.map((member) => {
-                            const isSelf = member.userId === user.id;
-                            const isOwnerRow = member.role === "owner";
-                            const canManage =
-                              activeTarget.role === "owner" && !isOwnerRow && !isSelf;
-                            const canLeave = isSelf && !isOwnerRow;
+                      )}
+                      {shareLinks.length > 0 && (
+                        <ul className="collab-list" data-testid="share-links-list">
+                          {shareLinks.map((link) => {
+                            const statusText = link.revokedAt
+                              ? t("Revoked|link")
+                              : link.singleUse && link.consumed
+                                ? t("Used|link")
+                                : t("Active|link");
+                            const active = !link.revokedAt && !(link.singleUse && link.consumed);
                             return (
-                              <li key={member.userId} className="collab-member-row">
+                              <li key={link.id} className="collab-member-row">
                                 <div className="collab-member-meta">
-                                  <strong>
-                                    {isSelf
-                                      ? t("{name} (you)", { name: member.name })
-                                      : member.name}
-                                  </strong>
-                                  <span className="collab-member-sub">{roleName(member.role)}</span>
+                                  <strong>{shareLinkText(link)}</strong>
+                                  <span className="collab-member-sub">
+                                    {roleName(link.role)} ·{" "}
+                                    {link.singleUse ? t("single-use") : t("multi-use")} ·{" "}
+                                    {statusText}
+                                  </span>
                                 </div>
-                                <div className="collab-row">
-                                  {canManage && (
-                                    <>
-                                      <select
-                                        className="collab-select"
-                                        data-testid={`member-role-${member.userId}`}
-                                        aria-label={t("Role for {name}", { name: member.name })}
-                                        disabled={busy}
-                                        value={member.role === "viewer" ? "viewer" : "editor"}
-                                        onChange={(e) =>
-                                          void handleUpdateMemberRole(
-                                            member.userId,
-                                            e.target.value === "viewer" ? "viewer" : "editor",
-                                          )
-                                        }
-                                      >
-                                        <option value="editor">{t("editor|role")}</option>
-                                        <option value="viewer">{t("viewer|role")}</option>
-                                      </select>
-                                      <button
-                                        type="button"
-                                        className="toolbar-btn"
-                                        data-testid={`remove-member-${member.userId}`}
-                                        disabled={busy}
-                                        onClick={() =>
-                                          void handleRemoveMember(member.userId, false)
-                                        }
-                                      >
-                                        {t("Remove")}
-                                      </button>
-                                    </>
-                                  )}
-                                  {canLeave && (
-                                    <button
-                                      type="button"
-                                      className="toolbar-btn"
-                                      data-testid="leave-workbook-btn"
-                                      disabled={busy}
-                                      onClick={() => void handleRemoveMember(member.userId, true)}
-                                    >
-                                      {t("Leave")}
-                                    </button>
-                                  )}
-                                </div>
+                                {active && (
+                                  <ActionButton
+                                    className="toolbar-btn"
+                                    aria-label={t("Revoke {label}", {
+                                      label: shareLinkText(link),
+                                    })}
+                                    data-testid={`revoke-share-link-${link.id}`}
+                                    inactive={busy}
+                                    onClick={() => void handleRevokeShareLink(link.id)}
+                                  >
+                                    {t("Revoke")}
+                                  </ActionButton>
+                                )}
                               </li>
                             );
                           })}
                         </ul>
-                      </>
-                    )}
-                  </div>
-                )}
-              </>
-            )}
+                      )}
+                    </>
+                  )}
 
-            <div className="modal-footer">
-              {(activeTarget || joinError || accessError) && (
-                <button
-                  type="button"
-                  className="toolbar-btn"
-                  data-testid="back-to-local-btn"
-                  onClick={handleBackToLocal}
-                >
-                  {t("Back to Local Sheets")}
-                </button>
+                  {members.length > 0 && (
+                    <>
+                      <h3 className="collab-section-title">
+                        {t("Members ({n})", { n: members.length })}
+                      </h3>
+                      <ul className="collab-list" data-testid="members-list">
+                        {members.map((member) => {
+                          const isSelf = member.userId === user.id;
+                          const isOwnerRow = member.role === "owner";
+                          const canManage = activeTarget.role === "owner" && !isOwnerRow && !isSelf;
+                          const canLeave = isSelf && !isOwnerRow;
+                          return (
+                            <li key={member.userId} className="collab-member-row">
+                              <div className="collab-member-meta">
+                                <strong>
+                                  {isSelf ? t("{name} (you)", { name: member.name }) : member.name}
+                                </strong>
+                                <span className="collab-member-sub">{roleName(member.role)}</span>
+                              </div>
+                              <div className="collab-row">
+                                {canManage && (
+                                  <>
+                                    <select
+                                      className="collab-select"
+                                      data-testid={`member-role-${member.userId}`}
+                                      aria-label={t("Role for {name}", { name: member.name })}
+                                      aria-disabled={busy || undefined}
+                                      value={member.role === "viewer" ? "viewer" : "editor"}
+                                      onChange={(e) => {
+                                        if (!busy) {
+                                          void handleUpdateMemberRole(
+                                            member.userId,
+                                            e.target.value === "viewer" ? "viewer" : "editor",
+                                          );
+                                        }
+                                      }}
+                                    >
+                                      <option value="editor">{t("editor|role")}</option>
+                                      <option value="viewer">{t("viewer|role")}</option>
+                                    </select>
+                                    <ActionButton
+                                      className="toolbar-btn"
+                                      aria-label={t("Remove {name}", { name: member.name })}
+                                      data-testid={`remove-member-${member.userId}`}
+                                      inactive={busy}
+                                      onClick={() => void handleRemoveMember(member.userId, false)}
+                                    >
+                                      {t("Remove")}
+                                    </ActionButton>
+                                  </>
+                                )}
+                                {canLeave && (
+                                  <ActionButton
+                                    className="toolbar-btn"
+                                    data-testid="leave-workbook-btn"
+                                    inactive={busy}
+                                    onClick={() => void handleRemoveMember(member.userId, true)}
+                                  >
+                                    {t("Leave")}
+                                  </ActionButton>
+                                )}
+                              </div>
+                            </li>
+                          );
+                        })}
+                      </ul>
+                    </>
+                  )}
+                </div>
               )}
+            </>
+          )}
+
+          <div className="dialog-footer">
+            {(activeTarget || joinError || accessError) && (
               <button
                 type="button"
                 className="toolbar-btn"
-                data-testid="collab-modal-close"
-                onClick={() => {
-                  setJoinError(null);
-                  setAccessError(null);
-                  onCloseModal();
-                }}
+                data-testid="back-to-local-btn"
+                onClick={handleBackToLocal}
               >
-                {t("Close")}
+                {t("Back to Local Sheets")}
               </button>
-            </div>
+            )}
+            <button
+              type="button"
+              className="toolbar-btn"
+              data-testid="collab-modal-close"
+              onClick={handleCloseModal}
+            >
+              {t("Close")}
+            </button>
           </div>
-        </div>
+        </Dialog>
       )}
     </>
   );

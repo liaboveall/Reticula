@@ -12,8 +12,11 @@ import type {
   WireSearchScope,
   WireSortKey,
 } from "@reticula/protocol";
-import { useEffect, useState } from "react";
+import { type RefObject, useEffect, useRef, useState } from "react";
 import { t } from "./i18n/index.ts";
+import { ActionButton } from "./ui/ActionButton.tsx";
+import { announce } from "./ui/announcer.ts";
+import { Dialog } from "./ui/Dialog.tsx";
 
 export type M3aToolMode =
   | { readonly kind: "find"; readonly replace: boolean }
@@ -73,6 +76,9 @@ function searchOutcome(event: M3aModalEvent): string | null {
 
 export interface M3aToolsModalProps {
   readonly mode: M3aToolMode;
+  /** What had the focus when it was opened. */
+  readonly opener: RefObject<Element | null>;
+  readonly onFocusGrid: () => void;
   readonly sheet: SheetInfo;
   readonly selection: Selection | null;
   readonly readOnly: boolean;
@@ -83,8 +89,30 @@ export interface M3aToolsModalProps {
   readonly onClose: () => void;
 }
 
+/** The heading every one of the panels begins with, which is the dialog's name. */
+const HEADING = "m3a-heading";
+
+function PanelHeader({
+  heading,
+  onClose,
+}: {
+  readonly heading: string;
+  readonly onClose: () => void;
+}) {
+  return (
+    <div className="dialog-header">
+      <h2 id={HEADING}>{heading}</h2>
+      <button type="button" className="tip-close" aria-label={t("Close")} onClick={onClose}>
+        ×
+      </button>
+    </div>
+  );
+}
+
 export default function M3aToolsModal({
   mode,
+  opener,
+  onFocusGrid,
   sheet,
   selection,
   readOnly,
@@ -94,68 +122,71 @@ export default function M3aToolsModal({
   onJumpMatch,
   onClose,
 }: M3aToolsModalProps) {
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") {
-        onClose();
-      }
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [onClose]);
+  const firstFieldRef = useRef<HTMLElement>(null);
 
   return (
-    <div className="modal-backdrop" role="presentation">
-      <div className="modal-card" role="dialog" aria-modal="true">
-        {mode.kind === "find" && (
-          <FindReplacePanel
-            initialReplace={mode.replace}
-            sheet={sheet}
-            selection={selection}
-            readOnly={readOnly}
-            lastEvent={lastEvent}
-            onSend={onSend}
-            onMutate={onMutate}
-            onJumpMatch={onJumpMatch}
-            onClose={onClose}
-          />
-        )}
-        {mode.kind === "sort" && (
-          <SortPanel
-            sheet={sheet}
-            selection={selection}
-            readOnly={readOnly}
-            onSend={onSend}
-            onMutate={onMutate}
-            onClose={onClose}
-          />
-        )}
-        {mode.kind === "filter" && (
-          <FilterPanel
-            initialCol={mode.col}
-            sheet={sheet}
-            lastEvent={lastEvent}
-            onSend={onSend}
-            onClose={onClose}
-          />
-        )}
-        {mode.kind === "names" && (
-          <NamesPanel
-            sheet={sheet}
-            selection={selection}
-            readOnly={readOnly}
-            lastEvent={lastEvent}
-            onSend={onSend}
-            onMutate={onMutate}
-            onClose={onClose}
-          />
-        )}
-      </div>
-    </div>
+    <Dialog
+      labelledBy={HEADING}
+      initialFocus={firstFieldRef}
+      opener={opener}
+      fallbackFocus={onFocusGrid}
+      onClose={onClose}
+    >
+      {mode.kind === "find" && (
+        <FindReplacePanel
+          firstFieldRef={firstFieldRef}
+          initialReplace={mode.replace}
+          sheet={sheet}
+          selection={selection}
+          readOnly={readOnly}
+          lastEvent={lastEvent}
+          onSend={onSend}
+          onMutate={onMutate}
+          onJumpMatch={onJumpMatch}
+          onClose={onClose}
+        />
+      )}
+      {mode.kind === "sort" && (
+        <SortPanel
+          firstFieldRef={firstFieldRef}
+          sheet={sheet}
+          selection={selection}
+          readOnly={readOnly}
+          onSend={onSend}
+          onMutate={onMutate}
+          onClose={onClose}
+        />
+      )}
+      {mode.kind === "filter" && (
+        <FilterPanel
+          firstFieldRef={firstFieldRef}
+          initialCol={mode.col}
+          sheet={sheet}
+          lastEvent={lastEvent}
+          onSend={onSend}
+          onClose={onClose}
+        />
+      )}
+      {mode.kind === "names" && (
+        <NamesPanel
+          firstFieldRef={firstFieldRef}
+          sheet={sheet}
+          selection={selection}
+          readOnly={readOnly}
+          lastEvent={lastEvent}
+          onSend={onSend}
+          onMutate={onMutate}
+          onClose={onClose}
+        />
+      )}
+    </Dialog>
   );
 }
 
+type FirstFieldRef = RefObject<HTMLElement | null>;
+
 function FindReplacePanel({
+  firstFieldRef,
   initialReplace,
   sheet,
   selection,
@@ -166,6 +197,7 @@ function FindReplacePanel({
   onJumpMatch,
   onClose,
 }: {
+  readonly firstFieldRef: FirstFieldRef;
   readonly initialReplace: boolean;
   readonly sheet: SheetInfo;
   readonly selection: Selection | null;
@@ -199,8 +231,10 @@ function FindReplacePanel({
     if (lastEvent.kind === "searchResults") {
       setMatches(lastEvent.matches);
     }
-    if (searchOutcome(lastEvent) !== null) {
+    const text = searchOutcome(lastEvent);
+    if (text !== null) {
       setOutcome(lastEvent);
+      announce(text);
     }
   }, [lastEvent]);
 
@@ -220,16 +254,14 @@ function FindReplacePanel({
 
   return (
     <div data-testid="m3a-find-modal" style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-      <div className="modal-header">
-        <h2>{showReplace ? t("Find & Replace") : t("Find")}</h2>
-        <button type="button" className="tip-close" aria-label={t("Close")} onClick={onClose}>
-          ×
-        </button>
-      </div>
+      <PanelHeader heading={showReplace ? t("Find & Replace") : t("Find")} onClose={onClose} />
       <div className="m3a-row">
         <label className="m3a-field" style={{ flex: 1 }}>
           <span>{t("Find")}</span>
           <input
+            ref={(input) => {
+              firstFieldRef.current = input;
+            }}
             type="text"
             data-testid="find-query"
             value={query}
@@ -238,7 +270,12 @@ function FindReplacePanel({
             style={{ width: "100%" }}
           />
         </label>
-        <button type="button" className="toolbar-btn" onClick={() => setShowReplace((v) => !v)}>
+        <button
+          type="button"
+          className="toolbar-btn"
+          aria-expanded={showReplace}
+          onClick={() => setShowReplace((v) => !v)}
+        >
           {showReplace ? t("Hide Replace") : t("Replace…")}
         </button>
       </div>
@@ -411,6 +448,7 @@ interface SortKeyRow {
 }
 
 function SortPanel({
+  firstFieldRef,
   sheet,
   selection,
   readOnly,
@@ -418,6 +456,7 @@ function SortPanel({
   onMutate,
   onClose,
 }: {
+  readonly firstFieldRef: FirstFieldRef;
   readonly sheet: SheetInfo;
   readonly selection: Selection | null;
   readonly readOnly: boolean;
@@ -449,19 +488,18 @@ function SortPanel({
 
   return (
     <div data-testid="m3a-sort-modal" style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-      <div className="modal-header">
-        <h2>{t("Sort Range")}</h2>
-        <button type="button" className="tip-close" aria-label={t("Close")} onClick={onClose}>
-          ×
-        </button>
-      </div>
+      <PanelHeader heading={t("Sort Range")} onClose={onClose} />
       <div className="m3a-row">
-        <label className="m3a-field">
+        <div className="m3a-field">
           <span>{t("Rows (1-based)")}</span>
           <input
+            ref={(input) => {
+              firstFieldRef.current = input;
+            }}
             type="number"
             min={1}
             max={sheet.rows}
+            aria-label={t("First row")}
             data-testid="sort-first-row"
             value={firstRow1}
             onChange={(e) => setFirstRow1(Math.max(1, Number(e.target.value) || 1))}
@@ -472,18 +510,20 @@ function SortPanel({
             type="number"
             min={1}
             max={sheet.rows}
+            aria-label={t("Last row")}
             data-testid="sort-last-row"
             value={lastRow1}
             onChange={(e) => setLastRow1(Math.max(1, Number(e.target.value) || 1))}
             style={{ width: 72 }}
           />
-        </label>
-        <label className="m3a-field">
+        </div>
+        <div className="m3a-field">
           <span>{t("Cols (1-based)")}</span>
           <input
             type="number"
             min={1}
             max={sheet.cols}
+            aria-label={t("First column")}
             value={firstCol1}
             onChange={(e) => setFirstCol1(Math.max(1, Number(e.target.value) || 1))}
             style={{ width: 58 }}
@@ -493,11 +533,12 @@ function SortPanel({
             type="number"
             min={1}
             max={sheet.cols}
+            aria-label={t("Last column")}
             value={lastCol1}
             onChange={(e) => setLastCol1(Math.max(1, Number(e.target.value) || 1))}
             style={{ width: 58 }}
           />
-        </label>
+        </div>
       </div>
       <div className="m3a-row">
         <label className="m3a-field">
@@ -574,6 +615,7 @@ function SortPanel({
               <button
                 type="button"
                 className="toolbar-btn"
+                aria-label={t("Remove level {n}", { n: idx + 1 })}
                 onClick={() => setKeys((prev) => prev.filter((item) => item.id !== k.id))}
               >
                 {t("Remove")}
@@ -624,12 +666,14 @@ function SortPanel({
 }
 
 function FilterPanel({
+  firstFieldRef,
   initialCol,
   sheet,
   lastEvent,
   onSend,
   onClose,
 }: {
+  readonly firstFieldRef: FirstFieldRef;
   readonly initialCol: number;
   readonly sheet: SheetInfo;
   readonly lastEvent: M3aModalEvent | null;
@@ -699,16 +743,20 @@ function FilterPanel({
       data-testid="m3a-filter-modal"
       style={{ display: "flex", flexDirection: "column", gap: 10 }}
     >
-      <div className="modal-header">
-        <h2>{t("AutoFilter — Column {name}", { name: columnName(col) })}</h2>
-        <button type="button" className="tip-close" aria-label={t("Close")} onClick={onClose}>
-          ×
-        </button>
-      </div>
+      <PanelHeader
+        heading={t("AutoFilter — Column {name}", { name: columnName(col) })}
+        onClose={onClose}
+      />
       <div className="m3a-row">
         <label className="m3a-field">
           <span>{t("Column")}</span>
-          <select value={col} onChange={(e) => setCol(Number(e.target.value))}>
+          <select
+            ref={(select) => {
+              firstFieldRef.current = select;
+            }}
+            value={col}
+            onChange={(e) => setCol(Number(e.target.value))}
+          >
             {Array.from({ length: Math.max(1, colMax - colMin + 1) }, (_, idx) => {
               const c = colMin + idx;
               return (
@@ -719,7 +767,7 @@ function FilterPanel({
             })}
           </select>
         </label>
-        <div className="m3a-row">
+        <fieldset className="m3a-row m3a-choice" aria-label={t("Filter by")}>
           {(
             [
               ["values", t("Values")],
@@ -732,12 +780,13 @@ function FilterPanel({
               key={id}
               type="button"
               className={modeTab === id ? "toolbar-btn primary-btn" : "toolbar-btn"}
+              aria-pressed={modeTab === id}
               onClick={() => setModeTab(id)}
             >
               {label}
             </button>
           ))}
-        </div>
+        </fieldset>
       </div>
 
       {modeTab === "values" && (
@@ -805,13 +854,18 @@ function FilterPanel({
 
       {modeTab === "text" && (
         <div className="m3a-row">
-          <select value={textOp} onChange={(e) => setTextOp(e.target.value as typeof textOp)}>
+          <select
+            aria-label={t("Condition")}
+            value={textOp}
+            onChange={(e) => setTextOp(e.target.value as typeof textOp)}
+          >
             <option value="contains">{t("Contains")}</option>
             <option value="startsWith">{t("Begins with")}</option>
             <option value="endsWith">{t("Ends with")}</option>
           </select>
           <input
             type="text"
+            aria-label={t("Text")}
             data-testid="filter-text-needle"
             value={textNeedle}
             onChange={(e) => setTextNeedle(e.target.value)}
@@ -822,7 +876,11 @@ function FilterPanel({
 
       {modeTab === "number" && (
         <div className="m3a-row">
-          <select value={numOp} onChange={(e) => setNumOp(e.target.value as WireFilterCmpOp)}>
+          <select
+            aria-label={t("Condition")}
+            value={numOp}
+            onChange={(e) => setNumOp(e.target.value as WireFilterCmpOp)}
+          >
             <option value="eq">=</option>
             <option value="ne">{"<>"}</option>
             <option value="gt">{">"}</option>
@@ -832,6 +890,7 @@ function FilterPanel({
           </select>
           <input
             type="number"
+            aria-label={t("Number")}
             data-testid="filter-num-val"
             value={numVal}
             onChange={(e) => setNumVal(e.target.value)}
@@ -842,6 +901,7 @@ function FilterPanel({
       {modeTab === "topN" && (
         <div className="m3a-row">
           <select
+            aria-label={t("Condition")}
             value={topDir ? "top" : "bottom"}
             onChange={(e) => setTopDir(e.target.value === "top")}
           >
@@ -851,6 +911,7 @@ function FilterPanel({
           <input
             type="number"
             min={1}
+            aria-label={t("How many")}
             data-testid="filter-topn-count"
             value={topCount}
             onChange={(e) => setTopCount(e.target.value)}
@@ -897,6 +958,7 @@ function FilterPanel({
 }
 
 function NamesPanel({
+  firstFieldRef,
   sheet,
   selection,
   readOnly,
@@ -905,6 +967,7 @@ function NamesPanel({
   onMutate,
   onClose,
 }: {
+  readonly firstFieldRef: FirstFieldRef;
   readonly sheet: SheetInfo;
   readonly selection: Selection | null;
   readonly readOnly: boolean;
@@ -936,16 +999,14 @@ function NamesPanel({
       data-testid="m3a-names-modal"
       style={{ display: "flex", flexDirection: "column", gap: 10 }}
     >
-      <div className="modal-header">
-        <h2>{t("Name Manager")}</h2>
-        <button type="button" className="tip-close" aria-label={t("Close")} onClick={onClose}>
-          ×
-        </button>
-      </div>
+      <PanelHeader heading={t("Name Manager")} onClose={onClose} />
       <div className="m3a-row">
         <label className="m3a-field">
           <span>{t("Name")}</span>
           <input
+            ref={(input) => {
+              firstFieldRef.current = input;
+            }}
             type="text"
             data-testid="name-input"
             value={name}
@@ -971,11 +1032,10 @@ function NamesPanel({
           />
           <span>{t("{sheet} only", { sheet: sheet.sheetName })}</span>
         </label>
-        <button
-          type="button"
+        <ActionButton
           className="toolbar-btn primary-btn"
           data-testid="name-save-btn"
-          disabled={readOnly || !name.trim() || !formula.trim()}
+          inactive={readOnly || !name.trim() || !formula.trim()}
           onClick={() => {
             onMutate?.();
             onSend({
@@ -991,7 +1051,7 @@ function NamesPanel({
           }}
         >
           {t("Define")}
-        </button>
+        </ActionButton>
       </div>
       <div className="m3a-list" data-testid="names-list">
         {items.length === 0 && <p className="m3a-status">{t("No defined named ranges yet.")}</p>}
@@ -1009,6 +1069,7 @@ function NamesPanel({
               <button
                 type="button"
                 className="toolbar-btn"
+                aria-label={t("Delete {title}", { title: item.name })}
                 data-testid={`name-delete-${item.name}`}
                 disabled={readOnly}
                 onClick={() => {

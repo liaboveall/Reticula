@@ -6,10 +6,13 @@ import {
   listVersions,
   type VersionEntry,
 } from "@reticula/protocol/collab-api";
-import { type FormEvent, useCallback, useEffect, useState } from "react";
+import { type FormEvent, type RefObject, useCallback, useEffect, useRef, useState } from "react";
 import { translateEngineText } from "../i18n/engine-text.ts";
 import { fmtDateTime, t } from "../i18n/index.ts";
 import { apiErrorMessage, pickNearestSnapshotSeq } from "../pages/helpers.ts";
+import { ActionButton } from "../ui/ActionButton.tsx";
+import { announce } from "../ui/announcer.ts";
+import { useDrawer } from "../ui/drawer.ts";
 import { personText } from "./labels.ts";
 
 export interface HistoryDrawerProps {
@@ -19,6 +22,9 @@ export interface HistoryDrawerProps {
   readonly open: boolean;
   readonly previewSeq: string | null;
   readonly previewElapsedMs: number | null;
+  /** What had the focus when it was opened. */
+  readonly opener: RefObject<Element | null>;
+  readonly onFocusGrid: () => void;
   readonly onSeek: (targetSeq: string, snapshotSeq: string | null) => void;
   readonly onExit: () => void;
   readonly onClose: () => void;
@@ -40,6 +46,8 @@ export function HistoryDrawer(props: HistoryDrawerProps) {
     open,
     previewSeq,
     previewElapsedMs,
+    opener,
+    onFocusGrid,
     onSeek,
     onExit,
     onClose,
@@ -53,6 +61,9 @@ export function HistoryDrawer(props: HistoryDrawerProps) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [versionName, setVersionName] = useState("");
+  const headingRef = useRef<HTMLHeadingElement>(null);
+  const scrubberRef = useRef<HTMLInputElement>(null);
+  const drawerRef = useDrawer({ open, initialFocus: headingRef, opener, onLeave: onFocusGrid });
 
   const loadHistory = useCallback(
     async (signal?: AbortSignal) => {
@@ -97,6 +108,13 @@ export function HistoryDrawer(props: HistoryDrawerProps) {
       controller.abort();
     };
   }, [open, loadHistory]);
+
+  // A scrubber that is dragged passes many revisions; the last one is read.
+  useEffect(() => {
+    if (previewSeq !== null) {
+      announce(t("Revision #{seq} of #{head}", { seq: previewSeq, head: headSeq }));
+    }
+  }, [previewSeq, headSeq]);
 
   if (!open) {
     return null;
@@ -149,7 +167,7 @@ export function HistoryDrawer(props: HistoryDrawerProps) {
       return;
     }
     const trimmed = versionName.trim();
-    if (!trimmed || activeSeq === "0") {
+    if (busy || !trimmed || activeSeq === "0") {
       return;
     }
     setBusy(true);
@@ -190,13 +208,16 @@ export function HistoryDrawer(props: HistoryDrawerProps) {
 
   return (
     <aside
+      ref={drawerRef}
       className="history-drawer"
       data-testid="history-drawer"
       aria-label={t("Version History")}
     >
       <div className="history-drawer-header">
         <div>
-          <h3 className="history-drawer-title">{t("Version History")}</h3>
+          <h2 ref={headingRef} className="history-drawer-title" tabIndex={-1}>
+            {t("Version History")}
+          </h2>
           <div className="history-drawer-subtitle">
             {previewElapsedMs === null
               ? t("Revision #{seq} of #{head}", { seq: activeSeq, head: headSeq })
@@ -213,20 +234,23 @@ export function HistoryDrawer(props: HistoryDrawerProps) {
               type="button"
               className="toolbar-btn primary-btn"
               data-testid="history-return-live-btn"
-              onClick={onExit}
+              onClick={() => {
+                // This button is gone then.
+                scrubberRef.current?.focus();
+                onExit();
+              }}
             >
               {t("Return to Live")}
             </button>
           )}
-          <button
-            type="button"
+          <ActionButton
             className="toolbar-btn"
             data-testid="history-refresh-btn"
-            disabled={loading || busy}
+            inactive={loading || busy}
             onClick={() => void loadHistory()}
           >
             {t("Refresh")}
-          </button>
+          </ActionButton>
           <button
             type="button"
             className="toolbar-btn"
@@ -246,16 +270,17 @@ export function HistoryDrawer(props: HistoryDrawerProps) {
 
       <div className="history-scrubber-box">
         <div className="collab-row">
-          <button
-            type="button"
+          <ActionButton
             className="toolbar-btn"
+            aria-label={t("Previous revision")}
             data-testid="history-step-prev"
-            disabled={activeBig <= 0n || loading}
+            inactive={activeBig <= 0n || loading}
             onClick={() => handleStep(-1n)}
           >
             -1
-          </button>
+          </ActionButton>
           <input
+            ref={scrubberRef}
             type="range"
             className="history-range"
             data-testid="history-scrubber"
@@ -263,19 +288,20 @@ export function HistoryDrawer(props: HistoryDrawerProps) {
             min={0}
             max={headMax}
             step={1}
-            disabled={headMax === 0 || loading}
+            aria-valuetext={t("Revision #{seq} of #{head}", { seq: activeSeq, head: headSeq })}
+            disabled={headMax === 0}
             value={Math.min(Math.max(sliderVal, 0), headMax)}
             onChange={(event) => seekSeq(event.target.value)}
           />
-          <button
-            type="button"
+          <ActionButton
             className="toolbar-btn"
+            aria-label={t("Next revision")}
             data-testid="history-step-next"
-            disabled={activeBig >= headBig || loading}
+            inactive={activeBig >= headBig || loading}
             onClick={() => handleStep(1n)}
           >
             +1
-          </button>
+          </ActionButton>
         </div>
       </div>
 
@@ -287,28 +313,30 @@ export function HistoryDrawer(props: HistoryDrawerProps) {
           <input
             type="text"
             className="collab-input"
+            aria-label={t("Name of the version")}
             data-testid="history-version-name-input"
             placeholder={t("Save #{seq} as version...", { seq: activeSeq })}
             maxLength={120}
             value={versionName}
-            disabled={busy || activeSeq === "0"}
+            readOnly={busy}
+            disabled={activeSeq === "0"}
             onChange={(event) => setVersionName(event.target.value)}
           />
-          <button
+          <ActionButton
             type="submit"
             className="toolbar-btn primary-btn"
             data-testid="history-save-version-btn"
-            disabled={busy || activeSeq === "0" || versionName.trim().length === 0}
+            inactive={busy || activeSeq === "0" || versionName.trim().length === 0}
           >
             {t("Save")}
-          </button>
+          </ActionButton>
         </form>
       )}
 
       <div className="history-section">
-        <h4 className="collab-section-title">
+        <h3 className="collab-section-title">
           {t("Named Versions ({n})", { n: versions.length })}
-        </h4>
+        </h3>
         {versions.length === 0 ? (
           <p className="history-empty">{t("No named versions saved yet.")}</p>
         ) : (
@@ -323,6 +351,7 @@ export function HistoryDrawer(props: HistoryDrawerProps) {
                 <button
                   type="button"
                   className="history-item-btn"
+                  aria-current={previewSeq === ver.seq ? "true" : undefined}
                   data-testid={`history-version-${ver.seq}`}
                   onClick={() => seekSeq(ver.seq)}
                 >
@@ -332,15 +361,15 @@ export function HistoryDrawer(props: HistoryDrawerProps) {
                   </span>
                 </button>
                 {!readOnly && (
-                  <button
-                    type="button"
+                  <ActionButton
                     className="toolbar-btn"
+                    aria-label={t("Delete {title}", { title: ver.name })}
                     data-testid={`history-delete-version-${ver.id}`}
-                    disabled={busy}
+                    inactive={busy}
                     onClick={() => void handleDeleteVersion(ver.id)}
                   >
                     {t("Delete")}
-                  </button>
+                  </ActionButton>
                 )}
               </li>
             ))}
@@ -349,7 +378,7 @@ export function HistoryDrawer(props: HistoryDrawerProps) {
       </div>
 
       <div className="history-section history-section-scroll">
-        <h4 className="collab-section-title">{t("Revisions ({n})", { n: entries.length })}</h4>
+        <h3 className="collab-section-title">{t("Revisions ({n})", { n: entries.length })}</h3>
         {loading && entries.length === 0 ? (
           <p className="history-empty">{t("Loading history...")}</p>
         ) : entries.length === 0 ? (
@@ -366,6 +395,7 @@ export function HistoryDrawer(props: HistoryDrawerProps) {
                 <button
                   type="button"
                   className="history-item-btn"
+                  aria-current={previewSeq === entry.seq ? "true" : undefined}
                   data-testid={`history-entry-${entry.seq}`}
                   onClick={() => seekSeq(entry.seq)}
                 >
@@ -385,15 +415,14 @@ export function HistoryDrawer(props: HistoryDrawerProps) {
           </ul>
         )}
         {canLoadOlder && (
-          <button
-            type="button"
+          <ActionButton
             className="toolbar-btn"
             data-testid="history-load-older-btn"
-            disabled={busy || loading}
+            inactive={busy || loading}
             onClick={() => void handleLoadOlder()}
           >
             {t("Load older revisions")}
-          </button>
+          </ActionButton>
         )}
       </div>
     </aside>

@@ -78,7 +78,7 @@ describe("M2b shell helpers", () => {
     const onNavigate = () => {};
     const links = [["/app", "Editor"]] as const;
     expect(renderToStaticMarkup(createElement(PageNav, { onNavigate, links }))).toBe(
-      '<nav class="page-nav"><a href="/" class="page-brand">Reticula</a>' +
+      '<nav class="page-nav" aria-label="Pages"><a href="/" class="page-brand">Reticula</a>' +
         '<div class="page-nav-links"><a href="/app" class="toolbar-btn">Editor</a></div></nav>',
     );
     const link = createElement(PageLink, { to: "/account", onNavigate });

@@ -1,4 +1,4 @@
-.sim-shell > :not(.page-nav) {
+.sim-main {
   margin-inline: 24px;
 }
 
@@ -53,8 +53,8 @@
 }
 
 .sim-badge-ok {
-  border-color: color-mix(in srgb, #2e8b57 50%, var(--shell-line));
-  color: #2e8b57;
+  border-color: color-mix(in srgb, var(--shell-success) 50%, var(--shell-line));
+  color: var(--shell-success);
 }
 
 .sim-badge-warn {
@@ -113,7 +113,7 @@
 .sim-num-input {
   width: 58px;
   padding: 5px 6px;
-  border: 1px solid var(--shell-line);
+  border: 1px solid var(--shell-control);
   border-radius: 5px;
   background: var(--shell-background);
   color: var(--shell-text);
@@ -156,7 +156,12 @@
 .sim-progress-fill {
   height: 100%;
   background: var(--shell-accent);
-  transition: width 80ms linear;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .sim-progress-fill {
+    transition: width 80ms linear;
+  }
 }
 
 .sim-invariants-grid {

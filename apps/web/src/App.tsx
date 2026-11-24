@@ -6,6 +6,8 @@ import { prefetchEditorWhenIdle, preloadEditor } from "./preload.ts";
 import { type AppRoute, normalizeAppRoute } from "./routes.ts";
 import { loadPage, type Page } from "./routes-load.ts";
 import type { LoadRecovery } from "./routes-recovery.ts";
+import { LiveRegions } from "./ui/LiveRegions.tsx";
+import { focusPage, pageTitle } from "./ui/page.ts";
 
 interface ShownPage {
   readonly route: AppRoute;
@@ -38,6 +40,8 @@ export function App({ first, recovery }: AppProps) {
   const [shown, setShown] = useState(first);
   const [pending, setPending] = useState(false);
   const latest = useRef(0);
+  const focused = useRef(first.route);
+  const wentBack = useRef(false);
 
   // The page in view stays until the next one is loaded, and React draws the
   // next one in a transition, so no moment in between shows neither.
@@ -60,6 +64,7 @@ export function App({ first, recovery }: AppProps) {
             window.history.pushState(null, "", target);
           }
           recovery.clear();
+          wentBack.current = target === null;
           startTransition(() => {
             setShown((current) => (current.route === route ? current : { route, Page }));
             setPending(false);
@@ -77,8 +82,16 @@ export function App({ first, recovery }: AppProps) {
   );
 
   useEffect(() => {
-    document.title = t("Reticula|title");
+    document.title = pageTitle(shown.route);
   });
+
+  // The link that led here is gone, and with it the focus.
+  useEffect(() => {
+    if (focused.current !== shown.route) {
+      focused.current = shown.route;
+      focusPage({ preventScroll: wentBack.current });
+    }
+  }, [shown.route]);
 
   useEffect(() => {
     const onPopState = () => show(normalizeAppRoute(window.location.pathname), null);
@@ -102,6 +115,10 @@ export function App({ first, recovery }: AppProps) {
   const { Page } = shown;
   return (
     <>
+      <button type="button" className="skip-button" onClick={() => focusPage()}>
+        {shown.route === "app" ? t("Skip to the grid") : t("Skip to content")}
+      </button>
+      <LiveRegions />
       {pending && <div className="route-pending" role="status" aria-label={t("Loading page")} />}
       <ErrorBoundary key={shown.route} recovery={recovery}>
         <Page onNavigate={navigate} />
