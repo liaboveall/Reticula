@@ -86,6 +86,7 @@ pub struct Sheet {
     row_slots: SlotMap,
     col_slots: SlotMap,
     columns: Vec<Column>,
+    col_generations: Vec<u64>,
     col_formats: Vec<NumberFormat>,
     row_formats: RowFormatMap,
     cell_formats: CellFormatMap,
@@ -116,11 +117,12 @@ impl Sheet {
             deleted_count: 0,
             frozen_rows: 0,
             frozen_cols: 0,
-            row_axis: Axis::empty(MAX_ROW_AXIS_LEN),
-            col_axis: Axis::with_base(base_cols, MAX_COL_AXIS_LEN),
+            row_axis: Axis::empty_with_px(MAX_ROW_AXIS_LEN, DEFAULT_ROW_HEIGHT),
+            col_axis: Axis::with_base_px(base_cols, MAX_COL_AXIS_LEN, DEFAULT_COL_WIDTH),
             row_slots: SlotMap::with_base(MAX_ROW_AXIS_LEN),
             col_slots: SlotMap::with_base(base_cols.max(DEFAULT_BASE_COLS)),
             columns: formats.iter().map(|_| Column::new()).collect(),
+            col_generations: vec![1; formats.len()],
             col_formats: formats.iter().map(|f| f.normalize()).collect(),
             row_formats: RowFormatMap::default(),
             cell_formats: CellFormatMap::default(),
@@ -144,11 +146,12 @@ impl Sheet {
             deleted_count: 0,
             frozen_rows: 0,
             frozen_cols: 0,
-            row_axis: Axis::with_base(base_rows, MAX_ROW_AXIS_LEN),
-            col_axis: Axis::with_base(base_cols, MAX_COL_AXIS_LEN),
+            row_axis: Axis::with_base_px(base_rows, MAX_ROW_AXIS_LEN, DEFAULT_ROW_HEIGHT),
+            col_axis: Axis::with_base_px(base_cols, MAX_COL_AXIS_LEN, DEFAULT_COL_WIDTH),
             row_slots: SlotMap::with_base(base_rows.max(DEFAULT_BASE_ROWS)),
             col_slots: SlotMap::with_base(base_cols.max(DEFAULT_BASE_COLS)),
             columns: Vec::new(),
+            col_generations: Vec::new(),
             col_formats: Vec::new(),
             row_formats: RowFormatMap::default(),
             cell_formats: CellFormatMap::default(),
@@ -178,14 +181,15 @@ impl Sheet {
             deleted_count: 0,
             frozen_rows: 0,
             frozen_cols: 0,
-            row_axis: Axis::with_base(rows, MAX_ROW_AXIS_LEN),
-            col_axis: Axis::with_base(base_cols, MAX_COL_AXIS_LEN),
+            row_axis: Axis::with_base_px(rows, MAX_ROW_AXIS_LEN, DEFAULT_ROW_HEIGHT),
+            col_axis: Axis::with_base_px(base_cols, MAX_COL_AXIS_LEN, DEFAULT_COL_WIDTH),
             row_slots: SlotMap::with_base(rows.max(DEFAULT_BASE_ROWS)),
             col_slots: SlotMap::with_base(base_cols.max(DEFAULT_BASE_COLS)),
             columns: formats
                 .iter()
                 .map(|_| Column::with_slot_capacity(rows))
                 .collect(),
+            col_generations: vec![1; formats.len()],
             col_formats: formats.iter().map(|f| f.normalize()).collect(),
             row_formats: RowFormatMap::default(),
             cell_formats: CellFormatMap::default(),
@@ -214,8 +218,7 @@ impl Sheet {
             None
         } else {
             self.row_axis
-                .runs()
-                .last()
+                .last_run()
                 .and_then(|r| r.ids.id_at(r.ids.len.saturating_sub(1)))
         };
         let run = IdRun::new(u64::from(cur), grow)?;
@@ -312,9 +315,11 @@ impl Sheet {
         match height {
             None | Some(DEFAULT_ROW_HEIGHT) => {
                 self.row_heights.remove(&row);
+                let _ = self.row_axis.set_entry_px(row.0, None);
             }
             Some(px) => {
                 self.row_heights.insert(row, px);
+                let _ = self.row_axis.set_entry_px(row.0, Some(px));
             }
         }
     }
@@ -331,9 +336,82 @@ impl Sheet {
         match width {
             None | Some(DEFAULT_COL_WIDTH) => {
                 self.col_widths.remove(&col);
+                let _ = self.col_axis.set_entry_px(col.0, None);
             }
             Some(px) => {
                 self.col_widths.insert(col, px);
+                let _ = self.col_axis.set_entry_px(col.0, Some(px));
+            }
+        }
+    }
+
+    /// Total pixel height summed across all live rows (`O(1)`).
+    #[must_use]
+    pub const fn total_height_px(&self) -> u64 {
+        self.row_axis.total_pixels()
+    }
+
+    /// Total pixel width summed across all live columns (`O(1)`).
+    #[must_use]
+    pub const fn total_width_px(&self) -> u64 {
+        self.col_axis.total_pixels()
+    }
+
+    /// Pixel Y-offset of 0-based visible row `row_pos` (`O(log R)`).
+    #[must_use]
+    pub fn row_pixel_offset(&self, row_pos: u32) -> Option<u64> {
+        self.row_axis.pixel_offset_of_pos(row_pos)
+    }
+
+    /// Pixel X-offset of 0-based visible column `col_pos` (`O(log C)`).
+    #[must_use]
+    pub fn col_pixel_offset(&self, col_pos: u32) -> Option<u64> {
+        self.col_axis.pixel_offset_of_pos(col_pos)
+    }
+
+    /// Resolves Y pixel coordinate to `(row_pos, row_top_px, row_height_px)` (`O(log R)`).
+    #[must_use]
+    pub fn row_at_pixel(&self, y_px: u64) -> Option<(u32, u64, u16)> {
+        self.row_axis.pos_at_pixel(y_px)
+    }
+
+    /// Resolves X pixel coordinate to `(col_pos, col_left_px, col_width_px)` (`O(log C)`).
+    #[must_use]
+    pub fn col_at_pixel(&self, x_px: u64) -> Option<(u32, u64, u16)> {
+        self.col_axis.pos_at_pixel(x_px)
+    }
+
+    /// Structural generation counter of the row axis (`O(1)`).
+    #[must_use]
+    pub const fn row_axis_generation(&self) -> u64 {
+        self.row_axis.generation()
+    }
+
+    /// Structural generation counter of the column axis (`O(1)`).
+    #[must_use]
+    pub const fn col_axis_generation(&self) -> u64 {
+        self.col_axis.generation()
+    }
+
+    /// Per-column write generation counter (`1` if never modified).
+    #[must_use]
+    pub fn col_generation(&self, col: ColId) -> u64 {
+        self.col_slots
+            .get(col.0)
+            .and_then(|slot| self.col_generations.get(slot as usize))
+            .copied()
+            .unwrap_or(1)
+    }
+
+    /// Bumps the write generation counter for `col` (used by bulk block writes).
+    pub fn bump_col_generation(&mut self, col: ColId) {
+        if let Some(slot) = self.col_slots.get(col.0) {
+            let idx = slot as usize;
+            if idx >= self.col_generations.len() {
+                self.col_generations.resize(idx.saturating_add(1), 1);
+            }
+            if let Some(g) = self.col_generations.get_mut(idx) {
+                *g = g.wrapping_add(1);
             }
         }
     }
@@ -669,8 +747,7 @@ impl Sheet {
             None
         } else {
             self.row_axis
-                .runs()
-                .last()
+                .last_run()
                 .and_then(|run| run.ids.id_at(run.ids.len.saturating_sub(1)))
         };
         let Some(id_run) = IdRun::new(next_id, 1) else {
@@ -685,6 +762,14 @@ impl Sheet {
         for (index, column) in self.columns.iter_mut().enumerate() {
             let val = values.get(index).copied().unwrap_or(Value::Empty);
             column.set(row_slot, val);
+            if val != Value::Empty {
+                if index >= self.col_generations.len() {
+                    self.col_generations.resize(index.saturating_add(1), 1);
+                }
+                if let Some(g) = self.col_generations.get_mut(index) {
+                    *g = g.wrapping_add(1);
+                }
+            }
         }
         true
     }
@@ -694,6 +779,12 @@ impl Sheet {
     pub fn set_base_slot(&mut self, row_slot: u32, col_slot: usize, value: Value) {
         if let Some(column) = self.columns.get_mut(col_slot) {
             column.set(row_slot, value);
+            if col_slot >= self.col_generations.len() {
+                self.col_generations.resize(col_slot.saturating_add(1), 1);
+            }
+            if let Some(g) = self.col_generations.get_mut(col_slot) {
+                *g = g.wrapping_add(1);
+            }
         }
     }
 
@@ -726,6 +817,12 @@ impl Sheet {
         if col_idx >= self.columns.len() {
             self.columns
                 .resize_with(col_idx.saturating_add(1), Column::new);
+            self.col_generations.resize(col_idx.saturating_add(1), 1);
+        } else if col_idx >= self.col_generations.len() {
+            self.col_generations.resize(col_idx.saturating_add(1), 1);
+        }
+        if let Some(g) = self.col_generations.get_mut(col_idx) {
+            *g = g.wrapping_add(1);
         }
         self.columns
             .get_mut(col_idx)
@@ -1060,6 +1157,9 @@ impl Sheet {
                 if let Some(col) = self.columns.get_mut(c_slot as usize) {
                     *col = Column::new();
                 }
+                if let Some(g) = self.col_generations.get_mut(c_slot as usize) {
+                    *g = g.wrapping_add(1);
+                }
                 if let Some(fmt_slot) = self.col_formats.get_mut(c_slot as usize) {
                     *fmt_slot = NumberFormat::General;
                 }
@@ -1153,19 +1253,22 @@ impl Sheet {
         {
             return None;
         }
-        let row_axis = Axis::from_runs(row_runs, MAX_ROW_AXIS_LEN).ok()?;
-        let col_axis = Axis::from_runs(col_runs, MAX_COL_AXIS_LEN).ok()?;
-        for &r in extras
-            .row_heights
-            .keys()
-            .chain(extras.row_formats.keys())
-            .chain(extras.row_styles.keys())
-        {
+        let mut row_axis =
+            Axis::from_runs_with_px(row_runs, MAX_ROW_AXIS_LEN, DEFAULT_ROW_HEIGHT).ok()?;
+        let mut col_axis =
+            Axis::from_runs_with_px(col_runs, MAX_COL_AXIS_LEN, DEFAULT_COL_WIDTH).ok()?;
+        for (&r, &px) in &extras.row_heights {
+            row_axis.set_entry_px(r.0, Some(px)).ok()?;
+        }
+        for &r in extras.row_formats.keys().chain(extras.row_styles.keys()) {
             if !row_axis.contains_id(r.0) {
                 return None;
             }
         }
-        for &c in extras.col_widths.keys().chain(extras.col_styles.keys()) {
+        for (&c, &px) in &extras.col_widths {
+            col_axis.set_entry_px(c.0, Some(px)).ok()?;
+        }
+        for &c in extras.col_styles.keys() {
             if !col_axis.contains_id(c.0) {
                 return None;
             }
@@ -1176,6 +1279,7 @@ impl Sheet {
             }
         }
 
+        let col_gen_len = columns.len();
         Some(Self {
             id,
             name,
@@ -1187,6 +1291,7 @@ impl Sheet {
             row_slots,
             col_slots,
             columns,
+            col_generations: vec![1; col_gen_len],
             col_formats: col_formats
                 .into_iter()
                 .map(NumberFormat::normalize)

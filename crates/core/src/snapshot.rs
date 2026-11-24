@@ -148,8 +148,8 @@ where
             .map(|sheet| SheetAxesWire {
                 id: sheet.id(),
                 name: String::from(sheet.name()),
-                row_runs: sheet.row_axis().runs().to_vec(),
-                col_runs: sheet.col_axis().runs().to_vec(),
+                row_runs: sheet.row_axis().to_runs_vec(),
+                col_runs: sheet.col_axis().to_runs_vec(),
                 row_slot_base: sheet.row_slots().base_len(),
                 row_slot_extra: sheet.row_slots().extra_ids().to_vec(),
                 col_slot_base: sheet.col_slots().base_len(),
