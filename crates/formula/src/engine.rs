@@ -74,6 +74,8 @@ const STATE_CLEAN: u8 = 0;
 const STATE_DIRTY: u8 = 1;
 const STATE_EVALUATING: u8 = 2;
 const STATE_SCC_WAIT: u8 = 3;
+const STATE_MAYBE_DIRTY: u8 = 4;
+const STATE_EVALUATING_MAYBE: u8 = 5;
 const MAX_WAVE_SPILL_REQUEUES: u8 = 16;
 
 /// Number of live formula rows populated in `M2..=M100001` of the default
@@ -216,6 +218,7 @@ struct StripSlot {
     program: Option<CompiledStripProgram>,
     reg: StripRegistration,
     dirty_intervals: SmallVec<[(u32, u32); 2]>,
+    maybe_dirty_intervals: SmallVec<[(u32, u32); 2]>,
     sequential_self_dep: bool,
 }
 
@@ -242,40 +245,54 @@ impl StripSlot {
     }
 
     #[inline]
-    fn dirty_cell_count(&self) -> u32 {
-        self.dirty_intervals.iter().fold(0_u32, |acc, &(lo, hi)| {
-            acc.saturating_add(hi.saturating_sub(lo))
-        })
+    fn has_dirty_or_maybe_offset(&self, off: u32) -> bool {
+        self.has_dirty_offset(off)
+            || self
+                .maybe_dirty_intervals
+                .iter()
+                .any(|&(lo, hi)| lo <= off && off < hi)
     }
 
-    fn insert_dirty_interval(&mut self, lo: u32, mut hi: u32) -> bool {
-        if self.sequential_self_dep {
-            hi = self.len;
+    #[inline]
+    fn dirty_cell_count(&self) -> u32 {
+        self.dirty_intervals
+            .iter()
+            .chain(self.maybe_dirty_intervals.iter())
+            .fold(0_u32, |acc, &(lo, hi)| {
+                acc.saturating_add(hi.saturating_sub(lo))
+            })
+            .min(self.len)
+    }
+
+    fn insert_interval_into(
+        intervals: &mut SmallVec<[(u32, u32); 2]>,
+        len: u32,
+        sequential_self_dep: bool,
+        lo: u32,
+        mut hi: u32,
+    ) -> bool {
+        if sequential_self_dep {
+            hi = len;
         }
-        let lo = lo.min(self.len);
-        let hi = hi.min(self.len);
+        let lo = lo.min(len);
+        let hi = hi.min(len);
         if lo >= hi {
             return false;
         }
-        // Check if `[lo, hi)` adds at least one offset not already dirty.
-        let already_covered = self
-            .dirty_intervals
-            .iter()
-            .any(|&(a, b)| a <= lo && hi <= b);
+        let already_covered = intervals.iter().any(|&(a, b)| a <= lo && hi <= b);
         if already_covered {
             return false;
         }
-        let mut insert_at = self.dirty_intervals.len();
-        for (idx, &(a, _)) in self.dirty_intervals.iter().enumerate() {
+        let mut insert_at = intervals.len();
+        for (idx, &(a, _)) in intervals.iter().enumerate() {
             if lo <= a {
                 insert_at = idx;
                 break;
             }
         }
-        self.dirty_intervals.insert(insert_at, (lo, hi));
-        // Coalesce overlapping or touching sorted intervals without indexing.
+        intervals.insert(insert_at, (lo, hi));
         let mut coalesced: SmallVec<[(u32, u32); 2]> = SmallVec::new();
-        for cur in self.dirty_intervals.iter().copied() {
+        for cur in intervals.iter().copied() {
             if let Some(prev) = coalesced.last_mut()
                 && cur.0 <= prev.1
             {
@@ -290,8 +307,28 @@ impl StripSlot {
             coalesced.clear();
             coalesced.push((min_lo, max_hi));
         }
-        self.dirty_intervals = coalesced;
+        *intervals = coalesced;
         true
+    }
+
+    fn insert_dirty_interval(&mut self, lo: u32, hi: u32) -> bool {
+        Self::insert_interval_into(
+            &mut self.dirty_intervals,
+            self.len,
+            self.sequential_self_dep,
+            lo,
+            hi,
+        )
+    }
+
+    fn insert_maybe_dirty_interval(&mut self, lo: u32, hi: u32) -> bool {
+        Self::insert_interval_into(
+            &mut self.maybe_dirty_intervals,
+            self.len,
+            self.sequential_self_dep,
+            lo,
+            hi,
+        )
     }
 }
 
@@ -387,6 +424,10 @@ pub struct FormulaEngine {
     volatile_strips: BTreeSet<u32>,
     filter_sensitive_set: BTreeSet<u32>,
     filter_sensitive_strips: BTreeSet<u32>,
+    dynamic_ref_set: BTreeSet<u32>,
+    slot_levels: Vec<u32>,
+    strip_levels: Vec<u32>,
+    levels_valid: bool,
     filters: BTreeMap<SheetId, (FilterTable, VisibleRowProjection)>,
     env: EvalEnv,
     batch_scratch: BatchScratch,
@@ -418,6 +459,7 @@ impl FormulaEngine {
         let mut slot_count_in_col: FxMap<(SheetId, ColId), u32> = FxMap::default();
         let mut volatile_set = BTreeSet::new();
         let mut filter_sensitive_set = BTreeSet::new();
+        let mut dynamic_ref_set = BTreeSet::new();
 
         for (&key, formula) in workbook.formulas().singles() {
             let fid = u32::try_from(slots.len()).unwrap_or(0);
@@ -427,6 +469,9 @@ impl FormulaEngine {
             }
             if flags.filter_sensitive {
                 filter_sensitive_set.insert(fid);
+            }
+            if flags.has_dynamic_ref {
+                dynamic_ref_set.insert(fid);
             }
             slots.push(Some(FormulaSlot { key, reg }));
             cell_to_fid.insert(key, fid);
@@ -467,6 +512,7 @@ impl FormulaEngine {
                     program,
                     reg,
                     dirty_intervals: SmallVec::new(),
+                    maybe_dirty_intervals: SmallVec::new(),
                     sequential_self_dep,
                 }));
                 strip_by_col.insert((strip.sheet, strip.col, strip.start_row), sid);
@@ -485,6 +531,9 @@ impl FormulaEngine {
                     }
                     if flags.filter_sensitive {
                         filter_sensitive_set.insert(fid);
+                    }
+                    if flags.has_dynamic_ref {
+                        dynamic_ref_set.insert(fid);
                     }
                     slots.push(Some(FormulaSlot { key, reg }));
                     cell_to_fid.insert(key, fid);
@@ -557,6 +606,10 @@ impl FormulaEngine {
             volatile_strips,
             filter_sensitive_set,
             filter_sensitive_strips,
+            dynamic_ref_set,
+            slot_levels: Vec::new(),
+            strip_levels: Vec::new(),
+            levels_valid: false,
             filters: BTreeMap::new(),
             env: EvalEnv::default(),
             batch_scratch: BatchScratch::default(),
@@ -2049,7 +2102,9 @@ impl FormulaEngine {
                 let mut next_root: Option<u32> = None;
                 while let Some(&fid) = self.dirty_queue.get(self.dirty_cursor) {
                     self.dirty_cursor = self.dirty_cursor.saturating_add(1);
-                    if self.node_state(fid) == STATE_DIRTY && self.node_exists(fid) {
+                    if matches!(self.node_state(fid), STATE_DIRTY | STATE_MAYBE_DIRTY)
+                        && self.node_exists(fid)
+                    {
                         next_root = Some(fid);
                         break;
                     }
@@ -2083,8 +2138,68 @@ impl FormulaEngine {
 
             if is_strip_fid(cur_fid) {
                 let sid = strip_index(cur_fid);
-                self.set_strip_state(sid, STATE_EVALUATING);
                 let my_pos = self.call_stack.len().saturating_sub(1);
+                let (has_dirty, has_maybe) = self.strip_slot_of(sid).map_or((false, false), |s| {
+                    (
+                        !s.dirty_intervals.is_empty(),
+                        !s.maybe_dirty_intervals.is_empty(),
+                    )
+                });
+                if has_maybe {
+                    self.set_strip_state(
+                        sid,
+                        if has_dirty {
+                            STATE_EVALUATING
+                        } else {
+                            STATE_EVALUATING_MAYBE
+                        },
+                    );
+                    match self.check_strip_maybe_precedents_ready(sid) {
+                        Ok(()) => {
+                            let cut_off =
+                                if let Some(Some(s)) = self.strip_slots.get_mut(sid as usize) {
+                                    s.maybe_dirty_intervals.clear();
+                                    s.dirty_intervals.is_empty()
+                                } else {
+                                    true
+                                };
+                            if cut_off && self.strip_state_of(sid) == STATE_EVALUATING_MAYBE {
+                                self.set_strip_state(sid, STATE_CLEAN);
+                                let _ = self.call_stack.pop();
+                                if !self.scc_stack.is_empty() {
+                                    self.release_scc_wait_at_or_above(my_pos);
+                                }
+                                continue;
+                            }
+                        }
+                        Err(ExprOutcome::Blocked(deps)) => {
+                            let mut count = 0usize;
+                            for &dep_fid in deps.iter().rev() {
+                                if matches!(
+                                    self.node_state(dep_fid),
+                                    STATE_DIRTY | STATE_MAYBE_DIRTY
+                                ) {
+                                    count = count.saturating_add(self.node_remaining_work(dep_fid));
+                                    self.call_stack.push(dep_fid);
+                                }
+                            }
+                            since_check = since_check.saturating_add(count.min(stride).max(1));
+                            if since_check >= stride {
+                                since_check = 0;
+                                if self.has_pending_recalc() && should_yield(self.wave_done) {
+                                    return self.in_progress_status();
+                                }
+                            }
+                            continue;
+                        }
+                        Err(ExprOutcome::Cycle(min_pos)) => {
+                            self.handle_cycle(cur_fid, min_pos);
+                            continue;
+                        }
+                        Err(ExprOutcome::Ready(_)) => {}
+                    }
+                }
+                self.set_strip_state(sid, STATE_EVALUATING);
                 match self.evaluate_strip_slot(sid, stride, &mut since_check, &mut should_yield) {
                     StripEvalControl::Done => {
                         self.set_strip_state(sid, STATE_CLEAN);
@@ -2105,7 +2220,7 @@ impl FormulaEngine {
                     StripEvalControl::Blocked(deps) => {
                         let mut count = 0usize;
                         for &dep_fid in deps.iter().rev() {
-                            if self.node_state(dep_fid) == STATE_DIRTY {
+                            if matches!(self.node_state(dep_fid), STATE_DIRTY | STATE_MAYBE_DIRTY) {
                                 count = count.saturating_add(self.node_remaining_work(dep_fid));
                                 self.call_stack.push(dep_fid);
                             }
@@ -2126,6 +2241,48 @@ impl FormulaEngine {
                     }
                 }
                 continue;
+            }
+
+            if matches!(
+                self.state_of(cur_fid),
+                STATE_MAYBE_DIRTY | STATE_EVALUATING_MAYBE
+            ) {
+                self.set_state(cur_fid, STATE_EVALUATING_MAYBE);
+                match self.check_single_static_precedents_ready(cur_fid) {
+                    Ok(()) => {
+                        if self.state_of(cur_fid) == STATE_EVALUATING_MAYBE {
+                            let my_pos = self.call_stack.len().saturating_sub(1);
+                            self.set_state(cur_fid, STATE_CLEAN);
+                            let _ = self.call_stack.pop();
+                            if !self.scc_stack.is_empty() {
+                                self.release_scc_wait_at_or_above(my_pos);
+                            }
+                            continue;
+                        }
+                    }
+                    Err(ExprOutcome::Blocked(deps)) => {
+                        let mut count = 0usize;
+                        for &dep_fid in deps.iter().rev() {
+                            if matches!(self.node_state(dep_fid), STATE_DIRTY | STATE_MAYBE_DIRTY) {
+                                count = count.saturating_add(self.node_remaining_work(dep_fid));
+                                self.call_stack.push(dep_fid);
+                            }
+                        }
+                        since_check = since_check.saturating_add(count.min(stride).max(1));
+                        if since_check >= stride {
+                            since_check = 0;
+                            if self.has_pending_recalc() && should_yield(self.wave_done) {
+                                return self.in_progress_status();
+                            }
+                        }
+                        continue;
+                    }
+                    Err(ExprOutcome::Cycle(min_pos)) => {
+                        self.handle_cycle(cur_fid, min_pos);
+                        continue;
+                    }
+                    Err(ExprOutcome::Ready(_)) => {}
+                }
             }
 
             self.set_state(cur_fid, STATE_EVALUATING);
@@ -2171,7 +2328,7 @@ impl FormulaEngine {
                     // Push dirty precedents in reverse so the first precedent is
                     // evaluated first on top of `call_stack`.
                     for &dep_fid in deps.iter().rev() {
-                        if self.node_state(dep_fid) == STATE_DIRTY {
+                        if matches!(self.node_state(dep_fid), STATE_DIRTY | STATE_MAYBE_DIRTY) {
                             count = count.saturating_add(self.node_remaining_work(dep_fid));
                             self.call_stack.push(dep_fid);
                         }
@@ -2212,7 +2369,7 @@ impl FormulaEngine {
     fn in_progress_status(&self) -> RecalcStatus {
         let mut rem = 0usize;
         for &fid in self.dirty_queue.get(self.dirty_cursor..).unwrap_or(&[]) {
-            if self.node_state(fid) == STATE_DIRTY {
+            if matches!(self.node_state(fid), STATE_DIRTY | STATE_MAYBE_DIRTY) {
                 rem = rem.saturating_add(self.node_remaining_work(fid));
             }
         }
@@ -2313,15 +2470,25 @@ impl FormulaEngine {
                     } => {
                         let new_shape = self.spills.spill_shape(key);
                         let shape_changed = old_shape != new_shape;
-                        self.store_eval_scalar(key, anchor_scalar);
+                        let anchor_stored_changed = self.store_eval_scalar(key, anchor_scalar);
                         let new_bits = self
                             .workbook
                             .sheet(key.0)
                             .map(|s| s.value_by_id(key.1, key.2).pack());
-                        let anchor_changed = old_bits != new_bits;
+                        let anchor_changed = anchor_stored_changed || old_bits != new_bits;
                         self.record_changed_cells(&changed_shadows);
                         self.set_state(cur_fid, STATE_CLEAN);
                         let _ = self.call_stack.pop();
+
+                        if anchor_changed {
+                            self.upgrade_cell_dependents_to_dirty(key);
+                        }
+                        for &displaced in &displaced_anchors {
+                            self.upgrade_cell_dependents_to_dirty(displaced);
+                        }
+                        for &shadow_key in &changed_shadows {
+                            self.upgrade_cell_dependents_to_dirty(shadow_key);
+                        }
 
                         let mut post_dirty = DirtyRoots::default();
                         if anchor_changed {
@@ -2362,25 +2529,34 @@ impl FormulaEngine {
                         freed_shadows,
                         unblocked_watchers,
                     } => {
-                        self.store_eval_scalar(key, EvalScalar::Error(CalcError::Spill));
+                        let anchor_stored_changed =
+                            self.store_eval_scalar(key, EvalScalar::Error(CalcError::Spill));
                         let new_bits = self
                             .workbook
                             .sheet(key.0)
                             .map(|s| s.value_by_id(key.1, key.2).pack());
-                        let anchor_changed = old_bits != new_bits;
+                        let anchor_changed = anchor_stored_changed || old_bits != new_bits;
                         self.set_state(cur_fid, STATE_CLEAN);
                         let _ = self.call_stack.pop();
+
+                        if anchor_changed || was_active {
+                            self.upgrade_cell_dependents_to_dirty(key);
+                        }
 
                         let mut post_dirty = DirtyRoots::default();
                         if anchor_changed || was_active {
                             self.collect_direct_dependents(key, &mut post_dirty);
                         }
                         for revoked in revoked_anchors {
-                            self.store_eval_scalar(revoked, EvalScalar::Error(CalcError::Spill));
+                            if self.store_eval_scalar(revoked, EvalScalar::Error(CalcError::Spill))
+                            {
+                                self.upgrade_cell_dependents_to_dirty(revoked);
+                            }
                             self.collect_direct_dependents(revoked, &mut post_dirty);
                         }
                         self.record_changed_cells(&freed_shadows);
                         for shadow_key in freed_shadows {
+                            self.upgrade_cell_dependents_to_dirty(shadow_key);
                             self.collect_direct_dependents(shadow_key, &mut post_dirty);
                         }
                         self.push_unblocked_watchers(
@@ -2414,13 +2590,17 @@ impl FormulaEngine {
 
     fn finish_scalar_formula(&mut self, cur_fid: u32, key: WorkbookCellKey, scalar: EvalScalar) {
         let clear_out = self.spills.clear_anchor(key);
-        self.store_eval_scalar(key, scalar);
+        let bits_changed = self.store_eval_scalar(key, scalar);
         self.set_state(cur_fid, STATE_CLEAN);
         let _ = self.call_stack.pop();
+        if bits_changed || clear_out.had_state {
+            self.upgrade_cell_dependents_to_dirty(key);
+        }
         let mut post_dirty = DirtyRoots::default();
         if clear_out.had_state {
             self.record_changed_cells(&clear_out.cleared_shadows);
             for shadow_key in clear_out.cleared_shadows {
+                self.upgrade_cell_dependents_to_dirty(shadow_key);
                 self.collect_direct_dependents(shadow_key, &mut post_dirty);
             }
             self.collect_spill_anchor_dependents(key, &mut post_dirty.singles);
@@ -3510,12 +3690,16 @@ impl FormulaEngine {
         if flags.filter_sensitive {
             self.filter_sensitive_set.insert(fid);
         }
+        if flags.has_dynamic_ref {
+            self.dynamic_ref_set.insert(fid);
+        }
         if let Some(slot_ref) = self.slots.get_mut(fid as usize) {
             *slot_ref = Some(FormulaSlot { key, reg });
         }
         self.cell_to_fid.insert(key, fid);
         let c = self.slot_count_in_col.entry((key.0, key.2)).or_insert(0);
         *c = c.saturating_add(1);
+        self.levels_valid = false;
         if dirty {
             self.mark_fid_dirty_only(fid);
         }
@@ -3528,6 +3712,8 @@ impl FormulaEngine {
         };
         self.volatile_set.remove(&fid);
         self.filter_sensitive_set.remove(&fid);
+        self.dynamic_ref_set.remove(&fid);
+        self.levels_valid = false;
         self.set_state(fid, STATE_CLEAN);
         if let Some(slot_opt) = self.slots.get_mut(fid as usize)
             && let Some(old_slot) = slot_opt.take()
@@ -3618,17 +3804,20 @@ impl FormulaEngine {
                 program,
                 reg,
                 dirty_intervals: SmallVec::new(),
+                maybe_dirty_intervals: SmallVec::new(),
                 sequential_self_dep,
             });
         }
         self.strip_by_col
             .insert((strip.sheet, strip.col, strip.start_row), sid);
+        self.levels_valid = false;
         sid
     }
 
     fn remove_strip_slot(&mut self, sid: u32) {
         self.volatile_strips.remove(&sid);
         self.filter_sensitive_strips.remove(&sid);
+        self.levels_valid = false;
         self.set_strip_state(sid, STATE_CLEAN);
         if let Some(slot_opt) = self.strip_slots.get_mut(sid as usize)
             && let Some(old) = slot_opt.take()
@@ -3646,10 +3835,21 @@ impl FormulaEngine {
         };
         let _ = strip.insert_dirty_interval(lo, hi);
         let non_empty = !strip.dirty_intervals.is_empty();
-        if self.strip_state_of(sid) == STATE_CLEAN && non_empty {
-            self.set_strip_state(sid, STATE_DIRTY);
-            self.dirty_queue.push(strip_fid(sid));
-            self.dirty_needs_sort = true;
+        if non_empty {
+            match self.strip_state_of(sid) {
+                STATE_CLEAN => {
+                    self.set_strip_state(sid, STATE_DIRTY);
+                    self.dirty_queue.push(strip_fid(sid));
+                    self.dirty_needs_sort = true;
+                }
+                STATE_MAYBE_DIRTY => {
+                    self.set_strip_state(sid, STATE_DIRTY);
+                }
+                STATE_EVALUATING_MAYBE => {
+                    self.set_strip_state(sid, STATE_EVALUATING);
+                }
+                _ => {}
+            }
         }
     }
 
@@ -3663,6 +3863,7 @@ impl FormulaEngine {
         let len = s.len;
         let template = s.template.clone();
         let dirty_intervals = s.dirty_intervals.clone();
+        let maybe_intervals = s.maybe_dirty_intervals.clone();
         let old_state = self.strip_state_of(sid);
         let raw_fid = strip_fid(sid);
         let was_deferred = self.wave_deferred_dirty.contains(&raw_fid);
@@ -3681,6 +3882,9 @@ impl FormulaEngine {
             let f = BoundFormula::instantiate_strip_template(&template, off);
             let was_dirty = all_dirty
                 || dirty_intervals
+                    .iter()
+                    .any(|&(lo, hi)| lo <= off && off < hi)
+                || maybe_intervals
                     .iter()
                     .any(|&(lo, hi)| lo <= off && off < hi);
             let fid = self.insert_slot(key, &f, was_dirty);
@@ -3825,7 +4029,11 @@ impl FormulaEngine {
                     if st == STATE_SCC_WAIT {
                         carried_dirty.push((start, end));
                     } else if st != STATE_CLEAN {
-                        for &(lo, hi) in &s.dirty_intervals {
+                        for &(lo, hi) in s
+                            .dirty_intervals
+                            .iter()
+                            .chain(s.maybe_dirty_intervals.iter())
+                        {
                             carried_dirty.push((
                                 start.saturating_add(u64::from(lo)),
                                 start.saturating_add(u64::from(hi)),
@@ -4197,11 +4405,16 @@ impl FormulaEngine {
                                     self.batch_scratch.out_words.get(..chunk_len as usize)
                                 {
                                     let changes_ref = &mut self.changes;
+                                    let mut min_changed_rel: Option<u32> = None;
+                                    let mut max_changed_rel: u32 = 0;
                                     host_sheet.write_row_id_span_packed(
                                         RowId(start_row.0.saturating_add(u64::from(lo))),
                                         col,
                                         src_words,
                                         |rel| {
+                                            min_changed_rel =
+                                                Some(min_changed_rel.map_or(rel, |m| m.min(rel)));
+                                            max_changed_rel = max_changed_rel.max(rel);
                                             if !changes_ref.structural {
                                                 if changes_ref.cells.len() < 256 {
                                                     let r = RowId(
@@ -4217,6 +4430,20 @@ impl FormulaEngine {
                                             }
                                         },
                                     );
+                                    if let Some(min_rel) = min_changed_rel {
+                                        let first_changed = start_row
+                                            .0
+                                            .saturating_add(u64::from(lo))
+                                            .saturating_add(u64::from(min_rel));
+                                        let count = max_changed_rel
+                                            .saturating_sub(min_rel)
+                                            .saturating_add(1);
+                                        if let Some(run) = IdRun::new(first_changed, count) {
+                                            self.upgrade_col_run_dependents_to_dirty(
+                                                sheet, col, sid, run,
+                                            );
+                                        }
+                                    }
                                 }
                             }
                             let remaining_empty =
@@ -4302,7 +4529,9 @@ impl FormulaEngine {
                             }
                         }
                     };
-                    self.store_eval_scalar(key, scalar);
+                    if self.store_eval_scalar(key, scalar) {
+                        self.upgrade_cell_dependents_to_dirty(key);
+                    }
                     let remaining_empty =
                         if let Some(Some(s)) = self.strip_slots.get_mut(sid as usize) {
                             if let Some((lo, hi)) = s.dirty_intervals.first_mut() {
@@ -4338,10 +4567,22 @@ impl FormulaEngine {
     }
 
     fn mark_fid_dirty_only(&mut self, fid: u32) {
-        if self.state_of(fid) == STATE_CLEAN && self.slot_of(fid).is_some() {
-            self.set_state(fid, STATE_DIRTY);
-            self.dirty_queue.push(fid);
-            self.dirty_needs_sort = true;
+        if self.slot_of(fid).is_none() {
+            return;
+        }
+        match self.state_of(fid) {
+            STATE_CLEAN => {
+                self.set_state(fid, STATE_DIRTY);
+                self.dirty_queue.push(fid);
+                self.dirty_needs_sort = true;
+            }
+            STATE_MAYBE_DIRTY => {
+                self.set_state(fid, STATE_DIRTY);
+            }
+            STATE_EVALUATING_MAYBE => {
+                self.set_state(fid, STATE_EVALUATING);
+            }
+            _ => {}
         }
     }
 
@@ -4350,7 +4591,7 @@ impl FormulaEngine {
             key,
             &self.workbook,
             |fid| {
-                if self.state_of(fid) == STATE_CLEAN {
+                if matches!(self.state_of(fid), STATE_CLEAN | STATE_MAYBE_DIRTY) {
                     out.singles.push(fid);
                 }
             },
@@ -4566,11 +4807,132 @@ impl FormulaEngine {
         self.propagate_dirty_impl(roots.singles, roots.strips, exclude, true);
     }
 
+    fn can_maybe_dirty_single(&self, fid: u32) -> bool {
+        let Some(slot) = self.slot_of(fid) else {
+            return false;
+        };
+        if self.volatile_set.contains(&fid)
+            || self.dynamic_ref_set.contains(&fid)
+            || slot.reg.has_extra()
+        {
+            return false;
+        }
+        let key = slot.key;
+        if self.spills.active_spill(key).is_some()
+            || self.spills.is_blocked_anchor(key)
+            || self.cycle_spills.contains_key(&key)
+        {
+            return false;
+        }
+        self.workbook
+            .sheet(key.0)
+            .is_some_and(|sh| sh.value_by_id(key.1, key.2) != Value::Error(CalcError::Cycle))
+    }
+
+    fn can_maybe_dirty_strip(&self, sid: u32) -> bool {
+        self.strip_slot_of(sid).is_some() && !self.volatile_strips.contains(&sid)
+    }
+
+    fn upgrade_single_to_dirty(&mut self, fid: u32) {
+        match self.state_of(fid) {
+            STATE_MAYBE_DIRTY => self.set_state(fid, STATE_DIRTY),
+            STATE_EVALUATING_MAYBE => self.set_state(fid, STATE_EVALUATING),
+            _ => {}
+        }
+    }
+
+    fn upgrade_strip_to_dirty(&mut self, sid: u32, lo: u32, hi: u32) {
+        let added = if let Some(Some(s)) = self.strip_slots.get_mut(sid as usize) {
+            s.insert_dirty_interval(lo, hi)
+        } else {
+            false
+        };
+        if !added {
+            return;
+        }
+        match self.strip_state_of(sid) {
+            STATE_MAYBE_DIRTY => self.set_strip_state(sid, STATE_DIRTY),
+            STATE_EVALUATING_MAYBE => self.set_strip_state(sid, STATE_EVALUATING),
+            _ => {}
+        }
+    }
+
+    fn upgrade_cell_dependents_to_dirty(&mut self, key: WorkbookCellKey) {
+        let mut upg_singles: SmallVec<[u32; 8]> = SmallVec::new();
+        let mut upg_strips: SmallVec<[(u32, u32, u32); 4]> = SmallVec::new();
+        let states_ref = &self.states;
+        let wb_ref = &self.workbook;
+        self.dep_graph.for_each_cell_dependent_target(
+            key,
+            wb_ref,
+            |dep_fid| {
+                if matches!(
+                    states_ref
+                        .get(dep_fid as usize)
+                        .copied()
+                        .unwrap_or(STATE_CLEAN),
+                    STATE_MAYBE_DIRTY | STATE_EVALUATING_MAYBE
+                ) {
+                    upg_singles.push(dep_fid);
+                }
+            },
+            |dep_sid, lo, hi| upg_strips.push((dep_sid, lo, hi)),
+        );
+        for fid in upg_singles {
+            self.upgrade_single_to_dirty(fid);
+        }
+        for (sid, lo, hi) in upg_strips {
+            self.upgrade_strip_to_dirty(sid, lo, hi);
+        }
+    }
+
+    fn upgrade_col_run_dependents_to_dirty(
+        &mut self,
+        sheet_id: SheetId,
+        col: ColId,
+        sid: u32,
+        row_run: IdRun,
+    ) {
+        let exclude_self = self
+            .strip_slot_of(sid)
+            .and_then(|s| s.sequential_self_dep.then_some(sid));
+        let mut upg_singles: SmallVec<[u32; 16]> = SmallVec::new();
+        let mut upg_strips: SmallVec<[(u32, u32, u32); 4]> = SmallVec::new();
+        let states_ref = &self.states;
+        let wb_ref = &self.workbook;
+        self.dep_graph.for_each_col_run_dependent_target(
+            sheet_id,
+            col,
+            row_run,
+            exclude_self,
+            wb_ref,
+            |dep_fid| {
+                if matches!(
+                    states_ref
+                        .get(dep_fid as usize)
+                        .copied()
+                        .unwrap_or(STATE_CLEAN),
+                    STATE_MAYBE_DIRTY | STATE_EVALUATING_MAYBE
+                ) {
+                    upg_singles.push(dep_fid);
+                }
+            },
+            |dep_sid, lo, hi| upg_strips.push((dep_sid, lo, hi)),
+        );
+        for fid in upg_singles {
+            self.upgrade_single_to_dirty(fid);
+        }
+        for (dep_sid, lo, hi) in upg_strips {
+            self.upgrade_strip_to_dirty(dep_sid, lo, hi);
+        }
+    }
+
     fn try_mark_dirty_for_bfs(
         &mut self,
         fid: u32,
         exclude: &[u32],
         cap_wave_requeues: bool,
+        as_maybe: bool,
         bfs: &mut Vec<BfsItem>,
     ) {
         if exclude.contains(&fid) || self.slot_of(fid).is_none() {
@@ -4580,6 +4942,19 @@ impl FormulaEngine {
         if st == STATE_SCC_WAIT {
             if !self.wave_deferred_dirty.contains(&fid) {
                 self.wave_deferred_dirty.push(fid);
+            }
+            return;
+        }
+        let want_maybe = as_maybe && self.can_maybe_dirty_single(fid);
+        if st == STATE_MAYBE_DIRTY {
+            if !want_maybe {
+                self.set_state(fid, STATE_DIRTY);
+            }
+            return;
+        }
+        if st == STATE_EVALUATING_MAYBE {
+            if !want_maybe {
+                self.set_state(fid, STATE_EVALUATING);
             }
             return;
         }
@@ -4593,7 +4968,12 @@ impl FormulaEngine {
             }
             *count = count.saturating_add(1);
         }
-        self.set_state(fid, STATE_DIRTY);
+        let next_state = if want_maybe {
+            STATE_MAYBE_DIRTY
+        } else {
+            STATE_DIRTY
+        };
+        self.set_state(fid, next_state);
         self.dirty_queue.push(fid);
         bfs.push(BfsItem::Single(fid));
     }
@@ -4601,10 +4981,10 @@ impl FormulaEngine {
     fn try_mark_strip_dirty_for_bfs(
         &mut self,
         sid: u32,
-        lo: u32,
-        hi: u32,
+        (lo, hi): (u32, u32),
         exclude: &[u32],
         cap_wave_requeues: bool,
+        as_maybe: bool,
         bfs: &mut Vec<BfsItem>,
     ) {
         let raw_fid = strip_fid(sid);
@@ -4612,6 +4992,7 @@ impl FormulaEngine {
             return;
         }
         let st = self.strip_state_of(sid);
+        let want_maybe = as_maybe && self.can_maybe_dirty_strip(sid);
         let (eff_lo, eff_hi, added, non_empty) = {
             let Some(Some(s)) = self.strip_slots.get_mut(sid as usize) else {
                 return;
@@ -4622,8 +5003,17 @@ impl FormulaEngine {
             } else {
                 hi.min(s.len)
             };
-            let added = s.insert_dirty_interval(eff_lo, eff_hi);
-            (eff_lo, eff_hi, added, !s.dirty_intervals.is_empty())
+            let added = if want_maybe {
+                s.insert_maybe_dirty_interval(eff_lo, eff_hi)
+            } else {
+                s.insert_dirty_interval(eff_lo, eff_hi)
+            };
+            (
+                eff_lo,
+                eff_hi,
+                added,
+                !s.dirty_intervals.is_empty() || !s.maybe_dirty_intervals.is_empty(),
+            )
         };
         if !non_empty {
             return;
@@ -4642,9 +5032,22 @@ impl FormulaEngine {
                 }
                 *count = count.saturating_add(1);
             }
-            self.set_strip_state(sid, STATE_DIRTY);
+            self.set_strip_state(
+                sid,
+                if want_maybe {
+                    STATE_MAYBE_DIRTY
+                } else {
+                    STATE_DIRTY
+                },
+            );
             self.dirty_queue.push(raw_fid);
             self.dirty_needs_sort = true;
+        } else if !want_maybe {
+            match st {
+                STATE_MAYBE_DIRTY => self.set_strip_state(sid, STATE_DIRTY),
+                STATE_EVALUATING_MAYBE => self.set_strip_state(sid, STATE_EVALUATING),
+                _ => {}
+            }
         }
         if added {
             bfs.push(BfsItem::Strip {
@@ -4674,19 +5077,26 @@ impl FormulaEngine {
                 if let Some(len) = self.strip_slot_of(sid).map(|s| s.len) {
                     self.try_mark_strip_dirty_for_bfs(
                         sid,
-                        0,
-                        len,
+                        (0, len),
                         exclude,
                         cap_wave_requeues,
+                        false,
                         &mut bfs,
                     );
                 }
             } else {
-                self.try_mark_dirty_for_bfs(fid, exclude, cap_wave_requeues, &mut bfs);
+                self.try_mark_dirty_for_bfs(fid, exclude, cap_wave_requeues, false, &mut bfs);
             }
         }
         for (sid, lo, hi) in strips {
-            self.try_mark_strip_dirty_for_bfs(sid, lo, hi, exclude, cap_wave_requeues, &mut bfs);
+            self.try_mark_strip_dirty_for_bfs(
+                sid,
+                (lo, hi),
+                exclude,
+                cap_wave_requeues,
+                false,
+                &mut bfs,
+            );
         }
         let mut head = 0usize;
         while let Some(item) = bfs.get(head).copied() {
@@ -4821,15 +5231,15 @@ impl FormulaEngine {
                 next_singles.extend(name_fids);
             }
             for dep_fid in next_singles {
-                self.try_mark_dirty_for_bfs(dep_fid, exclude, cap_wave_requeues, &mut bfs);
+                self.try_mark_dirty_for_bfs(dep_fid, exclude, cap_wave_requeues, true, &mut bfs);
             }
             for (dep_sid, dlo, dhi) in next_strips {
                 self.try_mark_strip_dirty_for_bfs(
                     dep_sid,
-                    dlo,
-                    dhi,
+                    (dlo, dhi),
                     exclude,
                     cap_wave_requeues,
+                    true,
                     &mut bfs,
                 );
             }
@@ -4848,10 +5258,18 @@ impl FormulaEngine {
         }
         let paused = core::mem::take(&mut self.call_stack);
         for fid in paused {
-            if self.node_state(fid) == STATE_EVALUATING {
-                self.set_node_state(fid, STATE_DIRTY);
-                self.dirty_queue.push(fid);
-                self.dirty_needs_sort = true;
+            match self.node_state(fid) {
+                STATE_EVALUATING => {
+                    self.set_node_state(fid, STATE_DIRTY);
+                    self.dirty_queue.push(fid);
+                    self.dirty_needs_sort = true;
+                }
+                STATE_EVALUATING_MAYBE => {
+                    self.set_node_state(fid, STATE_MAYBE_DIRTY);
+                    self.dirty_queue.push(fid);
+                    self.dirty_needs_sort = true;
+                }
+                _ => {}
             }
         }
         let parked = core::mem::take(&mut self.scc_stack);
@@ -4948,20 +5366,23 @@ impl FormulaEngine {
                         ready.singles.push(fid);
                     }
                 }
-                STATE_DIRTY => {
+                STATE_DIRTY | STATE_MAYBE_DIRTY => {
                     if is_strip_fid(fid) {
                         let sid = strip_index(fid);
-                        let intervals = self
+                        let (intervals, maybe_ivs) = self
                             .strip_slot_of(sid)
-                            .map(|s| s.dirty_intervals.clone())
+                            .map(|s| (s.dirty_intervals.clone(), s.maybe_dirty_intervals.clone()))
                             .unwrap_or_default();
                         self.set_strip_state(sid, STATE_CLEAN);
-                        if intervals.is_empty() {
+                        if intervals.is_empty() && maybe_ivs.is_empty() {
                             if let Some(len) = self.strip_slot_of(sid).map(|s| s.len) {
                                 ready.strips.push((sid, 0, len));
                             }
                         } else {
                             for (lo, hi) in intervals {
+                                ready.strips.push((sid, lo, hi));
+                            }
+                            for (lo, hi) in maybe_ivs {
                                 ready.strips.push((sid, lo, hi));
                             }
                         }
@@ -4984,7 +5405,7 @@ impl FormulaEngine {
                 if is_strip_fid(fid) {
                     let sid = strip_index(fid);
                     if let Some(s) = self.strip_slot_of(sid)
-                        && !s.dirty_intervals.is_empty()
+                        && (!s.dirty_intervals.is_empty() || !s.maybe_dirty_intervals.is_empty())
                     {
                         self.set_strip_state(sid, STATE_DIRTY);
                         self.dirty_queue.push(fid);
@@ -5007,28 +5428,311 @@ impl FormulaEngine {
             self.dirty_queue.drain(0..self.dirty_cursor);
             self.dirty_cursor = 0;
         }
+        self.ensure_levels_valid();
+        for idx in 0..self.dirty_queue.len() {
+            if let Some(&fid) = self.dirty_queue.get(idx) {
+                let _ = self.compute_node_level(fid);
+            }
+        }
         let slots_ref = &self.slots;
         let strip_slots_ref = &self.strip_slots;
+        let slot_levels_ref = &self.slot_levels;
+        let strip_levels_ref = &self.strip_levels;
         self.dirty_queue.sort_unstable_by_key(|&fid| {
-            let key = if is_strip_fid(fid) {
-                strip_slots_ref
-                    .get(strip_index(fid) as usize)
+            let (lvl, key) = if is_strip_fid(fid) {
+                let sid = strip_index(fid) as usize;
+                let lv = strip_levels_ref
+                    .get(sid)
+                    .copied()
+                    .filter(|&x| x != u32::MAX)
+                    .unwrap_or(1);
+                let k = strip_slots_ref
+                    .get(sid)
                     .and_then(Option::as_ref)
                     .map_or((SheetId(u32::MAX), RowId(u64::MAX), ColId(u64::MAX)), |s| {
                         (s.sheet, s.start_row, s.col)
-                    })
+                    });
+                (lv, k)
             } else {
-                slots_ref
+                let lv = slot_levels_ref
+                    .get(fid as usize)
+                    .copied()
+                    .filter(|&x| x != u32::MAX)
+                    .unwrap_or(1);
+                let k = slots_ref
                     .get(fid as usize)
                     .and_then(Option::as_ref)
                     .map_or((SheetId(u32::MAX), RowId(u64::MAX), ColId(u64::MAX)), |s| {
                         s.key
-                    })
+                    });
+                (lv, k)
             };
-            (key, fid)
+            (lvl, key, fid)
         });
         self.dirty_queue.dedup();
         self.dirty_needs_sort = false;
+    }
+
+    fn ensure_levels_valid(&mut self) {
+        if !self.levels_valid {
+            self.slot_levels.clear();
+            self.strip_levels.clear();
+            self.levels_valid = true;
+        }
+        if self.slot_levels.len() < self.slots.len() {
+            self.slot_levels.resize(self.slots.len(), 0);
+        }
+        if self.strip_levels.len() < self.strip_slots.len() {
+            self.strip_levels.resize(self.strip_slots.len(), 0);
+        }
+    }
+
+    fn level_slot(&self, fid: u32) -> u32 {
+        if is_strip_fid(fid) {
+            self.strip_levels
+                .get(strip_index(fid) as usize)
+                .copied()
+                .unwrap_or(0)
+        } else {
+            self.slot_levels.get(fid as usize).copied().unwrap_or(0)
+        }
+    }
+
+    fn set_level_slot(&mut self, fid: u32, lvl: u32) {
+        if is_strip_fid(fid) {
+            let sid = strip_index(fid) as usize;
+            if sid >= self.strip_levels.len() {
+                self.strip_levels.resize(sid.saturating_add(1), 0);
+            }
+            if let Some(s) = self.strip_levels.get_mut(sid) {
+                *s = lvl;
+            }
+        } else {
+            let idx = fid as usize;
+            if idx >= self.slot_levels.len() {
+                self.slot_levels.resize(idx.saturating_add(1), 0);
+            }
+            if let Some(s) = self.slot_levels.get_mut(idx) {
+                *s = lvl;
+            }
+        }
+    }
+
+    fn compute_node_level(&mut self, root: u32) -> u32 {
+        let existing = self.level_slot(root);
+        if existing != 0 && existing != u32::MAX {
+            return existing;
+        }
+        let mut stack: Vec<(u32, bool)> = Vec::new();
+        stack.push((root, false));
+        while let Some((node, post)) = stack.pop() {
+            let cur_lvl = self.level_slot(node);
+            if post {
+                if cur_lvl != u32::MAX && cur_lvl != 0 {
+                    continue;
+                }
+                let mut precs: SmallVec<[u32; 8]> = SmallVec::new();
+                self.collect_static_precedent_fids_for_level(node, &mut precs);
+                let mut max_p = 0_u32;
+                for p in precs {
+                    let pl = self.level_slot(p);
+                    if pl != u32::MAX {
+                        max_p = max_p.max(pl);
+                    }
+                }
+                self.set_level_slot(node, max_p.saturating_add(1));
+                continue;
+            }
+            if cur_lvl != 0 {
+                continue;
+            }
+            self.set_level_slot(node, u32::MAX);
+            stack.push((node, true));
+            let mut precs: SmallVec<[u32; 8]> = SmallVec::new();
+            self.collect_static_precedent_fids_for_level(node, &mut precs);
+            for p in precs {
+                if self.level_slot(p) == 0 {
+                    stack.push((p, false));
+                }
+            }
+        }
+        let out = self.level_slot(root);
+        if out == u32::MAX || out == 0 { 1 } else { out }
+    }
+
+    fn collect_static_precedent_fids_for_level(&self, node: u32, out: &mut SmallVec<[u32; 8]>) {
+        if is_strip_fid(node) {
+            let sid = strip_index(node);
+            let Some(strip) = self.strip_slot_of(sid) else {
+                return;
+            };
+            for &(s, c, sub) in strip.reg.cell_subs() {
+                if s == strip.sheet
+                    && c == strip.col
+                    && strip.sequential_self_dep
+                    && sub.row.stride == 1
+                    && sub.row.base < strip.start_row.0
+                    && id_stream(sub.row.base) == id_stream(strip.start_row.0)
+                {
+                    let pre_end = strip.start_row.0.saturating_sub(1);
+                    self.collect_span_precedents_for_level(s, sub.row.base, pre_end, c.0, c.0, out);
+                } else if sub.row.stride == 0 {
+                    self.push_cell_precedent_for_level((s, RowId(sub.row.base), c), out);
+                } else {
+                    let last_r = sub
+                        .row
+                        .base
+                        .saturating_add(u64::from(strip.len.saturating_sub(1)));
+                    self.collect_span_precedents_for_level(s, sub.row.base, last_r, c.0, c.0, out);
+                }
+            }
+            for &(s, sub) in strip.reg.area_subs() {
+                if let Some(sh) = self.workbook.sheet(s) {
+                    let r1 = sub.first_row.base;
+                    let r2 = sub.last_row.resolve(strip.len.saturating_sub(1)).0;
+                    let (c1, c2) = match sub.cols {
+                        Some((a, b)) => (a.0, b.0),
+                        None => (
+                            sh.col_axis().pos_to_id(0).unwrap_or(0),
+                            sh.col_axis()
+                                .pos_to_id(sh.col_axis().live_len().saturating_sub(1))
+                                .unwrap_or(0),
+                        ),
+                    };
+                    self.collect_span_precedents_for_level(s, r1, r2, c1, c2, out);
+                }
+            }
+            strip
+                .reg
+                .for_each_fixed_range_span(&self.workbook, |s, r1, r2, c1, c2| {
+                    self.collect_span_precedents_for_level(s, r1, r2, c1, c2, out);
+                });
+            out.retain(|f| *f != node);
+        } else {
+            let Some(slot) = self.slot_of(node) else {
+                return;
+            };
+            for &cell_key in slot.reg.single_cells() {
+                self.push_cell_precedent_for_level(cell_key, out);
+            }
+            slot.reg
+                .for_each_range_span(&self.workbook, |s, r1, r2, c1, c2| {
+                    self.collect_span_precedents_for_level(s, r1, r2, c1, c2, out);
+                });
+            out.retain(|f| *f != node);
+        }
+    }
+
+    fn push_cell_precedent_for_level(&self, key: WorkbookCellKey, out: &mut SmallVec<[u32; 8]>) {
+        if let Some(&fid) = self.cell_to_fid.get(&key) {
+            if !out.contains(&fid) {
+                out.push(fid);
+            }
+        } else if let Some((sid, _)) = self.strip_covering_cell(key) {
+            let fid = strip_fid(sid);
+            if !out.contains(&fid) {
+                out.push(fid);
+            }
+        }
+    }
+
+    fn has_strips_in_col(&self, sheet: SheetId, col: ColId) -> bool {
+        !self.strip_by_col.is_empty()
+            && self
+                .strip_by_col
+                .range((sheet, col, RowId(0))..=(sheet, col, RowId(u64::MAX)))
+                .next()
+                .is_some()
+    }
+
+    fn collect_span_precedents_for_level(
+        &self,
+        sheet_id: SheetId,
+        first_row: u64,
+        last_row: u64,
+        first_col: u64,
+        last_col: u64,
+        out: &mut SmallVec<[u32; 8]>,
+    ) {
+        let Some(sheet) = self.workbook.sheet(sheet_id) else {
+            return;
+        };
+        let Some((r1_ord, r2_ord)) = live_span_positions(sheet.row_axis(), first_row, last_row)
+        else {
+            return;
+        };
+        sheet
+            .col_axis()
+            .for_each_live_in_range(first_col, last_col, |c_run| {
+                for raw_c in c_run.iter() {
+                    let col = ColId(raw_c);
+                    let single_cnt = self
+                        .slot_count_in_col
+                        .get(&(sheet_id, col))
+                        .copied()
+                        .unwrap_or(0);
+                    let has_strips = self.has_strips_in_col(sheet_id, col);
+                    if single_cnt == 0 && !has_strips {
+                        continue;
+                    }
+                    if has_strips {
+                        for (_, &sid) in self
+                            .strip_by_col
+                            .range((sheet_id, col, RowId(0))..=(sheet_id, col, RowId(u64::MAX)))
+                        {
+                            if let Some(strip) = self.strip_slot_of(sid) {
+                                let s_first = strip.start_row.0;
+                                let s_last = strip.end_row_inclusive().0;
+                                if let Some((sr1, sr2)) =
+                                    live_span_positions(sheet.row_axis(), s_first, s_last)
+                                    && sr1 <= r2_ord
+                                    && r1_ord <= sr2
+                                {
+                                    let sf = strip_fid(sid);
+                                    if !out.contains(&sf) {
+                                        out.push(sf);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if single_cnt > 0 {
+                        let span_len = r2_ord.saturating_sub(r1_ord).saturating_add(1);
+                        if span_len <= 64 {
+                            sheet
+                                .row_axis()
+                                .for_each_live_in_range(first_row, last_row, |r_run| {
+                                    for raw_r in r_run.iter() {
+                                        if let Some(&fid) =
+                                            self.cell_to_fid.get(&(sheet_id, RowId(raw_r), col))
+                                            && !out.contains(&fid)
+                                        {
+                                            out.push(fid);
+                                        }
+                                    }
+                                });
+                        } else {
+                            let mut checked = 0_u32;
+                            sheet
+                                .row_axis()
+                                .for_each_live_in_range(first_row, last_row, |r_run| {
+                                    for raw_r in r_run.iter() {
+                                        if checked >= 64 {
+                                            return;
+                                        }
+                                        checked = checked.saturating_add(1);
+                                        if let Some(&fid) =
+                                            self.cell_to_fid.get(&(sheet_id, RowId(raw_r), col))
+                                            && !out.contains(&fid)
+                                        {
+                                            out.push(fid);
+                                        }
+                                    }
+                                });
+                        }
+                    }
+                }
+            });
     }
 
     fn collect_cleared_spill_dependents(
@@ -5082,7 +5786,10 @@ impl FormulaEngine {
             while self.call_stack.len() > target_len {
                 if let Some(frame) = self.call_stack.pop()
                     && !is_strip_fid(frame)
-                    && self.state_of(frame) == STATE_EVALUATING
+                    && matches!(
+                        self.state_of(frame),
+                        STATE_EVALUATING | STATE_EVALUATING_MAYBE
+                    )
                 {
                     self.set_state(frame, STATE_DIRTY);
                     self.dirty_queue.push(frame);
@@ -5202,7 +5909,9 @@ impl FormulaEngine {
                 } else {
                     self.drain_cycle_spill_anchor(key, None, &mut post_dirty.singles);
                 }
-                self.store_eval_scalar(key, EvalScalar::Error(CalcError::Cycle));
+                if self.store_eval_scalar(key, EvalScalar::Error(CalcError::Cycle)) {
+                    self.upgrade_cell_dependents_to_dirty(key);
+                }
                 unwound_keys.push(key);
             }
             self.set_state(fid, STATE_CLEAN);
@@ -5227,9 +5936,9 @@ impl FormulaEngine {
         self.flush_deferred_dirty();
     }
 
-    fn store_eval_scalar(&mut self, key: WorkbookCellKey, scalar: EvalScalar) {
+    fn store_eval_scalar(&mut self, key: WorkbookCellKey, scalar: EvalScalar) -> bool {
         let Some(sheet) = self.workbook.sheet_mut(key.0) else {
-            return;
+            return false;
         };
         let old_bits = sheet.value_by_id(key.1, key.2).pack();
         let new_val = match scalar {
@@ -5243,13 +5952,15 @@ impl FormulaEngine {
             },
         };
         sheet.set_value_by_id(key.1, key.2, new_val);
-        if new_val.pack() != old_bits && !self.changes.structural {
+        let changed = new_val.pack() != old_bits;
+        if changed && !self.changes.structural {
             if self.changes.cells.len() < 256 {
                 self.changes.cells.push(key);
             } else {
                 self.changes.structural = true;
             }
         }
+        changed
     }
 
     fn eval_root_formula(&mut self, root: &BoundExpr, caller: CallerContext) -> ExprOutcome {
@@ -6220,7 +6931,9 @@ impl FormulaEngine {
 
     fn cycle_low_of(&self, fid: u32) -> Option<usize> {
         match self.node_state(fid) {
-            STATE_EVALUATING => self.call_stack.iter().rposition(|&f| f == fid),
+            STATE_EVALUATING | STATE_EVALUATING_MAYBE => {
+                self.call_stack.iter().rposition(|&f| f == fid)
+            }
             STATE_SCC_WAIT => self.scc_low.get(&fid).copied(),
             _ => None,
         }
@@ -6233,16 +6946,130 @@ impl FormulaEngine {
         cycle_low: &mut Option<usize>,
     ) {
         match self.node_state(fid) {
-            STATE_EVALUATING | STATE_SCC_WAIT => {
+            STATE_EVALUATING | STATE_EVALUATING_MAYBE | STATE_SCC_WAIT => {
                 if let Some(low) = self.cycle_low_of(fid) {
                     merge_cycle(cycle_low, low);
                 }
             }
-            STATE_DIRTY if !blocked.contains(&fid) => {
-                blocked.push(fid);
+            STATE_DIRTY | STATE_MAYBE_DIRTY => {
+                if let Some(low) = self.call_stack.iter().rposition(|&f| f == fid) {
+                    merge_cycle(cycle_low, low);
+                } else if !blocked.contains(&fid) {
+                    blocked.push(fid);
+                }
             }
             _ => {}
         }
+    }
+
+    fn check_single_static_precedents_ready(&self, fid: u32) -> Result<(), ExprOutcome> {
+        let Some(slot) = self.slot_of(fid) else {
+            return Ok(());
+        };
+        let mut blocked: SmallVec<[u32; 4]> = SmallVec::new();
+        let mut cycle_low: Option<usize> = None;
+        let mut absorb = |res: Result<(), ExprOutcome>| match res {
+            Ok(()) | Err(ExprOutcome::Ready(_)) => {}
+            Err(ExprOutcome::Blocked(deps)) => {
+                for dep in deps {
+                    if !blocked.contains(&dep) {
+                        blocked.push(dep);
+                    }
+                }
+            }
+            Err(ExprOutcome::Cycle(low)) => merge_cycle(&mut cycle_low, low),
+        };
+        for &(s, r, c) in slot.reg.single_cells() {
+            absorb(self.check_cell_ready(s, r, c));
+        }
+        slot.reg
+            .for_each_range_span(&self.workbook, |s, r1, r2, c1, c2| {
+                absorb(self.check_span_ready(s, r1, r2, c1, c2));
+            });
+        if let Some(wait) = Self::wait_outcome(blocked, cycle_low) {
+            return Err(wait);
+        }
+        Ok(())
+    }
+
+    fn check_strip_maybe_precedents_ready(&self, sid: u32) -> Result<(), ExprOutcome> {
+        let Some(strip) = self.strip_slot_of(sid) else {
+            return Ok(());
+        };
+        let mut blocked: SmallVec<[u32; 4]> = SmallVec::new();
+        let mut cycle_low: Option<usize> = None;
+        let mut absorb = |res: Result<(), ExprOutcome>| match res {
+            Ok(()) | Err(ExprOutcome::Ready(_)) => {}
+            Err(ExprOutcome::Blocked(deps)) => {
+                for dep in deps {
+                    if !blocked.contains(&dep) {
+                        blocked.push(dep);
+                    }
+                }
+            }
+            Err(ExprOutcome::Cycle(low)) => merge_cycle(&mut cycle_low, low),
+        };
+        for &(s, col, sub) in strip.reg.cell_subs() {
+            let is_self_back = s == strip.sheet
+                && col == strip.col
+                && strip.sequential_self_dep
+                && sub.row.stride == 1
+                && sub.row.base < strip.start_row.0
+                && id_stream(sub.row.base) == id_stream(strip.start_row.0);
+            if sub.row.stride == 0 {
+                absorb(self.check_cell_ready(s, RowId(sub.row.base), col));
+                continue;
+            }
+            for &(lo, hi) in &strip.maybe_dirty_intervals {
+                if lo >= hi {
+                    continue;
+                }
+                let r1 = sub.row.base.saturating_add(u64::from(lo));
+                let r2 = if is_self_back {
+                    if r1 >= strip.start_row.0 {
+                        continue;
+                    }
+                    sub.row
+                        .base
+                        .saturating_add(u64::from(hi.saturating_sub(1)))
+                        .min(strip.start_row.0.saturating_sub(1))
+                } else {
+                    sub.row.base.saturating_add(u64::from(hi.saturating_sub(1)))
+                };
+                absorb(self.check_span_ready(s, r1, r2, col.0, col.0));
+            }
+        }
+        for &(s, sub) in strip.reg.area_subs() {
+            let Some(sh) = self.workbook.sheet(s) else {
+                continue;
+            };
+            let (c1, c2) = match sub.cols {
+                Some((a, b)) => (a.0, b.0),
+                None => (
+                    sh.col_axis().pos_to_id(0).unwrap_or(0),
+                    sh.col_axis()
+                        .pos_to_id(sh.col_axis().live_len().saturating_sub(1))
+                        .unwrap_or(0),
+                ),
+            };
+            for &(lo, hi) in &strip.maybe_dirty_intervals {
+                if lo >= hi {
+                    continue;
+                }
+                let r1 = sub.first_row.resolve(lo).0;
+                let r2 = sub.last_row.resolve(hi.saturating_sub(1)).0;
+                absorb(self.check_span_ready(s, r1, r2, c1, c2));
+            }
+        }
+        strip
+            .reg
+            .for_each_fixed_range_span(&self.workbook, |s, r1, r2, c1, c2| {
+                absorb(self.check_span_ready(s, r1, r2, c1, c2));
+            });
+        if let Some(wait) = Self::wait_outcome(blocked, cycle_low) {
+            return Err(wait);
+        }
+        Ok(())
     }
 
     fn check_cell_ready(&self, sheet: SheetId, row: RowId, col: ColId) -> Result<(), ExprOutcome> {
@@ -6262,7 +7089,7 @@ impl FormulaEngine {
                     && (self.strip_state_of(sid) == STATE_SCC_WAIT
                         || self
                             .strip_slot_of(sid)
-                            .is_some_and(|s| s.has_dirty_offset(off)))
+                            .is_some_and(|s| s.has_dirty_or_maybe_offset(off)))
                 {
                     Some(strip_fid(sid))
                 } else {
@@ -6733,48 +7560,51 @@ fn strip_overlaps_live_span(
     r2_pos: u32,
 ) -> bool {
     let single_full = [(0_u32, strip.len)];
-    let intervals: &[(u32, u32)] = if st == STATE_SCC_WAIT {
-        &single_full
+    let interval_groups: [&[(u32, u32)]; 2] = if st == STATE_SCC_WAIT {
+        [&single_full, &[]]
     } else {
-        &strip.dirty_intervals
+        [&strip.dirty_intervals, &strip.maybe_dirty_intervals]
     };
     let span_len = r2_pos.saturating_sub(r1_pos).saturating_add(1);
-    for &(lo, hi) in intervals {
-        if lo >= hi {
-            continue;
-        }
-        let s_first = strip.start_row.0.saturating_add(u64::from(lo));
-        let count = hi.saturating_sub(lo);
-        let s_last = strip
-            .start_row
-            .0
-            .saturating_add(u64::from(hi.saturating_sub(1)));
-        if row_axis.single_run_covers(s_first, count) {
-            if let Some((s_r1, s_r2)) = live_span_positions(row_axis, s_first, s_last)
-                && s_r1 <= r2_pos
-                && r1_pos <= s_r2
-            {
-                return true;
+    for intervals in interval_groups {
+        for &(lo, hi) in intervals {
+            if lo >= hi {
+                continue;
             }
-        } else if count <= span_len {
-            for off in lo..hi {
-                let row_id = strip.start_row.0.saturating_add(u64::from(off));
-                if let Some(pos) = row_axis.id_to_pos(row_id)
-                    && pos >= r1_pos
-                    && pos <= r2_pos
+            let s_first = strip.start_row.0.saturating_add(u64::from(lo));
+            let count = hi.saturating_sub(lo);
+            let s_last = strip
+                .start_row
+                .0
+                .saturating_add(u64::from(hi.saturating_sub(1)));
+            if row_axis.single_run_covers(s_first, count) {
+                if let Some((s_r1, s_r2)) = live_span_positions(row_axis, s_first, s_last)
+                    && s_r1 <= r2_pos
+                    && r1_pos <= s_r2
                 {
                     return true;
                 }
-            }
-        } else {
-            let mut hit = false;
-            row_axis.for_each_live_in_range(first_row, last_row, |run| {
-                if !hit && strip_run_overlap(strip, run).is_some_and(|(a, b)| a < hi && b > lo) {
-                    hit = true;
+            } else if count <= span_len {
+                for off in lo..hi {
+                    let row_id = strip.start_row.0.saturating_add(u64::from(off));
+                    if let Some(pos) = row_axis.id_to_pos(row_id)
+                        && pos >= r1_pos
+                        && pos <= r2_pos
+                    {
+                        return true;
+                    }
                 }
-            });
-            if hit {
-                return true;
+            } else {
+                let mut hit = false;
+                row_axis.for_each_live_in_range(first_row, last_row, |run| {
+                    if !hit && strip_run_overlap(strip, run).is_some_and(|(a, b)| a < hi && b > lo)
+                    {
+                        hit = true;
+                    }
+                });
+                if hit {
+                    return true;
+                }
             }
         }
     }
@@ -7221,9 +8051,10 @@ mod tests {
                 .edit_cell_raw(s, RowId(r), ColId(1), "=$C$1+1")
                 .unwrap();
         }
-        // A1 sorts ahead of B1:B20, so evaluating A1 blocks on 20 dirty formulas while done == 0.
+        // Dynamic INDIRECT has no static precedent edge (`level == 1`), so A1 sorts
+        // ahead of B1:B20 and blocks on those 20 dirty formulas while done == 0.
         sliced
-            .edit_cell_raw(s, RowId(0), ColId(0), "=SUM(B1:B20)")
+            .edit_cell_raw(s, RowId(0), ColId(0), "=SUM(INDIRECT(\"B1:B20\"))")
             .unwrap();
         sliced.recalc_all();
 
@@ -9501,5 +10332,101 @@ mod tests {
                 Value::Number(f64::from((r + 1) * 3))
             );
         }
+    }
+
+    #[test]
+    fn early_cutoff_skips_1000_downstream_singles_and_strips() {
+        let mut eng = FormulaEngine::new();
+        let s = SheetId(0);
+        eng.edit_cell_raw(s, RowId(0), ColId(0), "5").unwrap();
+        eng.edit_cell_raw(s, RowId(0), ColId(1), "=IF(A1>0, 100, 0)")
+            .unwrap();
+        for r in 0_u32..1000 {
+            eng.edit_cell_raw(s, RowId(u64::from(r)), ColId(2), "=B$1+ROW()")
+                .unwrap();
+            let single_expr = format!("=B$1+0*{r}");
+            eng.edit_cell_raw(s, RowId(u64::from(r)), ColId(3), &single_expr)
+                .unwrap();
+        }
+        assert_eq!(eng.strip_by_col.len(), 1);
+        assert!(eng.strip_by_col.contains_key(&(s, ColId(2), RowId(0))));
+        eng.recalc_all();
+
+        // Editing A1 from 5 to 10 keeps B1 bitwise identical at 100.0, cutting off
+        // all 1,000 strip rows in column C and all 1,000 single slots in column D.
+        eng.edit_cell_raw(s, RowId(0), ColId(0), "10").unwrap();
+        assert_eq!(eng.recalc_all(), 1);
+        {
+            let sh = eng.workbook().sheet(s).unwrap();
+            assert_eq!(sh.value_by_id(RowId(0), ColId(1)), Value::Number(100.0));
+            assert_eq!(sh.value_by_id(RowId(0), ColId(2)), Value::Number(101.0));
+            assert_eq!(sh.value_by_id(RowId(999), ColId(2)), Value::Number(1100.0));
+            assert_eq!(sh.value_by_id(RowId(0), ColId(3)), Value::Number(100.0));
+            assert_eq!(sh.value_by_id(RowId(999), ColId(3)), Value::Number(100.0));
+        }
+
+        // Editing A1 from 10 to -5 changes B1 from 100.0 to 0.0, waking every
+        // downstream single formula and strip interval.
+        eng.edit_cell_raw(s, RowId(0), ColId(0), "-5").unwrap();
+        assert_eq!(eng.recalc_all(), 2001);
+        {
+            let sh = eng.workbook().sheet(s).unwrap();
+            assert_eq!(sh.value_by_id(RowId(0), ColId(1)), Value::Number(0.0));
+            assert_eq!(sh.value_by_id(RowId(0), ColId(2)), Value::Number(1.0));
+            assert_eq!(sh.value_by_id(RowId(999), ColId(2)), Value::Number(1000.0));
+            assert_eq!(sh.value_by_id(RowId(0), ColId(3)), Value::Number(0.0));
+            assert_eq!(sh.value_by_id(RowId(999), ColId(3)), Value::Number(0.0));
+        }
+    }
+
+    #[test]
+    fn early_cutoff_canonicalizes_negative_zero() {
+        let mut eng = FormulaEngine::new();
+        let s = SheetId(0);
+        eng.edit_cell_raw(s, RowId(0), ColId(0), "-5").unwrap();
+        eng.edit_cell_raw(s, RowId(0), ColId(1), "=A1*0").unwrap();
+        eng.edit_cell_raw(s, RowId(0), ColId(2), "=B1+42").unwrap();
+        eng.recalc_all();
+
+        let b1_bits = eng
+            .workbook()
+            .sheet(s)
+            .unwrap()
+            .value_by_id(RowId(0), ColId(1))
+            .pack();
+        assert_eq!(b1_bits, Value::number(0.0).pack());
+
+        eng.edit_cell_raw(s, RowId(0), ColId(0), "5").unwrap();
+        assert_eq!(eng.recalc_all(), 1);
+        let sh = eng.workbook().sheet(s).unwrap();
+        assert_eq!(sh.value_by_id(RowId(0), ColId(2)), Value::Number(42.0));
+    }
+
+    #[test]
+    fn topological_wavefront_evaluates_diamond_sink_once() {
+        let mut eng = FormulaEngine::new();
+        let s = SheetId(0);
+        eng.edit_cell_raw(s, RowId(0), ColId(0), "1").unwrap();
+        eng.edit_cell_raw(s, RowId(0), ColId(1), "=A1*2").unwrap();
+        eng.edit_cell_raw(s, RowId(0), ColId(2), "=A1*3").unwrap();
+        eng.edit_cell_raw(s, RowId(0), ColId(3), "=B1+C1").unwrap();
+        eng.recalc_all();
+        assert_eq!(
+            eng.workbook()
+                .sheet(s)
+                .unwrap()
+                .value_by_id(RowId(0), ColId(3)),
+            Value::Number(5.0)
+        );
+
+        eng.edit_cell_raw(s, RowId(0), ColId(0), "2").unwrap();
+        assert_eq!(eng.recalc_all(), 3);
+        assert_eq!(
+            eng.workbook()
+                .sheet(s)
+                .unwrap()
+                .value_by_id(RowId(0), ColId(3)),
+            Value::Number(10.0)
+        );
     }
 }

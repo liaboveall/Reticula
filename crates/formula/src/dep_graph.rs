@@ -200,6 +200,72 @@ impl FormulaRegistration {
             || ranges.full_cols.iter().any(|&(s, _)| s == target)
             || ranges.full_rows.iter().any(|&(s, _)| s == target)
     }
+
+    /// Direct single-cell precedents `(sheet, row, col)`.
+    #[must_use]
+    pub fn single_cells(&self) -> &[WorkbookCellKey] {
+        &self.single_cells
+    }
+
+    /// Whether this formula references named ranges or `#` spill operators
+    /// whose indirect target dependencies bypass `STATE_MAYBE_DIRTY`.
+    #[must_use]
+    pub const fn has_extra(&self) -> bool {
+        self.extra.is_some()
+    }
+
+    /// Visits every static range precedent `(sheet, first_row, last_row, first_col, last_col)`
+    /// recorded in this registration.
+    pub fn for_each_range_span(
+        &self,
+        workbook: &Workbook<BoundFormula>,
+        mut f: impl FnMut(SheetId, u64, u64, u64, u64),
+    ) {
+        if let Some(ranges) = self.ranges.as_deref() {
+            for_each_range_reg_span(ranges, workbook, &mut f);
+        }
+    }
+}
+
+fn for_each_range_reg_span(
+    ranges: &RangeRegistrations,
+    workbook: &Workbook<BoundFormula>,
+    f: &mut impl FnMut(SheetId, u64, u64, u64, u64),
+) {
+    for &(s, col, r1, r2) in &ranges.col_spans {
+        f(s, r1.0, r2.0, col.0, col.0);
+    }
+    for &(s, sub) in &ranges.areas {
+        f(
+            s,
+            sub.first_row.0,
+            sub.last_row.0,
+            sub.first_col.0,
+            sub.last_col.0,
+        );
+    }
+    for &(s, sub) in &ranges.full_cols {
+        if let Some(sh) = workbook.sheet(s)
+            && let (Some(r1), Some(r2)) = (
+                sh.row_axis().pos_to_id(0),
+                sh.row_axis()
+                    .pos_to_id(sh.row_axis().live_len().saturating_sub(1)),
+            )
+        {
+            f(s, r1, r2, sub.first_col.0, sub.last_col.0);
+        }
+    }
+    for &(s, sub) in &ranges.full_rows {
+        if let Some(sh) = workbook.sheet(s)
+            && let (Some(c1), Some(c2)) = (
+                sh.col_axis().pos_to_id(0),
+                sh.col_axis()
+                    .pos_to_id(sh.col_axis().live_len().saturating_sub(1)),
+            )
+        {
+            f(s, sub.first_row.0, sub.last_row.0, c1, c2);
+        }
+    }
 }
 
 /// Affine single-cell subscription targeting a column strip (`sid`).
@@ -260,6 +326,30 @@ impl StripRegistration {
             || ranges.full_cols.iter().any(|&(s, _)| s == target)
             || ranges.full_rows.iter().any(|&(s, _)| s == target)
     }
+
+    /// Affine cell precedents subscribed by this strip.
+    #[must_use]
+    pub fn cell_subs(&self) -> &[(SheetId, ColId, StripCellSub)] {
+        &self.cell_subs
+    }
+
+    /// Affine range precedents subscribed by this strip.
+    #[must_use]
+    pub fn area_subs(&self) -> &[(SheetId, StripAreaSub)] {
+        &self.area_subs
+    }
+
+    /// Visits every fixed range precedent `(sheet, first_row, last_row, first_col, last_col)`
+    /// shared across the strip.
+    pub fn for_each_fixed_range_span(
+        &self,
+        workbook: &Workbook<BoundFormula>,
+        mut f: impl FnMut(SheetId, u64, u64, u64, u64),
+    ) {
+        if let Some(ranges) = self.fixed_ranges.as_deref() {
+            for_each_range_reg_span(ranges, workbook, &mut f);
+        }
+    }
 }
 
 /// Reverse dependency graph keyed by dense `FormulaId` (`u32`).
@@ -287,6 +377,8 @@ pub struct FormulaFlags {
     pub volatile: bool,
     /// Whether the formula calls a filter-sensitive function (`SUBTOTAL`, `AGGREGATE`).
     pub filter_sensitive: bool,
+    /// Whether the formula calls dynamic reference functions (`INDIRECT`, `OFFSET`).
+    pub has_dynamic_ref: bool,
 }
 
 impl DepGraph {
@@ -411,6 +503,7 @@ impl DepGraph {
             FormulaFlags {
                 volatile: flags.volatile,
                 filter_sensitive: flags.filter_sensitive,
+                has_dynamic_ref: flags.has_dynamic_ref,
             },
         )
     }
@@ -512,6 +605,7 @@ impl DepGraph {
             FormulaFlags {
                 volatile: flags.volatile,
                 filter_sensitive: flags.filter_sensitive,
+                has_dynamic_ref: flags.has_dynamic_ref,
             },
         )
     }
@@ -1580,6 +1674,9 @@ fn collect_affine_refs(
             if is_filter_sensitive_function(name) {
                 flags.filter_sensitive = true;
             }
+            if name == "INDIRECT" || name == "OFFSET" {
+                flags.has_dynamic_ref = true;
+            }
             for arg in args {
                 collect_affine_refs(arg, host_sheet, sid, strip_len, reg, flags);
             }
@@ -1757,6 +1854,7 @@ struct WalkFlags {
     structural: bool,
     volatile: bool,
     filter_sensitive: bool,
+    has_dynamic_ref: bool,
 }
 
 fn collect_refs(
@@ -1898,6 +1996,9 @@ fn collect_refs(
             }
             if is_filter_sensitive_function(name) {
                 flags.filter_sensitive = true;
+            }
+            if name == "INDIRECT" || name == "OFFSET" {
+                flags.has_dynamic_ref = true;
             }
             for arg in args {
                 collect_refs(arg, host_sheet, fid, reg, flags);
