@@ -116,6 +116,45 @@
         "b7aInsertCrossP50Ms": 2.46,
         "b7aInsertTopUs": 5.1
       }
+    },
+    {
+      "browser": "chrome 158.0.8127.36",
+      "commit": "0610c53",
+      "cpu": "13th Gen Intel(R) Core(TM) i9-13980HX",
+      "date": "2026-11-24",
+      "native": {
+        "b11ProbeP95Ms": null,
+        "b11Save20mMs": 499.78,
+        "b12Load50mMs": 292.27,
+        "b12PeakWasmMiB": null,
+        "b12Recalc100kMs": 0.56,
+        "b12Save50mMs": 413.72,
+        "b1Load20mMs": 282.38,
+        "b2Sum1mMs": 1.67,
+        "b3FullRecalc1mMs": 5.97,
+        "b4Incremental100kP50Ms": 0.31,
+        "b4Incremental100kP95Ms": 0.37,
+        "b5Chain1mMs": 16.57,
+        "b7aInsertCrossP50Ms": 1.64,
+        "b7aInsertTopUs": 3.0
+      },
+      "suite": "m3b-engine",
+      "wasmChrome": {
+        "b11ProbeP95Ms": 8.15,
+        "b11Save20mMs": 510.4,
+        "b12Load50mMs": 402.93,
+        "b12PeakWasmMiB": 552.63,
+        "b12Recalc100kMs": 1.21,
+        "b12Save50mMs": 620.29,
+        "b1Load20mMs": 324.79,
+        "b2Sum1mMs": 2.52,
+        "b3FullRecalc1mMs": 7.77,
+        "b4Incremental100kP50Ms": 0.64,
+        "b4Incremental100kP95Ms": 1.1,
+        "b5Chain1mMs": 19.6,
+        "b7aInsertCrossP50Ms": 2.17,
+        "b7aInsertTopUs": 4.7
+      }
     }
   ],
   "latestDiff": {
@@ -590,6 +629,14 @@
       "firstScreenP50Ms": 1115.1,
       "networkLabel": "20 Mbps / 50 ms RTT",
       "shellP50Ms": 538.0,
+      "suite": "s9"
+    },
+    {
+      "commit": "0610c53",
+      "date": "2026-11-24",
+      "firstScreenP50Ms": 1033.2,
+      "networkLabel": "20 Mbps / 50 ms RTT",
+      "shellP50Ms": 496.9,
       "suite": "s9"
     }
   ],

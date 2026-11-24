@@ -1,0 +1,1279 @@
+{
+ "spike": "s9",
+ "date": "2026-11-24T10:13:32.305Z",
+ "commit": "0610c53",
+ "uncommittedChanges": false,
+ "machine": {
+  "cpu": "13th Gen Intel(R) Core(TM) i9-13980HX",
+  "logicalProcessors": 32,
+  "memoryGB": 32,
+  "os": "Windows_NT 10.0.26300 x64"
+ },
+ "browser": {
+  "name": "chrome",
+  "version": "158.0.8127.36",
+  "headless": true,
+  "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/158.0.0.0 Safari/537.36"
+ },
+ "options": {
+  "browser": "chrome",
+  "runs": 20,
+  "path": "/app",
+  "network": "reference",
+  "connect": 2,
+  "shaping": "server",
+  "encoding": "br",
+  "slowdown": 1,
+  "affinity": "FFFF",
+  "headed": false,
+  "quick": false,
+  "out": "target/spikes/startup/m3b-startup.json"
+ },
+ "network": {
+  "roundTripMs": 50,
+  "downBitsPerSecond": 20000000,
+  "upBitsPerSecond": 5000000,
+  "connectRoundTrips": 2,
+  "heldBackBy": "server"
+ },
+ "targets": {
+  "shell": 1500,
+  "firstScreen": 2000
+ },
+ "sizes": [
+  {
+   "file": "assets/AccountPage-DdpySvyD.js",
+   "raw": 5072,
+   "gzip": 1796,
+   "brotli": 1537
+  },
+  {
+   "file": "assets/AiPanel-B1cPiA3f.js",
+   "raw": 19247,
+   "gzip": 5838,
+   "brotli": 5202
+  },
+  {
+   "file": "assets/AiPanel-B62h7QzG.css",
+   "raw": 3252,
+   "gzip": 976,
+   "brotli": 805
+  },
+  {
+   "file": "assets/BenchmarksPage-CYbzaVon.js",
+   "raw": 20207,
+   "gzip": 5561,
+   "brotli": 4883
+  },
+  {
+   "file": "assets/collab-storage-BuPsyAFi.js",
+   "raw": 5839,
+   "gzip": 2361,
+   "brotli": 2121
+  },
+  {
+   "file": "assets/collab-transport-CsvTDOyo.js",
+   "raw": 3546,
+   "gzip": 1616,
+   "brotli": 1412
+  },
+  {
+   "file": "assets/CollabShell-CCAtreiA.js",
+   "raw": 16762,
+   "gzip": 4885,
+   "brotli": 4381
+  },
+  {
+   "file": "assets/CollabShell-DjvTo8YY.css",
+   "raw": 5365,
+   "gzip": 1176,
+   "brotli": 998
+  },
+  {
+   "file": "assets/draft-preview-CT04bTX1.js",
+   "raw": 2925,
+   "gzip": 1208,
+   "brotli": 1069
+  },
+  {
+   "file": "assets/HistoryDrawer-BjlnfVLM.js",
+   "raw": 6119,
+   "gzip": 1974,
+   "brotli": 1775
+  },
+  {
+   "file": "assets/index-CLc2hvpR.js",
+   "raw": 582138,
+   "gzip": 177135,
+   "brotli": 152328
+  },
+  {
+   "file": "assets/index-DHA4cX8V.css",
+   "raw": 23974,
+   "gzip": 4792,
+   "brotli": 4222
+  },
+  {
+   "file": "assets/LocalModals-CQTJIUqw.js",
+   "raw": 11092,
+   "gzip": 3798,
+   "brotli": 3363
+  },
+  {
+   "file": "assets/M3aToolsModal-0iiTf59j.js",
+   "raw": 17490,
+   "gzip": 4139,
+   "brotli": 3663
+  },
+  {
+   "file": "assets/pages-C6mkCrg6.css",
+   "raw": 3479,
+   "gzip": 965,
+   "brotli": 792
+  },
+  {
+   "file": "assets/PrivacyPage-KAzB66ZF.js",
+   "raw": 2778,
+   "gzip": 1083,
+   "brotli": 843
+  },
+  {
+   "file": "assets/reticula_sim_wasm_bg-BZN190gw.wasm",
+   "raw": 3135476,
+   "gzip": 981632,
+   "brotli": 684281
+  },
+  {
+   "file": "assets/reticula_wasm_bg-B2bT0-jS.wasm",
+   "raw": 4284556,
+   "gzip": 1370101,
+   "brotli": 937804
+  },
+  {
+   "file": "assets/reticula_xlsx_wasm_bg-mh7ZG_TU.wasm",
+   "raw": 2711799,
+   "gzip": 1119782,
+   "brotli": 764849
+  },
+  {
+   "file": "assets/SimLabPage-CUckM-SM.js",
+   "raw": 21742,
+   "gzip": 6555,
+   "brotli": 5899
+  },
+  {
+   "file": "assets/SimLabPage-rn1fgof4.css",
+   "raw": 3284,
+   "gzip": 841,
+   "brotli": 690
+  },
+  {
+   "file": "assets/storage-w4kfFNRP.js",
+   "raw": 2241,
+   "gzip": 997,
+   "brotli": 903
+  },
+  {
+   "file": "assets/WorkbooksPage-BlEC48ZT.js",
+   "raw": 9066,
+   "gzip": 2715,
+   "brotli": 2369
+  },
+  {
+   "file": "assets/worker-CCXTLBmb.js",
+   "raw": 45472,
+   "gzip": 13166,
+   "brotli": 11832
+  },
+  {
+   "file": "assets/xlsxBridge-We53zYmt.js",
+   "raw": 9367,
+   "gzip": 3341,
+   "brotli": 3014
+  },
+  {
+   "file": "data/ai-replays/cohort-kpi-named-range.json",
+   "raw": 6755,
+   "gzip": 2218,
+   "brotli": 1951
+  },
+  {
+   "file": "data/ai-replays/conflict-and-closure-demo.json",
+   "raw": 7931,
+   "gzip": 2563,
+   "brotli": 2267
+  },
+  {
+   "file": "data/ai-replays/date-sla-tracking.json",
+   "raw": 7929,
+   "gzip": 2350,
+   "brotli": 2005
+  },
+  {
+   "file": "data/ai-replays/dynamic-top5-spill.json",
+   "raw": 7223,
+   "gzip": 2311,
+   "brotli": 2012
+  },
+  {
+   "file": "data/ai-replays/gross-margin-audit.json",
+   "raw": 8008,
+   "gzip": 2524,
+   "brotli": 2189
+  },
+  {
+   "file": "data/ai-replays/index.json",
+   "raw": 5226,
+   "gzip": 1712,
+   "brotli": 1416
+  },
+  {
+   "file": "data/ai-replays/messy-text-cleanup.json",
+   "raw": 7703,
+   "gzip": 2258,
+   "brotli": 1943
+  },
+  {
+   "file": "data/ai-replays/monthly-budget-variance.json",
+   "raw": 10049,
+   "gzip": 2896,
+   "brotli": 2474
+  },
+  {
+   "file": "data/ai-replays/quarterly-sort-ranking.json",
+   "raw": 9067,
+   "gzip": 2638,
+   "brotli": 2316
+  },
+  {
+   "file": "data/ai-replays/regional-sales-summary.json",
+   "raw": 11135,
+   "gzip": 2989,
+   "brotli": 2536
+  },
+  {
+   "file": "data/ai-replays/xlookup-price-join.json",
+   "raw": 8442,
+   "gzip": 2311,
+   "brotli": 1991
+  },
+  {
+   "file": "data/benchmarks-history.json",
+   "raw": 19999,
+   "gzip": 3598,
+   "brotli": 3033
+  },
+  {
+   "file": "index.html",
+   "raw": 640,
+   "gzip": 355,
+   "brotli": 233
+  },
+  {
+   "file": "sw.js",
+   "raw": 2745,
+   "gzip": 1316,
+   "brotli": 1137
+  }
+ ],
+ "requests": [
+  {
+   "path": "/app",
+   "encoding": "br",
+   "bytes": 233
+  },
+  {
+   "path": "/assets/index-DHA4cX8V.css",
+   "encoding": "br",
+   "bytes": 4222
+  },
+  {
+   "path": "/assets/index-CLc2hvpR.js",
+   "encoding": "br",
+   "bytes": 152328
+  },
+  {
+   "path": "/assets/worker-CCXTLBmb.js",
+   "encoding": "br",
+   "bytes": 11832
+  },
+  {
+   "path": "/assets/reticula_wasm_bg-B2bT0-jS.wasm",
+   "encoding": "br",
+   "bytes": 937804
+  },
+  {
+   "path": "/sw.js",
+   "encoding": "br",
+   "bytes": 1137
+  }
+ ],
+ "results": {
+  "shell": {
+   "count": 20,
+   "min": 434.30000001192093,
+   "p50": 496.90000000596046,
+   "p95": 566.6000000238419,
+   "max": 566.6000000238419
+  },
+  "firstScreen": {
+   "count": 20,
+   "min": 1020,
+   "p50": 1033.2000000178814,
+   "p95": 1191.5,
+   "max": 1191.5
+  },
+  "steps": {
+   "document, first byte": {
+    "count": 20,
+    "min": 154.40000000596046,
+    "p50": 154.80000001192093,
+    "p95": 156.7999999821186,
+    "max": 156.7999999821186
+   },
+   "script, loaded": {
+    "count": 20,
+    "min": 338.80000001192093,
+    "p50": 341.40000000596046,
+    "p95": 348,
+    "max": 348
+   },
+   "style sheet, loaded": {
+    "count": 20,
+    "min": 214.09999999403954,
+    "p50": 216.19999998807907,
+    "p95": 224,
+    "max": 224
+   },
+   "first contentful paint": {
+    "count": 20,
+    "min": 488,
+    "p50": 504,
+    "p95": 576,
+    "max": 576
+   },
+   "shell: the grid's first frame": {
+    "count": 20,
+    "min": 434.30000001192093,
+    "p50": 496.90000000596046,
+    "p95": 566.6000000238419,
+    "max": 566.6000000238419
+   },
+   "worker's script, loaded": {
+    "count": 20,
+    "min": 228.69999998807907,
+    "p50": 230.5,
+    "p95": 236.40000000596046,
+    "max": 236.40000000596046
+   },
+   "worker running": {
+    "count": 20,
+    "min": 437.800048828125,
+    "p50": 499.699951171875,
+    "p95": 505.7998046875,
+    "max": 505.7998046875
+   },
+   "wasm, downloaded": {
+    "count": 20,
+    "min": 654.7000976502895,
+    "p50": 656.7000976800919,
+    "p95": 663.0998046994209,
+    "max": 663.0998046994209
+   },
+   "wasm, compiled and instantiated": {
+    "count": 20,
+    "min": 660.60009765625,
+    "p50": 662.4999511837959,
+    "p95": 668.8998046815395,
+    "max": 668.8998046815395
+   },
+   "sample generated": {
+    "count": 20,
+    "min": 995.2998535037041,
+    "p50": 1005.3999511599541,
+    "p95": 1165.699951171875,
+    "max": 1165.699951171875
+   },
+   "page told that the engine is ready": {
+    "count": 20,
+    "min": 996,
+    "p50": 1006.1000000238419,
+    "p95": 1166.800000011921,
+    "max": 1166.800000011921
+   },
+   "first screen drawn": {
+    "count": 20,
+    "min": 1020,
+    "p50": 1033.2000000178814,
+    "p95": 1191.5,
+    "max": 1191.5
+   }
+  },
+  "parts": {
+   "wasm: compiling after the download ended": {
+    "count": 20,
+    "min": 5.699999988079071,
+    "p50": 5.9000000059604645,
+    "p95": 7.199999988079071,
+    "max": 7.199999988079071
+   },
+   "generating the sample": {
+    "count": 20,
+    "min": 332.09999999403954,
+    "p50": 341.7000000178814,
+    "p95": 502.30000001192093,
+    "max": 502.30000001192093
+   },
+   "engine ready to first screen": {
+    "count": 20,
+    "min": 24,
+    "p50": 27,
+    "p95": 28.700000017881393,
+    "max": 28.700000017881393
+   }
+  }
+ },
+ "visits": [
+  {
+   "marks": {
+    "shell": 493.40000000596046,
+    "engineReady": 1005.6999999880791,
+    "firstScreen": 1034.2999999821186,
+    "workerStarted": 442.900146484375,
+    "wasmReady": 663.900146484375,
+    "sampleReady": 1004.8001464903355
+   },
+   "document": {
+    "firstByte": 156.7999999821186,
+    "end": 157.2999999821186,
+    "transferSize": 533
+   },
+   "script": {
+    "start": 160.40000000596046,
+    "end": 342.19999998807907,
+    "transferSize": 152628
+   },
+   "style": {
+    "start": 160.5,
+    "end": 217.7999999821186,
+    "transferSize": 4522
+   },
+   "workerScript": {
+    "start": 160.59999999403954,
+    "end": 231.69999998807907,
+    "transferSize": 12132
+   },
+   "wasm": {
+    "start": 447.70014649629593,
+    "end": 657.7001464962959,
+    "transferSize": 0
+   },
+   "firstContentfulPaint": 524,
+   "compileAfterDownload": 6.199999988079071,
+   "generation": 340.90000000596046,
+   "generationAsShown": 320.7,
+   "readyToFirstScreen": 28.599999994039536,
+   "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/158.0.0.0 Safari/537.36",
+   "problems": []
+  },
+  {
+   "marks": {
+    "shell": 499.2999999821186,
+    "engineReady": 1001.3999999761581,
+    "firstScreen": 1027.5999999940395,
+    "workerStarted": 505,
+    "wasmReady": 661.0999999940395,
+    "sampleReady": 1000.4000000059605
+   },
+   "document": {
+    "firstByte": 154.89999997615814,
+    "end": 155.39999997615814,
+    "transferSize": 533
+   },
+   "script": {
+    "start": 158.19999998807907,
+    "end": 340.5,
+    "transferSize": 152628
+   },
+   "style": {
+    "start": 158.2999999821186,
+    "end": 214.09999999403954,
+    "transferSize": 4522
+   },
+   "workerScript": {
+    "start": 158.2999999821186,
+    "end": 228.69999998807907,
+    "transferSize": 12132
+   },
+   "wasm": {
+    "start": 510.69999998807907,
+    "end": 655.1999999880791,
+    "transferSize": 0
+   },
+   "firstContentfulPaint": 504,
+   "compileAfterDownload": 5.9000000059604645,
+   "generation": 339.30000001192093,
+   "generationAsShown": 318.5,
+   "readyToFirstScreen": 26.200000017881393,
+   "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/158.0.0.0 Safari/537.36",
+   "problems": []
+  },
+  {
+   "marks": {
+    "shell": 481.80000001192093,
+    "engineReady": 1001.8000000119209,
+    "firstScreen": 1029,
+    "workerStarted": 440.800048828125,
+    "wasmReady": 661.5000488162041,
+    "sampleReady": 1001.1000488102436
+   },
+   "document": {
+    "firstByte": 155.09999999403954,
+    "end": 155.59999999403954,
+    "transferSize": 533
+   },
+   "script": {
+    "start": 158.59999999403954,
+    "end": 340.5,
+    "transferSize": 152628
+   },
+   "style": {
+    "start": 158.7000000178814,
+    "end": 214.2000000178814,
+    "transferSize": 4522
+   },
+   "workerScript": {
+    "start": 158.7000000178814,
+    "end": 228.80000001192093,
+    "transferSize": 12132
+   },
+   "wasm": {
+    "start": 446.40004882216454,
+    "end": 655.5000488162041,
+    "transferSize": 0
+   },
+   "firstContentfulPaint": 488,
+   "compileAfterDownload": 6,
+   "generation": 339.59999999403954,
+   "generationAsShown": 317.1,
+   "readyToFirstScreen": 27.19999998807907,
+   "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/158.0.0.0 Safari/537.36",
+   "problems": []
+  },
+  {
+   "marks": {
+    "shell": 493.7000000178814,
+    "engineReady": 1166.800000011921,
+    "firstScreen": 1191.5,
+    "workerStarted": 499.699951171875,
+    "wasmReady": 663.3999511599541,
+    "sampleReady": 1165.699951171875
+   },
+   "document": {
+    "firstByte": 154.80000001192093,
+    "end": 155.40000000596046,
+    "transferSize": 533
+   },
+   "script": {
+    "start": 158.5,
+    "end": 342.5,
+    "transferSize": 152628
+   },
+   "style": {
+    "start": 158.7000000178814,
+    "end": 218.40000000596046,
+    "transferSize": 4522
+   },
+   "workerScript": {
+    "start": 158.7000000178814,
+    "end": 230.80000001192093,
+    "transferSize": 12132
+   },
+   "wasm": {
+    "start": 508.199951171875,
+    "end": 657.2999511659145,
+    "transferSize": 0
+   },
+   "firstContentfulPaint": 504,
+   "compileAfterDownload": 6.0999999940395355,
+   "generation": 502.30000001192093,
+   "generationAsShown": 481.2,
+   "readyToFirstScreen": 24.69999998807907,
+   "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/158.0.0.0 Safari/537.36",
+   "problems": []
+  },
+  {
+   "marks": {
+    "shell": 566.6000000238419,
+    "engineReady": 997,
+    "firstScreen": 1025,
+    "workerStarted": 443.60009765625,
+    "wasmReady": 660.60009765625,
+    "sampleReady": 995.9000976383686
+   },
+   "document": {
+    "firstByte": 154.7000000178814,
+    "end": 155.2000000178814,
+    "transferSize": 533
+   },
+   "script": {
+    "start": 157.90000000596046,
+    "end": 338.80000001192093,
+    "transferSize": 152628
+   },
+   "style": {
+    "start": 158.10000002384186,
+    "end": 218.2000000178814,
+    "transferSize": 4522
+   },
+   "workerScript": {
+    "start": 158.2000000178814,
+    "end": 229.40000000596046,
+    "transferSize": 12132
+   },
+   "wasm": {
+    "start": 447.80009764432907,
+    "end": 654.7000976502895,
+    "transferSize": 0
+   },
+   "firstContentfulPaint": 572,
+   "compileAfterDownload": 5.9000000059604645,
+   "generation": 335.2999999821186,
+   "generationAsShown": 314,
+   "readyToFirstScreen": 28,
+   "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/158.0.0.0 Safari/537.36",
+   "problems": []
+  },
+  {
+   "marks": {
+    "shell": 488.69999998807907,
+    "engineReady": 1001.5999999940395,
+    "firstScreen": 1030.199999988079,
+    "workerStarted": 494.10009765625,
+    "wasmReady": 662.60009765625,
+    "sampleReady": 1000.8000976741314
+   },
+   "document": {
+    "firstByte": 154.59999999403954,
+    "end": 155.40000000596046,
+    "transferSize": 533
+   },
+   "script": {
+    "start": 158.69999998807907,
+    "end": 341.40000000596046,
+    "transferSize": 152628
+   },
+   "style": {
+    "start": 158.80000001192093,
+    "end": 216.19999998807907,
+    "transferSize": 4522
+   },
+   "workerScript": {
+    "start": 158.90000000596046,
+    "end": 230.19999998807907,
+    "transferSize": 12132
+   },
+   "wasm": {
+    "start": 500.40009766817093,
+    "end": 656.7000976800919,
+    "transferSize": 0
+   },
+   "firstContentfulPaint": 492,
+   "compileAfterDownload": 5.899999976158142,
+   "generation": 338.2000000178814,
+   "generationAsShown": 316.8,
+   "readyToFirstScreen": 28.599999994039536,
+   "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/158.0.0.0 Safari/537.36",
+   "problems": []
+  },
+  {
+   "marks": {
+    "shell": 495.09999999403954,
+    "engineReady": 996,
+    "firstScreen": 1020,
+    "workerStarted": 501.099853515625,
+    "wasmReady": 663.1998535096645,
+    "sampleReady": 995.2998535037041
+   },
+   "document": {
+    "firstByte": 154.40000000596046,
+    "end": 155,
+    "transferSize": 533
+   },
+   "script": {
+    "start": 159.2999999821186,
+    "end": 342.40000000596046,
+    "transferSize": 152628
+   },
+   "style": {
+    "start": 159.40000000596046,
+    "end": 216.19999998807907,
+    "transferSize": 4522
+   },
+   "workerScript": {
+    "start": 159.5,
+    "end": 231.2999999821186,
+    "transferSize": 12132
+   },
+   "wasm": {
+    "start": 506.8998534977436,
+    "end": 657.4998535215855,
+    "transferSize": 0
+   },
+   "firstContentfulPaint": 500,
+   "compileAfterDownload": 5.699999988079071,
+   "generation": 332.09999999403954,
+   "generationAsShown": 310.7,
+   "readyToFirstScreen": 24,
+   "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/158.0.0.0 Safari/537.36",
+   "problems": []
+  },
+  {
+   "marks": {
+    "shell": 513.1000000238419,
+    "engineReady": 1016.3000000119209,
+    "firstScreen": 1043,
+    "workerStarted": 445,
+    "wasmReady": 661.5,
+    "sampleReady": 1015.5999999940395
+   },
+   "document": {
+    "firstByte": 155.10000002384186,
+    "end": 155.60000002384186,
+    "transferSize": 533
+   },
+   "script": {
+    "start": 158.5,
+    "end": 340.30000001192093,
+    "transferSize": 152628
+   },
+   "style": {
+    "start": 158.7000000178814,
+    "end": 215.7000000178814,
+    "transferSize": 4522
+   },
+   "workerScript": {
+    "start": 158.80000001192093,
+    "end": 229.7000000178814,
+    "transferSize": 12132
+   },
+   "wasm": {
+    "start": 449.5,
+    "end": 655.8000000119209,
+    "transferSize": 0
+   },
+   "firstContentfulPaint": 520,
+   "compileAfterDownload": 5.699999988079071,
+   "generation": 354.09999999403954,
+   "generationAsShown": 333.3,
+   "readyToFirstScreen": 26.69999998807907,
+   "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/158.0.0.0 Safari/537.36",
+   "problems": []
+  },
+  {
+   "marks": {
+    "shell": 498.2000000178814,
+    "engineReady": 1005.4000000059605,
+    "firstScreen": 1031.4000000059605,
+    "workerStarted": 504.7998046875,
+    "wasmReady": 663.7998046875,
+    "sampleReady": 1004.4998047053814
+   },
+   "document": {
+    "firstByte": 154.40000000596046,
+    "end": 154.90000000596046,
+    "transferSize": 533
+   },
+   "script": {
+    "start": 159.60000002384186,
+    "end": 343,
+    "transferSize": 152628
+   },
+   "style": {
+    "start": 159.7000000178814,
+    "end": 218.90000000596046,
+    "transferSize": 4522
+   },
+   "workerScript": {
+    "start": 159.7000000178814,
+    "end": 231.90000000596046,
+    "transferSize": 12132
+   },
+   "wasm": {
+    "start": 510.39980468153954,
+    "end": 657.6998046934605,
+    "transferSize": 0
+   },
+   "firstContentfulPaint": 500,
+   "compileAfterDownload": 6.0999999940395355,
+   "generation": 340.7000000178814,
+   "generationAsShown": 318.2,
+   "readyToFirstScreen": 26,
+   "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/158.0.0.0 Safari/537.36",
+   "problems": []
+  },
+  {
+   "marks": {
+    "shell": 500.59999999403954,
+    "engineReady": 1007.6999999880791,
+    "firstScreen": 1034.699999988079,
+    "workerStarted": 505.7998046875,
+    "wasmReady": 668.8998046815395,
+    "sampleReady": 1007.0998046994209
+   },
+   "document": {
+    "firstByte": 154.5,
+    "end": 155,
+    "transferSize": 533
+   },
+   "script": {
+    "start": 164.59999999403954,
+    "end": 348,
+    "transferSize": 152628
+   },
+   "style": {
+    "start": 164.90000000596046,
+    "end": 224,
+    "transferSize": 4522
+   },
+   "workerScript": {
+    "start": 164.90000000596046,
+    "end": 236.40000000596046,
+    "transferSize": 12132
+   },
+   "wasm": {
+    "start": 511.19980469346046,
+    "end": 663.0998046994209,
+    "transferSize": 0
+   },
+   "firstContentfulPaint": 504,
+   "compileAfterDownload": 5.799999982118607,
+   "generation": 338.2000000178814,
+   "generationAsShown": 316.9,
+   "readyToFirstScreen": 27,
+   "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/158.0.0.0 Safari/537.36",
+   "problems": []
+  },
+  {
+   "marks": {
+    "shell": 485.09999999403954,
+    "engineReady": 1015.4000000059605,
+    "firstScreen": 1043.0999999940395,
+    "workerStarted": 442.300048828125,
+    "wasmReady": 664.4000488221645,
+    "sampleReady": 1014.7000488042831
+   },
+   "document": {
+    "firstByte": 155.7999999821186,
+    "end": 156.19999998807907,
+    "transferSize": 533
+   },
+   "script": {
+    "start": 160,
+    "end": 343.7999999821186,
+    "transferSize": 152628
+   },
+   "style": {
+    "start": 160.19999998807907,
+    "end": 220.90000000596046,
+    "transferSize": 4522
+   },
+   "workerScript": {
+    "start": 160.2999999821186,
+    "end": 232.09999999403954,
+    "transferSize": 12132
+   },
+   "wasm": {
+    "start": 446.800048828125,
+    "end": 658.4000488221645,
+    "transferSize": 0
+   },
+   "firstContentfulPaint": 512,
+   "compileAfterDownload": 6,
+   "generation": 350.2999999821186,
+   "generationAsShown": 327.4,
+   "readyToFirstScreen": 27.69999998807907,
+   "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/158.0.0.0 Safari/537.36",
+   "problems": []
+  },
+  {
+   "marks": {
+    "shell": 496.10000002384186,
+    "engineReady": 1011.5,
+    "firstScreen": 1040.2000000178814,
+    "workerStarted": 502,
+    "wasmReady": 663.4000000059605,
+    "sampleReady": 1010.6000000238419
+   },
+   "document": {
+    "firstByte": 155,
+    "end": 155.80000001192093,
+    "transferSize": 533
+   },
+   "script": {
+    "start": 159.10000002384186,
+    "end": 342.60000002384186,
+    "transferSize": 152628
+   },
+   "style": {
+    "start": 159.2000000178814,
+    "end": 219.80000001192093,
+    "transferSize": 4522
+   },
+   "workerScript": {
+    "start": 159.40000000596046,
+    "end": 230.80000001192093,
+    "transferSize": 12132
+   },
+   "wasm": {
+    "start": 507.2000000178814,
+    "end": 657.4000000059605,
+    "transferSize": 0
+   },
+   "firstContentfulPaint": 504,
+   "compileAfterDownload": 6,
+   "generation": 347.2000000178814,
+   "generationAsShown": 325.9,
+   "readyToFirstScreen": 28.700000017881393,
+   "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/158.0.0.0 Safari/537.36",
+   "problems": []
+  },
+  {
+   "marks": {
+    "shell": 543.5999999940395,
+    "engineReady": 1002.5999999940395,
+    "firstScreen": 1027.5999999940395,
+    "workerStarted": 441.60009765625,
+    "wasmReady": 661.5000976622105,
+    "sampleReady": 1001.8000976443291
+   },
+   "document": {
+    "firstByte": 154.59999999403954,
+    "end": 155.2999999821186,
+    "transferSize": 533
+   },
+   "script": {
+    "start": 158.59999999403954,
+    "end": 340.89999997615814,
+    "transferSize": 152628
+   },
+   "style": {
+    "start": 158.89999997615814,
+    "end": 214.59999999403954,
+    "transferSize": 4522
+   },
+   "workerScript": {
+    "start": 159,
+    "end": 229.19999998807907,
+    "transferSize": 12132
+   },
+   "wasm": {
+    "start": 446.00009766221046,
+    "end": 655.60009765625,
+    "transferSize": 0
+   },
+   "firstContentfulPaint": 576,
+   "compileAfterDownload": 5.9000000059604645,
+   "generation": 340.2999999821186,
+   "generationAsShown": 319,
+   "readyToFirstScreen": 25,
+   "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/158.0.0.0 Safari/537.36",
+   "problems": []
+  },
+  {
+   "marks": {
+    "shell": 499.2000000178814,
+    "engineReady": 1012.2000000178814,
+    "firstScreen": 1039.800000011921,
+    "workerStarted": 505,
+    "wasmReady": 660.9000000059605,
+    "sampleReady": 1011.4000000059605
+   },
+   "document": {
+    "firstByte": 154.5,
+    "end": 154.90000000596046,
+    "transferSize": 533
+   },
+   "script": {
+    "start": 157.80000001192093,
+    "end": 339.7000000178814,
+    "transferSize": 152628
+   },
+   "style": {
+    "start": 158,
+    "end": 214.2000000178814,
+    "transferSize": 4522
+   },
+   "workerScript": {
+    "start": 158,
+    "end": 228.90000000596046,
+    "transferSize": 12132
+   },
+   "wasm": {
+    "start": 510.30000001192093,
+    "end": 655.0999999940395,
+    "transferSize": 0
+   },
+   "firstContentfulPaint": 500,
+   "compileAfterDownload": 5.800000011920929,
+   "generation": 350.5,
+   "generationAsShown": 328.2,
+   "readyToFirstScreen": 27.599999994039536,
+   "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/158.0.0.0 Safari/537.36",
+   "problems": []
+  },
+  {
+   "marks": {
+    "shell": 435.2999999821186,
+    "engineReady": 1003.6999999880791,
+    "firstScreen": 1029.0999999940395,
+    "workerStarted": 442.099853515625,
+    "wasmReady": 661.9998535215855,
+    "sampleReady": 1002.9998535215855
+   },
+   "document": {
+    "firstByte": 155.19999998807907,
+    "end": 155.69999998807907,
+    "transferSize": 533
+   },
+   "script": {
+    "start": 159,
+    "end": 341.40000000596046,
+    "transferSize": 152628
+   },
+   "style": {
+    "start": 159.19999998807907,
+    "end": 215.69999998807907,
+    "transferSize": 4522
+   },
+   "workerScript": {
+    "start": 159.19999998807907,
+    "end": 229.69999998807907,
+    "transferSize": 12132
+   },
+   "wasm": {
+    "start": 448.3998534977436,
+    "end": 656.2998535037041,
+    "transferSize": 0
+   },
+   "firstContentfulPaint": 528,
+   "compileAfterDownload": 5.700000017881393,
+   "generation": 341,
+   "generationAsShown": 319.1,
+   "readyToFirstScreen": 25.400000005960464,
+   "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/158.0.0.0 Safari/537.36",
+   "problems": []
+  },
+  {
+   "marks": {
+    "shell": 496.90000000596046,
+    "engineReady": 1007.6999999880791,
+    "firstScreen": 1035,
+    "workerStarted": 502.599853515625,
+    "wasmReady": 661.7998535037041,
+    "sampleReady": 1006.8998535275459
+   },
+   "document": {
+    "firstByte": 155.40000000596046,
+    "end": 156,
+    "transferSize": 533
+   },
+   "script": {
+    "start": 158.69999998807907,
+    "end": 340.90000000596046,
+    "transferSize": 152628
+   },
+   "style": {
+    "start": 159,
+    "end": 214.5,
+    "transferSize": 4522
+   },
+   "workerScript": {
+    "start": 159.09999999403954,
+    "end": 229.09999999403954,
+    "transferSize": 12132
+   },
+   "wasm": {
+    "start": 507.89985352754593,
+    "end": 655.7998535037041,
+    "transferSize": 0
+   },
+   "firstContentfulPaint": 500,
+   "compileAfterDownload": 6,
+   "generation": 345.10000002384186,
+   "generationAsShown": 323.7,
+   "readyToFirstScreen": 27.30000001192093,
+   "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/158.0.0.0 Safari/537.36",
+   "problems": []
+  },
+  {
+   "marks": {
+    "shell": 497,
+    "engineReady": 1009.0999999940395,
+    "firstScreen": 1033.2000000178814,
+    "workerStarted": 503.699951171875,
+    "wasmReady": 662.3999511599541,
+    "sampleReady": 1008.199951171875
+   },
+   "document": {
+    "firstByte": 154.7000000178814,
+    "end": 155.09999999403954,
+    "transferSize": 533
+   },
+   "script": {
+    "start": 158,
+    "end": 341.59999999403954,
+    "transferSize": 152628
+   },
+   "style": {
+    "start": 158.2000000178814,
+    "end": 215.80000001192093,
+    "transferSize": 4522
+   },
+   "workerScript": {
+    "start": 158.2000000178814,
+    "end": 229.80000001192093,
+    "transferSize": 12132
+   },
+   "wasm": {
+    "start": 511.39995115995407,
+    "end": 656.5999511480331,
+    "transferSize": 0
+   },
+   "firstContentfulPaint": 500,
+   "compileAfterDownload": 5.800000011920929,
+   "generation": 345.80000001192093,
+   "generationAsShown": 324.6,
+   "readyToFirstScreen": 24.100000023841858,
+   "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/158.0.0.0 Safari/537.36",
+   "problems": []
+  },
+  {
+   "marks": {
+    "shell": 495.5,
+    "engineReady": 1006.1000000238419,
+    "firstScreen": 1032.800000011921,
+    "workerStarted": 501.199951171875,
+    "wasmReady": 662.4999511837959,
+    "sampleReady": 1005.3999511599541
+   },
+   "document": {
+    "firstByte": 154.5,
+    "end": 155,
+    "transferSize": 533
+   },
+   "script": {
+    "start": 158,
+    "end": 341.40000000596046,
+    "transferSize": 152628
+   },
+   "style": {
+    "start": 158.30000001192093,
+    "end": 218.5,
+    "transferSize": 4522
+   },
+   "workerScript": {
+    "start": 158.30000001192093,
+    "end": 230.80000001192093,
+    "transferSize": 12132
+   },
+   "wasm": {
+    "start": 507.09995117783546,
+    "end": 656.7999511659145,
+    "transferSize": 0
+   },
+   "firstContentfulPaint": 500,
+   "compileAfterDownload": 5.700000017881393,
+   "generation": 342.89999997615814,
+   "generationAsShown": 321.6,
+   "readyToFirstScreen": 26.69999998807907,
+   "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/158.0.0.0 Safari/537.36",
+   "problems": []
+  },
+  {
+   "marks": {
+    "shell": 498.09999999403954,
+    "engineReady": 1004.6999999880791,
+    "firstScreen": 1032.199999988079,
+    "workerStarted": 437.800048828125,
+    "wasmReady": 662.1000488102436,
+    "sampleReady": 1003.800048828125
+   },
+   "document": {
+    "firstByte": 155.09999999403954,
+    "end": 155.5,
+    "transferSize": 533
+   },
+   "script": {
+    "start": 158.69999998807907,
+    "end": 339.90000000596046,
+    "transferSize": 152628
+   },
+   "style": {
+    "start": 158.7999999821186,
+    "end": 215.69999998807907,
+    "transferSize": 4522
+   },
+   "workerScript": {
+    "start": 158.7999999821186,
+    "end": 230.5,
+    "transferSize": 12132
+   },
+   "wasm": {
+    "start": 442.40004882216454,
+    "end": 655.800048828125,
+    "transferSize": 0
+   },
+   "firstContentfulPaint": 504,
+   "compileAfterDownload": 6.299999982118607,
+   "generation": 341.7000000178814,
+   "generationAsShown": 320.6,
+   "readyToFirstScreen": 27.5,
+   "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/158.0.0.0 Safari/537.36",
+   "problems": []
+  },
+  {
+   "marks": {
+    "shell": 434.30000001192093,
+    "engineReady": 1009.3000000119209,
+    "firstScreen": 1035.199999988079,
+    "workerStarted": 441.099853515625,
+    "wasmReady": 664.2998535037041,
+    "sampleReady": 1008.599853515625
+   },
+   "document": {
+    "firstByte": 154.80000001192093,
+    "end": 155.59999999403954,
+    "transferSize": 533
+   },
+   "script": {
+    "start": 158.30000001192093,
+    "end": 341.40000000596046,
+    "transferSize": 152628
+   },
+   "style": {
+    "start": 158.40000000596046,
+    "end": 218.19999998807907,
+    "transferSize": 4522
+   },
+   "workerScript": {
+    "start": 158.40000000596046,
+    "end": 230.90000000596046,
+    "transferSize": 12132
+   },
+   "wasm": {
+    "start": 447.29985350370407,
+    "end": 657.099853515625,
+    "transferSize": 0
+   },
+   "firstContentfulPaint": 532,
+   "compileAfterDownload": 7.199999988079071,
+   "generation": 344.30000001192093,
+   "generationAsShown": 321.3,
+   "readyToFirstScreen": 25.899999976158142,
+   "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/158.0.0.0 Safari/537.36",
+   "problems": []
+  }
+ ],
+ "problems": []
+}
