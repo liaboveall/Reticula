@@ -2187,4 +2187,81 @@ proptest! {
     ) {
         assert_spill_steps_match_full_recalc(&steps)?;
     }
+
+    #[test]
+    fn prop_strip_batch_matches_ast_per_row_bit_exact(
+        vals in prop::collection::vec(-1000.0_f64..1000.0_f64, 1040..1080),
+        k in -50.0_f64..50.0_f64,
+        kind in 0_u8..5,
+    ) {
+        let len = u32::try_from(vals.len()).unwrap();
+        let mut sheet = reticula_core::sheet::Sheet::with_axes(
+            SheetId(0),
+            String::from("Sheet1"),
+            len.saturating_add(16),
+            6,
+        );
+        sheet.set_value_by_id(RowId(0), ColId(5), reticula_core::value::Value::Number(k));
+        for (i, &v) in vals.iter().enumerate() {
+            let rid = RowId(u64::from(u32::try_from(i).unwrap()));
+            let a = (v * 100.0).round() / 100.0;
+            let b = if i % 11 == 0 { 0.0 } else { (v * 0.5).round() / 10.0 };
+            sheet.set_value_by_id(rid, ColId(0), reticula_core::value::Value::Number(a));
+            sheet.set_value_by_id(rid, ColId(1), reticula_core::value::Value::Number(b));
+        }
+        let mut wb = Workbook::<BoundFormula>::from_sheet(sheet, None);
+        let pat = match kind {
+            0 => "=A{r}*B{r}+$F$1",
+            1 => "=IF(B{r}=0, \"zero\", ROUND(A{r}/B{r}, 3))",
+            2 => "=IFERROR(A{r}/B{r}+$F$1, -999)",
+            3 => "=ABS(A{r}-B{r})+ROW()",
+            _ => "=AND(A{r}>0, NOT(B{r}=0))",
+        };
+        let edits: Vec<CellEdit<BoundFormula>> = (1..=len)
+            .map(|r| {
+                let raw = pat.replace("{r}", &format!("{r}"));
+                let ast = parse_formula(&raw).unwrap();
+                let formula = BoundFormula {
+                    mode: FormulaMode::Dynamic,
+                    root: reticula_formula::binder::bind_expr(&ast, &wb, SheetId(0)),
+                };
+                CellEdit {
+                    row: RowId(u64::from(r - 1)),
+                    col: ColId(2),
+                    input: CellInput::Formula {
+                        formula,
+                        cached: None,
+                    },
+                    format: FormatPatch::Keep,
+                }
+            })
+            .collect();
+        wb.apply(Op::SetCells {
+            sheet: SheetId(0),
+            edits,
+        })
+        .unwrap();
+
+        let mut eng_batch = FormulaEngine::from_workbook_recalc_all(wb.clone());
+        let mut eng_ast = FormulaEngine::from_workbook_recalc_all(wb);
+        eng_batch.recalc_all();
+        loop {
+            match eng_ast.recalc_step(1) {
+                RecalcStatus::Complete { .. } => break,
+                RecalcStatus::InProgress { .. } => {}
+            }
+        }
+        let sb = eng_batch.workbook().sheet(SheetId(0)).unwrap();
+        let sa = eng_ast.workbook().sheet(SheetId(0)).unwrap();
+        for r in 0..len {
+            let rid = RowId(u64::from(r));
+            let vb = sb.value_by_id(rid, ColId(2));
+            let va = sa.value_by_id(rid, ColId(2));
+            prop_assert_eq!(
+                reticula_formula::value_eval::EvalScalar::from_sheet_value(sb, vb),
+                reticula_formula::value_eval::EvalScalar::from_sheet_value(sa, va),
+                "row {} mismatch", r
+            );
+        }
+    }
 }

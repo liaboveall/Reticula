@@ -570,14 +570,14 @@ pub(crate) fn empty_to_zero(s: EvalScalar) -> EvalScalar {
 // ------------------------------------------------------------ aggregations
 
 #[derive(Clone, Copy)]
-struct SumAcc {
-    sum: f64,
+pub(crate) struct SumAcc {
+    pub(crate) sum: f64,
     prev_sum: f64,
-    count: u64,
+    pub(crate) count: u64,
 }
 
 impl SumAcc {
-    const fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         Self {
             sum: 0.0,
             prev_sum: 0.0,
@@ -585,7 +585,7 @@ impl SumAcc {
         }
     }
 
-    fn push(&mut self, val: f64) -> Result<(), CalcError> {
+    pub(crate) fn push(&mut self, val: f64) -> Result<(), CalcError> {
         self.prev_sum = self.sum;
         self.sum += val;
         if !self.sum.is_finite() {
@@ -595,7 +595,7 @@ impl SumAcc {
         Ok(())
     }
 
-    fn finish(self) -> f64 {
+    pub(crate) fn finish(self) -> f64 {
         if self.count >= 2 {
             snap_cancelled_zero(self.prev_sum, self.sum)
         } else if self.sum == 0.0 {
@@ -611,7 +611,7 @@ pub(crate) enum RefCellVal<'a> {
     Shadow(&'a EvalScalar),
 }
 
-fn eval_sum(
+pub(crate) fn eval_sum(
     args: &[EvalValue],
     workbook: &Workbook<BoundFormula>,
     spills: &SpillRegistry,
@@ -628,7 +628,7 @@ fn eval_sum(
     EvalScalar::number(acc.finish())
 }
 
-fn eval_average(
+pub(crate) fn eval_average(
     args: &[EvalValue],
     workbook: &Workbook<BoundFormula>,
     spills: &SpillRegistry,
@@ -654,7 +654,7 @@ fn eval_average(
     EvalScalar::number(total / denom)
 }
 
-fn eval_min_max(
+pub(crate) fn eval_min_max(
     args: &[EvalValue],
     workbook: &Workbook<BoundFormula>,
     spills: &SpillRegistry,
@@ -724,7 +724,7 @@ fn visit_numeric_arg(
     }
 }
 
-fn eval_count(
+pub(crate) fn eval_count(
     args: &[EvalValue],
     workbook: &Workbook<BoundFormula>,
     spills: &SpillRegistry,
@@ -766,7 +766,7 @@ fn eval_count(
     EvalScalar::Number(count as f64)
 }
 
-fn eval_counta(
+pub(crate) fn eval_counta(
     args: &[EvalValue],
     workbook: &Workbook<BoundFormula>,
     spills: &SpillRegistry,
@@ -1114,7 +1114,7 @@ fn eval_and_or(
     }
 }
 
-fn eval_round_scalar(x: &EvalScalar, d: &EvalScalar, mode: RoundingMode) -> EvalScalar {
+pub(crate) fn eval_round_scalar(x: &EvalScalar, d: &EvalScalar, mode: RoundingMode) -> EvalScalar {
     let val = match x.to_number() {
         Ok(v) => v,
         Err(e) => return EvalScalar::Error(e),
@@ -1140,7 +1140,7 @@ fn eval_trunc(
     })
 }
 
-fn trunc_to_i32(n: f64) -> Result<i32, CalcError> {
+pub(crate) fn trunc_to_i32(n: f64) -> Result<i32, CalcError> {
     if !n.is_finite() {
         return Err(CalcError::Num);
     }

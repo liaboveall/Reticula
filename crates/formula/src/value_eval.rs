@@ -787,7 +787,7 @@ pub fn eval_unary(
     }
 }
 
-fn apply_unary_scalar(op: UnaryOp, s: &EvalScalar) -> EvalScalar {
+pub(crate) fn apply_unary_scalar(op: UnaryOp, s: &EvalScalar) -> EvalScalar {
     let n = match s.to_number() {
         Ok(v) => v,
         Err(e) => return EvalScalar::Error(e),

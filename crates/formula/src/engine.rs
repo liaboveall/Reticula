@@ -46,9 +46,11 @@ use smallvec::SmallVec;
 
 use crate::address::CellAddr;
 use crate::ast::{BinaryOp, Literal, MAX_NESTING_DEPTH};
+use crate::batch_eval::BatchScratch;
 use crate::binder::{
     AffineExpr, AffineFormula, AffineRef, BoundExpr, BoundFormula, BoundRef, live_span_positions,
 };
+use crate::bytecode::{CHUNK_LEN, CHUNK_LEN_U32, CompiledStripProgram, compile_strip_program};
 use crate::dep_graph::{
     DepGraph, FormulaRegistration, StripRegistration, is_strip_fid, strip_fid, strip_index,
 };
@@ -211,6 +213,7 @@ struct StripSlot {
     start_row: RowId,
     len: u32,
     template: AffineFormula,
+    program: Option<CompiledStripProgram>,
     reg: StripRegistration,
     dirty_intervals: SmallVec<[(u32, u32); 2]>,
     sequential_self_dep: bool,
@@ -300,6 +303,13 @@ enum StripEvalControl {
     ExpandedToSingles,
 }
 
+enum BatchChunkPrep {
+    Ready { host_base_pos: u32, chunk_len: u32 },
+    Blocked(SmallVec<[u32; 4]>),
+    Cycle(usize),
+    FallbackToAst,
+}
+
 #[derive(Default)]
 struct DirtyRoots {
     singles: Vec<u32>,
@@ -379,6 +389,7 @@ pub struct FormulaEngine {
     filter_sensitive_strips: BTreeSet<u32>,
     filters: BTreeMap<SheetId, (FilterTable, VisibleRowProjection)>,
     env: EvalEnv,
+    batch_scratch: BatchScratch,
 }
 
 impl Default for FormulaEngine {
@@ -439,12 +450,21 @@ impl FormulaEngine {
                 if flags.filter_sensitive {
                     filter_sensitive_strips.insert(sid);
                 }
+                let program = compile_strip_program(
+                    &strip.template,
+                    strip.sheet,
+                    strip.col,
+                    strip.start_row,
+                    strip.len,
+                    sequential_self_dep,
+                );
                 strip_slots.push(Some(StripSlot {
                     sheet: strip.sheet,
                     col: strip.col,
                     start_row: strip.start_row,
                     len: strip.len,
                     template: strip.template.clone(),
+                    program,
                     reg,
                     dirty_intervals: SmallVec::new(),
                     sequential_self_dep,
@@ -539,6 +559,7 @@ impl FormulaEngine {
             filter_sensitive_strips,
             filters: BTreeMap::new(),
             env: EvalEnv::default(),
+            batch_scratch: BatchScratch::default(),
         }
     }
 
@@ -3580,12 +3601,21 @@ impl FormulaEngine {
             self.filter_sensitive_strips.insert(sid);
         }
         if let Some(slot_ref) = self.strip_slots.get_mut(sid as usize) {
+            let program = compile_strip_program(
+                &strip.template,
+                strip.sheet,
+                strip.col,
+                strip.start_row,
+                strip.len,
+                sequential_self_dep,
+            );
             *slot_ref = Some(StripSlot {
                 sheet: strip.sheet,
                 col: strip.col,
                 start_row: strip.start_row,
                 len: strip.len,
                 template: strip.template.clone(),
+                program,
                 reg,
                 dirty_intervals: SmallVec::new(),
                 sequential_self_dep,
@@ -3981,6 +4011,137 @@ impl FormulaEngine {
         }
     }
 
+    fn try_prepare_batch_chunk(&self, sid: u32, lo: u32, hi: u32, max_rows: u32) -> BatchChunkPrep {
+        let Some(slot) = self.strip_slot_of(sid) else {
+            return BatchChunkPrep::FallbackToAst;
+        };
+        let Some(ref program) = slot.program else {
+            return BatchChunkPrep::FallbackToAst;
+        };
+        let remaining = hi.saturating_sub(lo);
+        if remaining < 2 || max_rows < 2 {
+            return BatchChunkPrep::FallbackToAst;
+        }
+        let chunk_len = remaining.min(CHUNK_LEN_U32).min(max_rows);
+        if program
+            .touched_sheets
+            .iter()
+            .any(|&s| self.spills.has_spills_on_sheet(s))
+        {
+            return BatchChunkPrep::FallbackToAst;
+        }
+        let Some(host_sheet) = self.workbook.live_sheet(slot.sheet) else {
+            return BatchChunkPrep::FallbackToAst;
+        };
+        if host_sheet.col_axis().id_to_pos(slot.col.0).is_none() {
+            return BatchChunkPrep::FallbackToAst;
+        }
+        let first_host_row = slot.start_row.0.saturating_add(u64::from(lo));
+        let Some(host_base_pos) = host_sheet
+            .row_axis()
+            .live_run_covers(first_host_row, chunk_len)
+        else {
+            return BatchChunkPrep::FallbackToAst;
+        };
+
+        let check_wait = |res: Result<(), ExprOutcome>| -> Option<BatchChunkPrep> {
+            match res {
+                Ok(()) => None,
+                Err(_) if program.has_lazy_branch => Some(BatchChunkPrep::FallbackToAst),
+                Err(ExprOutcome::Blocked(deps)) => Some(BatchChunkPrep::Blocked(deps)),
+                Err(ExprOutcome::Cycle(low)) => Some(BatchChunkPrep::Cycle(low)),
+                Err(ExprOutcome::Ready(_)) => Some(BatchChunkPrep::FallbackToAst),
+            }
+        };
+
+        if program.sequential_self_dep {
+            let Some(min_base) = program.min_self_base_row else {
+                return BatchChunkPrep::FallbackToAst;
+            };
+            let seed_first = min_base.saturating_add(u64::from(lo));
+            let Some(seed_span) = first_host_row
+                .checked_sub(seed_first)
+                .and_then(|d| u32::try_from(d).ok())
+            else {
+                return BatchChunkPrep::FallbackToAst;
+            };
+            let Some(total_self_span) = seed_span.checked_add(chunk_len) else {
+                return BatchChunkPrep::FallbackToAst;
+            };
+            if host_sheet
+                .row_axis()
+                .live_run_covers(seed_first, total_self_span)
+                .is_none()
+            {
+                return BatchChunkPrep::FallbackToAst;
+            }
+            if lo < program.max_self_back && seed_first < slot.start_row.0 {
+                let pre_end = slot.start_row.0.saturating_sub(1);
+                if let Some(fail) = check_wait(
+                    self.check_span_ready(slot.sheet, seed_first, pre_end, slot.col.0, slot.col.0),
+                ) {
+                    return fail;
+                }
+            }
+        }
+
+        for &(s_id, r, c) in &program.fixed_cells {
+            let Some(sh) = self.workbook.live_sheet(s_id) else {
+                return BatchChunkPrep::FallbackToAst;
+            };
+            if sh.row_axis().id_to_pos(r.0).is_none() || sh.col_axis().id_to_pos(c.0).is_none() {
+                return BatchChunkPrep::FallbackToAst;
+            }
+            if let Some(fail) = check_wait(self.check_cell_ready(s_id, r, c)) {
+                return fail;
+            }
+        }
+
+        for spec in &program.stride_cols {
+            let Some(sh) = self.workbook.live_sheet(spec.sheet) else {
+                return BatchChunkPrep::FallbackToAst;
+            };
+            if sh.col_axis().id_to_pos(spec.col.0).is_none() {
+                return BatchChunkPrep::FallbackToAst;
+            }
+            let s_first = spec.base_row.saturating_add(u64::from(lo));
+            if sh.row_axis().live_run_covers(s_first, chunk_len).is_none() {
+                return BatchChunkPrep::FallbackToAst;
+            }
+            let s_last = s_first.saturating_add(u64::from(chunk_len.saturating_sub(1)));
+            if let Some(fail) = check_wait(
+                self.check_span_ready(spec.sheet, s_first, s_last, spec.col.0, spec.col.0),
+            ) {
+                return fail;
+            }
+        }
+
+        for area in &program.fixed_areas {
+            let Some(sh) = self.workbook.live_sheet(area.sheet) else {
+                return BatchChunkPrep::FallbackToAst;
+            };
+            if live_span_positions(sh.row_axis(), area.first_row.0, area.last_row.0).is_none()
+                || live_span_positions(sh.col_axis(), area.first_col.0, area.last_col.0).is_none()
+            {
+                return BatchChunkPrep::FallbackToAst;
+            }
+            if let Some(fail) = check_wait(self.check_span_ready(
+                area.sheet,
+                area.first_row.0,
+                area.last_row.0,
+                area.first_col.0,
+                area.last_col.0,
+            )) {
+                return fail;
+            }
+        }
+
+        BatchChunkPrep::Ready {
+            host_base_pos,
+            chunk_len,
+        }
+    }
+
     fn evaluate_strip_slot(
         &mut self,
         sid: u32,
@@ -3989,6 +4150,107 @@ impl FormulaEngine {
         should_yield: &mut impl FnMut(u32) -> bool,
     ) -> StripEvalControl {
         loop {
+            if stride >= 16
+                && let Some((sheet, col, start_row, lo, hi)) =
+                    self.strip_slot_of(sid).and_then(|s| {
+                        s.dirty_intervals
+                            .first()
+                            .map(|&(lo, hi)| (s.sheet, s.col, s.start_row, lo, hi))
+                    })
+                && let Ok(max_rows) =
+                    u32::try_from(stride.saturating_sub(*since_check).min(CHUNK_LEN))
+                && max_rows >= 2
+                && hi.saturating_sub(lo) >= 2
+            {
+                match self.try_prepare_batch_chunk(sid, lo, hi, max_rows) {
+                    BatchChunkPrep::Ready {
+                        host_base_pos,
+                        chunk_len,
+                    } => {
+                        if let Some(program) = self
+                            .strip_slots
+                            .get(sid as usize)
+                            .and_then(Option::as_ref)
+                            .and_then(|s| s.program.as_ref())
+                        {
+                            self.batch_scratch.eval_strip_chunk(
+                                program,
+                                &self.workbook,
+                                sheet,
+                                host_base_pos,
+                                col,
+                                start_row,
+                                lo,
+                                chunk_len as usize,
+                            );
+                            if let Some(host_sheet) = self.workbook.sheet_mut(sheet) {
+                                for (lane, text) in self.batch_scratch.text_fixups.drain(..) {
+                                    let w = match host_sheet.add_string(&text) {
+                                        Some(id) => Value::Text(id).pack(),
+                                        None => Value::Error(CalcError::Calc).pack(),
+                                    };
+                                    if let Some(dst) = self.batch_scratch.out_words.get_mut(lane) {
+                                        *dst = w;
+                                    }
+                                }
+                                if let Some(src_words) =
+                                    self.batch_scratch.out_words.get(..chunk_len as usize)
+                                {
+                                    let changes_ref = &mut self.changes;
+                                    host_sheet.write_row_id_span_packed(
+                                        RowId(start_row.0.saturating_add(u64::from(lo))),
+                                        col,
+                                        src_words,
+                                        |rel| {
+                                            if !changes_ref.structural {
+                                                if changes_ref.cells.len() < 256 {
+                                                    let r = RowId(
+                                                        start_row
+                                                            .0
+                                                            .saturating_add(u64::from(lo))
+                                                            .saturating_add(u64::from(rel)),
+                                                    );
+                                                    changes_ref.cells.push((sheet, r, col));
+                                                } else {
+                                                    changes_ref.structural = true;
+                                                }
+                                            }
+                                        },
+                                    );
+                                }
+                            }
+                            let remaining_empty =
+                                if let Some(Some(s)) = self.strip_slots.get_mut(sid as usize) {
+                                    if let Some((iv_lo, iv_hi)) = s.dirty_intervals.first_mut() {
+                                        *iv_lo = lo.saturating_add(chunk_len).min(*iv_hi);
+                                        if *iv_lo >= *iv_hi {
+                                            s.dirty_intervals.remove(0);
+                                        }
+                                    }
+                                    s.dirty_intervals.is_empty()
+                                } else {
+                                    true
+                                };
+                            self.wave_done = self.wave_done.saturating_add(chunk_len);
+                            *since_check = (*since_check).saturating_add(chunk_len as usize);
+                            if remaining_empty {
+                                return StripEvalControl::Done;
+                            }
+                            if *since_check >= stride {
+                                *since_check = 0;
+                                if should_yield(self.wave_done) {
+                                    return StripEvalControl::Yielded;
+                                }
+                            }
+                            continue;
+                        }
+                    }
+                    BatchChunkPrep::Blocked(deps) => return StripEvalControl::Blocked(deps),
+                    BatchChunkPrep::Cycle(min_pos) => return StripEvalControl::Cycle(min_pos),
+                    BatchChunkPrep::FallbackToAst => {}
+                }
+            }
+
             let (sheet, col, start_row, off, mode, root_tmpl) = {
                 let Some(s) = self.strip_slot_of(sid) else {
                     return StripEvalControl::Done;
@@ -5983,56 +6245,58 @@ impl FormulaEngine {
         }
     }
 
+    fn check_cell_ready(&self, sheet: SheetId, row: RowId, col: ColId) -> Result<(), ExprOutcome> {
+        let target_key = (sheet, row, col);
+        let mut blocked: SmallVec<[u32; 4]> = SmallVec::new();
+        let mut cycle_low: Option<usize> = None;
+        let fid_opt = self.cell_to_fid.get(&target_key).copied().or_else(|| {
+            if let Some((sid, off)) = self.strip_covering_cell(target_key) {
+                let is_cur_back = self.cur_strip_eval.is_some_and(|(cur_sid, cur_off)| {
+                    cur_sid == sid
+                        && self
+                            .strip_slot_of(sid)
+                            .is_some_and(|s| s.sequential_self_dep)
+                        && off < cur_off
+                });
+                if !is_cur_back
+                    && (self.strip_state_of(sid) == STATE_SCC_WAIT
+                        || self
+                            .strip_slot_of(sid)
+                            .is_some_and(|s| s.has_dirty_offset(off)))
+                {
+                    Some(strip_fid(sid))
+                } else {
+                    None
+                }
+            } else {
+                self.spills
+                    .anchor_of_cell(target_key)
+                    .and_then(|anchor| self.cell_to_fid.get(&anchor).copied())
+            }
+        });
+        if let Some(fid) = fid_opt {
+            self.record_fid_wait(fid, &mut blocked, &mut cycle_low);
+        }
+        if let Some(anchors) = self.cycle_shadow_watch.get(&target_key) {
+            for &anchor in anchors {
+                if let Some(&fid) = self.cell_to_fid.get(&anchor) {
+                    self.record_fid_wait(fid, &mut blocked, &mut cycle_low);
+                }
+            }
+        }
+        if let Some(wait) = Self::wait_outcome(blocked, cycle_low) {
+            return Err(wait);
+        }
+        Ok(())
+    }
+
     fn ensure_value_ready(&self, val: &EvalValue) -> Result<(), ExprOutcome> {
         let EvalValue::Reference(r) = val else {
             return Ok(());
         };
         match r {
             ResolvedRef::Invalid(_) => Ok(()),
-            ResolvedRef::Cell { sheet, row, col } => {
-                let target_key = (*sheet, *row, *col);
-                let mut blocked: SmallVec<[u32; 4]> = SmallVec::new();
-                let mut cycle_low: Option<usize> = None;
-                let fid_opt = self.cell_to_fid.get(&target_key).copied().or_else(|| {
-                    if let Some((sid, off)) = self.strip_covering_cell(target_key) {
-                        let is_cur_back = self.cur_strip_eval.is_some_and(|(cur_sid, cur_off)| {
-                            cur_sid == sid
-                                && self
-                                    .strip_slot_of(sid)
-                                    .is_some_and(|s| s.sequential_self_dep)
-                                && off < cur_off
-                        });
-                        if !is_cur_back
-                            && (self.strip_state_of(sid) == STATE_SCC_WAIT
-                                || self
-                                    .strip_slot_of(sid)
-                                    .is_some_and(|s| s.has_dirty_offset(off)))
-                        {
-                            Some(strip_fid(sid))
-                        } else {
-                            None
-                        }
-                    } else {
-                        self.spills
-                            .anchor_of_cell(target_key)
-                            .and_then(|anchor| self.cell_to_fid.get(&anchor).copied())
-                    }
-                });
-                if let Some(fid) = fid_opt {
-                    self.record_fid_wait(fid, &mut blocked, &mut cycle_low);
-                }
-                if let Some(anchors) = self.cycle_shadow_watch.get(&target_key) {
-                    for &anchor in anchors {
-                        if let Some(&fid) = self.cell_to_fid.get(&anchor) {
-                            self.record_fid_wait(fid, &mut blocked, &mut cycle_low);
-                        }
-                    }
-                }
-                if let Some(wait) = Self::wait_outcome(blocked, cycle_low) {
-                    return Err(wait);
-                }
-                Ok(())
-            }
+            ResolvedRef::Cell { sheet, row, col } => self.check_cell_ready(*sheet, *row, *col),
             ResolvedRef::Area {
                 sheet,
                 first_row,

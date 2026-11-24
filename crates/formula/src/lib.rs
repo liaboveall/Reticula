@@ -34,7 +34,9 @@ extern crate std;
 
 pub mod address;
 pub mod ast;
+mod batch_eval;
 pub mod binder;
+mod bytecode;
 pub mod dep_graph;
 pub mod determinism;
 pub mod engine;

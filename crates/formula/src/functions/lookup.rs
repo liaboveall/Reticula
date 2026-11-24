@@ -386,6 +386,45 @@ pub fn eval_match(
     }
 }
 
+/// Evaluates exact `MATCH(needle, reference, 0)` for scalar needles.
+pub(crate) fn match_exact_on_ref(
+    needle: &EvalScalar,
+    reference: ResolvedRef,
+    workbook: &Workbook<BoundFormula>,
+    spills: &SpillRegistry,
+) -> EvalScalar {
+    match_one(
+        needle,
+        &EvalValue::Reference(reference),
+        0,
+        workbook,
+        spills,
+    )
+}
+
+/// Evaluates exact `VLOOKUP(needle, table_reference, col_index, FALSE)` for
+/// scalar needles.
+pub(crate) fn vlookup_exact_on_ref(
+    needle: &EvalScalar,
+    table: ResolvedRef,
+    col_index: u32,
+    workbook: &Workbook<BoundFormula>,
+    spills: &SpillRegistry,
+) -> EvalScalar {
+    if col_index < 1 {
+        return EvalScalar::Error(CalcError::Value);
+    }
+    vh_lookup_one(
+        needle,
+        &EvalValue::Reference(table),
+        col_index,
+        0,
+        true,
+        workbook,
+        spills,
+    )
+}
+
 fn match_one(
     needle: &EvalScalar,
     array_arg: &EvalValue,

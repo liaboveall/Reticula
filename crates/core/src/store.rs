@@ -227,6 +227,164 @@ impl Block {
         }
     }
 
+    fn read_span(&self, offset: u16, out: &mut [u64]) {
+        let len = out.len();
+        if len == 0 {
+            return;
+        }
+        let off_usize = usize::from(offset);
+        let end_usize = off_usize.saturating_add(len);
+        match self {
+            Self::Empty => out.fill(Value::EMPTY_BITS),
+            Self::Dense(words) => {
+                if let Some(src) = words.get(off_usize..end_usize) {
+                    out.copy_from_slice(src);
+                } else {
+                    out.fill(Value::EMPTY_BITS);
+                }
+            }
+            Self::Sparse(entries) => {
+                out.fill(Value::EMPTY_BITS);
+                let start_idx =
+                    entries.partition_point(|&(e_off, _)| usize::from(e_off) < off_usize);
+                for &(e_off, bits) in entries.get(start_idx..).unwrap_or(&[]) {
+                    let e_u = usize::from(e_off);
+                    if e_u >= end_usize {
+                        break;
+                    }
+                    if let Some(dst) = out.get_mut(e_u.saturating_sub(off_usize)) {
+                        *dst = bits;
+                    }
+                }
+            }
+        }
+    }
+
+    fn write_span(
+        &mut self,
+        offset: u16,
+        span_base_off: u32,
+        src: &[u64],
+        on_changed: &mut impl FnMut(u32),
+    ) -> u32 {
+        let len = src.len();
+        if len == 0 {
+            return 0;
+        }
+        let off_usize = usize::from(offset);
+        let end_usize = off_usize.saturating_add(len);
+        let mut changed = 0_u32;
+        match self {
+            Self::Empty => {
+                let mut non_empty = 0usize;
+                for (i, &w) in src.iter().enumerate() {
+                    if w != Value::EMPTY_BITS {
+                        non_empty = non_empty.saturating_add(1);
+                        let rel = u32::try_from(i).unwrap_or(u32::MAX);
+                        changed = changed.saturating_add(1);
+                        on_changed(span_base_off.saturating_add(rel));
+                    }
+                }
+                if non_empty == 0 {
+                    return 0;
+                }
+                if non_empty > SPARSE_LIMIT {
+                    let mut dense = vec![Value::EMPTY_BITS; BLOCK_ROWS as usize];
+                    if let Some(dst) = dense.get_mut(off_usize..end_usize) {
+                        dst.copy_from_slice(src);
+                    }
+                    *self = Self::Dense(Arc::new(dense));
+                } else {
+                    let mut entries = Vec::with_capacity(non_empty);
+                    for (i, &w) in src.iter().enumerate() {
+                        if w != Value::EMPTY_BITS
+                            && let Ok(rel_u16) = u16::try_from(off_usize.saturating_add(i))
+                        {
+                            entries.push((rel_u16, w));
+                        }
+                    }
+                    *self = Self::Sparse(Arc::new(entries));
+                }
+            }
+            Self::Dense(words_arc) => {
+                let any_diff = words_arc
+                    .get(off_usize..end_usize)
+                    .is_some_and(|existing| existing != src);
+                if !any_diff {
+                    return 0;
+                }
+                let words = Arc::make_mut(words_arc);
+                if let Some(dst) = words.get_mut(off_usize..end_usize) {
+                    for (i, (old_slot, &new_w)) in dst.iter_mut().zip(src.iter()).enumerate() {
+                        if *old_slot != new_w {
+                            *old_slot = new_w;
+                            changed = changed.saturating_add(1);
+                            let rel = u32::try_from(i).unwrap_or(u32::MAX);
+                            on_changed(span_base_off.saturating_add(rel));
+                        }
+                    }
+                }
+            }
+            Self::Sparse(entries_arc) => {
+                // Fast check for whether any entry inside or outside changes.
+                let mut merged: Vec<(u16, u64)> = Vec::with_capacity(
+                    entries_arc
+                        .len()
+                        .saturating_add(len)
+                        .min(BLOCK_ROWS as usize),
+                );
+                let mut e_idx = 0usize;
+                let e_slice = entries_arc.as_slice();
+                while let Some(&(e_off, bits)) = e_slice.get(e_idx) {
+                    if usize::from(e_off) >= off_usize {
+                        break;
+                    }
+                    merged.push((e_off, bits));
+                    e_idx = e_idx.saturating_add(1);
+                }
+                for (i, &new_w) in src.iter().enumerate() {
+                    let cur_off_usize = off_usize.saturating_add(i);
+                    let cur_off = u16::try_from(cur_off_usize).unwrap_or(u16::MAX);
+                    let mut old_w = Value::EMPTY_BITS;
+                    if let Some(&(e_off, e_bits)) = e_slice.get(e_idx)
+                        && e_off == cur_off
+                    {
+                        old_w = e_bits;
+                        e_idx = e_idx.saturating_add(1);
+                    }
+                    if old_w != new_w {
+                        changed = changed.saturating_add(1);
+                        let rel = u32::try_from(i).unwrap_or(u32::MAX);
+                        on_changed(span_base_off.saturating_add(rel));
+                    }
+                    if new_w != Value::EMPTY_BITS {
+                        merged.push((cur_off, new_w));
+                    }
+                }
+                for &(e_off, bits) in e_slice.get(e_idx..).unwrap_or(&[]) {
+                    merged.push((e_off, bits));
+                }
+                if changed == 0 {
+                    return 0;
+                }
+                if merged.is_empty() {
+                    *self = Self::Empty;
+                } else if merged.len() > SPARSE_LIMIT {
+                    let mut dense = vec![Value::EMPTY_BITS; BLOCK_ROWS as usize];
+                    for (e_off, bits) in merged {
+                        if let Some(cell) = dense.get_mut(usize::from(e_off)) {
+                            *cell = bits;
+                        }
+                    }
+                    *self = Self::Dense(Arc::new(dense));
+                } else {
+                    *entries_arc = Arc::new(merged);
+                }
+            }
+        }
+        changed
+    }
+
     fn set(&mut self, offset: u16, bits: u64) {
         let is_empty = bits == Value::EMPTY_BITS;
         match self {
@@ -456,6 +614,96 @@ impl Column {
             .map_or(Value::EMPTY_BITS, |block| block.get(offset))
     }
 
+    /// Reads contiguous packed 64-bit words for slots `[start_slot .. start_slot + out.len())`
+    /// block-by-block into `out`.
+    pub fn read_slot_span_packed(&self, start_slot: u32, out: &mut [u64]) {
+        let total = out.len();
+        if total == 0 {
+            return;
+        }
+        let mut done = 0usize;
+        while done < total {
+            let Some(rel_u32) = u32::try_from(done).ok() else {
+                break;
+            };
+            let Some(cur_slot) = start_slot.checked_add(rel_u32) else {
+                if let Some(tail) = out.get_mut(done..) {
+                    tail.fill(Value::EMPTY_BITS);
+                }
+                break;
+            };
+            let (block_idx, offset) = locate(cur_slot);
+            let rem_in_block = (BLOCK_ROWS as usize).saturating_sub(usize::from(offset));
+            let take = rem_in_block.min(total.saturating_sub(done));
+            if let Some(dst) = out.get_mut(done..done.saturating_add(take)) {
+                match self.blocks.get(block_idx) {
+                    None => dst.fill(Value::EMPTY_BITS),
+                    Some(block) => block.read_span(offset, dst),
+                }
+            }
+            done = done.saturating_add(take);
+        }
+    }
+
+    /// Writes contiguous packed 64-bit words from `src` into slots
+    /// `[start_slot .. start_slot + src.len())`, returning changed slot count
+    /// and invoking `on_changed(offset_in_src)` for each modified cell.
+    pub fn write_slot_span_packed(
+        &mut self,
+        start_slot: u32,
+        src: &[u64],
+        mut on_changed: impl FnMut(u32),
+    ) -> u32 {
+        let total = src.len();
+        if total == 0 {
+            return 0;
+        }
+        let mut changed_total = 0_u32;
+        let mut done = 0usize;
+        let mut max_after = self.len;
+        while done < total {
+            let Ok(rel_u32) = u32::try_from(done) else {
+                break;
+            };
+            let Some(cur_slot) = start_slot.checked_add(rel_u32) else {
+                break;
+            };
+            let (block_idx, offset) = locate(cur_slot);
+            let rem_in_block = (BLOCK_ROWS as usize).saturating_sub(usize::from(offset));
+            let take = rem_in_block.min(total.saturating_sub(done));
+            let Some(src_slice) = src.get(done..done.saturating_add(take)) else {
+                break;
+            };
+            if block_idx >= self.blocks.len() {
+                if src_slice.iter().any(|&w| w != Value::EMPTY_BITS) {
+                    self.blocks
+                        .resize_with(block_idx.saturating_add(1), || Block::Empty);
+                    if let Some(block) = self.blocks.get_mut(block_idx) {
+                        let c = block.write_span(offset, rel_u32, src_slice, &mut on_changed);
+                        changed_total = changed_total.saturating_add(c);
+                    }
+                    if let Some(take_u32) = u32::try_from(take).ok()
+                        && let Some(after) = cur_slot.checked_add(take_u32)
+                    {
+                        max_after = max_after.max(after);
+                    }
+                }
+            } else if let Some(block) = self.blocks.get_mut(block_idx) {
+                let c = block.write_span(offset, rel_u32, src_slice, &mut on_changed);
+                changed_total = changed_total.saturating_add(c);
+                if src_slice.iter().any(|&w| w != Value::EMPTY_BITS)
+                    && let Some(take_u32) = u32::try_from(take).ok()
+                    && let Some(after) = cur_slot.checked_add(take_u32)
+                {
+                    max_after = max_after.max(after);
+                }
+            }
+            done = done.saturating_add(take);
+        }
+        self.len = max_after;
+        changed_total
+    }
+
     /// Reconstructs a column from decoded blocks and slot bound, validating
     /// every block's internal invariants and every stored word via `check_word`.
     pub fn try_from_blocks(
@@ -636,6 +884,9 @@ mod tests {
     #[cfg(target_arch = "wasm32")]
     use wasm_bindgen_test::wasm_bindgen_test as test;
 
+    use alloc::vec;
+    use alloc::vec::Vec;
+
     use super::{BLOCK_ROWS, Block, Column, SPARSE_LIMIT, SlotMap};
     use crate::axis::Axis;
     use crate::id::pack_id;
@@ -714,5 +965,61 @@ mod tests {
         assert_eq!(col.jump_vertical(&axis, &slots, 10, false), 4);
         assert_eq!(col.jump_vertical(&axis, &slots, 4, false), 2);
         assert_eq!(col.jump_vertical(&axis, &slots, 2, false), 0);
+    }
+
+    #[test]
+    fn span_read_write_preserves_cow_and_matches_scalar_access() {
+        let mut col = Column::new();
+        let mut words = Vec::with_capacity(5000);
+        for i in 0_u32..5000 {
+            words.push(if i % 10 == 0 {
+                Value::EMPTY_BITS
+            } else {
+                Value::Number(f64::from(i) * 1.25).pack()
+            });
+        }
+        let mut changed_slots = Vec::new();
+        let changed = col.write_slot_span_packed(10, &words, |off| changed_slots.push(off));
+        assert_eq!(changed as usize, changed_slots.len());
+        assert_eq!(changed, 4500);
+        assert_eq!(col.len(), 5010);
+
+        let mut forked = col.clone();
+        // Writing identical words reports 0 changes (preserving CoW sharing).
+        let noop_changed = forked.write_slot_span_packed(10, &words, |_| {
+            panic!("identical span write should not report changes")
+        });
+        assert_eq!(noop_changed, 0);
+
+        // Sparse patch across empty/sparse block.
+        let mut sparse_col = Column::new();
+        let patch = [
+            Value::Number(42.0).pack(),
+            Value::EMPTY_BITS,
+            Value::Bool(true).pack(),
+        ];
+        assert_eq!(sparse_col.write_slot_span_packed(4095, &patch, |_| {}), 2);
+        let mut round_trip = vec![0_u64; 5];
+        sparse_col.read_slot_span_packed(4094, &mut round_trip);
+        assert_eq!(
+            round_trip,
+            vec![
+                Value::EMPTY_BITS,
+                Value::Number(42.0).pack(),
+                Value::EMPTY_BITS,
+                Value::Bool(true).pack(),
+                Value::EMPTY_BITS,
+            ]
+        );
+
+        let mut out = vec![0_u64; 5000];
+        col.read_slot_span_packed(10, &mut out);
+        assert_eq!(out, words);
+        for (i, &w) in words.iter().enumerate() {
+            assert_eq!(
+                col.get_packed(10_u32.saturating_add(u32::try_from(i).unwrap_or(0))),
+                w
+            );
+        }
     }
 }

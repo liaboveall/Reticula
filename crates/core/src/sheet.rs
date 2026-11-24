@@ -15,7 +15,7 @@ use crate::axis::{
     Axis, AxisRun, DEFAULT_BASE_COLS, DEFAULT_BASE_ROWS, MAX_COL_AXIS_LEN, MAX_ROW_AXIS_LEN,
 };
 use crate::format::{NumberFormat, write_number};
-use crate::id::{ColId, IdRun, RowId, SheetId};
+use crate::id::{ColId, IdRun, RowId, SheetId, is_base_id};
 use crate::store::{Column, SlotMap};
 use crate::strings::StringTable;
 use crate::style::{CellStyle, StyleId, StylePatch, StyleTable};
@@ -829,6 +829,97 @@ impl Sheet {
             .is_some_and(|column| column.set(row_slot, value))
     }
 
+    /// Reads contiguous packed 64-bit cell words for `[first_row .. first_row + out.len())`
+    /// in column `col` (`O(blocks)` when rows sit in base identity slots).
+    pub fn read_row_id_span_packed(&self, first_row: RowId, col: ColId, out: &mut [u64]) {
+        if out.is_empty() {
+            return;
+        }
+        let len_u64 = u64::try_from(out.len()).unwrap_or(u64::MAX);
+        let Some(col_slot) = self.col_slots.get(col.0) else {
+            out.fill(Value::EMPTY_BITS);
+            return;
+        };
+        let Some(column) = self.columns.get(col_slot as usize) else {
+            out.fill(Value::EMPTY_BITS);
+            return;
+        };
+        if is_base_id(first_row.0)
+            && let Some(end_id) = first_row.0.checked_add(len_u64)
+            && end_id <= u64::from(self.row_slots.base_len())
+            && let Ok(start_slot) = u32::try_from(first_row.0)
+        {
+            column.read_slot_span_packed(start_slot, out);
+            return;
+        }
+        for (i, dst) in out.iter_mut().enumerate() {
+            let off = u64::try_from(i).unwrap_or(u64::MAX);
+            let row = RowId(first_row.0.saturating_add(off));
+            *dst = self
+                .row_slots
+                .get(row.0)
+                .map_or(Value::EMPTY_BITS, |rs| column.get_packed(rs));
+        }
+    }
+
+    /// Writes contiguous packed 64-bit cell words from `src` into `[first_row .. first_row + src.len())`
+    /// in column `col`, bumping `col_generation(col)` whenever any cell changed.
+    pub fn write_row_id_span_packed(
+        &mut self,
+        first_row: RowId,
+        col: ColId,
+        src: &[u64],
+        mut on_changed: impl FnMut(u32),
+    ) -> u32 {
+        if src.is_empty() {
+            return 0;
+        }
+        let len_u64 = u64::try_from(src.len()).unwrap_or(u64::MAX);
+        if is_base_id(first_row.0)
+            && let Some(end_id) = first_row.0.checked_add(len_u64)
+            && end_id <= u64::from(self.row_slots.base_len())
+            && let Ok(start_slot) = u32::try_from(first_row.0)
+        {
+            if self.col_slots.get(col.0).is_none() && src.iter().all(|&w| w == Value::EMPTY_BITS) {
+                return 0;
+            }
+            let Some(col_slot) = self.col_slots.get_or_alloc(col.0) else {
+                return 0;
+            };
+            let col_idx = col_slot as usize;
+            if col_idx >= self.columns.len() {
+                self.columns
+                    .resize_with(col_idx.saturating_add(1), Column::new);
+            }
+            if col_idx >= self.col_generations.len() {
+                self.col_generations.resize(col_idx.saturating_add(1), 1);
+            }
+            let changed = self.columns.get_mut(col_idx).map_or(0, |column| {
+                column.write_slot_span_packed(start_slot, src, &mut on_changed)
+            });
+            if changed > 0
+                && let Some(g) = self.col_generations.get_mut(col_idx)
+            {
+                *g = g.wrapping_add(1);
+            }
+            return changed;
+        }
+        let mut changed = 0_u32;
+        for (i, &w) in src.iter().enumerate() {
+            let off = u64::try_from(i).unwrap_or(u64::MAX);
+            let row = RowId(first_row.0.saturating_add(off));
+            let old_w = self.value_by_id(row, col).pack();
+            if old_w != w {
+                let _ = self.set_value_by_id(row, col, Value::unpack(w));
+                changed = changed.saturating_add(1);
+                if let Ok(rel) = u32::try_from(i) {
+                    on_changed(rel);
+                }
+            }
+        }
+        changed
+    }
+
     /// Explicit per-cell number format at `(row, col)`, if any.
     #[must_use]
     pub fn cell_format_by_id(&self, row: RowId, col: ColId) -> Option<NumberFormat> {
@@ -1345,10 +1436,12 @@ mod tests {
     use wasm_bindgen_test::wasm_bindgen_test as test;
 
     use alloc::string::String;
+    use alloc::vec;
+    use alloc::vec::Vec;
 
     use super::Sheet;
     use crate::format::NumberFormat;
-    use crate::id::{ColId, IdAllocator, RowId};
+    use crate::id::{ColId, IdAllocator, RowId, SheetId};
     use crate::value::{CalcError, Value};
 
     fn text(sheet: &Sheet, row: u32, col: u32) -> String {
@@ -1418,5 +1511,36 @@ mod tests {
         assert_eq!(sheet.strings().len(), 2);
         assert_eq!(text(&sheet, 0, 0), "kept-b");
         assert_eq!(text(&sheet, 1, 0), "kept-a");
+    }
+
+    #[test]
+    fn span_read_write_bumps_col_generation_only_on_change() {
+        let mut sheet = Sheet::with_axes(SheetId(0), String::from("Sheet1"), 5000, 3);
+        let col = ColId(1);
+        let g0 = sheet.col_generation(col);
+
+        let vals = [Value::Number(10.0).pack(), Value::Number(20.0).pack()];
+        let mut changes = Vec::new();
+        let n = sheet.write_row_id_span_packed(RowId(5), col, &vals, |o| changes.push(o));
+        assert_eq!(n, 2);
+        assert_eq!(changes, vec![0, 1]);
+        let g1 = sheet.col_generation(col);
+        assert!(g1 > g0);
+
+        let n2 = sheet.write_row_id_span_packed(RowId(5), col, &vals, |_| {});
+        assert_eq!(n2, 0);
+        assert_eq!(sheet.col_generation(col), g1);
+
+        let mut read_back = [0_u64; 4];
+        sheet.read_row_id_span_packed(RowId(4), col, &mut read_back);
+        assert_eq!(
+            read_back,
+            [
+                Value::EMPTY_BITS,
+                Value::Number(10.0).pack(),
+                Value::Number(20.0).pack(),
+                Value::EMPTY_BITS,
+            ]
+        );
     }
 }

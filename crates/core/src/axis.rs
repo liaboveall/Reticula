@@ -1119,6 +1119,23 @@ impl Axis {
             .is_some_and(|lr| lr.run.ids.len.saturating_sub(loc.offset) >= len)
     }
 
+    /// Returns the 0-based visible position of `first_id` when
+    /// `[first_id .. first_id + len)` lies inside a single tombstone-free
+    /// [`AxisRun`].
+    #[must_use]
+    pub fn live_run_covers(&self, first_id: u64, len: u32) -> Option<u32> {
+        if len == 0 {
+            return self.id_to_pos(first_id);
+        }
+        let loc = self.locate_id(first_id)?;
+        let lr = self.leaf_run_at(loc.leaf_id, loc.run_idx)?;
+        if lr.run.live_count == lr.run.ids.len && lr.run.ids.len.saturating_sub(loc.offset) >= len {
+            Some(loc.live_before.saturating_add(loc.offset))
+        } else {
+            None
+        }
+    }
+
     /// Whether `id` exists on the axis and has tombstone count `0`.
     #[must_use]
     pub fn is_live(&self, id: u64) -> bool {
