@@ -6,6 +6,8 @@
 import {
   MAX_SUBSCRIBED_PAGE_COLS,
   MAX_SUBSCRIBED_PAGE_ROWS,
+  MAX_SUBSCRIBED_PAGES,
+  MAX_VISIBLE_PAGES_PER_AXIS,
   PAGE_COLS,
   PAGE_ROWS,
 } from "@reticula/protocol/viewport";
@@ -61,33 +63,42 @@ export const EMPTY_SPAN: Span = { firstRow: 0, endRow: 0, firstCol: 0, endCol: 0
  * - `O(1)` arithmetic when there are no custom row/column overrides;
  * - `O(log k)` binary search over compact prefix deltas when `k` rows/columns
  *   have custom pixel sizes.
+ *
+ * Given a device scale, sizes are whole device pixels and all sums are done in
+ * those, so that an offset found from a position leads back to it whatever the
+ * scale: `floor((p * d) / d)` is not always `p`.
  */
 export class SparseAxis {
   readonly defaultSize: number;
   readonly #indices: Uint32Array;
-  readonly #sizes: Uint16Array;
+  // In device pixels with a device scale, and otherwise in CSS pixels.
+  readonly #sizes: Float64Array;
   readonly #deltasPrefix: Float64Array;
+  readonly #defaultUnits: number;
+  readonly #unitsPerPixel: number;
+  readonly #snaps: boolean;
 
-  constructor(defaultSize: number, custom?: readonly (readonly [number, number])[]) {
-    this.defaultSize = defaultSize;
-    if (!custom || custom.length === 0) {
-      this.#indices = new Uint32Array(0);
-      this.#sizes = new Uint16Array(0);
-      this.#deltasPrefix = new Float64Array(1);
-      return;
-    }
+  constructor(
+    defaultSize: number,
+    custom: readonly (readonly [number, number])[] = [],
+    deviceScale?: number,
+  ) {
+    this.#snaps = deviceScale !== undefined;
+    this.#unitsPerPixel = deviceScale ?? 1;
+    this.#defaultUnits = this.#snaps ? Math.max(1, this.#toUnits(defaultSize)) : defaultSize;
+    this.defaultSize = this.#defaultUnits / this.#unitsPerPixel;
     const k = custom.length;
     this.#indices = new Uint32Array(k);
-    this.#sizes = new Uint16Array(k);
+    this.#sizes = new Float64Array(k);
     this.#deltasPrefix = new Float64Array(k + 1);
     let acc = 0;
     for (let i = 0; i < k; i++) {
       const entry = custom[i];
       const idx = entry ? entry[0] : 0;
-      const px = entry ? entry[1] : defaultSize;
+      const units = entry ? this.#toUnits(entry[1]) : this.#defaultUnits;
       this.#indices[i] = idx;
-      this.#sizes[i] = px;
-      acc += px - defaultSize;
+      this.#sizes[i] = units;
+      acc += units - this.#defaultUnits;
       this.#deltasPrefix[i + 1] = acc;
     }
   }
@@ -103,10 +114,10 @@ export class SparseAxis {
     }
     const k = this.#indices.length;
     if (k === 0) {
-      return pos * this.defaultSize;
+      return (pos * this.#defaultUnits) / this.#unitsPerPixel;
     }
     const i = this.#lowerBound(pos);
-    return pos * this.defaultSize + (this.#deltasPrefix[i] ?? 0);
+    return (pos * this.#defaultUnits + (this.#deltasPrefix[i] ?? 0)) / this.#unitsPerPixel;
   }
 
   /** Pixel size of item `pos`. */
@@ -117,7 +128,7 @@ export class SparseAxis {
     }
     const i = this.#lowerBound(pos);
     if (i < k && this.#indices[i] === pos) {
-      return this.#sizes[i] ?? this.defaultSize;
+      return (this.#sizes[i] ?? this.#defaultUnits) / this.#unitsPerPixel;
     }
     return this.defaultSize;
   }
@@ -129,21 +140,35 @@ export class SparseAxis {
 
   /** `0`-based item index covering pixel offset `px >= 0`. */
   indexAtOffset(px: number): number {
-    if (px <= 0) {
+    return this.#indexAtUnits(this.#toUnits(px));
+  }
+
+  /** Index after the last item that starts before pixel offset `px`. */
+  endAtOffset(px: number): number {
+    const before = this.#snaps ? this.#toUnits(px) - 1 : px - 0.0001;
+    return this.#indexAtUnits(Math.max(0, before)) + 1;
+  }
+
+  #toUnits(px: number): number {
+    return this.#snaps ? Math.round(px * this.#unitsPerPixel) : px;
+  }
+
+  #indexAtUnits(units: number): number {
+    if (units <= 0) {
       return 0;
     }
     const k = this.#indices.length;
     if (k === 0) {
-      return Math.floor(px / this.defaultSize);
+      return Math.floor(units / this.#defaultUnits);
     }
-    // Binary search last custom entry `mid` whose start offset `<= px`.
+    // Binary search last custom entry `mid` whose start offset `<= units`.
     let lo = 0;
     let hi = k;
     while (lo < hi) {
       const mid = (lo + hi) >>> 1;
       const idx = this.#indices[mid] ?? 0;
-      const startPx = idx * this.defaultSize + (this.#deltasPrefix[mid] ?? 0);
-      if (startPx <= px) {
+      const start = idx * this.#defaultUnits + (this.#deltasPrefix[mid] ?? 0);
+      if (start <= units) {
         lo = mid + 1;
       } else {
         hi = mid;
@@ -152,14 +177,14 @@ export class SparseAxis {
     if (lo > 0) {
       const prev = lo - 1;
       const idx = this.#indices[prev] ?? 0;
-      const startPx = idx * this.defaultSize + (this.#deltasPrefix[prev] ?? 0);
-      const size = this.#sizes[prev] ?? this.defaultSize;
-      if (px < startPx + size) {
+      const start = idx * this.#defaultUnits + (this.#deltasPrefix[prev] ?? 0);
+      const size = this.#sizes[prev] ?? this.#defaultUnits;
+      if (units < start + size) {
         return idx;
       }
     }
     const delta = this.#deltasPrefix[lo] ?? 0;
-    return Math.floor((px - delta) / this.defaultSize);
+    return Math.floor((units - delta) / this.#defaultUnits);
   }
 
   /** First `i` in `0..k` with `indices[i] >= pos`. */
@@ -307,9 +332,7 @@ export function visibleCells(
     Math.max(fz.frozenRows, layout.rowAxis.indexAtOffset(startTop)),
   );
   let endRow =
-    endTop <= startTop
-      ? firstRow
-      : Math.min(sheet.rows, layout.rowAxis.indexAtOffset(Math.max(0, endTop - 0.0001)) + 1);
+    endTop <= startTop ? firstRow : Math.min(sheet.rows, layout.rowAxis.endAtOffset(endTop));
   if (endRow < firstRow) {
     endRow = firstRow;
   }
@@ -319,9 +342,7 @@ export function visibleCells(
     Math.max(fz.frozenCols, layout.colAxis.indexAtOffset(startLeft)),
   );
   let endCol =
-    endLeft <= startLeft
-      ? firstCol
-      : Math.min(sheet.cols, layout.colAxis.indexAtOffset(Math.max(0, endLeft - 0.0001)) + 1);
+    endLeft <= startLeft ? firstCol : Math.min(sheet.cols, layout.colAxis.endAtOffset(endLeft));
   if (endCol < firstCol) {
     endCol = firstCol;
   }
@@ -560,9 +581,69 @@ export function scrollToReveal(
   };
 }
 
+/** Pages along one axis: the visible ones, and how many to hold on either side. */
+interface HeldPages {
+  readonly first: number;
+  readonly end: number;
+  before: number;
+  after: number;
+}
+
+function heldAlong(
+  first: number,
+  end: number,
+  extent: number,
+  margin: number,
+  page: number,
+  limit: number,
+): HeldPages {
+  const cells = Math.ceil((end - first) * margin);
+  const firstPage = Math.floor(first / page);
+  const endPage = Math.min(Math.ceil(end / page), firstPage + MAX_VISIBLE_PAGES_PER_AXIS);
+  const held = {
+    first: firstPage,
+    end: endPage,
+    before: firstPage - Math.floor(Math.max(0, first - cells) / page),
+    after: Math.max(0, Math.ceil(Math.min(extent, end + cells) / page) - endPage),
+  };
+  // A side that has less to hold than its half leaves the rest to the other one.
+  const room = Math.max(0, limit - (endPage - firstPage));
+  if (held.before + held.after > room) {
+    const half = Math.floor(room / 2);
+    if (held.before <= half) {
+      held.after = room - held.before;
+    } else if (held.after <= room - half) {
+      held.before = room - held.after;
+    } else {
+      held.before = half;
+      held.after = room - half;
+    }
+  }
+  return held;
+}
+
+const heldLength = (pages: HeldPages): number =>
+  pages.end - pages.first + pages.before + pages.after;
+
+/** Gives up a page on a side with `distance` pages of margin, if there is one. */
+function cutAt(pages: HeldPages, distance: number): boolean {
+  if (pages.before === distance) {
+    pages.before--;
+    return true;
+  }
+  if (pages.after === distance) {
+    pages.after--;
+    return true;
+  }
+  return false;
+}
+
 /**
  * The pages to hold for a range of visible cells: the pages those cells are
- * in, and around them a margin measured in multiples of the visible range.
+ * in, and around them a margin measured in multiples of the visible range. The
+ * visible pages are held however many they are; the margin is cut, where it is
+ * furthest from them, to what they leave of the limits. The engine applies the
+ * same rule, so it sends what is held and nothing else.
  */
 export function pagesToHold(
   visible: Span,
@@ -572,17 +653,34 @@ export function pagesToHold(
   if (isEmpty(visible)) {
     return EMPTY_SPAN;
   }
-  const marginRows = Math.ceil((visible.endRow - visible.firstRow) * margin.rows);
-  const marginCols = Math.ceil((visible.endCol - visible.firstCol) * margin.cols);
-  const firstRow = Math.floor(Math.max(0, visible.firstRow - marginRows) / PAGE_ROWS);
-  const firstCol = Math.floor(Math.max(0, visible.firstCol - marginCols) / PAGE_COLS);
-  const lastRow = Math.min(sheet.rows, visible.endRow + marginRows) - 1;
-  const lastCol = Math.min(sheet.cols, visible.endCol + marginCols) - 1;
+  const rows = heldAlong(
+    visible.firstRow,
+    visible.endRow,
+    sheet.rows,
+    margin.rows,
+    PAGE_ROWS,
+    MAX_SUBSCRIBED_PAGE_ROWS,
+  );
+  const cols = heldAlong(
+    visible.firstCol,
+    visible.endCol,
+    sheet.cols,
+    margin.cols,
+    PAGE_COLS,
+    MAX_SUBSCRIBED_PAGE_COLS,
+  );
+  const limit = Math.max(MAX_SUBSCRIBED_PAGES, (rows.end - rows.first) * (cols.end - cols.first));
+  while (heldLength(rows) * heldLength(cols) > limit) {
+    const furthest = Math.max(rows.before, rows.after, cols.before, cols.after);
+    if (!cutAt(cols, furthest)) {
+      cutAt(rows, furthest);
+    }
+  }
   return {
-    firstRow,
-    endRow: Math.min(Math.floor(lastRow / PAGE_ROWS) + 1, firstRow + MAX_SUBSCRIBED_PAGE_ROWS),
-    firstCol,
-    endCol: Math.min(Math.floor(lastCol / PAGE_COLS) + 1, firstCol + MAX_SUBSCRIBED_PAGE_COLS),
+    firstRow: rows.first - rows.before,
+    endRow: rows.end + rows.after,
+    firstCol: cols.first - cols.before,
+    endCol: cols.end + cols.after,
   };
 }
 

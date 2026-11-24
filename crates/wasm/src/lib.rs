@@ -11,7 +11,7 @@
 //! defined here and exported to TypeScript via `tsify`, so there is exactly one
 //! definition of each type.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use reticula_core::csv::{CsvError, CsvReader, export_sheet_delimited};
@@ -22,8 +22,7 @@ use reticula_core::sheet::Sheet;
 use reticula_core::style::{
     BorderSet, BorderWeight, CellStyle, ColorPatch, ColorValue, HorizontalAlign, StylePatch,
 };
-use reticula_core::value::Value;
-use reticula_core::viewport::{self, PAGE_COLS, PAGE_ROWS, Page, PageRange};
+use reticula_core::viewport::{CellSpan, PAGE_COLS, PAGE_ROWS, Page};
 use reticula_formula::address::CellAddr;
 use reticula_formula::binder::BoundFormula;
 use reticula_formula::determinism;
@@ -53,11 +52,16 @@ pub mod bench_sync;
 pub mod clipboard;
 pub mod collab;
 pub mod history;
+pub mod pages;
+pub mod query;
 pub mod undo;
 
 use crate::clipboard::{
-    InternalClipboard, RectPos, build_fill_ops, build_paste_ops, copy_range, find_autofill_end_row,
+    InternalClipboard, RectPos, build_copy_fill_ops, build_fill_ops, build_paste_ops,
+    find_autofill_end_row,
 };
+use crate::pages::{PageQueue, PageRequest};
+use crate::query::map_display_rect_to_physical;
 use crate::undo::{UndoStack, collab_compensations};
 use reticula_core::ops::{FormulaMode, NamedRangeKey, is_valid_named_range_name};
 use reticula_formula::filter::{ColFilterCriterion, FilterCmpOp};
@@ -437,6 +441,16 @@ pub enum WireFormatPatch {
     },
 }
 
+/// Where [`EngineCommand::CopyFill`] copies to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Tsify)]
+#[serde(rename_all = "camelCase")]
+pub enum FillDirection {
+    /// The first row of the range over the rows below it.
+    Down,
+    /// The first column of the range over the columns to the right of it.
+    Right,
+}
+
 /// Cardinal direction for `Ctrl+Arrow` / `Ctrl+Shift+Arrow` edge jumping.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Tsify)]
 #[serde(rename_all = "camelCase")]
@@ -655,6 +669,48 @@ pub struct WireCellRect {
     pub last_row: u32,
     pub first_col: u32,
     pub last_col: u32,
+}
+
+/// 0-based half-open cell rectangle in visible display coordinates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Tsify)]
+#[serde(rename_all = "camelCase")]
+pub struct WireCellSpan {
+    pub first_row: u32,
+    pub end_row: u32,
+    pub first_col: u32,
+    pub end_col: u32,
+}
+
+impl From<WireCellSpan> for CellSpan {
+    fn from(span: WireCellSpan) -> Self {
+        Self {
+            first_row: span.first_row,
+            end_row: span.end_row,
+            first_col: span.first_col,
+            end_col: span.end_col,
+        }
+    }
+}
+
+/// The cell whose formula spilled a value into another one.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Tsify)]
+#[serde(rename_all = "camelCase")]
+pub struct WireSpillAnchor {
+    /// A1 address on the same worksheet.
+    pub address: String,
+    /// Formula as it was entered.
+    pub formula: String,
+}
+
+/// What kind of value a cell shows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Tsify)]
+#[serde(rename_all = "camelCase")]
+pub enum WireValueKind {
+    Number,
+    Text,
+    Boolean,
+    Error,
+    Empty,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Tsify)]
@@ -991,6 +1047,13 @@ pub enum EngineCommand {
         first_col: u32,
         /// Number of columns in the range.
         col_count: u32,
+        /// The unfrozen cells on screen. Their pages are held and sent first.
+        #[serde(default)]
+        visible: Option<WireCellSpan>,
+        /// The grid may miss any of the pages, so all of them are due, whatever
+        /// was sent before.
+        #[serde(default)]
+        resend: bool,
     },
     /// Switch active worksheet tab and return its [`SheetInfo`].
     SwitchSheet { sheet: u32 },
@@ -1111,6 +1174,17 @@ pub enum EngineCommand {
         src_row_count: u32,
         src_first_col: u32,
         src_col_count: u32,
+    },
+    /// Copy the first row of a range over the rest of it, or the first column
+    /// (`Ctrl+D` / `Ctrl+R`): nothing is continued as a series, and the
+    /// clipboard stays as it is.
+    CopyFill {
+        sheet: u32,
+        first_row: u32,
+        row_count: u32,
+        first_col: u32,
+        col_count: u32,
+        dir: FillDirection,
     },
     /// Capture selection as TSV + HTML `<table>` and record internal clipboard state.
     CopyRange {
@@ -1296,6 +1370,9 @@ pub enum EngineEvent {
         style: WireCellStyle,
         spill_range: Option<WireCellRect>,
         is_spill_shadow: bool,
+        /// Where the value comes from, when it was spilled into the cell.
+        spill_anchor: Option<WireSpillAnchor>,
+        value_kind: WireValueKind,
     },
     /// Language-service tokens, diagnostics, completions, signature help, and colored refs.
     FormulaAnalyzed { analysis: WireFormulaAnalysis },
@@ -1617,16 +1694,9 @@ pub struct Engine {
     generation_ms: f64,
     /// Sheet currently subscribed by the grid.
     subscribed_sheet: SheetId,
-    subscribed_rows: (u32, u32),
-    subscribed_cols: (u32, u32),
-    subscribed_pages: Vec<Page>,
-    subscribed_set: HashSet<Page>,
+    pages: PageQueue,
     /// The subscription epoch that pages are currently sent for.
     epoch: u32,
-    /// Pages that are due, in the order they will be sent.
-    due: VecDeque<Page>,
-    /// O(1) membership set keeping `due` free of duplicates.
-    due_set: HashSet<Page>,
     /// Number of style entries sent in the latest `SheetInfo` / `StylesUpdated`.
     last_sent_styles_len: usize,
     /// Pending auxiliary event (such as `StylesUpdated` when scrolling interns a new style).
@@ -1664,13 +1734,8 @@ impl Default for Engine {
             seed: 0,
             generation_ms: 0.0,
             subscribed_sheet: SheetId(0),
-            subscribed_rows: (0, 0),
-            subscribed_cols: (0, 0),
-            subscribed_pages: Vec::new(),
-            subscribed_set: HashSet::new(),
+            pages: PageQueue::default(),
             epoch: 0,
-            due: VecDeque::new(),
-            due_set: HashSet::new(),
             last_sent_styles_len: 1,
             pending_aux_event: None,
             recalc_elapsed_ms: 0.0,
@@ -1718,31 +1783,21 @@ impl Engine {
     /// nothing when the grid has been sent everything due.
     #[wasm_bindgen(js_name = takePage)]
     pub fn take_page(&mut self) -> Option<Vec<u8>> {
-        let page = self.due.pop_front()?;
-        self.due_set.remove(&page);
-        let sheet_id = self.subscribed_sheet;
-        self.engine.prepare_page_styles(sheet_id, page);
-        let sheet = self.engine.workbook().sheet(sheet_id)?;
-        if sheet.styles().entries().len() > self.last_sent_styles_len {
-            self.last_sent_styles_len = sheet.styles().entries().len();
-            self.pending_aux_event = Some(EngineEvent::StylesUpdated {
-                sheet: sheet_id.0,
-                styles: sheet
-                    .styles()
-                    .entries()
-                    .iter()
-                    .copied()
-                    .map(WireCellStyle::from)
-                    .collect(),
-            });
-        }
-        let _ = sheet;
-        self.engine
-            .encode_viewport_page(sheet_id, page, self.epoch, &mut self.text)
+        let page = self.pages.pop()?;
+        pages::encode_due_page(
+            &mut self.engine,
+            self.subscribed_sheet,
+            page,
+            self.epoch,
+            &mut self.text,
+            &mut self.last_sent_styles_len,
+            &mut self.pending_aux_event,
+        )
     }
 
     /// Takes an auxiliary event (such as [`EngineEvent::StylesUpdated`] emitted
-    /// if `takePage` lazily interned a cross-axis style).
+    /// if `takePage` lazily interned a cross-axis style). It has to reach the
+    /// grid before the page that was taken last.
     #[wasm_bindgen(js_name = takeAuxEvent)]
     pub fn take_aux_event(&mut self) -> Result<Option<Ts<EngineEvent>>, JsError> {
         let ev = self.pending_aux_event.take();
@@ -2018,10 +2073,7 @@ impl Engine {
         if active != self.subscribed_sheet {
             self.reset_subscription(active);
         } else {
-            let pages = self.subscribed_pages.clone();
-            for page in pages {
-                self.enqueue_page(page);
-            }
+            self.pages.mark_all();
         }
         Ok(Ts::from_rust(&self.sheet_info(active))?)
     }
@@ -2120,13 +2172,15 @@ impl Engine {
                 row_count,
                 first_col,
                 col_count,
+                visible,
+                resend,
             } => {
-                self.subscribe(
-                    SheetId(sheet),
-                    epoch,
-                    (first_row, row_count),
-                    (first_col, col_count),
-                );
+                let request = PageRequest {
+                    rows: (first_row, row_count),
+                    cols: (first_col, col_count),
+                    visible: visible.map_or_else(CellSpan::default, Into::into),
+                };
+                self.subscribe(SheetId(sheet), epoch, request, resend);
                 None
             }
             EngineCommand::SwitchSheet { sheet } => Some(self.switch_sheet(SheetId(sheet))),
@@ -2248,6 +2302,23 @@ impl Engine {
                     col_count: src_col_count,
                 },
             )),
+            EngineCommand::CopyFill {
+                sheet,
+                first_row,
+                row_count,
+                first_col,
+                col_count,
+                dir,
+            } => Some(self.copy_fill(
+                SheetId(sheet),
+                RectPos {
+                    first_row,
+                    row_count,
+                    first_col,
+                    col_count,
+                },
+                dir,
+            )),
             EngineCommand::CopyRange {
                 sheet,
                 first_row,
@@ -2360,9 +2431,16 @@ impl Engine {
                 col,
                 dir,
                 select,
-            } => Some(self.jump_edge(SheetId(sheet), row, col, dir, select)),
+            } => Some(query::jump_edge(
+                &self.engine,
+                SheetId(sheet),
+                row,
+                col,
+                dir,
+                select,
+            )),
             EngineCommand::JumpUsedEnd { sheet, select } => {
-                Some(self.jump_used_end(SheetId(sheet), select))
+                Some(query::jump_used_end(&self.engine, SheetId(sheet), select))
             }
             EngineCommand::ResumeRecalc => Some(self.resume_recalc()),
             EngineCommand::ContinueRecalc => self.continue_recalc(),
@@ -2409,7 +2487,8 @@ impl Engine {
                 sheet,
                 options,
                 max_results,
-            } => Some(self.find_all_matches(
+            } => Some(query::find_all(
+                &self.engine,
                 SheetId(sheet),
                 &options.into(),
                 max_results.unwrap_or(500) as usize,
@@ -2420,7 +2499,8 @@ impl Engine {
                 from_col,
                 backwards,
                 options,
-            } => Some(self.find_next_match(
+            } => Some(query::find_next(
+                &self.engine,
                 SheetId(sheet),
                 from_row,
                 from_col,
@@ -2475,12 +2555,7 @@ impl Engine {
 
     fn reset_subscription(&mut self, sheet_id: SheetId) {
         self.subscribed_sheet = sheet_id;
-        self.subscribed_rows = (0, 0);
-        self.subscribed_cols = (0, 0);
-        self.subscribed_pages.clear();
-        self.subscribed_set.clear();
-        self.due.clear();
-        self.due_set.clear();
+        self.pages.clear();
         self.pending_aux_event = None;
         self.recalc_elapsed_ms = 0.0;
     }
@@ -2556,130 +2631,47 @@ impl Engine {
         info
     }
 
-    fn subscribe(&mut self, sheet_id: SheetId, epoch: u32, rows: (u32, u32), cols: (u32, u32)) {
-        let visible_rows = self.engine.visible_row_count(sheet_id);
-        let (dims, frozen) = self
-            .engine
-            .workbook()
-            .sheet(sheet_id)
-            .map_or(((0, 0), (0, 0)), |s| {
-                ((visible_rows, s.cols()), (s.frozen_rows(), s.frozen_cols()))
-            });
-        let base_range = PageRange::covering(dims, rows, cols);
-        let wanted = viewport::collect_wanted_pages_with_freeze(base_range, frozen.0, frozen.1);
-        let wanted_set: HashSet<Page> = wanted.iter().copied().collect();
-
-        let sheet_changed = sheet_id != self.subscribed_sheet;
-        if sheet_changed {
-            self.due.clear();
-            self.due_set.clear();
-            self.subscribed_set.clear();
-        } else {
-            self.due.retain(|page| {
-                let keep = wanted_set.contains(page);
-                if !keep {
-                    self.due_set.remove(page);
-                }
-                keep
-            });
+    fn subscribe(&mut self, sheet_id: SheetId, epoch: u32, request: PageRequest, resend: bool) {
+        if sheet_id != self.subscribed_sheet {
+            self.pages.clear();
         }
-
-        for &page in &wanted {
-            if !self.subscribed_set.contains(&page) && self.due_set.insert(page) {
-                self.due.push_back(page);
-            }
-        }
+        self.pages
+            .subscribe(&self.engine, sheet_id, request, resend);
         self.subscribed_sheet = sheet_id;
-        self.subscribed_rows = rows;
-        self.subscribed_cols = cols;
-        self.subscribed_pages = wanted;
-        self.subscribed_set = wanted_set;
         self.epoch = epoch;
     }
 
     fn refresh_subscription_extent(&mut self) {
-        if self.subscribed_pages.is_empty() {
-            return;
-        }
-        let sheet_id = self.subscribed_sheet;
-        let visible_rows = self.engine.visible_row_count(sheet_id);
-        let (dims, frozen) = self
-            .engine
-            .workbook()
-            .sheet(sheet_id)
-            .map_or(((0, 0), (0, 0)), |s| {
-                ((visible_rows, s.cols()), (s.frozen_rows(), s.frozen_cols()))
-            });
-        let base_range = PageRange::covering(dims, self.subscribed_rows, self.subscribed_cols);
-        let wanted = viewport::collect_wanted_pages_with_freeze(base_range, frozen.0, frozen.1);
-        let wanted_set: HashSet<Page> = wanted.iter().copied().collect();
-        self.due.retain(|page| {
-            let keep = wanted_set.contains(page);
-            if !keep {
-                self.due_set.remove(page);
-            }
-            keep
-        });
-        for &page in &wanted {
-            if !self.subscribed_set.contains(&page) && self.due_set.insert(page) {
-                self.due.push_back(page);
-            }
-        }
-        self.subscribed_pages = wanted;
-        self.subscribed_set = wanted_set;
-    }
-
-    fn enqueue_page(&mut self, page: Page) {
-        if self.subscribed_set.contains(&page) && self.due_set.insert(page) {
-            self.due.push_back(page);
-        }
+        self.pages.refresh(&self.engine, self.subscribed_sheet);
     }
 
     fn flush_dirty_pages(&mut self) {
         let dirty = self.engine.take_dirty_changes();
-        if self.subscribed_pages.is_empty() {
+        if self.pages.is_empty() {
             return;
         }
         if dirty.structural || dirty.cells.len() > BULK_DIRTY_PAGE_THRESHOLD {
-            let pages = self.subscribed_pages.clone();
-            for page in pages {
-                self.enqueue_page(page);
-            }
+            self.pages.mark_all();
             return;
         }
         let target_sheet = self.subscribed_sheet;
-        let mut to_enqueue = Vec::new();
-        if let Some(sheet) = self.engine.workbook().sheet(target_sheet) {
-            for (s_id, row_id, col_id) in dirty.cells {
-                if s_id != target_sheet {
-                    continue;
-                }
-                if let (Some(phys_r), Some(c_pos)) = (
-                    sheet.row_axis().id_to_pos(row_id.0),
-                    sheet.col_axis().id_to_pos(col_id.0),
-                ) && let Some(r_pos) = self.engine.physical_to_display_row(target_sheet, phys_r)
-                {
-                    let page = Page {
-                        row: r_pos / PAGE_ROWS,
-                        col: c_pos / PAGE_COLS,
-                    };
-                    if self.subscribed_set.contains(&page) {
-                        to_enqueue.push(page);
-                    }
-                    // Also refresh the immediately rightward page (`col + 1`) if
-                    // left-overflow text could spill into it!
-                    let right_page = Page {
-                        row: r_pos / PAGE_ROWS,
-                        col: (c_pos / PAGE_COLS).saturating_add(1),
-                    };
-                    if self.subscribed_set.contains(&right_page) {
-                        to_enqueue.push(right_page);
-                    }
-                }
+        let Some(sheet) = self.engine.workbook().sheet(target_sheet) else {
+            return;
+        };
+        for (s_id, row_id, col_id) in dirty.cells {
+            if s_id != target_sheet {
+                continue;
             }
-        }
-        for page in to_enqueue {
-            self.enqueue_page(page);
+            if let (Some(phys_r), Some(c_pos)) = (
+                sheet.row_axis().id_to_pos(row_id.0),
+                sheet.col_axis().id_to_pos(col_id.0),
+            ) && let Some(r_pos) = self.engine.physical_to_display_row(target_sheet, phys_r)
+            {
+                self.pages.mark_changed(Page {
+                    row: r_pos / PAGE_ROWS,
+                    col: c_pos / PAGE_COLS,
+                });
+            }
         }
     }
 
@@ -2783,10 +2775,7 @@ impl Engine {
             };
         }
         self.subscribed_sheet = sheet_id;
-        self.subscribed_pages.clear();
-        self.subscribed_set.clear();
-        self.due.clear();
-        self.due_set.clear();
+        self.pages.clear();
         EngineEvent::SheetChanged {
             sheet: self.sheet_info(sheet_id),
             action_ms: 0.0,
@@ -2795,7 +2784,7 @@ impl Engine {
     }
 
     fn inspect_cell(&self, sheet_id: SheetId, row_id: RowId, col_id: ColId) -> Option<EngineEvent> {
-        build_cell_inspected(&self.engine, sheet_id, row_id, col_id)
+        query::inspect_cell(&self.engine, sheet_id, row_id, col_id)
     }
 
     fn edit_cell(
@@ -3206,55 +3195,10 @@ impl Engine {
         }
     }
 
-    fn map_display_rect_to_physical(&self, sheet_id: SheetId, rect: RectPos) -> Option<RectPos> {
-        if self.engine.filter_state(sheet_id).is_none() {
-            return Some(rect);
-        }
-        let pr1 = self
-            .engine
-            .display_to_physical_row(sheet_id, rect.first_row)?;
-        let last_disp = rect
-            .first_row
-            .saturating_add(rect.row_count.saturating_sub(1));
-        let pr2 = self.engine.display_to_physical_row(sheet_id, last_disp)?;
-        Some(RectPos {
-            first_row: pr1,
-            row_count: pr2.saturating_sub(pr1).saturating_add(1),
-            first_col: rect.first_col,
-            col_count: rect.col_count,
-        })
-    }
-
-    fn nearest_visible_display_row(&self, sheet_id: SheetId, physical_row: u32) -> u32 {
-        if self.engine.filter_state(sheet_id).is_none() {
-            return physical_row;
-        }
-        if let Some(d) = self.engine.physical_to_display_row(sheet_id, physical_row) {
-            return d;
-        }
-        let Some(sheet) = self.engine.workbook().sheet(sheet_id) else {
-            return 0;
-        };
-        let mut r = physical_row;
-        while r > 0 {
-            r = r.saturating_sub(1);
-            if let Some(d) = self.engine.physical_to_display_row(sheet_id, r) {
-                return d;
-            }
-        }
-        let max_r = sheet.rows().saturating_sub(1);
-        for candidate in physical_row..=max_r {
-            if let Some(d) = self.engine.physical_to_display_row(sheet_id, candidate) {
-                return d;
-            }
-        }
-        0
-    }
-
     fn fill_range(&mut self, sheet_id: SheetId, src: RectPos, dst: RectPos) -> EngineEvent {
         let (Some(phys_src), Some(phys_dst)) = (
-            self.map_display_rect_to_physical(sheet_id, src),
-            self.map_display_rect_to_physical(sheet_id, dst),
+            map_display_rect_to_physical(&self.engine, sheet_id, src),
+            map_display_rect_to_physical(&self.engine, sheet_id, dst),
         ) else {
             return EngineEvent::Rejected {
                 reason: String::from("Fill range falls outside visible rows."),
@@ -3295,7 +3239,7 @@ impl Engine {
     }
 
     fn auto_fill_down(&mut self, sheet_id: SheetId, src: RectPos) -> EngineEvent {
-        let Some(phys_src) = self.map_display_rect_to_physical(sheet_id, src) else {
+        let Some(phys_src) = map_display_rect_to_physical(&self.engine, sheet_id, src) else {
             return EngineEvent::SheetChanged {
                 sheet: self.sheet_info(sheet_id),
                 action_ms: 0.0,
@@ -3321,26 +3265,50 @@ impl Engine {
         self.fill_range_physical(sheet_id, phys_src, dst)
     }
 
-    fn copy_selection(&mut self, sheet_id: SheetId, rect: RectPos, cut: bool) -> EngineEvent {
-        let Some(phys_rect) = self.map_display_rect_to_physical(sheet_id, rect) else {
+    fn copy_fill(&mut self, sheet_id: SheetId, rect: RectPos, dir: FillDirection) -> EngineEvent {
+        let started = now_ms();
+        let Some(row_runs) =
+            query::physical_row_runs(&self.engine, sheet_id, rect.first_row, rect.row_count)
+        else {
             return EngineEvent::Rejected {
-                reason: String::from("Copy selection falls outside visible rows."),
+                reason: String::from("Fill range falls outside visible rows."),
             };
         };
-        match copy_range(self.engine.workbook(), sheet_id, phys_rect, cut) {
-            Ok((payload, internal)) => {
+        let cols = (rect.first_col, rect.col_count);
+        let ops = match build_copy_fill_ops(self.engine.workbook(), sheet_id, &row_runs, cols, dir)
+        {
+            Ok(ops) => ops,
+            Err(reason) => return EngineEvent::Rejected { reason },
+        };
+        if ops.is_empty() {
+            return EngineEvent::SheetChanged {
+                sheet: self.sheet_info(sheet_id),
+                action_ms: 0.0,
+                recalculated: 0,
+            };
+        }
+        let label = match dir {
+            FillDirection::Down => "Fill down",
+            FillDirection::Right => "Fill right",
+        };
+        if let Err(reason) = self.execute_user_txn(String::from(label), &ops) {
+            return EngineEvent::Rejected { reason };
+        }
+        let recalculated = self.run_initial_recalc_slice();
+        let sheet_meta = self.sheet_info(sheet_id);
+        self.flush_dirty_pages();
+        EngineEvent::SheetChanged {
+            sheet: sheet_meta,
+            action_ms: now_ms() - started,
+            recalculated,
+        }
+    }
+
+    fn copy_selection(&mut self, sheet_id: SheetId, rect: RectPos, cut: bool) -> EngineEvent {
+        match query::copy_selection(&self.engine, sheet_id, rect, cut) {
+            Ok((event, internal)) => {
                 self.clipboard = Some(internal);
-                EngineEvent::ClipboardCopied {
-                    sheet: sheet_id.0,
-                    first_row: rect.first_row,
-                    row_count: rect.row_count,
-                    first_col: rect.first_col,
-                    col_count: rect.col_count,
-                    cut,
-                    tsv: payload.tsv,
-                    html: payload.html,
-                    fingerprint: payload.fingerprint,
-                }
+                event
             }
             Err(reason) => EngineEvent::Rejected { reason },
         }
@@ -3354,7 +3322,7 @@ impl Engine {
         html: Option<&str>,
     ) -> EngineEvent {
         let started = now_ms();
-        let Some(phys_dest) = self.map_display_rect_to_physical(sheet_id, dest) else {
+        let Some(phys_dest) = map_display_rect_to_physical(&self.engine, sheet_id, dest) else {
             return EngineEvent::Rejected {
                 reason: String::from("Paste target falls outside visible rows."),
             };
@@ -3425,10 +3393,7 @@ impl Engine {
         }
         let _ = self.engine.take_dirty_changes();
         self.subscribed_sheet = new_id;
-        self.subscribed_pages.clear();
-        self.subscribed_set.clear();
-        self.due.clear();
-        self.due_set.clear();
+        self.pages.clear();
         EngineEvent::SheetChanged {
             sheet: self.sheet_info(new_id),
             action_ms: now_ms() - started,
@@ -3464,10 +3429,7 @@ impl Engine {
             && let Some(next_live) = self.engine.workbook().live_sheets().next().map(Sheet::id)
         {
             self.subscribed_sheet = next_live;
-            self.subscribed_pages.clear();
-            self.subscribed_set.clear();
-            self.due.clear();
-            self.due_set.clear();
+            self.pages.clear();
         }
         self.flush_dirty_pages();
         EngineEvent::SheetChanged {
@@ -3579,81 +3541,7 @@ impl Engine {
             && let Some(first_live) = self.engine.workbook().live_sheets().next().map(Sheet::id)
         {
             self.subscribed_sheet = first_live;
-            self.subscribed_pages.clear();
-            self.subscribed_set.clear();
-            self.due.clear();
-            self.due_set.clear();
-        }
-    }
-
-    fn jump_edge(
-        &self,
-        sheet_id: SheetId,
-        row: u32,
-        col: u32,
-        dir: JumpDirection,
-        select: bool,
-    ) -> EngineEvent {
-        let Some(sheet) = self.engine.workbook().sheet(sheet_id) else {
-            return EngineEvent::EdgeJumped {
-                sheet: sheet_id.0,
-                row,
-                col,
-                select,
-            };
-        };
-        let rows = sheet.rows();
-        let cols = sheet.cols();
-        if rows == 0 || cols == 0 {
-            return EngineEvent::EdgeJumped {
-                sheet: sheet_id.0,
-                row: 0,
-                col: 0,
-                select,
-            };
-        }
-        let phys_row = self
-            .engine
-            .display_to_physical_row(sheet_id, row)
-            .unwrap_or(row);
-        let r0 = phys_row.min(rows.saturating_sub(1));
-        let c0 = col.min(cols.saturating_sub(1));
-        let (nr, nc) = compute_jump_target(self.engine.workbook(), sheet, sheet_id, r0, c0, dir);
-        let disp_nr = self.nearest_visible_display_row(sheet_id, nr);
-        EngineEvent::EdgeJumped {
-            sheet: sheet_id.0,
-            row: disp_nr,
-            col: nc,
-            select,
-        }
-    }
-
-    fn jump_used_end(&self, sheet_id: SheetId, select: bool) -> EngineEvent {
-        let (mut max_r, mut max_c) = self
-            .engine
-            .workbook()
-            .sheet(sheet_id)
-            .and_then(Sheet::used_extent)
-            .unwrap_or((0, 0));
-        if let Some(sheet) = self.engine.workbook().sheet(sheet_id) {
-            let start = (sheet_id, RowId(0), ColId(0));
-            let end = (sheet_id, RowId(u64::MAX), ColId(u64::MAX));
-            for ((_, r_id, c_id), _) in self.engine.workbook().formulas().range(start..=end) {
-                if let (Some(rp), Some(cp)) = (
-                    sheet.row_axis().id_to_pos(r_id.0),
-                    sheet.col_axis().id_to_pos(c_id.0),
-                ) {
-                    max_r = max_r.max(rp);
-                    max_c = max_c.max(cp);
-                }
-            }
-        }
-        let disp_max_r = self.nearest_visible_display_row(sheet_id, max_r);
-        EngineEvent::EdgeJumped {
-            sheet: sheet_id.0,
-            row: disp_max_r,
-            col: max_c,
-            select,
+            self.pages.clear();
         }
     }
 
@@ -3806,69 +3694,6 @@ impl Engine {
         }
     }
 
-    fn search_match_to_wire(&self, m: search::SearchMatch) -> WireSearchMatch {
-        let row = self.nearest_visible_display_row(m.sheet, m.row_pos);
-        WireSearchMatch {
-            sheet: m.sheet.0,
-            sheet_name: m.sheet_name,
-            row,
-            physical_row: m.row_pos,
-            col: m.col_pos,
-            row_id: m.row_id.0,
-            col_id: m.col_id.0,
-            text: m.text,
-            is_formula: m.is_formula,
-        }
-    }
-
-    fn find_all_matches(
-        &self,
-        sheet_id: SheetId,
-        opts: &FindOptions,
-        max_results: usize,
-    ) -> EngineEvent {
-        match search::find_all(&self.engine, sheet_id, opts, max_results) {
-            Ok(res) => {
-                let total = u32::try_from(res.matches.len()).unwrap_or(u32::MAX);
-                let matches = res
-                    .matches
-                    .into_iter()
-                    .map(|m| self.search_match_to_wire(m))
-                    .collect();
-                EngineEvent::SearchResults {
-                    matches,
-                    total,
-                    truncated: res.truncated,
-                }
-            }
-            Err(err) => EngineEvent::Rejected {
-                reason: err.to_string(),
-            },
-        }
-    }
-
-    fn find_next_match(
-        &self,
-        sheet_id: SheetId,
-        from_row: u32,
-        from_col: u32,
-        backwards: bool,
-        opts: &FindOptions,
-    ) -> EngineEvent {
-        let phys_row = self
-            .engine
-            .display_to_physical_row(sheet_id, from_row)
-            .unwrap_or(from_row);
-        match search::find_next(&self.engine, sheet_id, phys_row, from_col, backwards, opts) {
-            Ok(found) => EngineEvent::SearchNavigated {
-                found: found.map(|m| self.search_match_to_wire(m)),
-            },
-            Err(err) => EngineEvent::Rejected {
-                reason: err.to_string(),
-            },
-        }
-    }
-
     fn replace_all_matches(
         &mut self,
         sheet_id: SheetId,
@@ -4011,10 +3836,7 @@ impl Engine {
         let wb = self.engine.workbook().clone();
         self.engine = FormulaEngine::from_workbook_recalc_all(wb);
         self.flush_dirty_pages();
-        let pages = self.subscribed_pages.clone();
-        for p in pages {
-            self.enqueue_page(p);
-        }
+        self.pages.mark_all();
         EngineEvent::SheetChanged {
             sheet: self.sheet_info(self.subscribed_sheet),
             action_ms: 0.0,
@@ -4194,140 +4016,6 @@ fn record_inverse_on_snapshot_encoder(enc: &mut SnapshotEncoder, inv: &InverseOp
     }
 }
 
-fn compute_jump_target(
-    wb: &Workbook<BoundFormula>,
-    sheet: &Sheet,
-    sheet_id: SheetId,
-    r0: u32,
-    c0: u32,
-    dir: JumpDirection,
-) -> (u32, u32) {
-    let rows = sheet.rows();
-    let cols = sheet.cols();
-    let is_occ = |r: u32, c: u32| -> bool {
-        let (Some(r_id), Some(c_id)) =
-            (sheet.row_axis().pos_to_id(r), sheet.col_axis().pos_to_id(c))
-        else {
-            return false;
-        };
-        !matches!(sheet.value_by_id(RowId(r_id), ColId(c_id)), Value::Empty)
-            || wb.formula(sheet_id, RowId(r_id), ColId(c_id)).is_some()
-    };
-
-    // O(1) fast path when jumping vertically along a completely empty column!
-    if matches!(dir, JumpDirection::Up | JumpDirection::Down)
-        && let Some(c_id) = sheet.col_axis().pos_to_id(c0)
-    {
-        let col_empty = sheet
-            .col_slots()
-            .get(c_id)
-            .and_then(|slot| sheet.raw_columns().get(slot as usize))
-            .is_none_or(|col| col.blocks().is_empty());
-        if col_empty && !is_occ(r0, c0) {
-            // Check if any formula exists in `c_id` (rare if cached value is Empty).
-            let has_any_formula = wb.formulas().col_has_any(sheet_id, ColId(c_id));
-            if !has_any_formula {
-                return match dir {
-                    JumpDirection::Up => (0, c0),
-                    JumpDirection::Down => (rows.saturating_sub(1), c0),
-                    _ => (r0, c0),
-                };
-            }
-        }
-    }
-
-    match dir {
-        JumpDirection::Down => {
-            if r0.saturating_add(1) >= rows {
-                return (r0, c0);
-            }
-            if is_occ(r0, c0) && is_occ(r0 + 1, c0) {
-                let mut r = r0 + 1;
-                while r + 1 < rows && is_occ(r + 1, c0) {
-                    r += 1;
-                }
-                (r, c0)
-            } else {
-                let mut r = r0 + 1;
-                while r < rows {
-                    if is_occ(r, c0) {
-                        return (r, c0);
-                    }
-                    r += 1;
-                }
-                (rows - 1, c0)
-            }
-        }
-        JumpDirection::Up => {
-            if r0 == 0 {
-                return (0, c0);
-            }
-            if is_occ(r0, c0) && is_occ(r0 - 1, c0) {
-                let mut r = r0 - 1;
-                while r > 0 && is_occ(r - 1, c0) {
-                    r -= 1;
-                }
-                (r, c0)
-            } else {
-                let mut r = r0 - 1;
-                loop {
-                    if is_occ(r, c0) {
-                        return (r, c0);
-                    }
-                    if r == 0 {
-                        return (0, c0);
-                    }
-                    r -= 1;
-                }
-            }
-        }
-        JumpDirection::Right => {
-            if c0.saturating_add(1) >= cols {
-                return (r0, c0);
-            }
-            if is_occ(r0, c0) && is_occ(r0, c0 + 1) {
-                let mut c = c0 + 1;
-                while c + 1 < cols && is_occ(r0, c + 1) {
-                    c += 1;
-                }
-                (r0, c)
-            } else {
-                let mut c = c0 + 1;
-                while c < cols {
-                    if is_occ(r0, c) {
-                        return (r0, c);
-                    }
-                    c += 1;
-                }
-                (r0, cols - 1)
-            }
-        }
-        JumpDirection::Left => {
-            if c0 == 0 {
-                return (r0, 0);
-            }
-            if is_occ(r0, c0) && is_occ(r0, c0 - 1) {
-                let mut c = c0 - 1;
-                while c > 0 && is_occ(r0, c - 1) {
-                    c -= 1;
-                }
-                (r0, c)
-            } else {
-                let mut c = c0 - 1;
-                loop {
-                    if is_occ(r0, c) {
-                        return (r0, c);
-                    }
-                    if c == 0 {
-                        return (r0, 0);
-                    }
-                    c -= 1;
-                }
-            }
-        }
-    }
-}
-
 fn format_csv_error(err: CsvError) -> String {
     match err {
         CsvError::InvalidUtf8 => String::from("CSV file is not valid UTF-8 text."),
@@ -4400,62 +4088,6 @@ fn format_op_error(err: OpError) -> String {
             String::from("Cut-and-paste source and destination ranges are invalid.")
         }
     }
-}
-
-pub(crate) fn build_cell_inspected(
-    engine: &FormulaEngine,
-    sheet_id: SheetId,
-    row_id: RowId,
-    col_id: ColId,
-) -> Option<EngineEvent> {
-    let info = engine.inspect_cell(sheet_id, row_id, col_id)?;
-    let sheet = engine.workbook().sheet(sheet_id)?;
-    let format_code = String::from(sheet.effective_format_by_id(row_id, col_id).code_str());
-    let style = WireCellStyle::from(sheet.effective_style_by_id(row_id, col_id));
-    let key = (sheet_id, row_id, col_id);
-    let anchor_opt = if engine.spills().active_spill(key).is_some() {
-        Some(key)
-    } else {
-        engine.spills().anchor_of_cell(key)
-    };
-    let is_spill_shadow = anchor_opt.is_some_and(|a| a != key);
-    let spill_range = anchor_opt.and_then(|anchor| {
-        let entry = engine.spills().active_spill(anchor)?;
-        let pr1 = sheet.row_axis().id_to_pos(anchor.1.0)?;
-        let c1 = sheet.col_axis().id_to_pos(anchor.2.0)?;
-        let pr2 = entry
-            .rows
-            .last()
-            .and_then(|r| sheet.row_axis().id_to_pos(r.0))
-            .unwrap_or(pr1);
-        let c2 = entry
-            .cols
-            .last()
-            .and_then(|c| sheet.col_axis().id_to_pos(c.0))
-            .unwrap_or(c1);
-        let d1 = engine.physical_to_display_row(sheet_id, pr1).unwrap_or(pr1);
-        let d2 = engine.physical_to_display_row(sheet_id, pr2).unwrap_or(pr2);
-        Some(WireCellRect {
-            first_row: d1.min(d2),
-            last_row: d1.max(d2),
-            first_col: c1.min(c2),
-            last_col: c1.max(c2),
-        })
-    });
-    Some(EngineEvent::CellInspected {
-        sheet: sheet_id.0,
-        row_id: row_id.0,
-        col_id: col_id.0,
-        address: info.address,
-        raw: info.raw,
-        display: info.display,
-        is_formula: info.is_formula,
-        error: info.error,
-        format_code,
-        style,
-        spill_range,
-        is_spill_shadow,
-    })
 }
 
 #[expect(
@@ -4637,6 +4269,8 @@ mod tests {
                 row_count: 64,
                 first_col: 0,
                 col_count: 22,
+                visible: None,
+                resend: false,
             })
             .is_none()
         );
@@ -4812,8 +4446,10 @@ mod tests {
             row_count: 32,
             first_col: 0,
             col_count: 8,
+            visible: None,
+            resend: false,
         });
-        assert!(eng.subscribed_set.contains(&Page { row: 0, col: 0 }));
+        assert!(eng.pages.contains(Page { row: 0, col: 0 }));
     }
 
     #[test]
@@ -4971,5 +4607,565 @@ mod tests {
             eng.engine.workbook().sheet(SheetId(0)).unwrap().value(0, 4),
             reticula_core::value::Value::number(60.0)
         );
+    }
+
+    fn subscribe(eng: &mut Engine, rows: (u32, u32), cols: (u32, u32)) {
+        let _ = eng.handle_command(EngineCommand::Subscribe {
+            sheet: 0,
+            epoch: 1,
+            first_row: rows.0,
+            row_count: rows.1,
+            first_col: cols.0,
+            col_count: cols.1,
+            visible: None,
+            resend: false,
+        });
+    }
+
+    /// `(page row, page column)` of the pages that are sent now.
+    fn sent_pages(eng: &mut Engine) -> Vec<(u32, u32)> {
+        std::iter::from_fn(|| eng.take_page())
+            .map(|page| {
+                let field = |at: usize| u32::from_le_bytes(page[at..at + 4].try_into().unwrap());
+                (field(8) / PAGE_ROWS, field(12) / PAGE_COLS)
+            })
+            .collect()
+    }
+
+    fn edit(eng: &mut Engine, row: u64, col: u64, raw: &str) {
+        let event = eng.handle_command(EngineCommand::EditCell {
+            sheet: 0,
+            row_id: row,
+            col_id: col,
+            raw: String::from(raw),
+        });
+        assert!(
+            !matches!(event, Some(EngineEvent::Rejected { .. })),
+            "{event:?}"
+        );
+        while eng.has_pending_recalc() {
+            let _ = eng.handle_command(EngineCommand::ContinueRecalc);
+        }
+    }
+
+    fn cell(eng: &Engine, row: u64, col: u64) -> (String, String) {
+        let cell = eng
+            .engine
+            .inspect_cell(SheetId(0), RowId(row), ColId(col))
+            .unwrap();
+        (cell.raw, cell.display)
+    }
+
+    fn copy_fill(
+        eng: &mut Engine,
+        (first_row, row_count): (u32, u32),
+        (first_col, col_count): (u32, u32),
+        dir: FillDirection,
+    ) -> SheetInfo {
+        let event = eng.handle_command(EngineCommand::CopyFill {
+            sheet: 0,
+            first_row,
+            row_count,
+            first_col,
+            col_count,
+            dir,
+        });
+        let Some(EngineEvent::SheetChanged { sheet, .. }) = event else {
+            panic!("expected SheetChanged, got {event:?}");
+        };
+        while eng.has_pending_recalc() {
+            let _ = eng.handle_command(EngineCommand::ContinueRecalc);
+        }
+        sheet
+    }
+
+    #[test]
+    fn visible_pages_are_sent_first_and_resent_on_request() {
+        let mut eng = Engine::new();
+        let mut ask = |visible, resend| {
+            let _ = eng.handle_command(EngineCommand::Subscribe {
+                sheet: 0,
+                epoch: 1,
+                first_row: 0,
+                row_count: 256,
+                first_col: 0,
+                col_count: 16,
+                visible,
+                resend,
+            });
+            sent_pages(&mut eng)
+        };
+        let middle = Some(WireCellSpan {
+            first_row: 130,
+            end_row: 180,
+            first_col: 0,
+            end_col: 10,
+        });
+        assert_eq!(ask(middle, false), [(2, 0), (1, 0), (3, 0), (0, 0)]);
+        assert_eq!(ask(middle, false), []);
+        assert_eq!(ask(middle, true), [(2, 0), (1, 0), (3, 0), (0, 0)]);
+        assert_eq!(ask(None, true), [(0, 0), (1, 0), (2, 0), (3, 0)]);
+    }
+
+    #[test]
+    fn an_edit_resends_the_pages_its_text_may_overflow_into() {
+        let mut eng = Engine::new();
+        subscribe(&mut eng, (0, 64), (0, 160));
+        assert_eq!(sent_pages(&mut eng).len(), 10);
+        edit(&mut eng, 3, 20, "A heading that runs on and on");
+        assert_eq!(
+            sent_pages(&mut eng),
+            [(0, 1), (0, 2), (0, 3), (0, 4), (0, 5)]
+        );
+
+        // Structural changes resend whatever is held, however far it is.
+        let _ = eng.handle_command(EngineCommand::InsertRows {
+            sheet: 0,
+            after_row_id: None,
+            count: 1,
+        });
+        assert_eq!(sent_pages(&mut eng).len(), 10);
+        let _ = eng.handle_command(EngineCommand::Undo);
+        assert_eq!(sent_pages(&mut eng).len(), 10);
+        let _ = eng.handle_command(EngineCommand::Undo);
+        assert_eq!(sent_pages(&mut eng).first(), Some(&(0, 1)));
+    }
+
+    #[test]
+    fn inspection_names_the_kind_of_value_and_the_origin_of_a_spilled_one() {
+        let mut eng = Engine::new();
+        edit(&mut eng, 0, 0, "12");
+        edit(&mut eng, 1, 0, "'007");
+        edit(&mut eng, 2, 0, "TRUE");
+        edit(&mut eng, 3, 0, "=1/0");
+        edit(&mut eng, 0, 1, "=IF({1;1;0}=1,{\"a\";5;6},NA())");
+        edit(&mut eng, 0, 2, "=SEQUENCE(2)");
+        edit(&mut eng, 1, 2, "in the way");
+        let mut inspect = |row_id: u64, col_id: u64| {
+            let event = eng.handle_command(EngineCommand::InspectCell {
+                sheet: 0,
+                row_id,
+                col_id,
+            });
+            let Some(EngineEvent::CellInspected {
+                value_kind,
+                spill_anchor,
+                is_spill_shadow,
+                ..
+            }) = event
+            else {
+                panic!("expected CellInspected, got {event:?}");
+            };
+            assert_eq!(spill_anchor.is_some(), is_spill_shadow);
+            (value_kind, spill_anchor)
+        };
+        assert_eq!(inspect(0, 0), (WireValueKind::Number, None));
+        assert_eq!(inspect(1, 0), (WireValueKind::Text, None));
+        assert_eq!(inspect(2, 0), (WireValueKind::Boolean, None));
+        assert_eq!(inspect(3, 0), (WireValueKind::Error, None));
+        assert_eq!(inspect(9, 9), (WireValueKind::Empty, None));
+        // The anchor itself is no shadow.
+        assert_eq!(inspect(0, 1), (WireValueKind::Text, None));
+        let anchor = Some(WireSpillAnchor {
+            address: String::from("B1"),
+            formula: String::from("=IF({1;1;0}=1,{\"a\";5;6},NA())"),
+        });
+        assert_eq!(inspect(1, 1), (WireValueKind::Number, anchor.clone()));
+        assert_eq!(inspect(2, 1), (WireValueKind::Error, anchor));
+        // A blocked one shows an error and spills nothing.
+        assert_eq!(inspect(0, 2), (WireValueKind::Error, None));
+    }
+
+    #[test]
+    fn filling_down_copies_the_first_row_as_it_is() {
+        let mut eng = Engine::new();
+        edit(&mut eng, 0, 0, "2026-11-19");
+        edit(&mut eng, 0, 1, "Item-7");
+        edit(&mut eng, 0, 2, "8");
+        edit(&mut eng, 0, 3, "=C1*$C$1");
+        edit(&mut eng, 0, 4, "=D1+1");
+        edit(&mut eng, 2, 5, "overwritten");
+        let _ = eng.handle_command(EngineCommand::SetFormat {
+            sheet: 0,
+            target: WireFormatTarget::Cells {
+                rows: vec![WireIdRun {
+                    first_id: 0,
+                    len: 1,
+                }],
+                cols: vec![WireIdRun {
+                    first_id: 1,
+                    len: 2,
+                }],
+            },
+            number_format: WireFormatPatch::Keep,
+            style: WireStylePatch {
+                bold: Some(true),
+                ..WireStylePatch::default()
+            },
+        });
+
+        let info = copy_fill(&mut eng, (0, 4), (0, 6), FillDirection::Down);
+        assert_eq!(info.undo_label.as_deref(), Some("Fill down"));
+        for row in 1..4 {
+            assert_eq!(cell(&eng, row, 0).1, "2026-11-19");
+            assert_eq!(cell(&eng, row, 1).1, "Item-7");
+            assert_eq!(cell(&eng, row, 2).1, "8");
+            let n = row + 1;
+            let squared = (format!("=C{n}*$C$1"), String::from("64"));
+            assert_eq!(cell(&eng, row, 3), squared);
+            assert_eq!(cell(&eng, row, 4), (format!("=D{n}+1"), String::from("65")));
+            assert_eq!(cell(&eng, row, 5).1, "");
+            let sheet = eng.engine.workbook().sheet(SheetId(0)).unwrap();
+            let bold = |col| sheet.effective_style_by_id(RowId(row), ColId(col)).bold;
+            assert_eq!([0, 1, 2, 3].map(bold), [false, true, true, false]);
+        }
+        assert_eq!(cell(&eng, 4, 1).1, "");
+
+        // One step takes all of it back.
+        let _ = eng.handle_command(EngineCommand::Undo);
+        for col in 0..5 {
+            assert_eq!(cell(&eng, 1, col).1, "", "column {col}");
+        }
+        assert_eq!(cell(&eng, 2, 5).1, "overwritten");
+        let sheet = eng.engine.workbook().sheet(SheetId(0)).unwrap();
+        assert!(!sheet.effective_style_by_id(RowId(2), ColId(1)).bold);
+        let _ = eng.handle_command(EngineCommand::Redo);
+        assert_eq!(cell(&eng, 3, 1).1, "Item-7");
+        assert_eq!(cell(&eng, 3, 3).0, "=C4*$C$1");
+    }
+
+    #[test]
+    fn filling_right_copies_the_first_column_as_it_is() {
+        let mut eng = Engine::new();
+        edit(&mut eng, 0, 0, "2026-11-19");
+        edit(&mut eng, 1, 0, "Item-7");
+        edit(&mut eng, 2, 0, "=A1");
+        edit(&mut eng, 3, 0, "=$A2&A$2");
+        edit(&mut eng, 4, 0, "=A4");
+        edit(&mut eng, 5, 0, "=A5");
+        let info = copy_fill(&mut eng, (0, 6), (0, 3), FillDirection::Right);
+        assert_eq!(info.undo_label.as_deref(), Some("Fill right"));
+        for (col, name) in [(1, "B"), (2, "C")] {
+            assert_eq!(cell(&eng, 0, col).1, "2026-11-19");
+            assert_eq!(cell(&eng, 1, col).1, "Item-7");
+            assert_eq!(cell(&eng, 2, col).0, format!("={name}1"));
+            assert_eq!(cell(&eng, 3, col).0, format!("=$A2&{name}$2"));
+            assert_eq!(cell(&eng, 3, col).1, "Item-7Item-7");
+            assert_eq!(cell(&eng, 4, col).0, format!("={name}4"));
+            assert_eq!(cell(&eng, 5, col).0, format!("={name}5"));
+        }
+        assert_eq!(cell(&eng, 0, 3).1, "");
+    }
+
+    #[test]
+    fn a_fill_with_nothing_to_copy_to_changes_nothing() {
+        let mut eng = Engine::new();
+        edit(&mut eng, 0, 0, "1");
+        let before = eng.engine.workbook().logical_digest();
+        for dir in [FillDirection::Down, FillDirection::Right] {
+            let info = copy_fill(&mut eng, (0, 1), (0, 1), dir);
+            assert_eq!(info.undo_label.as_deref(), Some("Edit A1"));
+        }
+        assert_eq!(eng.engine.workbook().logical_digest(), before);
+        let outside = eng.handle_command(EngineCommand::CopyFill {
+            sheet: 0,
+            first_row: u32::MAX,
+            row_count: 5,
+            first_col: 0,
+            col_count: 1,
+            dir: FillDirection::Down,
+        });
+        assert!(matches!(outside, Some(EngineEvent::Rejected { .. })));
+    }
+
+    #[test]
+    fn a_fill_leaves_the_clipboard_alone() {
+        let mut eng = Engine::new();
+        edit(&mut eng, 0, 0, "5");
+        edit(&mut eng, 0, 1, "=A1*2");
+        let copied = eng.handle_command(EngineCommand::CopyRange {
+            sheet: 0,
+            first_row: 0,
+            row_count: 1,
+            first_col: 1,
+            col_count: 1,
+            cut: false,
+        });
+        let Some(EngineEvent::ClipboardCopied { tsv, .. }) = copied else {
+            panic!("expected ClipboardCopied, got {copied:?}");
+        };
+        let _ = copy_fill(&mut eng, (0, 3), (0, 1), FillDirection::Down);
+        // Pasting still knows the formula, and not just the text that was copied.
+        let _ = eng.handle_command(EngineCommand::PasteClipboard {
+            sheet: 0,
+            dest_row: 2,
+            dest_row_count: 1,
+            dest_col: 1,
+            dest_col_count: 1,
+            tsv,
+            html: None,
+        });
+        assert_eq!(cell(&eng, 2, 1).0, "=A3*2");
+    }
+
+    /// What a copied cell can hold: values, formulas with every mix of
+    /// references, and looks of its own.
+    fn scribble(eng: &mut Engine, next: &mut impl FnMut(u32) -> u32) {
+        let inputs = [
+            "",
+            "7",
+            "Item-7",
+            "'007",
+            "2026-11-19",
+            "TRUE",
+            "=A1+$B$2",
+            "=$A3&B$1",
+            "=SUM(A1:B2)",
+            "=C$1:D2",
+            "=ROW()",
+            "12.5%",
+        ];
+        for row in 0..12 {
+            for col in 0..8 {
+                let raw = inputs[next(12) as usize];
+                let row_id = eng.engine.workbook().sheet(SheetId(0)).unwrap().row_id(row);
+                let col_id = eng.engine.workbook().sheet(SheetId(0)).unwrap().col_id(col);
+                if !raw.is_empty() {
+                    edit(eng, row_id, col_id, raw);
+                }
+                if next(4) == 0 {
+                    let _ = eng.handle_command(EngineCommand::SetFormat {
+                        sheet: 0,
+                        target: WireFormatTarget::Cells {
+                            rows: vec![WireIdRun {
+                                first_id: row_id,
+                                len: 1,
+                            }],
+                            cols: vec![WireIdRun {
+                                first_id: col_id,
+                                len: 1,
+                            }],
+                        },
+                        number_format: WireFormatPatch::Keep,
+                        style: WireStylePatch {
+                            bold: Some(true),
+                            italic: (next(2) == 0).then_some(true),
+                            ..WireStylePatch::default()
+                        },
+                    });
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_fill_leaves_what_pasting_would_have_left() {
+        for seed in 0..40_u32 {
+            let mut state = seed.wrapping_mul(2_654_435_761).wrapping_add(12_345);
+            let mut next = move |below: u32| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state % below
+            };
+            let mut filled = Engine::new();
+            // Identifiers that do not follow each other, as after moving rows about.
+            for at in [2, 5, 9] {
+                let after = filled
+                    .engine
+                    .workbook()
+                    .sheet(SheetId(0))
+                    .unwrap()
+                    .row_id(at);
+                let _ = filled.handle_command(EngineCommand::InsertRows {
+                    sheet: 0,
+                    after_row_id: Some(after),
+                    count: 2,
+                });
+            }
+            let after = filled
+                .engine
+                .workbook()
+                .sheet(SheetId(0))
+                .unwrap()
+                .col_id(3);
+            let _ = filled.handle_command(EngineCommand::InsertCols {
+                sheet: 0,
+                after_col_id: Some(after),
+                count: 1,
+            });
+            scribble(&mut filled, &mut next);
+            let mut pasted = Engine::new();
+            pasted.engine =
+                FormulaEngine::from_workbook_recalc_all(filled.engine.workbook().clone());
+
+            let rows = (next(5), 2 + next(6));
+            let cols = (next(3), 2 + next(4));
+            let dir = if next(2) == 0 {
+                FillDirection::Down
+            } else {
+                FillDirection::Right
+            };
+            let _ = copy_fill(&mut filled, rows, cols, dir);
+            let (source, dest) = match dir {
+                FillDirection::Down => ((1, cols.1), (rows.0 + 1, rows.1 - 1, cols.0, cols.1)),
+                FillDirection::Right => ((rows.1, 1), (rows.0, rows.1, cols.0 + 1, cols.1 - 1)),
+            };
+            let copied = pasted.handle_command(EngineCommand::CopyRange {
+                sheet: 0,
+                first_row: rows.0,
+                row_count: source.0,
+                first_col: cols.0,
+                col_count: source.1,
+                cut: false,
+            });
+            let Some(EngineEvent::ClipboardCopied { tsv, .. }) = copied else {
+                panic!("expected ClipboardCopied, got {copied:?}");
+            };
+            // A line with nothing in it has no text to paste.
+            if tsv.is_empty() {
+                continue;
+            }
+            let event = pasted.handle_command(EngineCommand::PasteClipboard {
+                sheet: 0,
+                dest_row: dest.0,
+                dest_row_count: dest.1,
+                dest_col: dest.2,
+                dest_col_count: dest.3,
+                tsv,
+                html: None,
+            });
+            assert!(
+                !matches!(event, Some(EngineEvent::Rejected { .. })),
+                "{event:?}"
+            );
+            while pasted.has_pending_recalc() {
+                let _ = pasted.handle_command(EngineCommand::ContinueRecalc);
+            }
+            let look = |eng: &Engine| -> Vec<_> {
+                let sheet = eng.engine.workbook().sheet(SheetId(0)).unwrap();
+                (0..16)
+                    .flat_map(|row| (0..10).map(move |col| (row, col)))
+                    .map(|(row, col)| {
+                        let (row_id, col_id) = (sheet.row_id(row), sheet.col_id(col));
+                        let (raw, display) = cell(eng, row_id, col_id);
+                        let style = sheet.effective_style_by_id(RowId(row_id), ColId(col_id));
+                        ((row, col), raw, display, format!("{style:?}"))
+                    })
+                    .collect()
+            };
+            assert_eq!(
+                look(&filled),
+                look(&pasted),
+                "seed {seed} {dir:?} {rows:?} {cols:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn formulas_with_nothing_in_common_are_filled_by_one_operation() {
+        let mut eng = Engine::new();
+        let rows = 400;
+        let inputs = (0..rows)
+            .map(|row| {
+                let source = format!("=A{}+{row}", row + 1);
+                let formula = BoundFormula::parse_and_bind(
+                    &source,
+                    FormulaMode::Dynamic,
+                    eng.engine.workbook(),
+                    SheetId(0),
+                )
+                .unwrap();
+                CellInput::Formula {
+                    formula,
+                    cached: None,
+                }
+            })
+            .collect();
+        let op = Op::SetBlock {
+            sheet: SheetId(0),
+            rows: vec![IdRun {
+                first_id: 0,
+                len: rows,
+            }],
+            cols: vec![ColId(1)],
+            columns_data: vec![inputs],
+        };
+        eng.execute_user_txn(String::from("Edit"), &[op]).unwrap();
+        let ops = build_copy_fill_ops(
+            eng.engine.workbook(),
+            SheetId(0),
+            &[(0, rows)],
+            (1, 3),
+            FillDirection::Right,
+        )
+        .unwrap();
+        assert!(matches!(ops.as_slice(), [Op::SetBlock { .. }]));
+        let _ = copy_fill(&mut eng, (0, rows), (1, 3), FillDirection::Right);
+        assert_eq!(cell(&eng, 0, 2).0, "=B1+0");
+        assert_eq!(
+            cell(&eng, 399, 3),
+            (String::from("=C400+399"), String::from("1197"))
+        );
+        let _ = eng.handle_command(EngineCommand::Undo);
+        assert_eq!(cell(&eng, 399, 3).0, "");
+    }
+
+    #[test]
+    fn filling_down_a_filter_that_leaves_every_other_row_is_one_block() {
+        let mut eng = Engine::new();
+        edit(&mut eng, 0, 1, "Item-7");
+        edit(&mut eng, 0, 2, "=ROW()");
+        let runs: Vec<(u32, u32)> = (0..5_000).map(|run| (run * 2, 1)).collect();
+        let ops = build_copy_fill_ops(
+            eng.engine.workbook(),
+            SheetId(0),
+            &runs,
+            (1, 2),
+            FillDirection::Down,
+        )
+        .unwrap();
+        assert!(matches!(ops.as_slice(), [Op::SetBlock { .. }]));
+        eng.execute_user_txn(String::from("Fill down"), &ops)
+            .unwrap();
+        assert_eq!(cell(&eng, 9_998, 1).0, "Item-7");
+        assert_eq!(cell(&eng, 9_998, 2).0, "=ROW()");
+        assert_eq!(cell(&eng, 9_997, 1).0, "");
+    }
+
+    #[test]
+    fn filling_down_a_filtered_range_skips_hidden_rows() {
+        let mut eng = Engine::new();
+        for (row, kind) in ["Kind", "a", "b", "a", "b", "a"].into_iter().enumerate() {
+            edit(&mut eng, row as u64, 0, kind);
+        }
+        edit(&mut eng, 1, 1, "Item-7");
+        edit(&mut eng, 1, 2, "=ROW()&A2");
+        let _ = eng.handle_command(EngineCommand::SetFilterTable {
+            sheet: 0,
+            header_row: 0,
+            last_row: 5,
+            first_col: 0,
+            last_col: 2,
+        });
+        let _ = eng.handle_command(EngineCommand::SetColumnFilter {
+            sheet: 0,
+            col: 0,
+            criterion: Some(WireColFilterCriterion::Values {
+                allowed: vec![String::from("a")],
+                include_blanks: false,
+            }),
+        });
+        // Shown are the header and rows 2, 4 and 6.
+        let _ = copy_fill(&mut eng, (1, 3), (1, 2), FillDirection::Down);
+        let shown: Vec<String> = (1..6).map(|row| cell(&eng, row, 1).1).collect();
+        assert_eq!(shown, ["Item-7", "", "Item-7", "", "Item-7"]);
+        let formulas: Vec<String> = (1..6).map(|row| cell(&eng, row, 2).0).collect();
+        assert_eq!(formulas, ["=ROW()&A2", "", "=ROW()&A4", "", "=ROW()&A6"]);
+        // To the right, the hidden rows are left alone as well.
+        edit(&mut eng, 2, 1, "hidden");
+        let _ = copy_fill(&mut eng, (1, 3), (1, 3), FillDirection::Right);
+        let shown: Vec<String> = (1..6).map(|row| cell(&eng, row, 3).1).collect();
+        assert_eq!(shown, ["Item-7", "", "Item-7", "", "Item-7"]);
     }
 }

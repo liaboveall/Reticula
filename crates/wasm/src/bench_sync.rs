@@ -211,6 +211,8 @@ impl SyncBench {
             row_count: 64,
             first_col: 0,
             col_count: 22,
+            visible: None,
+            resend: false,
         });
         let _ = engine.handle_sync_command(SyncCommand::Connected);
         let _ = engine.handle_sync_command(SyncCommand::Receive {

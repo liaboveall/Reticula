@@ -329,6 +329,40 @@ fn remote_presence_is_resolved_again_after_a_structural_commit() {
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), test)]
+fn a_commit_resends_the_pages_its_text_may_overflow_into() {
+    let (mut engine, mut server) = connect();
+    let _ = engine.handle_command(EngineCommand::Subscribe {
+        sheet: 0,
+        epoch: 1,
+        first_row: 0,
+        row_count: 64,
+        first_col: 0,
+        col_count: 160,
+        visible: None,
+        resend: false,
+    });
+    assert_eq!(std::iter::from_fn(|| engine.take_page()).count(), 10);
+    let bob = server.allocate_replica(BOB).unwrap();
+    let edited = commit(
+        &mut server,
+        BOB,
+        WirePendingTxnV3 {
+            replica: bob,
+            client_seq: 1,
+            base_server_seq: 0,
+            timestamp_ms: 0,
+            txn: ops_to_wire_txn_v3("Edit".into(), &[edit_op(3, 7.0)]).unwrap(),
+        },
+    );
+    deliver(&mut engine, edited);
+    let columns: Vec<u32> = std::iter::from_fn(|| engine.take_page())
+        .map(|page| u32::from_le_bytes(page[12..16].try_into().unwrap()) / 16)
+        .collect();
+    assert_eq!(columns, [0, 1, 2, 3, 4]);
+}
+
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), test)]
 fn local_cursor_follows_rows_inserted_by_someone_else() {
     let (mut engine, mut server) = connect();
     let span = |first_row, first_col| PresenceSpan {

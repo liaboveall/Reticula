@@ -21,9 +21,15 @@ use reticula_formula::binder::{
 };
 use reticula_formula::determinism;
 
+use crate::FillDirection;
+
 /// Maximum cells copied to the system clipboard in a single `Copy` / `Cut`
 /// action (`200,000` cells keeps TSV + HTML strings bounded to a few MiB).
 pub const MAX_CLIPBOARD_CELLS: usize = 200_000;
+
+/// Most `Op::FillFormula` one copy fill is made of. Applying and undoing each
+/// takes time that grows with the formulas on the sheet.
+const MAX_FILL_FORMULA_OPS: usize = 128;
 
 /// 0-based visible rectangle on a worksheet.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -862,6 +868,324 @@ const fn non_general_opt(fmt: NumberFormat) -> Option<NumberFormat> {
     } else {
         Some(fmt)
     }
+}
+
+// ------------------------------------------------------------------ copy fill
+
+/// Number format and style that a copy fill gives to the cells it writes.
+type FillLook = (Option<NumberFormat>, StylePatch);
+
+/// Cells of one line of a copy fill whose formulas are written by the same operation.
+struct FillGroup {
+    /// Position of the first cell along the line.
+    first: u32,
+    len: u32,
+    value: BoundFormula,
+}
+
+/// Adds the cell at `position` to the last group if it continues it.
+fn extend_groups(
+    groups: &mut Vec<FillGroup>,
+    position: u32,
+    value: &BoundFormula,
+    continues: impl FnOnce(&FillGroup, &BoundFormula) -> bool,
+) {
+    if let Some(last) = groups.last_mut()
+        && last.first.saturating_add(last.len) == position
+        && continues(last, value)
+    {
+        last.len = last.len.saturating_add(1);
+        return;
+    }
+    groups.push(FillGroup {
+        first: position,
+        len: 1,
+        value: value.clone(),
+    });
+}
+
+/// A cell of the line a copy fill copies.
+struct FillSource {
+    /// Identifier along the line.
+    id: u64,
+    row: u32,
+    col: u32,
+    input: CellInput<BoundFormula>,
+}
+
+impl FillSource {
+    /// What the cell at a position holds after it was copied from this one.
+    fn copied_to(
+        &self,
+        workbook: &Workbook<BoundFormula>,
+        sheet: SheetId,
+        row: u32,
+        col: u32,
+    ) -> CellInput<BoundFormula> {
+        let CellInput::Formula { formula, .. } = &self.input else {
+            return self.input.clone();
+        };
+        CellInput::Formula {
+            formula: shift_formula_for_cell(
+                formula,
+                workbook,
+                FormulaShiftSpec {
+                    src_sheet: sheet,
+                    src_row_pos: self.row,
+                    src_col_pos: self.col,
+                    dst_sheet: sheet,
+                    dst_row_pos: row,
+                    dst_col_pos: col,
+                },
+            ),
+            cached: None,
+        }
+    }
+}
+
+/// Builds the operations that copy the first row of a range over the rest of
+/// it, or its first column, the way pasting it there would: relative references
+/// shift, and values, dates included, stay as they are.
+///
+/// The rows are `(first, count)` runs of adjacent rows, so that rows hidden by
+/// a filter can be left out.
+pub fn build_copy_fill_ops(
+    workbook: &Workbook<BoundFormula>,
+    sheet_id: SheetId,
+    row_runs: &[(u32, u32)],
+    (first_col, col_count): (u32, u32),
+    dir: FillDirection,
+) -> Result<Vec<Op<BoundFormula>>, String> {
+    let sheet = workbook
+        .sheet(sheet_id)
+        .ok_or_else(|| String::from("Target sheet does not exist."))?;
+    let total_rows = row_runs
+        .iter()
+        .fold(0_u32, |sum, &(_, count)| sum.saturating_add(count));
+    if row_runs
+        .iter()
+        .any(|&(first, count)| first.saturating_add(count) > sheet.rows())
+        || first_col.saturating_add(col_count) > sheet.cols()
+    {
+        return Err(String::from("Fill range exceeds worksheet dimensions."));
+    }
+    if (total_rows as usize).saturating_mul(col_count as usize) > MAX_BULK_CELLS_PER_OP {
+        return Err(String::from(
+            "Fill exceeds 2,000,000-cell transaction limit.",
+        ));
+    }
+    match dir {
+        FillDirection::Down => {
+            let Some((&(first_row, first_count), rest)) = row_runs.split_first() else {
+                return Ok(Vec::new());
+            };
+            let mut targets = Vec::with_capacity(row_runs.len());
+            if first_count > 1 {
+                targets.push((first_row.saturating_add(1), first_count.saturating_sub(1)));
+            }
+            targets.extend_from_slice(rest);
+            let source = (first_col..first_col.saturating_add(col_count))
+                .map(|col| (first_row, col))
+                .collect::<Vec<_>>();
+            Ok(copy_fill_ops(
+                workbook, sheet, sheet_id, &source, &targets, dir,
+            ))
+        }
+        FillDirection::Right => {
+            let source = row_runs
+                .iter()
+                .flat_map(|&(first, count)| first..first.saturating_add(count))
+                .map(|row| (row, first_col))
+                .collect::<Vec<_>>();
+            let targets = [(first_col.saturating_add(1), col_count.saturating_sub(1))];
+            Ok(copy_fill_ops(
+                workbook, sheet, sheet_id, &source, &targets, dir,
+            ))
+        }
+    }
+}
+
+/// `source` is the line of cells to copy, and `targets` the `(first, count)`
+/// runs across it to copy each of them to.
+fn copy_fill_ops(
+    workbook: &Workbook<BoundFormula>,
+    sheet: &Sheet,
+    sheet_id: SheetId,
+    source: &[(u32, u32)],
+    targets: &[(u32, u32)],
+    dir: FillDirection,
+) -> Vec<Op<BoundFormula>> {
+    let across = targets.iter().fold(0_usize, |sum, &(_, count)| {
+        sum.saturating_add(count as usize)
+    });
+    if across == 0 || source.is_empty() {
+        return Vec::new();
+    }
+    let (line_axis, target_axis) = match dir {
+        FillDirection::Down => (sheet.col_axis(), sheet.row_axis()),
+        FillDirection::Right => (sheet.row_axis(), sheet.col_axis()),
+    };
+    let target_ids = targets
+        .iter()
+        .flat_map(|&(first, count)| axis_runs_for_span(target_axis, first, count))
+        .collect::<Vec<_>>();
+
+    let mut block: Vec<FillSource> = Vec::new();
+    let mut formula_cells: Vec<FillSource> = Vec::new();
+    let mut formulas: Vec<FillGroup> = Vec::new();
+    let mut formats: Vec<(FillLook, Vec<u64>)> = Vec::new();
+    for &(row, col) in source {
+        let position = match dir {
+            FillDirection::Down => col,
+            FillDirection::Right => row,
+        };
+        let Some(id) = line_axis.pos_to_id(position) else {
+            continue;
+        };
+        let cell = read_copied_cell(workbook, sheet, sheet_id, row, col);
+        if let CellInput::Formula { formula, .. } = &cell.input {
+            // A cell that holds what filling would have put there can be
+            // filled together with the cells before it.
+            extend_groups(&mut formulas, position, formula, |group, formula| {
+                let (src_row_pos, src_col_pos) = match dir {
+                    FillDirection::Down => (row, group.first),
+                    FillDirection::Right => (group.first, col),
+                };
+                shift_formula_for_cell(
+                    &group.value,
+                    workbook,
+                    FormulaShiftSpec {
+                        src_sheet: sheet_id,
+                        src_row_pos,
+                        src_col_pos,
+                        dst_sheet: sheet_id,
+                        dst_row_pos: row,
+                        dst_col_pos: col,
+                    },
+                ) == *formula
+            });
+        }
+        if cell.explicit_format.is_some() || !cell.style_patch.is_empty() {
+            let look = (cell.explicit_format, cell.style_patch);
+            match formats.iter_mut().find(|(other, _)| *other == look) {
+                Some((_, ids)) => ids.push(id),
+                None => formats.push((look, vec![id])),
+            }
+        }
+        let line = FillSource {
+            id,
+            row,
+            col,
+            input: cell.input,
+        };
+        if matches!(line.input, CellInput::Formula { .. }) {
+            formula_cells.push(line);
+        } else {
+            block.push(line);
+        }
+    }
+    // Each operation costs time of its own: many formulas that have nothing in
+    // common are written cell by cell, as pasting writes them.
+    if formulas.len().saturating_mul(targets.len()) > MAX_FILL_FORMULA_OPS {
+        formulas.clear();
+        block.append(&mut formula_cells);
+    }
+
+    let mut ops = Vec::new();
+    if !block.is_empty() {
+        let positions = targets
+            .iter()
+            .flat_map(|&(first, count)| first..first.saturating_add(count));
+        ops.push(match dir {
+            FillDirection::Down => Op::SetBlock {
+                sheet: sheet_id,
+                rows: target_ids.clone(),
+                cols: block.iter().map(|line| ColId(line.id)).collect(),
+                columns_data: block
+                    .iter()
+                    .map(|line| {
+                        positions
+                            .clone()
+                            .map(|row| line.copied_to(workbook, sheet_id, row, line.col))
+                            .collect()
+                    })
+                    .collect(),
+            },
+            FillDirection::Right => {
+                block.sort_unstable_by_key(|line| line.row);
+                Op::SetBlock {
+                    sheet: sheet_id,
+                    rows: coalesce_raw_ids(block.iter().map(|line| line.id)),
+                    cols: target_ids
+                        .iter()
+                        .flat_map(|run| run.iter())
+                        .map(ColId)
+                        .collect(),
+                    columns_data: positions
+                        .map(|col| {
+                            block
+                                .iter()
+                                .map(|line| line.copied_to(workbook, sheet_id, line.row, col))
+                                .collect()
+                        })
+                        .collect(),
+                }
+            }
+        });
+    }
+    let (first_row, first_col) = source.first().copied().unwrap_or_default();
+    for group in &formulas {
+        for &(first, count) in targets {
+            let (src, rect) = match dir {
+                FillDirection::Down => (
+                    (first_row, group.first),
+                    RectPos {
+                        first_row: first,
+                        row_count: count,
+                        first_col: group.first,
+                        col_count: group.len,
+                    },
+                ),
+                FillDirection::Right => (
+                    (group.first, first_col),
+                    RectPos {
+                        first_row: group.first,
+                        row_count: group.len,
+                        first_col: first,
+                        col_count: count,
+                    },
+                ),
+            };
+            ops.extend(build_fill_plan(
+                &group.value,
+                workbook,
+                sheet_id,
+                src.0,
+                src.1,
+                FillTargetRect {
+                    dst_sheet: sheet_id,
+                    first_row_pos: rect.first_row,
+                    row_count: rect.row_count,
+                    first_col_pos: rect.first_col,
+                    col_count: rect.col_count,
+                },
+            ));
+        }
+    }
+    for ((number_format, style), ids) in formats {
+        let line_ids = coalesce_raw_ids(ids.into_iter());
+        let (rows, cols) = match dir {
+            FillDirection::Down => (target_ids.clone(), line_ids),
+            FillDirection::Right => (line_ids, target_ids.clone()),
+        };
+        ops.push(Op::SetFormat {
+            sheet: sheet_id,
+            target: FormatTarget::Cells { rows, cols },
+            number_format: number_format.map_or(FormatPatch::Keep, FormatPatch::Set),
+            style,
+        });
+    }
+    ops
 }
 
 // ------------------------------------------------------------------ clipboard

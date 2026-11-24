@@ -1040,9 +1040,7 @@ impl Engine {
                     .replace_reconciled_workbook(session.machine.visible().clone());
                 session.reset_engine_pending();
                 self.pending_aux_event = None;
-                for page in self.subscribed_pages.clone() {
-                    self.enqueue_page(page);
-                }
+                self.pages.mark_all();
             }
             self.ensure_subscribed_sheet_live();
             self.refresh_subscription_extent();

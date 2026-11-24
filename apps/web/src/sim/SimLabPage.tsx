@@ -30,6 +30,8 @@ const DEFAULT_SUBSCRIPTION: Subscription = {
   rowCount: 64,
   firstCol: 0,
   colCount: 16,
+  visible: { firstRow: 0, endRow: 64, firstCol: 0, endCol: 16 },
+  resend: false,
 };
 
 const TEN_INVARIANTS: readonly string[] = [

@@ -108,6 +108,8 @@ fn layout() -> String {
         MAX_CELL_DISPLAY_UTF16,
         MAX_SUBSCRIBED_PAGE_ROWS,
         MAX_SUBSCRIBED_PAGE_COLS,
+        MAX_SUBSCRIBED_PAGES,
+        MAX_VISIBLE_PAGES_PER_AXIS,
     ];
 
     let mut out = String::from(BANNER);

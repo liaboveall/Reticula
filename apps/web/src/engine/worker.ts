@@ -21,6 +21,7 @@ import type {
 } from "./client.ts";
 import type { CollabReplicaSession } from "./collab-storage.ts";
 import type { DraftPreviewSession } from "./draft-preview.ts";
+import { type PageSource, pumpPages } from "./page-pump.ts";
 import {
   detectStorageBackend,
   isQuotaExceededError,
@@ -110,12 +111,14 @@ const locksChannel =
 // Zero-delay macrotask yielding channel (`MessageChannel` avoids 4 ms nested timer clamping).
 const sliceChannel = new MessageChannel();
 let sliceScheduled = false;
+// Whether the grid may still be waiting for pages that did not fit into the last slice.
+let pagesPending = false;
 
 function scheduleWorkSlice(): void {
   if (stopped || sliceScheduled) {
     return;
   }
-  if (!engine?.hasPendingRecalc() && !activeSnap) {
+  if (!engine?.hasPendingRecalc() && !activeSnap && !pagesPending) {
     return;
   }
   sliceScheduled = true;
@@ -131,9 +134,12 @@ sliceChannel.port1.onmessage = () => {
     if (engine.hasPendingRecalc()) {
       if (draftPreview || historyPreviewActive) {
         engine.handle({ kind: "continueRecalc" });
+        flushDuePages(engine);
       } else {
         await runEngineCommand({ kind: "continueRecalc" });
       }
+    } else if (pagesPending) {
+      flushDuePages(engine);
     } else if (activeSnap) {
       await stepBackgroundSnapshot();
     }
@@ -410,26 +416,21 @@ scope.__reticulaOnWasmPanic = (message: string) => {
   scope.postMessage({ kind: "failed", message, panicked: true });
 };
 
-function flushHistoryPages(player: HistoryPlayer): void {
-  const pages: ArrayBuffer[] = [];
-  for (let page = player.takePage(); page; page = player.takePage()) {
-    pages.push(page.buffer as ArrayBuffer);
-  }
-  for (const buffer of pages) {
-    scope.postMessage(buffer, [buffer]);
-  }
+/**
+ * Posts pages of `source` for one slice. What does not fit follows in later
+ * slices, between commands, encoded as the engine is by then.
+ */
+function postPages(source: PageSource): void {
+  pagesPending = pumpPages(source, (message, transfer) => scope.postMessage(message, transfer));
+  scheduleWorkSlice();
 }
 
-function flushDuePagesAndAux(eng: Engine): void {
-  const pages: ArrayBuffer[] = [];
-  for (let page = eng.takePage(); page; page = eng.takePage()) {
-    pages.push(page.buffer as ArrayBuffer);
-  }
-  for (let aux = eng.takeAuxEvent(); aux; aux = eng.takeAuxEvent()) {
-    scope.postMessage(aux);
-  }
-  for (const buffer of pages) {
-    scope.postMessage(buffer, [buffer]);
+/** Posts pages of whatever the grid is showing: a draft, a past revision, or the workbook. */
+function flushDuePages(live: Engine): void {
+  if (draftPreview) {
+    draftPreview.flushPages();
+  } else {
+    postPages(historyPreviewActive && historyPlayer ? historyPlayer : live);
   }
 }
 
@@ -773,20 +774,8 @@ async function runEngineCommand(command: EngineCommand): Promise<void> {
     return;
   }
   if (historyPreviewActive && historyPlayer) {
-    if (command.kind === "subscribe") {
-      historyPlayer.subscribePages(
-        command.sheet ?? activeSheetId,
-        command.epoch,
-        command.firstRow,
-        command.rowCount,
-        command.firstCol,
-        command.colCount,
-      );
-      flushHistoryPages(historyPlayer);
-      return;
-    }
-    if (command.kind === "switchSheet") {
-      try {
+    try {
+      if (command.kind === "switchSheet") {
         const sheet = historyPlayer.setSheet(command.sheet);
         activeSheetId = sheet.sheet;
         scope.postMessage({
@@ -795,32 +784,24 @@ async function runEngineCommand(command: EngineCommand): Promise<void> {
           sheet,
           elapsedMs: 0,
         });
-        flushHistoryPages(historyPlayer);
-      } catch (err) {
+      } else {
+        const event = historyPlayer.handle(
+          command.kind === "subscribe" ? { ...command, sheet: activeSheetId } : command,
+        );
+        if (event) {
+          scope.postMessage(event);
+        }
+      }
+    } catch (err) {
+      // A cell that does not exist in this revision is no reason to alarm anyone.
+      if (command.kind !== "inspectCell") {
         scope.postMessage({
           kind: "rejected",
           reason: err instanceof Error ? err.message : String(err),
         });
       }
-      return;
     }
-    if (command.kind === "inspectCell") {
-      try {
-        const ev = historyPlayer.inspectCell(command.sheet, command.rowId, command.colId);
-        if (ev) {
-          scope.postMessage(ev);
-        }
-      } catch {
-        // Ignore invalid cell inspection while scrubbing history.
-      }
-      return;
-    }
-    if (command.kind !== "setEvalEnv") {
-      scope.postMessage({
-        kind: "rejected",
-        reason: "Return to the live workbook before editing.",
-      });
-    }
+    postPages(historyPlayer);
     return;
   }
   if (collaborative && (command.kind === "openEmpty" || command.kind === "openSample")) {
@@ -842,7 +823,7 @@ async function runEngineCommand(command: EngineCommand): Promise<void> {
   if (collaborative) {
     await flushCollabEvents(engine);
   }
-  flushDuePagesAndAux(engine);
+  flushDuePages(engine);
   await settleOpeningSentinelIfReady(engine);
   scheduleWorkSlice();
 }
@@ -907,7 +888,7 @@ async function runSyncCommand(command: SyncCommand): Promise<void> {
     }
   }
   if (!previewing) {
-    flushDuePagesAndAux(engine);
+    flushDuePages(engine);
   }
   scheduleWorkSlice();
 }
@@ -1525,7 +1506,7 @@ async function handleHostCommand(cmd: HostCommand): Promise<void> {
           });
           scope.postMessage(readyEv);
           await flushCollabEvents(engine);
-          flushDuePagesAndAux(engine);
+          flushDuePages(engine);
           scheduleWorkSlice();
           return;
         }
@@ -1570,7 +1551,7 @@ async function handleHostCommand(cmd: HostCommand): Promise<void> {
         });
         scope.postMessage(readyEv);
         await flushCollabEvents(engine);
-        flushDuePagesAndAux(engine);
+        flushDuePages(engine);
         scheduleWorkSlice();
       } catch (err) {
         scope.postMessage({
@@ -1767,16 +1748,16 @@ async function handleHostCommand(cmd: HostCommand): Promise<void> {
           sheet,
           elapsedMs: performance.now() - started,
         });
-        const sub = lastSubscription;
-        player.subscribePages(
-          sheet.sheet,
-          sub?.epoch ?? 1,
-          sub?.firstRow ?? 0,
-          sub?.rowCount ?? 64,
-          sub?.firstCol ?? 0,
-          sub?.colCount ?? 16,
-        );
-        flushHistoryPages(player);
+        const sub = lastSubscription ?? {
+          kind: "subscribe",
+          epoch: 1,
+          firstRow: 0,
+          rowCount: 64,
+          firstCol: 0,
+          colCount: 16,
+        };
+        player.handle({ ...sub, sheet: sheet.sheet });
+        postPages(player);
       } catch (err) {
         scope.postMessage({
           kind: "rejected",
@@ -1797,7 +1778,7 @@ async function handleHostCommand(cmd: HostCommand): Promise<void> {
       }
       // Do not replay stale `lastSubscription`: `historyExited` calls `grid.setSheet(...)`,
       // which clears PageCache and issues a fresh `subscribe` at the new epoch.
-      flushDuePagesAndAux(engine);
+      flushDuePages(engine);
       break;
     }
     case "draftOpenCloud":
@@ -1815,6 +1796,7 @@ async function handleHostCommand(cmd: HostCommand): Promise<void> {
           activeSheetId = s;
         },
         getActiveSheet: () => activeSheetId,
+        postPages,
       });
       if (cmd.kind === "draftOpenCloud") {
         draftPreview.openCloud(cmd.docId, cmd.branchId);
@@ -1847,7 +1829,7 @@ async function handleHostCommand(cmd: HostCommand): Promise<void> {
         }
         activeSheetId = sheet.sheet;
         scope.postMessage({ kind: "draftExited", sheet });
-        flushDuePagesAndAux(engine);
+        flushDuePages(engine);
         break;
       }
       // Fall back to cleanly exiting draft preview on collaborative workbooks.
@@ -1859,7 +1841,7 @@ async function handleHostCommand(cmd: HostCommand): Promise<void> {
         activeSheetId = ev.sheet.sheet;
         scope.postMessage({ kind: "draftExited", sheet: ev.sheet });
       }
-      flushDuePagesAndAux(engine);
+      flushDuePages(engine);
       break;
     }
     case "draftExit": {
@@ -1873,7 +1855,7 @@ async function handleHostCommand(cmd: HostCommand): Promise<void> {
         activeSheetId = ev.sheet.sheet;
         scope.postMessage({ kind: "draftExited", sheet: ev.sheet });
       }
-      flushDuePagesAndAux(engine);
+      flushDuePages(engine);
       break;
     }
     case "debugSpinWorker": {

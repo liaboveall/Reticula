@@ -8,7 +8,7 @@ use std::collections::VecDeque;
 
 use reticula_core::id::{ColId, RowId, SheetId};
 use reticula_core::ops::{InverseOp, Op, Workbook};
-use reticula_core::viewport::{self, Page, PageRange};
+use reticula_core::viewport::CellSpan;
 use reticula_formula::binder::BoundFormula;
 use reticula_formula::engine::FormulaEngine;
 use reticula_wire::convert_v3::ops_from_wire_txn_v3;
@@ -18,7 +18,9 @@ use reticula_wire::v3::WireCommittedTxnV3;
 use tsify::Ts;
 use wasm_bindgen::prelude::*;
 
-use crate::{EngineEvent, SheetInfo, build_cell_inspected, build_sheet_info_from_engine};
+use crate::clipboard::RectPos;
+use crate::pages::{self, PageQueue, PageRequest};
+use crate::{EngineCommand, EngineEvent, SheetInfo, build_sheet_info_from_engine, query};
 
 const MAX_CACHED_SNAPSHOTS: usize = 3;
 
@@ -32,7 +34,12 @@ pub struct HistoryPlayer {
     txns: Vec<WireCommittedTxnV3>,
     applied_inverses: Vec<(u64, Vec<InverseOp<BoundFormula>>)>,
     text_scratch: String,
-    due_pages: VecDeque<(SheetId, u32, Page)>,
+    subscribed_sheet: SheetId,
+    epoch: u32,
+    pages: PageQueue,
+    /// Number of style entries sent in the latest `SheetInfo` / `StylesUpdated`.
+    last_sent_styles_len: usize,
+    pending_aux_event: Option<EngineEvent>,
 }
 
 impl Default for HistoryPlayer {
@@ -55,7 +62,11 @@ impl HistoryPlayer {
             txns: Vec::new(),
             applied_inverses: Vec::new(),
             text_scratch: String::with_capacity(1024),
-            due_pages: VecDeque::new(),
+            subscribed_sheet: SheetId(0),
+            epoch: 0,
+            pages: PageQueue::default(),
+            last_sent_styles_len: 1,
+            pending_aux_event: None,
         }
     }
 
@@ -124,66 +135,36 @@ impl HistoryPlayer {
         Ts::from_rust(&info).map_err(Into::into)
     }
 
-    #[wasm_bindgen(js_name = encodePage)]
-    pub fn encode_page(
+    /// Carries out a command that changes nothing, as `Engine.handle` does, and
+    /// rejects the others. A subscription is answered with pages.
+    pub fn handle(
         &mut self,
-        sheet: u32,
-        page_row: u32,
-        page_col: u32,
-        epoch: u32,
-    ) -> Option<Vec<u8>> {
-        self.encode_page_raw(
-            SheetId(sheet),
-            Page {
-                row: page_row,
-                col: page_col,
-            },
-            epoch,
-        )
-    }
-
-    #[wasm_bindgen(js_name = subscribePages)]
-    pub fn subscribe_pages(
-        &mut self,
-        sheet: u32,
-        epoch: u32,
-        first_row: u32,
-        row_count: u32,
-        first_col: u32,
-        col_count: u32,
-    ) {
-        self.subscribe_range(
-            SheetId(sheet),
-            epoch,
-            (first_row, first_row.saturating_add(row_count)),
-            (first_col, first_col.saturating_add(col_count)),
-        );
+        command: &Ts<EngineCommand>,
+    ) -> Result<Option<Ts<EngineEvent>>, JsError> {
+        let event = self.handle_command(command.to_rust()?);
+        Ok(event.as_ref().map(Ts::from_rust).transpose()?)
     }
 
     #[wasm_bindgen(js_name = takePage)]
     pub fn take_page(&mut self) -> Option<Vec<u8>> {
-        let (sheet_id, epoch, page) = self.due_pages.pop_front()?;
-        self.encode_page_raw(sheet_id, page, epoch)
+        let page = self.pages.pop()?;
+        pages::encode_due_page(
+            &mut self.engine,
+            self.subscribed_sheet,
+            page,
+            self.epoch,
+            &mut self.text_scratch,
+            &mut self.last_sent_styles_len,
+            &mut self.pending_aux_event,
+        )
     }
 
-    #[wasm_bindgen(js_name = inspectCell)]
-    pub fn inspect_cell(
-        &self,
-        sheet: u32,
-        row_id: &str,
-        col_id: &str,
-    ) -> Result<Option<Ts<EngineEvent>>, JsError> {
-        let row: u64 = row_id
-            .parse()
-            .map_err(|_| JsError::new("invalid row identifier"))?;
-        let col: u64 = col_id
-            .parse()
-            .map_err(|_| JsError::new("invalid column identifier"))?;
-        let ev = self.inspect_cell_ids(SheetId(sheet), RowId(row), ColId(col));
-        ev.as_ref()
-            .map(Ts::from_rust)
-            .transpose()
-            .map_err(Into::into)
+    /// Takes an event that has to reach the grid before the page that was taken
+    /// last.
+    #[wasm_bindgen(js_name = takeAuxEvent)]
+    pub fn take_aux_event(&mut self) -> Result<Option<Ts<EngineEvent>>, JsError> {
+        let event = self.pending_aux_event.take();
+        Ok(event.as_ref().map(Ts::from_rust).transpose()?)
     }
 }
 
@@ -196,7 +177,7 @@ impl HistoryPlayer {
         self.current_seq = 0;
         self.txns.clear();
         self.applied_inverses.clear();
-        self.due_pages.clear();
+        self.forget_subscription();
         self.clamp_active_sheet();
     }
 
@@ -211,7 +192,7 @@ impl HistoryPlayer {
         self.current_seq = seq;
         self.txns.clear();
         self.applied_inverses.clear();
-        self.due_pages.clear();
+        self.forget_subscription();
         self.clamp_active_sheet();
         Ok(())
     }
@@ -233,7 +214,7 @@ impl HistoryPlayer {
         self.current_seq = seq;
         self.txns.clear();
         self.applied_inverses.clear();
-        self.due_pages.clear();
+        self.forget_subscription();
         self.clamp_active_sheet();
         Ok(())
     }
@@ -274,6 +255,9 @@ impl HistoryPlayer {
             ));
         }
 
+        // Every page may show something else from here on, even if this fails half
+        // way, so whatever was sent is void.
+        self.forget_subscription();
         if target_seq > self.current_seq {
             let start = usize::try_from(self.current_seq - self.base_seq)
                 .map_err(|_| String::from("sequence offset overflow"))?;
@@ -322,50 +306,115 @@ impl HistoryPlayer {
             ));
         }
         self.active_sheet = sheet_id;
+        self.forget_subscription();
         Ok(self.build_sheet_info(sheet_id))
     }
 
-    pub fn encode_page_raw(
-        &mut self,
-        sheet_id: SheetId,
-        page: Page,
-        epoch: u32,
-    ) -> Option<Vec<u8>> {
-        self.engine.prepare_page_styles(sheet_id, page);
-        self.engine
-            .encode_viewport_page(sheet_id, page, epoch, &mut self.text_scratch)
-    }
-
-    pub fn subscribe_range(
-        &mut self,
-        sheet_id: SheetId,
-        epoch: u32,
-        rows: (u32, u32),
-        cols: (u32, u32),
-    ) {
-        self.due_pages.clear();
-        let (dims, frozen) = self
-            .engine
-            .workbook()
-            .sheet(sheet_id)
-            .map_or(((0, 0), (0, 0)), |s| {
-                ((s.rows(), s.cols()), (s.frozen_rows(), s.frozen_cols()))
-            });
-        let base_range = PageRange::covering(dims, rows, cols);
-        let wanted = viewport::collect_wanted_pages_with_freeze(base_range, frozen.0, frozen.1);
-        for page in wanted {
-            self.due_pages.push_back((sheet_id, epoch, page));
+    pub fn handle_command(&mut self, command: EngineCommand) -> Option<EngineEvent> {
+        match command {
+            EngineCommand::Subscribe {
+                sheet,
+                epoch,
+                first_row,
+                row_count,
+                first_col,
+                col_count,
+                visible,
+                resend,
+            } => {
+                let sheet = SheetId(sheet);
+                if sheet != self.subscribed_sheet {
+                    self.pages.clear();
+                }
+                let request = PageRequest {
+                    rows: (first_row, row_count),
+                    cols: (first_col, col_count),
+                    visible: visible.map_or_else(CellSpan::default, Into::into),
+                };
+                self.pages.subscribe(&self.engine, sheet, request, resend);
+                self.subscribed_sheet = sheet;
+                self.epoch = epoch;
+                None
+            }
+            EngineCommand::InspectCell {
+                sheet,
+                row_id,
+                col_id,
+            } => query::inspect_cell(&self.engine, SheetId(sheet), RowId(row_id), ColId(col_id)),
+            EngineCommand::JumpEdge {
+                sheet,
+                row,
+                col,
+                dir,
+                select,
+            } => Some(query::jump_edge(
+                &self.engine,
+                SheetId(sheet),
+                row,
+                col,
+                dir,
+                select,
+            )),
+            EngineCommand::JumpUsedEnd { sheet, select } => {
+                Some(query::jump_used_end(&self.engine, SheetId(sheet), select))
+            }
+            EngineCommand::CopyRange {
+                sheet,
+                first_row,
+                row_count,
+                first_col,
+                col_count,
+                cut: _,
+            } => {
+                let rect = RectPos {
+                    first_row,
+                    row_count,
+                    first_col,
+                    col_count,
+                };
+                // Nothing can be cut from the past, and what a paste inside the
+                // live workbook keeps belongs to the live engine.
+                Some(
+                    match query::copy_selection(&self.engine, SheetId(sheet), rect, false) {
+                        Ok((event, _)) => event,
+                        Err(reason) => EngineEvent::Rejected { reason },
+                    },
+                )
+            }
+            EngineCommand::FindAll {
+                sheet,
+                options,
+                max_results,
+            } => Some(query::find_all(
+                &self.engine,
+                SheetId(sheet),
+                &options.into(),
+                max_results.unwrap_or(500) as usize,
+            )),
+            EngineCommand::FindNext {
+                sheet,
+                from_row,
+                from_col,
+                backwards,
+                options,
+            } => Some(query::find_next(
+                &self.engine,
+                SheetId(sheet),
+                from_row,
+                from_col,
+                backwards,
+                &options.into(),
+            )),
+            EngineCommand::SetEvalEnv { .. } => None,
+            _ => Some(EngineEvent::Rejected {
+                reason: String::from("Return to the live workbook before editing."),
+            }),
         }
     }
 
-    #[must_use]
-    pub fn inspect_cell_ids(
-        &self,
-        sheet_id: SheetId,
-        row_id: RowId,
-        col_id: ColId,
-    ) -> Option<EngineEvent> {
-        build_cell_inspected(&self.engine, sheet_id, row_id, col_id)
+    fn forget_subscription(&mut self) {
+        self.pages.clear();
+        self.pending_aux_event = None;
     }
 
     #[must_use]
@@ -433,7 +482,7 @@ impl HistoryPlayer {
     }
 
     fn build_sheet_info(&mut self, sheet_id: SheetId) -> SheetInfo {
-        let (info, _) = build_sheet_info_from_engine(
+        let (info, styles_len) = build_sheet_info_from_engine(
             &mut self.engine,
             sheet_id,
             0,
@@ -445,6 +494,7 @@ impl HistoryPlayer {
             self.current_seq,
             false,
         );
+        self.last_sent_styles_len = styles_len;
         info
     }
 }
@@ -461,6 +511,10 @@ mod tests {
     use reticula_wire::v2::WireCommittedTxnV2;
 
     use super::HistoryPlayer;
+    use crate::{
+        EngineCommand, EngineEvent, JumpDirection, WireCellSpan, WireFindOptions, WireSearchIn,
+        WireSearchScope,
+    };
 
     fn make_edit_txn(
         seq: u64,
@@ -734,5 +788,212 @@ mod tests {
             player.engine().workbook().state_digest(),
             fresh_replay_digest(&wb0, &txns, 0)
         );
+    }
+
+    /// A player at the last of `values.len()` edits, which put those values into
+    /// column A from the top.
+    fn player_with(values: &[&str]) -> HistoryPlayer {
+        let base = Workbook::<BoundFormula>::new();
+        let sheet = base.sheet(SheetId(0)).unwrap();
+        let col = sheet.col_axis().pos_to_id(0).unwrap();
+        let txns: Vec<WireCommittedTxnV2> = (1..)
+            .zip(values)
+            .map(|(seq, value)| {
+                let row = sheet
+                    .row_axis()
+                    .pos_to_id(u32::try_from(seq - 1).unwrap())
+                    .unwrap();
+                let value = ScalarValue::Text(String::from(*value));
+                make_edit_txn(seq, row, col, CellInput::Scalar(value), "Edit")
+            })
+            .collect();
+        let mut player = HistoryPlayer::new();
+        player.load_empty_base_state();
+        player
+            .append_txns_bytes(&postcard::to_allocvec(&txns).unwrap())
+            .unwrap();
+        player.seek_to_seq(values.len() as u64).unwrap();
+        player
+    }
+
+    fn subscribe(
+        player: &mut HistoryPlayer,
+        (first_row, row_count): (u32, u32),
+        resend: bool,
+    ) -> Vec<(u32, u32)> {
+        let event = player.handle_command(EngineCommand::Subscribe {
+            sheet: 0,
+            epoch: 1,
+            first_row,
+            row_count,
+            first_col: 16,
+            col_count: 16,
+            visible: Some(WireCellSpan {
+                first_row,
+                end_row: first_row + row_count,
+                first_col: 16,
+                end_col: 32,
+            }),
+            resend,
+        });
+        assert!(event.is_none());
+        std::iter::from_fn(|| player.take_page())
+            .map(|page| {
+                let field = |at: usize| u32::from_le_bytes(page[at..at + 4].try_into().unwrap());
+                (field(8) / 64, field(12) / 16)
+            })
+            .collect()
+    }
+
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+    fn a_subscription_gets_the_pages_it_asks_for_and_then_only_new_ones() {
+        let mut player = player_with(&["one", "two"]);
+        // 128 rows from row 640 are page rows 10 and 11, and not 10 to 21.
+        assert_eq!(
+            subscribe(&mut player, (640, 128), false),
+            [(10, 1), (11, 1)]
+        );
+        assert_eq!(subscribe(&mut player, (640, 128), false), []);
+        assert_eq!(subscribe(&mut player, (704, 128), false), [(12, 1)]);
+        assert_eq!(subscribe(&mut player, (704, 128), true), [(11, 1), (12, 1)]);
+    }
+
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+    fn pages_sent_for_another_revision_or_sheet_do_not_count() {
+        let mut player = player_with(&["one", "two"]);
+        let all = [(10, 1), (11, 1)];
+        assert_eq!(subscribe(&mut player, (640, 128), false), all);
+        player.seek_to_seq(1).unwrap();
+        assert!(player.take_page().is_none());
+        assert_eq!(subscribe(&mut player, (640, 128), false), all);
+        player.set_sheet_id(SheetId(0)).unwrap();
+        assert_eq!(subscribe(&mut player, (640, 128), false), all);
+        player.activate_cached_snapshot(0).unwrap();
+        assert_eq!(subscribe(&mut player, (640, 128), false), all);
+    }
+
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+    fn pages_sent_before_a_seek_that_fails_half_way_do_not_count() {
+        let mut player = player_with(&["one", "two"]);
+        let value = CellInput::Scalar(ScalarValue::Text(String::from("three")));
+        let txns = vec![
+            make_edit_txn(3, 2, 0, value.clone(), "Edit"),
+            make_edit_txn(4, u64::MAX >> 1, 0, value, "Edit"),
+        ];
+        player
+            .append_txns_bytes(&postcard::to_allocvec(&txns).unwrap())
+            .unwrap();
+        let all = [(10, 1), (11, 1)];
+        assert_eq!(subscribe(&mut player, (640, 128), false), all);
+        assert!(player.seek_to_seq(4).is_err());
+        assert_eq!(player.current_seq, 3);
+        assert_eq!(subscribe(&mut player, (640, 128), false), all);
+    }
+
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+    fn queries_read_the_revision_shown_and_edits_are_rejected() {
+        let mut player = player_with(&["one", "two", "three"]);
+        player.seek_to_seq(2).unwrap();
+        let before = player.engine().workbook().state_digest();
+
+        let jumped = player.handle_command(EngineCommand::JumpEdge {
+            sheet: 0,
+            row: 0,
+            col: 0,
+            dir: JumpDirection::Down,
+            select: false,
+        });
+        assert!(matches!(
+            jumped,
+            Some(EngineEvent::EdgeJumped { row: 1, col: 0, .. })
+        ));
+        let end = player.handle_command(EngineCommand::JumpUsedEnd {
+            sheet: 0,
+            select: true,
+        });
+        assert!(matches!(
+            end,
+            Some(EngineEvent::EdgeJumped {
+                row: 1,
+                col: 0,
+                select: true,
+                ..
+            })
+        ));
+        let copied = player.handle_command(EngineCommand::CopyRange {
+            sheet: 0,
+            first_row: 0,
+            row_count: 3,
+            first_col: 0,
+            col_count: 1,
+            cut: true,
+        });
+        let Some(EngineEvent::ClipboardCopied { tsv, cut, .. }) = copied else {
+            panic!("expected ClipboardCopied, got {copied:?}");
+        };
+        assert_eq!(tsv, "one\ntwo\n");
+        assert!(!cut);
+
+        let options = |query: &str| WireFindOptions {
+            query: String::from(query),
+            scope: WireSearchScope::WholeWorkbook,
+            search_in: WireSearchIn::DisplayValues,
+            case_sensitive: false,
+            whole_cell: false,
+            use_regex: false,
+            skip_hidden: false,
+        };
+        let mut found = |query: &str| {
+            let all = player.handle_command(EngineCommand::FindAll {
+                sheet: 0,
+                options: options(query),
+                max_results: None,
+            });
+            let Some(EngineEvent::SearchResults { total, .. }) = all else {
+                panic!("expected SearchResults, got {all:?}");
+            };
+            let next = player.handle_command(EngineCommand::FindNext {
+                sheet: 0,
+                from_row: 0,
+                from_col: 0,
+                backwards: false,
+                options: options(query),
+            });
+            let Some(EngineEvent::SearchNavigated { found }) = next else {
+                panic!("expected SearchNavigated, got {next:?}");
+            };
+            (total, found.map(|m| m.row))
+        };
+        assert_eq!(found("o"), (2, Some(1)));
+        // The third edit is not part of this revision.
+        assert_eq!(found("three"), (0, None));
+
+        let inspected = player.handle_command(EngineCommand::InspectCell {
+            sheet: 0,
+            row_id: 1,
+            col_id: 0,
+        });
+        assert!(matches!(inspected, Some(EngineEvent::CellInspected { raw, .. }) if raw == "two"));
+        let rejected = player.handle_command(EngineCommand::EditCell {
+            sheet: 0,
+            row_id: 0,
+            col_id: 0,
+            raw: String::from("changed"),
+        });
+        assert!(matches!(rejected, Some(EngineEvent::Rejected { .. })));
+        assert!(
+            player
+                .handle_command(EngineCommand::SetEvalEnv {
+                    now_serial: 1.0,
+                    seed: 1,
+                    timestamp_ms: None,
+                })
+                .is_none()
+        );
+        assert_eq!(player.engine().workbook().state_digest(), before);
     }
 }

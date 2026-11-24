@@ -65,6 +65,10 @@ export interface Subscription {
   readonly rowCount: number;
   readonly firstCol: number;
   readonly colCount: number;
+  /** The unfrozen cells on screen, whose pages are wanted first. */
+  readonly visible: Span;
+  /** Whether the grid may miss any of the pages, so that all of them have to be sent again. */
+  readonly resend: boolean;
 }
 
 export interface GridContextTarget {
@@ -1007,6 +1011,8 @@ export class Grid {
       return;
     }
     this.#lastFreezeKey = freezeKey;
+    // Pages of newly pinned strips may have come before there was room for them.
+    const resend = force || isEmpty(this.#cache.span);
     this.#cache.retain(pages, this.#frozenRows, this.#frozenCols);
     const cells = cellsOfPages(pages, this.#sheet);
     this.#epoch = (this.#epoch + 1) >>> 0;
@@ -1016,6 +1022,8 @@ export class Grid {
       rowCount: cells.endRow - cells.firstRow,
       firstCol: cells.firstCol,
       colCount: cells.endCol - cells.firstCol,
+      visible: isEmpty(pages) ? EMPTY_SPAN : this.#visible,
+      resend,
     });
   }
 
@@ -1032,8 +1040,11 @@ export class Grid {
       this.#canvas.width = pixelWidth;
       this.#canvas.height = pixelHeight;
     }
-    this.#canvas.style.width = `${width}px`;
-    this.#canvas.style.height = `${height}px`;
+    // The size the backing store has on the screen, not the host's, which is
+    // rarely a whole number of device pixels: the browser would scale the one
+    // to the other and blur every line. The host clips what is too much.
+    this.#canvas.style.width = `${pixelWidth / scale}px`;
+    this.#canvas.style.height = `${pixelHeight / scale}px`;
     this.#scroll = clampScroll(
       this.#scroll,
       scrollLimits(this.#metrics, this.#sheet, this.#size, this.#layout),

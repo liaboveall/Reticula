@@ -1060,10 +1060,11 @@ impl FormulaEngine {
     /// viewport page encoding.
     pub fn prepare_page_styles(&mut self, sheet_id: SheetId, page: reticula_core::viewport::Page) {
         let proj = self.filters.get(&sheet_id).map(|(_, p)| p);
+        let spilled = self.spills.has_spills_on_sheet(sheet_id);
         if let Some(sheet) = self.workbook.sheet_mut(sheet_id) {
             let visible_rows =
                 proj.map_or_else(|| sheet.rows(), VisibleRowProjection::visible_rows);
-            prepare_projected_page_styles(sheet, page, visible_rows, |disp| match proj {
+            prepare_projected_page_styles(sheet, page, visible_rows, spilled, |disp| match proj {
                 Some(p) => p.display_to_physical(disp),
                 None => Some(disp),
             });

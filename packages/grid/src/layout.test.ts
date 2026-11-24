@@ -1,3 +1,11 @@
+import {
+  MAX_SUBSCRIBED_PAGE_COLS,
+  MAX_SUBSCRIBED_PAGE_ROWS,
+  MAX_SUBSCRIBED_PAGES,
+  MAX_VISIBLE_PAGES_PER_AXIS,
+  PAGE_COLS,
+  PAGE_ROWS,
+} from "@reticula/protocol/viewport";
 import { describe, expect, test } from "vitest";
 import {
   cellArea,
@@ -11,6 +19,7 @@ import {
   type Metrics,
   pagesToHold,
   type SheetLayout,
+  type Span,
   SparseAxis,
   scrollAtThumb,
   scrollLimits,
@@ -160,14 +169,102 @@ describe("the pages to hold", () => {
     });
   });
 
-  test("are bounded however much is visible", () => {
+  const wide = { rows: 1_000_000, cols: 16_384 };
+  const around = (
+    rows: readonly [number, number],
+    cols: readonly [number, number],
+    margin: { rows: number; cols: number },
+  ) => {
+    const span = pagesToHold(
+      { firstRow: rows[0], endRow: rows[1], firstCol: cols[0], endCol: cols[1] },
+      wide,
+      margin,
+    );
+    return [span.firstRow, span.endRow, span.firstCol, span.endCol];
+  };
+
+  // The engine's tests expect the same of the same cells (crates/core/src/viewport.rs).
+  test("include every visible one, and the margin gets what they leave", () => {
+    // 3840 by 2160 at a quarter of the size: columns of 6 px, rows of 4 px.
+    const rows = [100_000, 100_540] as const;
+    const cols = [1_000, 1_640] as const;
+    expect(around(rows, cols, noMargin)).toEqual([1562, 1571, 62, 103]);
+    expect(around(rows, cols, { rows: 2, cols: 1 })).toEqual([1561, 1572, 61, 104]);
+
+    // More visible pages than the budget: all of them, and no margin.
+    expect(
+      around([6_400, 6_400 + 64 * 20], [1_600, 1_600 + 16 * 40], { rows: 2, cols: 1 }),
+    ).toEqual([100, 120, 100, 140]);
+    // More visible columns than the limit along one axis.
+    expect(around([64, 128], [0, 16 * 70], { rows: 2, cols: 1 })).toEqual([0, 4, 0, 70]);
+  });
+
+  test("lose the margin that is furthest from what is visible", () => {
+    const margin = { rows: 0, cols: 1 };
+    // The margin asks for 40 page columns on both sides, and there is room for 24.
+    expect(around([64, 128], [16 * 100, 16 * 140], margin)).toEqual([1, 2, 88, 152]);
+    // At the left edge there is nothing to hold there, so the right gets it all.
+    expect(around([64, 128], [0, 16 * 40], margin)).toEqual([1, 2, 0, 64]);
+    // And the other way round at the right edge.
+    expect(around([64, 128], [16_384 - 16 * 40, 16_384], margin)).toEqual([1, 2, 960, 1024]);
+  });
+
+  test("always contain the visible ones and stay within the limits", () => {
+    const margins = [noMargin, { rows: 0.5, cols: 1 }, { rows: 2, cols: 1 }, { rows: 9, cols: 9 }];
+    for (const [height, width] of [
+      [1, 1],
+      [45, 17],
+      [180, 89],
+      [540, 640],
+      [1080, 1280],
+    ] as const) {
+      for (const firstRow of [0, 1, 63, 64, 777, 999_999 - height]) {
+        for (const firstCol of [0, 5, 16, 250, 8_191, 16_384 - width]) {
+          for (const margin of margins) {
+            const visible = {
+              firstRow,
+              endRow: Math.min(wide.rows, firstRow + height),
+              firstCol,
+              endCol: Math.min(wide.cols, firstCol + width),
+            };
+            const held = pagesToHold(visible, wide, margin);
+            const seen = pagesToHold(visible, wide, noMargin);
+            expect(held.firstRow).toBeLessThanOrEqual(seen.firstRow);
+            expect(held.endRow).toBeGreaterThanOrEqual(seen.endRow);
+            expect(held.firstCol).toBeLessThanOrEqual(seen.firstCol);
+            expect(held.endCol).toBeGreaterThanOrEqual(seen.endCol);
+            expect(held.firstRow).toBeGreaterThanOrEqual(0);
+            expect(held.firstCol).toBeGreaterThanOrEqual(0);
+            expect(held.endRow).toBeLessThanOrEqual(Math.ceil(wide.rows / PAGE_ROWS));
+            expect(held.endCol).toBeLessThanOrEqual(Math.ceil(wide.cols / PAGE_COLS));
+            // Every cell on screen is in a page that is held.
+            const cells = cellsOfPages(held, wide);
+            expect(cells.firstRow).toBeLessThanOrEqual(visible.firstRow);
+            expect(cells.endRow).toBeGreaterThanOrEqual(visible.endRow);
+            expect(cells.firstCol).toBeLessThanOrEqual(visible.firstCol);
+            expect(cells.endCol).toBeGreaterThanOrEqual(visible.endCol);
+
+            const area = (span: Span) =>
+              (span.endRow - span.firstRow) * (span.endCol - span.firstCol);
+            expect(area(held)).toBeLessThanOrEqual(Math.max(MAX_SUBSCRIBED_PAGES, area(seen)));
+            expect(held.endRow - held.firstRow).toBeLessThanOrEqual(MAX_SUBSCRIBED_PAGE_ROWS);
+            expect(held.endCol - held.firstCol).toBeLessThanOrEqual(
+              Math.max(MAX_SUBSCRIBED_PAGE_COLS, seen.endCol - seen.firstCol),
+            );
+          }
+        }
+      }
+    }
+  });
+
+  test("are bounded however much claims to be visible", () => {
     const huge = { rows: 10_000_000, cols: 10_000 };
     const visible = { firstRow: 640, endRow: 100_000, firstCol: 0, endCol: 5000 };
-    expect(pagesToHold(visible, huge, noMargin)).toEqual({
+    expect(pagesToHold(visible, huge, { rows: 1, cols: 1 })).toEqual({
       firstRow: 10,
-      endRow: 74,
+      endRow: 10 + MAX_VISIBLE_PAGES_PER_AXIS,
       firstCol: 0,
-      endCol: 16,
+      endCol: MAX_VISIBLE_PAGES_PER_AXIS,
     });
   });
 
@@ -332,6 +429,115 @@ describe("sparse axis metrics and frozen panes", () => {
       expectedOffset += sz;
     }
     expect(axis.totalSize(25)).toBe(expectedOffset);
+  });
+
+  test("sizes that are no whole number of pixels are kept as they are", () => {
+    const axis = new SparseAxis(19.2, [
+      [2, 55.5],
+      [5, 7.25],
+    ]);
+    expect(axis.sizeOf(2)).toBe(55.5);
+    expect(axis.sizeOf(5)).toBe(7.25);
+    for (let pos = 0; pos < 10; pos++) {
+      expect(axis.offsetOf(pos + 1) - axis.offsetOf(pos)).toBeCloseTo(axis.sizeOf(pos), 9);
+    }
+  });
+
+  describe("with a device scale", () => {
+    const densities = [0.9, 1, 1.1, 1.25, 1.333, 1.5, 1.65, 1.75, 2];
+    const zooms = [25, 33, 50, 67, 75, 80, 90, 100, 110, 125, 150, 175, 200];
+    const scaled = (base: number, zoom: number, dpr: number) =>
+      Math.max(1, Math.round((base * zoom * dpr) / 100)) / dpr;
+    // Far enough for rounding errors to add up, and both sides of every custom size.
+    const positions = [
+      ...Array.from({ length: 300 }, (_, index) => index),
+      ...Array.from({ length: 200 }, (_, index) => 1_048_375 + index),
+      9_999,
+      65_535,
+      123_457,
+      777_777,
+    ];
+
+    test.each(densities)("a position is found again from its offset at %f", (dpr) => {
+      for (const zoom of zooms) {
+        for (const base of [24, 112, 16, 25, 1200]) {
+          const custom: [number, number][] = [
+            [3, scaled(17, zoom, dpr)],
+            [4, scaled(600, zoom, dpr)],
+            [128, scaled(1, zoom, dpr)],
+            [65_535, scaled(91, zoom, dpr)],
+            [1_048_400, scaled(33, zoom, dpr)],
+          ];
+          for (const sizes of [[], custom]) {
+            const axis = new SparseAxis(scaled(base, zoom, dpr), sizes, dpr);
+            for (const pos of positions) {
+              const offset = axis.offsetOf(pos);
+              if (axis.indexAtOffset(offset) !== pos) {
+                expect({ dpr, zoom, base, pos, at: axis.indexAtOffset(offset) }).toBe("found");
+              }
+              if (pos > 0 && axis.endAtOffset(offset) !== pos) {
+                expect({ dpr, zoom, base, pos, end: axis.endAtOffset(offset) }).toBe("found");
+              }
+              // And so it is from every device pixel it covers.
+              const lastPixel = offset + axis.sizeOf(pos) - 1 / dpr;
+              if (axis.indexAtOffset(lastPixel) !== pos) {
+                expect({ dpr, zoom, base, pos, last: axis.indexAtOffset(lastPixel) }).toBe("found");
+              }
+            }
+          }
+        }
+      }
+    });
+
+    test("sizes that are no whole device pixels are rounded, offsets included", () => {
+      const axis = new SparseAxis(19.2, [[3, 7.3]], 1.25);
+      for (const pos of [0, 2, 3, 4, 900_000]) {
+        expect(axis.offsetOf(pos + 1) - axis.offsetOf(pos)).toBeCloseTo(axis.sizeOf(pos), 6);
+      }
+      expect(axis.sizeOf(0)).toBe(19.2);
+      expect(axis.sizeOf(3)).toBe(7.2);
+      const uniform = new SparseAxis(0.1, [], 1.333);
+      expect(uniform.sizeOf(5)).toBe(uniform.offsetOf(1));
+      expect(uniform.indexAtOffset(uniform.offsetOf(7))).toBe(7);
+    });
+
+    test("offsets and sizes agree", () => {
+      for (const dpr of densities) {
+        const axis = new SparseAxis(scaled(24, 33, dpr), [[2, scaled(31, 33, dpr)]], dpr);
+        for (let pos = 0; pos < 20; pos++) {
+          expect(axis.offsetOf(pos + 1) - axis.offsetOf(pos)).toBeCloseTo(axis.sizeOf(pos), 9);
+        }
+        expect(axis.totalSize(20)).toBe(axis.offsetOf(20));
+      }
+    });
+
+    test("the visible range ends with the last cell that shows a pixel", () => {
+      const dpr = 1.25;
+      const layout: SheetLayout = {
+        rowAxis: new SparseAxis(scaled(20, 33, dpr), [], dpr),
+        colAxis: new SparseAxis(scaled(100, 33, dpr), [], dpr),
+        frozenRows: 0,
+        frozenCols: 0,
+      };
+      const area = cellArea(metrics, size);
+      for (const firstRow of [0, 7, 1_001, 900_000]) {
+        for (const firstCol of [0, 1, 4]) {
+          const scroll = {
+            top: layout.rowAxis.offsetOf(firstRow),
+            left: layout.colAxis.offsetOf(firstCol),
+          };
+          const visible = visibleCells(metrics, sheet, scroll, size, layout);
+          expect(visible.firstRow).toBe(firstRow);
+          expect(visible.firstCol).toBe(firstCol);
+          expect(layout.rowAxis.offsetOf(visible.endRow - 1)).toBeLessThan(
+            scroll.top + area.height,
+          );
+          expect(layout.rowAxis.offsetOf(visible.endRow)).toBeGreaterThan(
+            scroll.top + area.height - 1 / dpr,
+          );
+        }
+      }
+    });
   });
 
   test("frozen rows and columns pin top/left coordinates and skip scrollToReveal", () => {

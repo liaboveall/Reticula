@@ -81,7 +81,11 @@ pub const OVERFLOW_ORIGIN_COL_AT: usize = 8;
 pub const OVERFLOW_STYLE_AT: usize = 10;
 
 /// Maximum columns scanned to the left of `first_col` for overflowing text (`14-m1b.md` 6.2).
-pub const MAX_LEFT_OVERFLOW_LOOKBACK: u32 = 16;
+pub const MAX_LEFT_OVERFLOW_LOOKBACK: u32 = 64;
+
+/// Page columns to the right of a changed cell whose overflow records can
+/// depend on it: the cell may start, stop or cover text that runs into them.
+pub const OVERFLOW_PAGE_COLS: u32 = MAX_LEFT_OVERFLOW_LOOKBACK.div_ceil(PAGE_COLS);
 
 /// Cell flag: numeric value (right-aligned when style alignment is `Auto`).
 pub const FLAG_NUMBER: u16 = 1;
@@ -99,10 +103,17 @@ pub const FLAG_SPILL: u16 = 32;
 /// Maximum UTF-16 code units written into a viewport page for a single cell.
 pub const MAX_CELL_DISPLAY_UTF16: u16 = 512;
 
-/// Most page rows one subscription may span.
+/// Most page rows one subscription may span, unless more than that are visible.
 pub const MAX_SUBSCRIBED_PAGE_ROWS: u32 = 64;
-/// Most page columns one subscription may span.
-pub const MAX_SUBSCRIBED_PAGE_COLS: u32 = 16;
+/// Most page columns one subscription may span, unless more than that are visible.
+pub const MAX_SUBSCRIBED_PAGE_COLS: u32 = 64;
+/// Most pages one subscription may hold besides the pinned strips. The pages
+/// with visible cells are held however many they are; the margin around them
+/// gets what they leave of this.
+pub const MAX_SUBSCRIBED_PAGES: u32 = 512;
+/// Most pages along one axis that count as visible. No display shows this many
+/// (a cell is at least one device pixel), so it only bounds nonsensical input.
+pub const MAX_VISIBLE_PAGES_PER_AXIS: u32 = 256;
 
 /// Coordinates of one `64 × 16` page in the sheet's page grid.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -111,6 +122,27 @@ pub struct Page {
     pub row: u32,
     /// Page column (`col * PAGE_COLS`).
     pub col: u32,
+}
+
+/// Half-open rectangle of cells `[first_row..end_row) × [first_col..end_col)`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CellSpan {
+    /// Position of the first row.
+    pub first_row: u32,
+    /// Position after the last row.
+    pub end_row: u32,
+    /// Position of the first column.
+    pub first_col: u32,
+    /// Position after the last column.
+    pub end_col: u32,
+}
+
+impl CellSpan {
+    /// Whether the span holds no cell.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.first_row >= self.end_row || self.first_col >= self.end_col
+    }
 }
 
 /// Half-open rectangle of pages `[first_row..end_row) × [first_col..end_col)`.
@@ -124,36 +156,57 @@ pub struct PageRange {
 
 impl PageRange {
     /// Pages covering `[first_row .. first_row + row_count)` by
-    /// `[first_col .. first_col + col_count)`, clipped to `sheet_rows × sheet_cols`
-    /// and bounded to [`MAX_SUBSCRIBED_PAGE_ROWS`] × [`MAX_SUBSCRIBED_PAGE_COLS`].
+    /// `[first_col .. first_col + col_count)`, clipped to `sheet_rows × sheet_cols`.
+    ///
+    /// Every page with cells of `visible` is in the result. Around them there
+    /// are at most [`MAX_SUBSCRIBED_PAGE_ROWS`] × [`MAX_SUBSCRIBED_PAGE_COLS`]
+    /// and [`MAX_SUBSCRIBED_PAGES`] pages; what is over is cut off the sides
+    /// that are furthest from the visible cells. An empty `visible` keeps the
+    /// start of the range.
     #[must_use]
     pub fn covering(
         (sheet_rows, sheet_cols): (u32, u32),
         (first_row, row_count): (u32, u32),
         (first_col, col_count): (u32, u32),
+        visible: CellSpan,
     ) -> Self {
-        let (first_row, end_row) = pages_along(
+        let visible = if visible.is_empty() {
+            CellSpan::default()
+        } else {
+            visible
+        };
+        let along_rows = AxisPages::new(
             sheet_rows,
-            first_row,
-            row_count,
             PAGE_ROWS,
+            (first_row, first_row.saturating_add(row_count)),
+            (visible.first_row, visible.end_row),
             MAX_SUBSCRIBED_PAGE_ROWS,
         );
-        let (first_col, end_col) = pages_along(
+        let along_cols = AxisPages::new(
             sheet_cols,
-            first_col,
-            col_count,
             PAGE_COLS,
+            (first_col, first_col.saturating_add(col_count)),
+            (visible.first_col, visible.end_col),
             MAX_SUBSCRIBED_PAGE_COLS,
         );
-        if first_row == end_row || first_col == end_col {
+        let (Some(mut rows), Some(mut cols)) = (along_rows, along_cols) else {
             return Self::default();
+        };
+        let limit = rows
+            .visible_len()
+            .saturating_mul(cols.visible_len())
+            .max(MAX_SUBSCRIBED_PAGES);
+        while rows.len().saturating_mul(cols.len()) > limit {
+            let furthest = rows.furthest().max(cols.furthest());
+            if !cols.cut_at(furthest) && !rows.cut_at(furthest) {
+                break;
+            }
         }
         Self {
-            first_row,
-            end_row,
-            first_col,
-            end_col,
+            first_row: rows.first,
+            end_row: rows.end,
+            first_col: cols.first,
+            end_col: cols.end,
         }
     }
 
@@ -220,24 +273,8 @@ pub fn is_page_wanted_with_freeze(
     if subscribed.contains(page) {
         return true;
     }
-    let pinned_row_pages = if frozen_rows == 0 {
-        0
-    } else {
-        frozen_rows
-            .saturating_sub(1)
-            .checked_div(PAGE_ROWS)
-            .unwrap_or(0)
-            .saturating_add(1)
-    };
-    let pinned_col_pages = if frozen_cols == 0 {
-        0
-    } else {
-        frozen_cols
-            .saturating_sub(1)
-            .checked_div(PAGE_COLS)
-            .unwrap_or(0)
-            .saturating_add(1)
-    };
+    let pinned_row_pages = frozen_rows.div_ceil(PAGE_ROWS);
+    let pinned_col_pages = frozen_cols.div_ceil(PAGE_COLS);
     let in_top_strip = page.row < pinned_row_pages
         && subscribed.first_col <= page.col
         && page.col < subscribed.end_col;
@@ -248,89 +285,188 @@ pub fn is_page_wanted_with_freeze(
     in_top_strip || in_left_strip || in_corner
 }
 
-/// Collects all unique pages wanted by `subscribed` together with pinned freeze
-/// strips (pinned corner & top/left strips first so frozen headers paint
-/// immediately, followed by main viewport pages).
+/// Collects the pages wanted by `subscribed` together with the pinned freeze
+/// strips, each once, in the order to send them: the pinned pages that show
+/// something, so that frozen headers paint immediately, then the pages with
+/// cells of `visible`, then the others in rings around those.
+///
+/// An empty `visible` says nothing about what is on screen: then all pinned
+/// pages come first, and the others row by row.
 #[must_use]
 pub fn collect_wanted_pages_with_freeze(
     subscribed: PageRange,
+    visible: CellSpan,
     frozen_rows: u32,
     frozen_cols: u32,
 ) -> Vec<Page> {
     if subscribed.is_empty() {
         return Vec::new();
     }
-    let pinned_r = if frozen_rows == 0 {
-        0
-    } else {
-        frozen_rows
-            .saturating_sub(1)
-            .checked_div(PAGE_ROWS)
-            .unwrap_or(0)
-            .saturating_add(1)
-    };
-    let pinned_c = if frozen_cols == 0 {
-        0
-    } else {
-        frozen_cols
-            .saturating_sub(1)
-            .checked_div(PAGE_COLS)
-            .unwrap_or(0)
-            .saturating_add(1)
-    };
+    let pinned_rows = frozen_rows.div_ceil(PAGE_ROWS);
+    let pinned_cols = frozen_cols.div_ceil(PAGE_COLS);
+    let rows = (0..pinned_rows).chain(subscribed.first_row.max(pinned_rows)..subscribed.end_row);
+    let cols = (0..pinned_cols).chain(subscribed.first_col.max(pinned_cols)..subscribed.end_col);
+    let mut out: Vec<Page> = rows
+        .flat_map(|row| cols.clone().map(move |col| Page { row, col }))
+        .collect();
 
-    let mut out = Vec::new();
-    let mut push_unique = |p: Page| {
-        if !out.contains(&p) {
-            out.push(p);
+    let seen = if visible.is_empty() {
+        subscribed
+    } else {
+        PageRange {
+            first_row: page_of(visible.first_row, PAGE_ROWS),
+            end_row: visible.end_row.div_ceil(PAGE_ROWS),
+            first_col: page_of(visible.first_col, PAGE_COLS),
+            end_col: visible.end_col.div_ceil(PAGE_COLS),
         }
     };
-
-    for r in 0..pinned_r {
-        for c in 0..pinned_c {
-            push_unique(Page { row: r, col: c });
+    let rank = |page: Page| -> u32 {
+        let below = distance(page.row, seen.first_row, seen.end_row);
+        let beside = distance(page.col, seen.first_col, seen.end_col);
+        // A pinned page does not move along its pinned axis, so what shows of
+        // it depends on the other axis only.
+        let pinned = match (page.row < pinned_rows, page.col < pinned_cols) {
+            (true, true) => Some(0),
+            (true, false) => Some(beside),
+            (false, true) => Some(below),
+            (false, false) => None,
+        };
+        match pinned {
+            Some(0) => 0,
+            _ => pinned
+                .unwrap_or(u32::MAX)
+                .min(below.max(beside))
+                .saturating_add(1),
         }
-        for c in subscribed.first_col..subscribed.end_col {
-            push_unique(Page { row: r, col: c });
-        }
-    }
-    for r in subscribed.first_row..subscribed.end_row {
-        for c in 0..pinned_c {
-            push_unique(Page { row: r, col: c });
-        }
-    }
-    for p in subscribed.pages() {
-        push_unique(p);
-    }
+    };
+    out.sort_unstable_by_key(|&page| (rank(page), page.row, page.col));
     out
 }
 
-fn pages_along(extent: u32, first: u32, count: u32, page: u32, limit: u32) -> (u32, u32) {
-    let end = first.saturating_add(count).min(extent);
-    if first >= end {
-        return (0, 0);
+const fn page_of(position: u32, page: u32) -> u32 {
+    match position.checked_div(page) {
+        Some(index) => index,
+        None => 0,
     }
-    let first_page = first.checked_div(page).unwrap_or(0);
-    let last_page = end.saturating_sub(1).checked_div(page).unwrap_or(0);
-    let end_page = last_page
-        .saturating_add(1)
-        .min(first_page.saturating_add(limit));
-    (first_page, end_page)
+}
+
+/// How many pages `index` is away from `first..end`.
+const fn distance(index: u32, first: u32, end: u32) -> u32 {
+    if index < first {
+        first.saturating_sub(index)
+    } else {
+        index.saturating_sub(end.saturating_sub(1))
+    }
+}
+
+/// Pages along one axis: the wanted `first..end`, and the part of it that has
+/// to stay because it is visible.
+struct AxisPages {
+    first: u32,
+    end: u32,
+    visible_first: u32,
+    visible_end: u32,
+}
+
+impl AxisPages {
+    /// `None` when nothing of `wanted` is on the axis.
+    fn new(
+        extent: u32,
+        page: u32,
+        wanted: (u32, u32),
+        visible: (u32, u32),
+        limit: u32,
+    ) -> Option<Self> {
+        let along = |(first, end): (u32, u32)| {
+            let end = end.min(extent);
+            (first < end).then(|| (page_of(first, page), end.div_ceil(page)))
+        };
+        let (first, end) = along(wanted)?;
+        let (visible_first, visible_end) =
+            along(visible).unwrap_or_else(|| (first, first.saturating_add(1)));
+        let visible_end = visible_end.min(visible_first.saturating_add(MAX_VISIBLE_PAGES_PER_AXIS));
+        let mut pages = Self {
+            first: first.min(visible_first),
+            end: end.max(visible_end),
+            visible_first,
+            visible_end,
+        };
+        pages.trim_to(limit);
+        Some(pages)
+    }
+
+    const fn len(&self) -> u32 {
+        self.end.saturating_sub(self.first)
+    }
+
+    const fn visible_len(&self) -> u32 {
+        self.visible_end.saturating_sub(self.visible_first)
+    }
+
+    const fn before(&self) -> u32 {
+        self.visible_first.saturating_sub(self.first)
+    }
+
+    const fn after(&self) -> u32 {
+        self.end.saturating_sub(self.visible_end)
+    }
+
+    /// Pages of margin on the side that has more of it.
+    fn furthest(&self) -> u32 {
+        self.before().max(self.after())
+    }
+
+    /// Cuts the larger margin until there are `limit` pages, or none to cut.
+    fn trim_to(&mut self, limit: u32) {
+        let room = limit.saturating_sub(self.visible_len());
+        if self.before().saturating_add(self.after()) <= room {
+            return;
+        }
+        let half = room / 2;
+        let rest = room.saturating_sub(half);
+        let (before, after) = if self.before() <= half {
+            (self.before(), room.saturating_sub(self.before()))
+        } else if self.after() <= rest {
+            (room.saturating_sub(self.after()), self.after())
+        } else {
+            (half, rest)
+        };
+        self.first = self.visible_first.saturating_sub(before);
+        self.end = self.visible_end.saturating_add(after);
+    }
+
+    /// Cuts one page off a side with `distance` pages of margin, if there is one.
+    const fn cut_at(&mut self, distance: u32) -> bool {
+        if distance == 0 {
+            return false;
+        }
+        if self.before() == distance {
+            self.first = self.first.saturating_add(1);
+            return true;
+        }
+        if self.after() == distance {
+            self.end = self.end.saturating_sub(1);
+            return true;
+        }
+        false
+    }
 }
 
 /// Ensures resolved styles for all cells (and left-overflow origin cells) on
 /// `page` are interned in `sheet.styles_mut()` prior to calling [`encode_page_with_formulas`].
 pub fn prepare_page_styles(sheet: &mut Sheet, page: Page) {
     let total = sheet.rows();
-    prepare_projected_page_styles(sheet, page, total, Some);
+    prepare_projected_page_styles(sheet, page, total, false, Some);
 }
 
 /// Projection-aware variant of [`prepare_page_styles`] mapping display rows
 /// `0..visible_rows` to physical sheet row indices via `map_display_row`.
+/// `spilled` tells whether cells the sheet has no value for may show one.
 pub fn prepare_projected_page_styles<R>(
     sheet: &mut Sheet,
     page: Page,
     visible_rows: u32,
+    spilled: bool,
     mut map_display_row: R,
 ) where
     R: FnMut(u32) -> Option<u32>,
@@ -363,11 +499,35 @@ pub fn prepare_projected_page_styles<R>(
             row_ids.push(RowId(sheet.row_id(phys)));
         }
     }
-    let mut col_ids: SmallVec<[ColId; 32]> = SmallVec::new();
-    for c in lookback_start..end_col {
-        col_ids.push(ColId(sheet.col_id(c)));
-    }
+    let col_ids: SmallVec<[ColId; 16]> = (first_col..end_col)
+        .map(|c| ColId(sheet.col_id(c)))
+        .collect();
     sheet.prepare_viewport_styles(&row_ids, &col_ids);
+
+    // Of the cells to the left only the one text overflows from is drawn: the
+    // first with a value, or one before it that a value is spilled into.
+    let Some(&first_page_col) = col_ids.first() else {
+        return;
+    };
+    let lookback: SmallVec<[ColId; 64]> = (lookback_start..first_col)
+        .rev()
+        .map(|c| ColId(sheet.col_id(c)))
+        .filter(|&col| spilled || column_has_storage(sheet, col))
+        .collect();
+    for &row in &row_ids {
+        if sheet.value_by_id(row, first_page_col) != Value::Empty {
+            continue;
+        }
+        for &col in &lookback {
+            let empty = sheet.value_by_id(row, col) == Value::Empty;
+            if spilled || !empty {
+                sheet.prepare_viewport_styles(&[row], &[col]);
+            }
+            if !empty {
+                break;
+            }
+        }
+    }
 }
 
 /// Borrowed value override for a single viewport cell (used so spilled values,
@@ -409,9 +569,7 @@ pub struct ViewportCellOverlay<'a> {
 /// Encodes one v2 page of `sheet`, without formula flags or spill overlays.
 #[must_use]
 pub fn encode_page(sheet: &Sheet, page: Page, epoch: u32, text: &mut String) -> Vec<u8> {
-    encode_page_with_overlay(sheet, page, epoch, text, |_, _| {
-        ViewportCellOverlay::default()
-    })
+    encode_page_with_formulas(sheet, page, epoch, text, |_, _| false)
 }
 
 /// Encodes one v2 page of `sheet`, marking cells where `is_formula` returns
@@ -428,10 +586,19 @@ pub fn encode_page_with_formulas<F>(
 where
     F: FnMut(RowId, ColId) -> bool,
 {
-    encode_page_with_overlay(sheet, page, epoch, text, |r, c| ViewportCellOverlay {
-        value: None,
-        extra_flags: if is_formula(r, c) { FLAG_FORMULA } else { 0 },
-    })
+    encode(
+        sheet,
+        page,
+        epoch,
+        sheet.rows(),
+        Some,
+        text,
+        |r, c| ViewportCellOverlay {
+            value: None,
+            extra_flags: if is_formula(r, c) { FLAG_FORMULA } else { 0 },
+        },
+        false,
+    )
 }
 
 fn format_overlay_or_sheet_value(
@@ -506,9 +673,42 @@ pub fn encode_projected_page_with_overlay<'a, R, F>(
     page: Page,
     epoch: u32,
     visible_rows: u32,
+    map_display_row: R,
+    text: &mut String,
+    overlay: F,
+) -> Vec<u8>
+where
+    R: FnMut(u32) -> Option<u32>,
+    F: FnMut(RowId, ColId) -> ViewportCellOverlay<'a>,
+{
+    encode(
+        sheet,
+        page,
+        epoch,
+        visible_rows,
+        map_display_row,
+        text,
+        overlay,
+        true,
+    )
+}
+
+/// `overlay_has_values` tells whether `overlay` ever supplies a value. Without,
+/// the cells to the left of the page are read from the sheet alone, which is
+/// what makes looking far back cheap.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the one encoder behind the public entry points"
+)]
+fn encode<'a, R, F>(
+    sheet: &Sheet,
+    page: Page,
+    epoch: u32,
+    visible_rows: u32,
     mut map_display_row: R,
     text: &mut String,
     mut overlay: F,
+    overlay_has_values: bool,
 ) -> Vec<u8>
 where
     R: FnMut(u32) -> Option<u32>,
@@ -594,17 +794,20 @@ where
         }
     }
 
-    // Left-overflow candidate scan (`first_col > 0`, up to 16 columns back).
+    // Left-overflow candidate scan (`first_col > 0`).
     let mut overflow_count: u16 = 0;
     if first_col > 0
         && let Some(&first_page_col_id) = col_ids.first()
     {
         let min_scan_col = first_col.saturating_sub(MAX_LEFT_OVERFLOW_LOOKBACK);
-        let mut lookback_col_ids: SmallVec<[(u32, ColId); 16]> = SmallVec::new();
+        let mut lookback_col_ids: SmallVec<[(u32, ColId); 64]> = SmallVec::new();
         let mut c = first_col;
         while c > min_scan_col {
             c = c.saturating_sub(1);
-            lookback_col_ids.push((c, ColId(sheet.col_id(c))));
+            let id = ColId(sheet.col_id(c));
+            if overlay_has_values || column_has_storage(sheet, id) {
+                lookback_col_ids.push((c, id));
+            }
         }
 
         for (r_idx, &row_id) in row_ids.iter().enumerate() {
@@ -616,7 +819,11 @@ where
                 continue;
             }
             for &(origin_col_pos, origin_col_id) in &lookback_col_ids {
-                let ov_val = overlay(row_id, origin_col_id).value;
+                let ov_val = if overlay_has_values {
+                    overlay(row_id, origin_col_id).value
+                } else {
+                    None
+                };
                 let (is_empty, is_text) = match ov_val {
                     Some(ov) => (ov.is_empty(), ov.is_text()),
                     None => {
@@ -669,6 +876,14 @@ where
     }
     out.extend_from_slice(text.as_bytes());
     out
+}
+
+fn column_has_storage(sheet: &Sheet, col: ColId) -> bool {
+    sheet
+        .col_slots()
+        .get(col.0)
+        .and_then(|slot| sheet.raw_columns().get(slot as usize))
+        .is_some_and(|column| !column.blocks().is_empty())
 }
 
 fn clip_to_record(text: &mut String, start: usize) -> (u16, bool) {
@@ -1012,10 +1227,10 @@ mod tests {
     #[test]
     fn a_range_is_covered_by_the_pages_it_touches_and_freeze_pins_strips() {
         let sheet = (1_000_000, 40);
-        let range = PageRange::covering(sheet, (5000, 64), (16, 16));
+        let range = PageRange::covering(sheet, (5000, 64), (16, 16), CellSpan::default());
         assert_eq!(pages(range), [(78, 1), (79, 1)]);
 
-        let wanted = collect_wanted_pages_with_freeze(range, 1, 2);
+        let wanted = collect_wanted_pages_with_freeze(range, span((5000, 5064), (16, 32)), 1, 2);
         let coords: Vec<(u32, u32)> = wanted.iter().map(|p| (p.row, p.col)).collect();
         assert_eq!(coords, [(0, 0), (0, 1), (78, 0), (79, 0), (78, 1), (79, 1)]);
         assert!(is_page_wanted_with_freeze(
@@ -1036,19 +1251,33 @@ mod tests {
     fn a_range_is_clipped_to_the_sheet() {
         let sheet = (130, 20);
         assert_eq!(
-            pages(PageRange::covering(sheet, (120, 1000), (10, 1000))),
+            pages(PageRange::covering(
+                sheet,
+                (120, 1000),
+                (10, 1000),
+                CellSpan::default()
+            )),
             [(1, 0), (1, 1), (2, 0), (2, 1)]
         );
-        assert_eq!(
-            pages(PageRange::covering(sheet, (0, u32::MAX), (0, u32::MAX))).len(),
-            6
-        );
+        let all = span((0, u32::MAX), (0, u32::MAX));
+        for visible in [CellSpan::default(), all] {
+            assert_eq!(
+                pages(PageRange::covering(
+                    sheet,
+                    (0, u32::MAX),
+                    (0, u32::MAX),
+                    visible
+                ))
+                .len(),
+                6
+            );
+        }
         for range in [
-            PageRange::covering(sheet, (130, 10), (0, 10)),
-            PageRange::covering(sheet, (0, 10), (20, 10)),
-            PageRange::covering(sheet, (0, 0), (0, 10)),
-            PageRange::covering(sheet, (u32::MAX, u32::MAX), (0, 10)),
-            PageRange::covering((0, 0), (0, 10), (0, 10)),
+            PageRange::covering(sheet, (130, 10), (0, 10), all),
+            PageRange::covering(sheet, (0, 10), (20, 10), all),
+            PageRange::covering(sheet, (0, 0), (0, 10), all),
+            PageRange::covering(sheet, (u32::MAX, u32::MAX), (0, 10), all),
+            PageRange::covering((0, 0), (0, 10), (0, 10), all),
         ] {
             assert!(range.is_empty());
             assert_eq!(range, PageRange::default());
@@ -1056,22 +1285,229 @@ mod tests {
         }
     }
 
+    fn span((first_row, end_row): (u32, u32), (first_col, end_col): (u32, u32)) -> CellSpan {
+        CellSpan {
+            first_row,
+            end_row,
+            first_col,
+            end_col,
+        }
+    }
+
+    /// `(first_row, end_row, first_col, end_col)` of the pages around `visible`
+    /// with a margin of so many multiples of it on every side.
+    fn around(
+        sheet: (u32, u32),
+        visible: CellSpan,
+        (times_rows, times_cols): (u32, u32),
+    ) -> (u32, u32, u32, u32) {
+        let rows = (visible.end_row - visible.first_row) * times_rows;
+        let cols = (visible.end_col - visible.first_col) * times_cols;
+        let first_row = visible.first_row.saturating_sub(rows);
+        let first_col = visible.first_col.saturating_sub(cols);
+        let range = PageRange::covering(
+            sheet,
+            (first_row, visible.end_row + rows - first_row),
+            (first_col, visible.end_col + cols - first_col),
+            visible,
+        );
+        (
+            range.first_row(),
+            range.end_row(),
+            range.first_col(),
+            range.end_col(),
+        )
+    }
+
     #[test]
     fn a_subscription_is_bounded() {
-        let range = PageRange::covering((u32::MAX, u32::MAX), (640, u32::MAX), (0, u32::MAX));
-        let pages = pages(range);
+        let any = (u32::MAX, u32::MAX);
+        let range = PageRange::covering(any, (640, u32::MAX), (0, u32::MAX), CellSpan::default());
+        let held = pages(range);
+        assert!(held.len() as u32 <= MAX_SUBSCRIBED_PAGES);
+        assert_eq!(held.first(), Some(&(10, 0)));
+
+        // A single row of cells leaves the whole budget to one axis.
+        let range = PageRange::covering(any, (0, 1), (0, u32::MAX), CellSpan::default());
+        assert_eq!(pages(range).len() as u32, MAX_SUBSCRIBED_PAGE_COLS);
+
+        // What claims to be visible is bounded too.
+        let all = span((0, u32::MAX), (0, u32::MAX));
+        let range = PageRange::covering(any, (0, u32::MAX), (0, u32::MAX), all);
+        assert_eq!(range.end_row(), MAX_VISIBLE_PAGES_PER_AXIS);
+        assert_eq!(range.end_col(), MAX_VISIBLE_PAGES_PER_AXIS);
+    }
+
+    #[test]
+    fn visible_pages_are_held_and_the_margin_gets_what_they_leave() {
+        // 3840 × 2160 at a quarter of the size: columns of 6 px, rows of 4 px.
+        let sheet = (1_000_000, 16_384);
+        let visible = span((100_000, 100_540), (1_000, 1_640));
+        // Page rows 1562 to 1570 and page columns 62 to 102 are visible: 369
+        // pages, which leave room for a row of pages on both sides.
+        assert_eq!(around(sheet, visible, (0, 0)), (1562, 1571, 62, 103));
+        assert_eq!(around(sheet, visible, (2, 1)), (1561, 1572, 61, 104));
+
+        // More visible pages than the budget: all of them, and no margin.
+        let visible = span((6_400, 6_400 + 64 * 20), (1_600, 1_600 + 16 * 40));
+        assert_eq!(around(sheet, visible, (2, 1)), (100, 120, 100, 140));
+
+        // More visible columns than the limit along one axis.
+        let visible = span((64, 128), (0, 16 * 70));
+        assert_eq!(around(sheet, visible, (2, 1)), (0, 4, 0, 70));
+    }
+
+    #[test]
+    fn the_margin_is_cut_where_it_is_furthest_from_what_is_visible() {
+        let sheet = (1_000_000, 16_384);
+        // 40 visible page columns: the margin asks for 40 more on both sides,
+        // and the limit leaves 24 for both, shared between left and right.
+        let visible = span((64, 128), (16 * 100, 16 * 140));
+        let (_, _, first_col, end_col) = around(sheet, visible, (0, 1));
+        assert_eq!((first_col, end_col), (100 - 12, 140 + 12));
+        // At the left edge there is nothing to hold there, so the right gets it.
+        let visible = span((64, 128), (0, 16 * 40));
+        assert_eq!(around(sheet, visible, (0, 1)), (1, 2, 0, 64));
+        // And the other way round at the right edge.
+        let visible = span((64, 128), (16_384 - 16 * 40, 16_384));
+        assert_eq!(around(sheet, visible, (0, 1)), (1, 2, 960, 1024));
+    }
+
+    #[test]
+    fn a_margin_within_the_limits_is_held_as_asked() {
+        let sheet = (1_000_000, 16_384);
+        for visible in [
+            span((0, 45), (0, 17)),
+            span((5_000, 5_045), (30, 47)),
+            span((999_955, 1_000_000), (16_367, 16_384)),
+        ] {
+            let held = around(sheet, visible, (2, 1));
+            let rows = (visible.end_row - visible.first_row) * 2;
+            let cols = visible.end_col - visible.first_col;
+            assert_eq!(
+                held,
+                (
+                    visible.first_row.saturating_sub(rows) / PAGE_ROWS,
+                    (visible.end_row + rows).min(sheet.0).div_ceil(PAGE_ROWS),
+                    visible.first_col.saturating_sub(cols) / PAGE_COLS,
+                    (visible.end_col + cols).min(sheet.1).div_ceil(PAGE_COLS),
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn wanted_pages_come_once_pinned_then_visible_then_in_rings() {
+        let sheet = (1_000_000, 16_384);
+        let visible = span((640, 700), (160, 190));
+        let range = PageRange::covering(sheet, (560, 240), (130, 100), visible);
+        assert_eq!((range.first_row(), range.end_row()), (8, 13));
+        assert_eq!((range.first_col(), range.end_col()), (8, 15));
+        let wanted = collect_wanted_pages_with_freeze(range, visible, 3, 20);
+        let coords: Vec<(u32, u32)> = wanted.iter().map(|p| (p.row, p.col)).collect();
+
+        // The corner, the strip above the visible columns and the strip to the
+        // left of the visible rows: what is drawn pinned comes first.
         assert_eq!(
-            pages.len() as u32,
-            MAX_SUBSCRIBED_PAGE_ROWS * MAX_SUBSCRIBED_PAGE_COLS
+            coords[..6],
+            [(0, 0), (0, 1), (0, 10), (0, 11), (10, 0), (10, 1)]
         );
-        assert_eq!(pages.first(), Some(&(10, 0)));
-        assert_eq!(
-            pages.last(),
-            Some(&(
-                10 + MAX_SUBSCRIBED_PAGE_ROWS - 1,
-                MAX_SUBSCRIBED_PAGE_COLS - 1
-            ))
+        // Then what is visible of the rest.
+        assert_eq!(coords[6..8], [(10, 10), (10, 11)]);
+        // Then the first ring around it, pinned pages included.
+        let ring: Vec<(u32, u32)> = coords[8..24].to_vec();
+        assert!(ring.contains(&(0, 9)) && ring.contains(&(0, 12)));
+        assert!(ring.contains(&(9, 0)) && ring.contains(&(11, 1)));
+        assert!(ring.contains(&(9, 9)) && ring.contains(&(11, 12)));
+        assert!(!ring.contains(&(10, 8)) && !ring.contains(&(12, 10)));
+
+        let mut unique = coords.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), coords.len());
+        // (1 pinned + 5) page rows by (2 pinned + 7) page columns.
+        assert_eq!(coords.len(), 6 * 9);
+        assert!(
+            wanted
+                .iter()
+                .all(|&page| is_page_wanted_with_freeze(range, 3, 20, page))
         );
+    }
+
+    #[test]
+    fn strips_that_overlap_the_range_are_not_collected_twice() {
+        let visible = span((0, 100), (0, 30));
+        let range = PageRange::covering((1_000, 64), (0, 128), (0, 40), visible);
+        let wanted = collect_wanted_pages_with_freeze(range, visible, 32, 32);
+        let mut coords: Vec<(u32, u32)> = wanted.iter().map(|p| (p.row, p.col)).collect();
+        coords.sort_unstable();
+        assert_eq!(coords, [(0, 0), (0, 1), (0, 2), (1, 0), (1, 1), (1, 2)]);
+    }
+
+    #[test]
+    fn overflow_is_found_four_page_columns_back() {
+        let mut sheet = Sheet::with_axes(SheetId(0), String::from("S1"), 3, 200);
+        let text = sheet.add_string("A heading that runs on and on").unwrap();
+        assert!(sheet.set_value_by_id(RowId(1), ColId(0), Value::Text(text)));
+        assert!(sheet.set_value_by_id(RowId(2), ColId(70), Value::Text(text)));
+        let mut scratch = String::new();
+        let mut origins = |col: u32| -> Vec<(u16, u16)> {
+            decode(&encode_page(&sheet, Page { row: 0, col }, 1, &mut scratch))
+                .overflows
+                .iter()
+                .map(|overflow| (overflow.0, overflow.1))
+                .collect()
+        };
+        for col in 1..=OVERFLOW_PAGE_COLS {
+            assert_eq!(origins(col).first(), Some(&(1, 0)), "page column {col}");
+        }
+        assert_eq!(origins(OVERFLOW_PAGE_COLS + 1), [(2, 70)]);
+        // Column 70 is in page column 4, so it reaches page column 8.
+        assert_eq!(origins(8), [(2, 70)]);
+        assert_eq!(origins(9), []);
+    }
+
+    #[test]
+    fn styles_of_cells_text_may_overflow_from_are_interned() {
+        let bold = StylePatch {
+            bold: Some(true),
+            ..StylePatch::default()
+        };
+        let italic = StylePatch {
+            italic: Some(true),
+            ..StylePatch::default()
+        };
+        let mut sheet = Sheet::with_axes(SheetId(0), String::from("S1"), 3, 200);
+        let text = sheet.add_string("A heading that runs on and on").unwrap();
+        assert!(sheet.set_value_by_id(RowId(1), ColId(0), Value::Text(text)));
+        // Where the bold rows cross an italic column, the combination is only
+        // interned on demand. One of those cells has text, and one nothing.
+        sheet.set_col_style_patch(ColId(0), italic);
+        sheet.set_row_style_patch(RowId(1), bold);
+        sheet.set_row_style_patch(
+            RowId(2),
+            StylePatch {
+                strikethrough: Some(true),
+                ..bold
+            },
+        );
+        let interned = sheet.styles().entries().len();
+
+        let page = Page { row: 0, col: 4 };
+        prepare_page_styles(&mut sheet, page);
+        assert_eq!(sheet.styles().entries().len(), interned + 1);
+        let decoded = decode(&encode_page(&sheet, page, 1, &mut String::new()));
+        let styles: Vec<u16> = decoded
+            .overflows
+            .iter()
+            .map(|overflow| overflow.2)
+            .collect();
+        assert_eq!(styles, [interned as u16]);
+
+        // The empty one counts too when a value may be spilled into it.
+        let rows = sheet.rows();
+        prepare_projected_page_styles(&mut sheet, page, rows, true, Some);
+        assert_eq!(sheet.styles().entries().len(), interned + 2);
     }
 
     #[test]

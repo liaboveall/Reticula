@@ -7,12 +7,28 @@ import {
   type SyncCommand,
 } from "@reticula/protocol";
 import type { WorkerOutput } from "./client.ts";
+import type { PageSource } from "./page-pump.ts";
 
 export interface DraftPreviewHost {
   post(msg: WorkerOutput, transfer?: Transferable[]): void;
+  /** Posts due pages for one slice, and asks for more in later ones. */
+  postPages(source: PageSource): void;
   setActiveSheet(sheet: number): void;
   getActiveSheet(): number;
 }
+
+/** What a draft can be asked: what reads it, and what shows another part of it. */
+const ALLOWED_COMMANDS: ReadonlySet<EngineCommand["kind"]> = new Set<EngineCommand["kind"]>([
+  "subscribe",
+  "switchSheet",
+  "inspectCell",
+  "setEvalEnv",
+  "jumpEdge",
+  "jumpUsedEnd",
+  "copyRange",
+  "findAll",
+  "findNext",
+]);
 
 export class DraftPreviewSession {
   #engine: Engine;
@@ -70,7 +86,7 @@ export class DraftPreviewSession {
     );
     this.#host.setActiveSheet(outcome.sheet.sheet);
     this.#host.post({ kind: "draftReady", sheet: outcome.sheet });
-    this.#flushPagesAndAux();
+    this.#recalcAndFlush();
   }
 
   applyReplayTxn(txn: ArrayBuffer): void {
@@ -78,36 +94,27 @@ export class DraftPreviewSession {
     const sheet = this.#engine.applyWireTxnV3(new Uint8Array(txn));
     this.#host.setActiveSheet(sheet.sheet);
     this.#host.post({ kind: "sheetChanged", sheet, actionMs: 0, recalculated: 0 });
-    this.#flushPagesAndAux();
+    this.#recalcAndFlush();
   }
 
   handleCommand(command: EngineCommand): void {
     if (this.#closed) return;
-    if (command.kind === "subscribe") {
-      // Clear Engine's cached subscribed_set so any post-draftReady or post-setSheet
-      // subscribe always emits all visible pages for the grid's current epoch.
-      this.#engine.handle({
-        kind: "switchSheet",
-        sheet: command.sheet ?? this.#host.getActiveSheet(),
+    if (!ALLOWED_COMMANDS.has(command.kind)) {
+      this.#host.post({
+        kind: "rejected",
+        reason: "Exit AI draft preview before editing.",
       });
-      this.#engine.handle(command);
-      this.#flushPagesAndAux();
       return;
     }
-    if (
-      command.kind === "switchSheet" ||
-      command.kind === "inspectCell" ||
-      command.kind === "setEvalEnv"
-    ) {
-      const ev = this.#engine.handle(command);
-      if (ev) this.#emitEngineEvent(ev);
-      this.#flushPagesAndAux();
-      return;
-    }
-    this.#host.post({
-      kind: "rejected",
-      reason: "Exit AI draft preview before editing.",
-    });
+    const ev = this.#engine.handle(this.#readOnly(command));
+    if (ev) this.#emitEngineEvent(ev);
+    this.#recalcAndFlush();
+  }
+
+  /** Posts pages that did not fit into an earlier slice. */
+  flushPages(): void {
+    if (this.#closed) return;
+    this.#host.postPages(this.#engine);
   }
 
   close(): void {
@@ -135,7 +142,7 @@ export class DraftPreviewSession {
         const ev = this.#engine.handleSync(cmd);
         if (ev) this.#emitEngineEvent(ev);
         await this.#drainCollab();
-        this.#flushPagesAndAux();
+        this.#recalcAndFlush();
       })
       .catch(() => {});
   }
@@ -164,7 +171,7 @@ export class DraftPreviewSession {
         });
         if (ready) this.#emitEngineEvent(ready);
         await this.#drainCollab();
-        this.#flushPagesAndAux();
+        this.#recalcAndFlush();
       }
     }
   }
@@ -183,18 +190,20 @@ export class DraftPreviewSession {
     this.#host.post(ev);
   }
 
-  #flushPagesAndAux(): void {
+  #readOnly(command: EngineCommand): EngineCommand {
+    if (command.kind === "subscribe") {
+      return { ...command, sheet: command.sheet ?? this.#host.getActiveSheet() };
+    }
+    // Nothing is taken out of a draft by copying from it.
+    return command.kind === "copyRange" ? { ...command, cut: false } : command;
+  }
+
+  #recalcAndFlush(): void {
     if (this.#closed) return;
     while (this.#engine.hasPendingRecalc()) {
       const ev = this.#engine.handle({ kind: "continueRecalc" });
       if (ev) this.#emitEngineEvent(ev);
     }
-    for (let page = this.#engine.takePage(); page; page = this.#engine.takePage()) {
-      const buf = page.buffer as ArrayBuffer;
-      this.#host.post(buf, [buf]);
-    }
-    for (let aux = this.#engine.takeAuxEvent(); aux; aux = this.#engine.takeAuxEvent()) {
-      this.#host.post(aux);
-    }
+    this.flushPages();
   }
 }
