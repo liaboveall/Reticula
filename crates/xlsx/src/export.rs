@@ -3,6 +3,7 @@
 //! truncation warnings, and optional `<v>` cache stripping for Step 6
 //! differential recalculation.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{Cursor, Read, Write as _};
 
@@ -350,9 +351,9 @@ pub fn export_workbook_with_options(
         }
     }
 
-    type SheetFormulaList<'a> = Vec<(u32, u32, RowId, ColId, &'a BoundFormula)>;
+    type SheetFormulaList<'a> = Vec<(u32, u32, RowId, ColId, Cow<'a, BoundFormula>)>;
     let mut per_sheet_formulas: BTreeMap<SheetId, SheetFormulaList<'_>> = BTreeMap::new();
-    for (&(sid, row_id, col_id), formula) in wb.formulas() {
+    for ((sid, row_id, col_id), formula) in wb.formulas() {
         let Some(sheet) = wb.sheet(sid) else {
             continue;
         };
@@ -408,7 +409,11 @@ pub fn export_workbook_with_options(
         let mut written_coords: BTreeMap<(u32, u32), ()> = BTreeMap::new();
 
         if let Some(sheet_formulas) = per_sheet_formulas.get(&sid) {
-            for &(r_pos, c_pos, row_id, col_id, formula) in sheet_formulas {
+            for (r_pos_ref, c_pos_ref, row_id_ref, col_id_ref, formula) in sheet_formulas {
+                let r_pos = *r_pos_ref;
+                let c_pos = *c_pos_ref;
+                let row_id = *row_id_ref;
+                let col_id = *col_id_ref;
                 formula_coords.insert((r_pos, c_pos), ());
                 written_coords.insert((r_pos, c_pos), ());
 

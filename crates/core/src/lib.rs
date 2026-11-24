@@ -39,6 +39,7 @@ pub mod decimal15;
 pub mod determinism;
 pub mod digest;
 pub mod format;
+pub mod formula_store;
 pub mod id;
 pub mod input;
 pub mod memory;

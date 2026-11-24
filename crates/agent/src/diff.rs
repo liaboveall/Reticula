@@ -255,7 +255,7 @@ enum LogicalContent {
 impl LogicalContent {
     fn from_workbook(wb: &Workbook<BoundFormula>, sheet: &Sheet, row: RowId, col: ColId) -> Self {
         if let Some(formula) = wb.formula(sheet.id(), row, col) {
-            return Self::Formula(formula.clone());
+            return Self::Formula(formula.into_owned());
         }
         match sheet.value_by_id(row, col) {
             Value::Empty => Self::Empty,
@@ -343,7 +343,7 @@ fn collect_sheet_populated_keys(
     sheet.for_each_non_empty_cell(|_, _, r, c, _| {
         keys.insert((r, c));
     });
-    for &(sid, r, c) in wb.formulas().keys() {
+    for (sid, r, c) in wb.formulas().keys() {
         if sid == sheet.id() {
             keys.insert((r, c));
         }

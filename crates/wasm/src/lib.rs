@@ -3638,7 +3638,7 @@ impl Engine {
         if let Some(sheet) = self.engine.workbook().sheet(sheet_id) {
             let start = (sheet_id, RowId(0), ColId(0));
             let end = (sheet_id, RowId(u64::MAX), ColId(u64::MAX));
-            for (&(_, r_id, c_id), _) in self.engine.workbook().formulas().range(start..=end) {
+            for ((_, r_id, c_id), _) in self.engine.workbook().formulas().range(start..=end) {
                 if let (Some(rp), Some(cp)) = (
                     sheet.row_axis().id_to_pos(r_id.0),
                     sheet.col_axis().id_to_pos(c_id.0),
@@ -4225,12 +4225,7 @@ fn compute_jump_target(
             .is_none_or(|col| col.blocks().is_empty());
         if col_empty && !is_occ(r0, c0) {
             // Check if any formula exists in `c_id` (rare if cached value is Empty).
-            let has_any_formula = wb
-                .formulas()
-                .range(
-                    (sheet_id, RowId(0), ColId(0))..=(sheet_id, RowId(u64::MAX), ColId(u64::MAX)),
-                )
-                .any(|(&(_, _, fc), _)| fc == ColId(c_id));
+            let has_any_formula = wb.formulas().col_has_any(sheet_id, ColId(c_id));
             if !has_any_formula {
                 return match dir {
                     JumpDirection::Up => (0, c0),

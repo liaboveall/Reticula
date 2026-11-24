@@ -1404,7 +1404,7 @@ mod tests {
             .workbook()
             .formula(s0, RowId(0), ColId(0))
             .unwrap()
-            .clone();
+            .into_owned();
         let plan = build_fill_plan(
             &src_f,
             engine.workbook(),

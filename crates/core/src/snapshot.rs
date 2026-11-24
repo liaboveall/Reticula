@@ -186,7 +186,7 @@ where
         entries: workbook
             .formulas()
             .iter()
-            .map(|(&(s, r, c), f)| (s, r, c, f.clone()))
+            .map(|((s, r, c), f)| (s, r, c, f.into_owned()))
             .collect(),
     };
 

@@ -371,7 +371,7 @@ fn visit_candidate_cells(
             for (tab_idx, s) in sheets.into_iter().enumerate() {
                 sheet_tab.insert(s.id(), (tab_idx, s));
             }
-            for (&(sid, row_id, col_id), formula) in wb.formulas() {
+            for ((sid, row_id, col_id), formula) in wb.formulas() {
                 let Some(&(tab_idx, sheet)) = sheet_tab.get(&sid) else {
                     continue;
                 };

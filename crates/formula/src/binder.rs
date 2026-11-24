@@ -16,10 +16,12 @@ use core::fmt::Write as _;
 
 use reticula_core::axis::Axis;
 use reticula_core::digest::Digest64;
-use reticula_core::id::{ColId, IdRun, RowId, SheetId};
+use reticula_core::formula_store::TemplateStrip;
+use reticula_core::id::{ColId, IdRun, RowId, SheetId, id_stream};
 use reticula_core::ops::{
     CellEdit, CellInput, FormatPatch, FormulaMode, FormulaPayload, MAX_CELL_TEXT_UTF16,
     MAX_EDITS_PER_OP, MAX_FORMULA_CHARS, MoveCellsRewriteCtx, Op, OpError, ScalarValue, Workbook,
+    WorkbookCellKey,
 };
 use reticula_core::sheet::Sheet;
 use serde::{Deserialize, Serialize};
@@ -376,8 +378,226 @@ pub struct TemplateFormula {
     pub root: TemplateExpr,
 }
 
+/// Identity-affine row rule inside a 1D vertical [`TemplateStrip`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AffineRow {
+    /// Target row identity at strip offset `0`.
+    pub base: u64,
+    /// Vertical identity step per strip row offset: `0` (fixed) or `1` (sliding).
+    pub stride: u8,
+}
+
+impl AffineRow {
+    /// Resolves the target row identity for `0`-based strip offset `offset`.
+    #[must_use]
+    pub const fn resolve(self, offset: u32) -> RowId {
+        RowId(
+            self.base
+                .saturating_add((self.stride as u64).saturating_mul(offset as u64)),
+        )
+    }
+
+    fn try_pair(r0: RowId, r1: RowId) -> Option<Self> {
+        if r0 == r1 {
+            Some(Self {
+                base: r0.0,
+                stride: 0,
+            })
+        } else if id_stream(r0.0) == id_stream(r1.0) && r1.0 == r0.0.saturating_add(1) {
+            Some(Self {
+                base: r0.0,
+                stride: 1,
+            })
+        } else {
+            None
+        }
+    }
+
+    fn matches(self, row: RowId, offset: u32) -> bool {
+        if self.stride == 0 {
+            row.0 == self.base
+        } else {
+            id_stream(row.0) == id_stream(self.base)
+                && row.0 == self.base.saturating_add(u64::from(offset))
+        }
+    }
+
+    const fn shifted(self, offset: u32) -> Self {
+        Self {
+            base: self.resolve(offset).0,
+            stride: self.stride,
+        }
+    }
+
+    fn can_merge(self, left_len: u32, right: Self) -> bool {
+        self.stride == right.stride
+            && if self.stride == 0 {
+                self.base == right.base
+            } else {
+                id_stream(self.base) == id_stream(right.base)
+                    && self.base.saturating_add(u64::from(left_len)) == right.base
+            }
+    }
+
+    fn validate(self, len: u32) -> Result<(), OpError> {
+        if self.stride > 1 {
+            return Err(OpError::InvalidFormula);
+        }
+        if self.stride == 1 && len > 0 && IdRun::new(self.base, len).is_none() {
+            return Err(OpError::InvalidFormula);
+        }
+        Ok(())
+    }
+}
+
+/// Identity-affine cell or range reference inside [`AffineFormula`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AffineRef {
+    /// Single cell anchored to `(row(offset), col)`.
+    Cell {
+        /// Target worksheet (`None` means the formula's own worksheet).
+        sheet: Option<SheetId>,
+        /// Unresolved external sheet name if missing at bind time.
+        missing_sheet: Option<String>,
+        /// Identity-affine row anchor.
+        row: AffineRow,
+        /// Fixed column identity.
+        col: ColId,
+        /// Original `$` flag on column.
+        abs_col: bool,
+        /// Original `$` flag on row.
+        abs_row: bool,
+    },
+    /// Rectangular range anchored by inclusive corner identities.
+    Area {
+        /// Target worksheet (`None` means the formula's own worksheet).
+        sheet: Option<SheetId>,
+        /// Unresolved external sheet name if missing at bind time.
+        missing_sheet: Option<String>,
+        /// Identity-affine top row anchor.
+        first_row: AffineRow,
+        /// Fixed left column anchor.
+        first_col: ColId,
+        /// Identity-affine bottom row anchor.
+        last_row: AffineRow,
+        /// Fixed right column anchor.
+        last_col: ColId,
+        /// Original `$` flag on `first_col`.
+        abs_first_col: bool,
+        /// Original `$` flag on `first_row`.
+        abs_first_row: bool,
+        /// Original `$` flag on `last_col`.
+        abs_last_col: bool,
+        /// Original `$` flag on `last_row`.
+        abs_last_row: bool,
+    },
+    /// Full-column range anchored by fixed inclusive columns.
+    ColRange {
+        /// Target worksheet (`None` means the formula's own worksheet).
+        sheet: Option<SheetId>,
+        /// Unresolved external sheet name if missing at bind time.
+        missing_sheet: Option<String>,
+        /// Fixed left column anchor.
+        first_col: ColId,
+        /// Fixed right column anchor.
+        last_col: ColId,
+        /// Original `$` flag on `first_col`.
+        abs_first: bool,
+        /// Original `$` flag on `last_col`.
+        abs_last: bool,
+    },
+    /// Full-row range anchored by identity-affine inclusive rows.
+    RowRange {
+        /// Target worksheet (`None` means the formula's own worksheet).
+        sheet: Option<SheetId>,
+        /// Unresolved external sheet name if missing at bind time.
+        missing_sheet: Option<String>,
+        /// Identity-affine top row anchor.
+        first_row: AffineRow,
+        /// Identity-affine bottom row anchor.
+        last_row: AffineRow,
+        /// Original `$` flag on `first_row`.
+        abs_first: bool,
+        /// Original `$` flag on `last_row`.
+        abs_last: bool,
+    },
+    /// Out-of-bounds or deleted reference (`#REF!`).
+    Invalid {
+        /// Optional sheet name prefix retained for display if present.
+        sheet_name: Option<String>,
+    },
+}
+
+/// Identity-affine expression tree compressed across a 1D vertical strip.
+#[derive(Clone, Debug, PartialEq)]
+pub enum AffineExpr {
+    /// Scalar literal leaf.
+    Literal(Literal),
+    /// Constant `{...}` array literal.
+    ArrayLiteral {
+        /// Row count (`>= 1`).
+        rows: u32,
+        /// Column count (`>= 1`).
+        cols: u32,
+        /// Row-major literal items.
+        elements: Vec<Literal>,
+    },
+    /// Identity-affine cell or range reference.
+    Reference(AffineRef),
+    /// Unresolved or workbook/sheet-local defined name.
+    Name(String),
+    /// Explicit parentheses `(inner)`.
+    Paren(Box<Self>),
+    /// Prefix or postfix unary operator.
+    Unary {
+        /// Operator kind.
+        op: UnaryOp,
+        /// Operand expression.
+        expr: Box<Self>,
+    },
+    /// Binary infix operator.
+    Binary {
+        /// Operator kind.
+        op: BinaryOp,
+        /// Left operand.
+        left: Box<Self>,
+        /// Right operand.
+        right: Box<Self>,
+    },
+    /// Function call.
+    Call {
+        /// Uppercase function name.
+        name: String,
+        /// Argument expressions.
+        args: Vec<Self>,
+    },
+    /// Worksheet-qualified defined name.
+    ScopedName {
+        /// Bound worksheet identity when resolved.
+        sheet: Option<SheetId>,
+        /// Original worksheet name preserved when target sheet was unresolved.
+        missing_sheet: Option<String>,
+        /// Identifier spelling.
+        name: String,
+    },
+    /// Dynamic-array spill-range operator (`expr#`).
+    SpillRef(Box<Self>),
+    /// Omitted optional argument in a function call.
+    MissingArg,
+}
+
+/// Identity-affine strip template carried by [`reticula_core::formula_store::FormulaStore`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct AffineFormula {
+    /// Dynamic vs legacy evaluation mode.
+    pub mode: FormulaMode,
+    /// Root affine expression.
+    pub root: AffineExpr,
+}
+
 impl FormulaPayload for BoundFormula {
     type Template = TemplateFormula;
+    type StripTemplate = AffineFormula;
 
     fn estimated_bytes(&self) -> usize {
         size_of::<Self>().saturating_add(expr_bytes(&self.root))
@@ -405,6 +625,83 @@ impl FormulaPayload for BoundFormula {
         Self {
             mode: template.mode,
             root: expand_template_expr(&template.root, row, col),
+        }
+    }
+
+    fn try_pair_strip_template(f0: &Self, f1: &Self) -> Option<Self::StripTemplate> {
+        if f0.mode != f1.mode {
+            return None;
+        }
+        let root = try_pair_affine_expr(&f0.root, &f1.root)?;
+        Some(AffineFormula {
+            mode: f0.mode,
+            root,
+        })
+    }
+
+    fn matches_strip_template(&self, template: &Self::StripTemplate, offset: u32) -> bool {
+        self.mode == template.mode && affine_expr_matches(&self.root, &template.root, offset)
+    }
+
+    fn instantiate_strip_template(template: &Self::StripTemplate, offset: u32) -> Self {
+        Self {
+            mode: template.mode,
+            root: instantiate_affine_expr(&template.root, offset),
+        }
+    }
+
+    fn shift_strip_template(template: &Self::StripTemplate, offset: u32) -> Self::StripTemplate {
+        AffineFormula {
+            mode: template.mode,
+            root: shift_affine_expr(&template.root, offset),
+        }
+    }
+
+    fn strips_can_merge(
+        left: &Self::StripTemplate,
+        left_len: u32,
+        right: &Self::StripTemplate,
+    ) -> bool {
+        left.mode == right.mode && affine_expr_can_merge(&left.root, left_len, &right.root)
+    }
+
+    fn validate_strip_template(template: &Self::StripTemplate, len: u32) -> Result<(), OpError> {
+        validate_affine_expr(&template.root, 0, len)
+    }
+
+    fn strip_template_bytes(template: &Self::StripTemplate) -> usize {
+        size_of::<AffineFormula>().saturating_add(affine_expr_bytes(&template.root))
+    }
+
+    fn write_strip_cell_digest(template: &Self::StripTemplate, offset: u32, digest: &mut Digest64) {
+        let mode_byte = match template.mode {
+            FormulaMode::Dynamic => 1_u8,
+            FormulaMode::Legacy => 2_u8,
+        };
+        digest.write_bytes(&[mode_byte]);
+        write_affine_expr_digest(&template.root, offset, digest);
+    }
+
+    fn collect_strip_row_endpoints(
+        strip: &TemplateStrip<Self::StripTemplate>,
+        target_sheet: SheetId,
+        ids: &[IdRun],
+        out: &mut BTreeSet<WorkbookCellKey>,
+    ) {
+        collect_affine_row_endpoints(&strip.template.root, strip, target_sheet, ids, out);
+    }
+
+    fn collect_strip_col_endpoints(
+        strip: &TemplateStrip<Self::StripTemplate>,
+        target_sheet: SheetId,
+        ids: &[IdRun],
+        out: &mut BTreeSet<WorkbookCellKey>,
+    ) {
+        if affine_expr_touches_col_endpoints(&strip.template.root, strip.sheet, target_sheet, ids) {
+            for offset in 0..strip.len {
+                let row = RowId(strip.start_row.0.saturating_add(u64::from(offset)));
+                out.insert((strip.sheet, row, strip.col));
+            }
         }
     }
 
@@ -2005,6 +2302,1207 @@ fn write_ref_digest(r: &BoundRef, d: &mut Digest64) {
                 d.write_bytes(s.as_bytes());
             }
         }
+    }
+}
+
+fn lit_bits_eq(a: &Literal, b: &Literal) -> bool {
+    match (a, b) {
+        (Literal::Number(x), Literal::Number(y)) => x.to_bits() == y.to_bits(),
+        (Literal::Text(x), Literal::Text(y)) => x == y,
+        (Literal::Bool(x), Literal::Bool(y)) => x == y,
+        (Literal::Error(x), Literal::Error(y)) => x == y,
+        _ => false,
+    }
+}
+
+fn lits_bits_eq(a: &[Literal], b: &[Literal]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| lit_bits_eq(x, y))
+}
+
+fn try_pair_affine_ref(r0: &BoundRef, r1: &BoundRef) -> Option<AffineRef> {
+    match (r0, r1) {
+        (
+            BoundRef::Cell {
+                sheet: s0,
+                missing_sheet: ms0,
+                row: row0,
+                col: col0,
+                abs_col: ac0,
+                abs_row: ar0,
+            },
+            BoundRef::Cell {
+                sheet: s1,
+                missing_sheet: ms1,
+                row: row1,
+                col: col1,
+                abs_col: ac1,
+                abs_row: ar1,
+            },
+        ) if s0 == s1 && ms0 == ms1 && col0 == col1 && ac0 == ac1 && ar0 == ar1 => {
+            Some(AffineRef::Cell {
+                sheet: *s0,
+                missing_sheet: ms0.clone(),
+                row: AffineRow::try_pair(*row0, *row1)?,
+                col: *col0,
+                abs_col: *ac0,
+                abs_row: *ar0,
+            })
+        }
+        (
+            BoundRef::Area {
+                sheet: s0,
+                missing_sheet: ms0,
+                first_row: fr0,
+                first_col: fc0,
+                last_row: lr0,
+                last_col: lc0,
+                abs_first_col: afc0,
+                abs_first_row: afr0,
+                abs_last_col: alc0,
+                abs_last_row: alr0,
+            },
+            BoundRef::Area {
+                sheet: s1,
+                missing_sheet: ms1,
+                first_row: fr1,
+                first_col: fc1,
+                last_row: lr1,
+                last_col: lc1,
+                abs_first_col: afc1,
+                abs_first_row: afr1,
+                abs_last_col: alc1,
+                abs_last_row: alr1,
+            },
+        ) if s0 == s1
+            && ms0 == ms1
+            && fc0 == fc1
+            && lc0 == lc1
+            && afc0 == afc1
+            && afr0 == afr1
+            && alc0 == alc1
+            && alr0 == alr1 =>
+        {
+            Some(AffineRef::Area {
+                sheet: *s0,
+                missing_sheet: ms0.clone(),
+                first_row: AffineRow::try_pair(*fr0, *fr1)?,
+                first_col: *fc0,
+                last_row: AffineRow::try_pair(*lr0, *lr1)?,
+                last_col: *lc0,
+                abs_first_col: *afc0,
+                abs_first_row: *afr0,
+                abs_last_col: *alc0,
+                abs_last_row: *alr0,
+            })
+        }
+        (
+            BoundRef::ColRange {
+                sheet: s0,
+                missing_sheet: ms0,
+                first_col: fc0,
+                last_col: lc0,
+                abs_first: af0,
+                abs_last: al0,
+            },
+            BoundRef::ColRange {
+                sheet: s1,
+                missing_sheet: ms1,
+                first_col: fc1,
+                last_col: lc1,
+                abs_first: af1,
+                abs_last: al1,
+            },
+        ) if s0 == s1 && ms0 == ms1 && fc0 == fc1 && lc0 == lc1 && af0 == af1 && al0 == al1 => {
+            Some(AffineRef::ColRange {
+                sheet: *s0,
+                missing_sheet: ms0.clone(),
+                first_col: *fc0,
+                last_col: *lc0,
+                abs_first: *af0,
+                abs_last: *al0,
+            })
+        }
+        (
+            BoundRef::RowRange {
+                sheet: s0,
+                missing_sheet: ms0,
+                first_row: fr0,
+                last_row: lr0,
+                abs_first: af0,
+                abs_last: al0,
+            },
+            BoundRef::RowRange {
+                sheet: s1,
+                missing_sheet: ms1,
+                first_row: fr1,
+                last_row: lr1,
+                abs_first: af1,
+                abs_last: al1,
+            },
+        ) if s0 == s1 && ms0 == ms1 && af0 == af1 && al0 == al1 => Some(AffineRef::RowRange {
+            sheet: *s0,
+            missing_sheet: ms0.clone(),
+            first_row: AffineRow::try_pair(*fr0, *fr1)?,
+            last_row: AffineRow::try_pair(*lr0, *lr1)?,
+            abs_first: *af0,
+            abs_last: *al0,
+        }),
+        (BoundRef::Invalid { sheet_name: n0 }, BoundRef::Invalid { sheet_name: n1 })
+            if n0 == n1 =>
+        {
+            Some(AffineRef::Invalid {
+                sheet_name: n0.clone(),
+            })
+        }
+        _ => None,
+    }
+}
+
+fn try_pair_affine_expr(e0: &BoundExpr, e1: &BoundExpr) -> Option<AffineExpr> {
+    match (e0, e1) {
+        (BoundExpr::Literal(a), BoundExpr::Literal(b)) if lit_bits_eq(a, b) => {
+            Some(AffineExpr::Literal(a.clone()))
+        }
+        (
+            BoundExpr::ArrayLiteral {
+                rows: r0,
+                cols: c0,
+                elements: el0,
+            },
+            BoundExpr::ArrayLiteral {
+                rows: r1,
+                cols: c1,
+                elements: el1,
+            },
+        ) if r0 == r1 && c0 == c1 && lits_bits_eq(el0, el1) => Some(AffineExpr::ArrayLiteral {
+            rows: *r0,
+            cols: *c0,
+            elements: el0.clone(),
+        }),
+        (BoundExpr::Reference(r0), BoundExpr::Reference(r1)) => {
+            Some(AffineExpr::Reference(try_pair_affine_ref(r0, r1)?))
+        }
+        (BoundExpr::Name(a), BoundExpr::Name(b)) if a == b => Some(AffineExpr::Name(a.clone())),
+        (BoundExpr::Paren(a), BoundExpr::Paren(b)) => {
+            Some(AffineExpr::Paren(Box::new(try_pair_affine_expr(a, b)?)))
+        }
+        (BoundExpr::Unary { op: op0, expr: a }, BoundExpr::Unary { op: op1, expr: b })
+            if op0 == op1 =>
+        {
+            Some(AffineExpr::Unary {
+                op: *op0,
+                expr: Box::new(try_pair_affine_expr(a, b)?),
+            })
+        }
+        (
+            BoundExpr::Binary {
+                op: op0,
+                left: l0,
+                right: r0,
+            },
+            BoundExpr::Binary {
+                op: op1,
+                left: l1,
+                right: r1,
+            },
+        ) if op0 == op1 => Some(AffineExpr::Binary {
+            op: *op0,
+            left: Box::new(try_pair_affine_expr(l0, l1)?),
+            right: Box::new(try_pair_affine_expr(r0, r1)?),
+        }),
+        (BoundExpr::Call { name: n0, args: a0 }, BoundExpr::Call { name: n1, args: a1 })
+            if n0 == n1 && a0.len() == a1.len() =>
+        {
+            let mut args = Vec::with_capacity(a0.len());
+            for (x, y) in a0.iter().zip(a1) {
+                args.push(try_pair_affine_expr(x, y)?);
+            }
+            Some(AffineExpr::Call {
+                name: n0.clone(),
+                args,
+            })
+        }
+        (
+            BoundExpr::ScopedName {
+                sheet: s0,
+                missing_sheet: ms0,
+                name: n0,
+            },
+            BoundExpr::ScopedName {
+                sheet: s1,
+                missing_sheet: ms1,
+                name: n1,
+            },
+        ) if s0 == s1 && ms0 == ms1 && n0 == n1 => Some(AffineExpr::ScopedName {
+            sheet: *s0,
+            missing_sheet: ms0.clone(),
+            name: n0.clone(),
+        }),
+        (BoundExpr::SpillRef(a), BoundExpr::SpillRef(b)) => {
+            Some(AffineExpr::SpillRef(Box::new(try_pair_affine_expr(a, b)?)))
+        }
+        (BoundExpr::MissingArg, BoundExpr::MissingArg) => Some(AffineExpr::MissingArg),
+        _ => None,
+    }
+}
+
+fn affine_ref_matches(r: &BoundRef, a: &AffineRef, offset: u32) -> bool {
+    match (r, a) {
+        (
+            BoundRef::Cell {
+                sheet: s0,
+                missing_sheet: ms0,
+                row: row0,
+                col: col0,
+                abs_col: ac0,
+                abs_row: ar0,
+            },
+            AffineRef::Cell {
+                sheet: s1,
+                missing_sheet: ms1,
+                row: row1,
+                col: col1,
+                abs_col: ac1,
+                abs_row: ar1,
+            },
+        ) => {
+            s0 == s1
+                && ms0 == ms1
+                && col0 == col1
+                && ac0 == ac1
+                && ar0 == ar1
+                && row1.matches(*row0, offset)
+        }
+        (
+            BoundRef::Area {
+                sheet: s0,
+                missing_sheet: ms0,
+                first_row: fr0,
+                first_col: fc0,
+                last_row: lr0,
+                last_col: lc0,
+                abs_first_col: afc0,
+                abs_first_row: afr0,
+                abs_last_col: alc0,
+                abs_last_row: alr0,
+            },
+            AffineRef::Area {
+                sheet: s1,
+                missing_sheet: ms1,
+                first_row: fr1,
+                first_col: fc1,
+                last_row: lr1,
+                last_col: lc1,
+                abs_first_col: afc1,
+                abs_first_row: afr1,
+                abs_last_col: alc1,
+                abs_last_row: alr1,
+            },
+        ) => {
+            s0 == s1
+                && ms0 == ms1
+                && fc0 == fc1
+                && lc0 == lc1
+                && afc0 == afc1
+                && afr0 == afr1
+                && alc0 == alc1
+                && alr0 == alr1
+                && fr1.matches(*fr0, offset)
+                && lr1.matches(*lr0, offset)
+        }
+        (
+            BoundRef::ColRange {
+                sheet: s0,
+                missing_sheet: ms0,
+                first_col: fc0,
+                last_col: lc0,
+                abs_first: af0,
+                abs_last: al0,
+            },
+            AffineRef::ColRange {
+                sheet: s1,
+                missing_sheet: ms1,
+                first_col: fc1,
+                last_col: lc1,
+                abs_first: af1,
+                abs_last: al1,
+            },
+        ) => s0 == s1 && ms0 == ms1 && fc0 == fc1 && lc0 == lc1 && af0 == af1 && al0 == al1,
+        (
+            BoundRef::RowRange {
+                sheet: s0,
+                missing_sheet: ms0,
+                first_row: fr0,
+                last_row: lr0,
+                abs_first: af0,
+                abs_last: al0,
+            },
+            AffineRef::RowRange {
+                sheet: s1,
+                missing_sheet: ms1,
+                first_row: fr1,
+                last_row: lr1,
+                abs_first: af1,
+                abs_last: al1,
+            },
+        ) => {
+            s0 == s1
+                && ms0 == ms1
+                && af0 == af1
+                && al0 == al1
+                && fr1.matches(*fr0, offset)
+                && lr1.matches(*lr0, offset)
+        }
+        (BoundRef::Invalid { sheet_name: n0 }, AffineRef::Invalid { sheet_name: n1 }) => n0 == n1,
+        _ => false,
+    }
+}
+
+fn affine_expr_matches(e: &BoundExpr, a: &AffineExpr, offset: u32) -> bool {
+    match (e, a) {
+        (BoundExpr::Literal(x), AffineExpr::Literal(y)) => lit_bits_eq(x, y),
+        (
+            BoundExpr::ArrayLiteral {
+                rows: r0,
+                cols: c0,
+                elements: el0,
+            },
+            AffineExpr::ArrayLiteral {
+                rows: r1,
+                cols: c1,
+                elements: el1,
+            },
+        ) => r0 == r1 && c0 == c1 && lits_bits_eq(el0, el1),
+        (BoundExpr::Reference(r0), AffineExpr::Reference(r1)) => affine_ref_matches(r0, r1, offset),
+        (BoundExpr::Name(x), AffineExpr::Name(y)) => x == y,
+        (BoundExpr::Paren(x), AffineExpr::Paren(y))
+        | (BoundExpr::SpillRef(x), AffineExpr::SpillRef(y)) => affine_expr_matches(x, y, offset),
+        (BoundExpr::Unary { op: op0, expr: x }, AffineExpr::Unary { op: op1, expr: y }) => {
+            op0 == op1 && affine_expr_matches(x, y, offset)
+        }
+        (
+            BoundExpr::Binary {
+                op: op0,
+                left: l0,
+                right: r0,
+            },
+            AffineExpr::Binary {
+                op: op1,
+                left: l1,
+                right: r1,
+            },
+        ) => {
+            op0 == op1 && affine_expr_matches(l0, l1, offset) && affine_expr_matches(r0, r1, offset)
+        }
+        (BoundExpr::Call { name: n0, args: a0 }, AffineExpr::Call { name: n1, args: a1 }) => {
+            n0 == n1
+                && a0.len() == a1.len()
+                && a0
+                    .iter()
+                    .zip(a1)
+                    .all(|(x, y)| affine_expr_matches(x, y, offset))
+        }
+        (
+            BoundExpr::ScopedName {
+                sheet: s0,
+                missing_sheet: ms0,
+                name: n0,
+            },
+            AffineExpr::ScopedName {
+                sheet: s1,
+                missing_sheet: ms1,
+                name: n1,
+            },
+        ) => s0 == s1 && ms0 == ms1 && n0 == n1,
+        (BoundExpr::MissingArg, AffineExpr::MissingArg) => true,
+        _ => false,
+    }
+}
+
+fn instantiate_affine_ref(r: &AffineRef, offset: u32) -> BoundRef {
+    match r {
+        AffineRef::Cell {
+            sheet,
+            missing_sheet,
+            row,
+            col,
+            abs_col,
+            abs_row,
+        } => BoundRef::Cell {
+            sheet: *sheet,
+            missing_sheet: missing_sheet.clone(),
+            row: row.resolve(offset),
+            col: *col,
+            abs_col: *abs_col,
+            abs_row: *abs_row,
+        },
+        AffineRef::Area {
+            sheet,
+            missing_sheet,
+            first_row,
+            first_col,
+            last_row,
+            last_col,
+            abs_first_col,
+            abs_first_row,
+            abs_last_col,
+            abs_last_row,
+        } => BoundRef::Area {
+            sheet: *sheet,
+            missing_sheet: missing_sheet.clone(),
+            first_row: first_row.resolve(offset),
+            first_col: *first_col,
+            last_row: last_row.resolve(offset),
+            last_col: *last_col,
+            abs_first_col: *abs_first_col,
+            abs_first_row: *abs_first_row,
+            abs_last_col: *abs_last_col,
+            abs_last_row: *abs_last_row,
+        },
+        AffineRef::ColRange {
+            sheet,
+            missing_sheet,
+            first_col,
+            last_col,
+            abs_first,
+            abs_last,
+        } => BoundRef::ColRange {
+            sheet: *sheet,
+            missing_sheet: missing_sheet.clone(),
+            first_col: *first_col,
+            last_col: *last_col,
+            abs_first: *abs_first,
+            abs_last: *abs_last,
+        },
+        AffineRef::RowRange {
+            sheet,
+            missing_sheet,
+            first_row,
+            last_row,
+            abs_first,
+            abs_last,
+        } => BoundRef::RowRange {
+            sheet: *sheet,
+            missing_sheet: missing_sheet.clone(),
+            first_row: first_row.resolve(offset),
+            last_row: last_row.resolve(offset),
+            abs_first: *abs_first,
+            abs_last: *abs_last,
+        },
+        AffineRef::Invalid { sheet_name } => BoundRef::Invalid {
+            sheet_name: sheet_name.clone(),
+        },
+    }
+}
+
+fn instantiate_affine_expr(expr: &AffineExpr, offset: u32) -> BoundExpr {
+    match expr {
+        AffineExpr::Literal(lit) => BoundExpr::Literal(lit.clone()),
+        AffineExpr::ArrayLiteral {
+            rows,
+            cols,
+            elements,
+        } => BoundExpr::ArrayLiteral {
+            rows: *rows,
+            cols: *cols,
+            elements: elements.clone(),
+        },
+        AffineExpr::Reference(r) => BoundExpr::Reference(instantiate_affine_ref(r, offset)),
+        AffineExpr::Name(s) => BoundExpr::Name(s.clone()),
+        AffineExpr::Paren(inner) => {
+            BoundExpr::Paren(Box::new(instantiate_affine_expr(inner, offset)))
+        }
+        AffineExpr::Unary { op, expr: inner } => BoundExpr::Unary {
+            op: *op,
+            expr: Box::new(instantiate_affine_expr(inner, offset)),
+        },
+        AffineExpr::Binary { op, left, right } => BoundExpr::Binary {
+            op: *op,
+            left: Box::new(instantiate_affine_expr(left, offset)),
+            right: Box::new(instantiate_affine_expr(right, offset)),
+        },
+        AffineExpr::Call { name, args } => BoundExpr::Call {
+            name: name.clone(),
+            args: args
+                .iter()
+                .map(|a| instantiate_affine_expr(a, offset))
+                .collect(),
+        },
+        AffineExpr::ScopedName {
+            sheet,
+            missing_sheet,
+            name,
+        } => BoundExpr::ScopedName {
+            sheet: *sheet,
+            missing_sheet: missing_sheet.clone(),
+            name: name.clone(),
+        },
+        AffineExpr::SpillRef(inner) => {
+            BoundExpr::SpillRef(Box::new(instantiate_affine_expr(inner, offset)))
+        }
+        AffineExpr::MissingArg => BoundExpr::MissingArg,
+    }
+}
+
+fn shift_affine_ref(r: &AffineRef, offset: u32) -> AffineRef {
+    match r {
+        AffineRef::Cell {
+            sheet,
+            missing_sheet,
+            row,
+            col,
+            abs_col,
+            abs_row,
+        } => AffineRef::Cell {
+            sheet: *sheet,
+            missing_sheet: missing_sheet.clone(),
+            row: row.shifted(offset),
+            col: *col,
+            abs_col: *abs_col,
+            abs_row: *abs_row,
+        },
+        AffineRef::Area {
+            sheet,
+            missing_sheet,
+            first_row,
+            first_col,
+            last_row,
+            last_col,
+            abs_first_col,
+            abs_first_row,
+            abs_last_col,
+            abs_last_row,
+        } => AffineRef::Area {
+            sheet: *sheet,
+            missing_sheet: missing_sheet.clone(),
+            first_row: first_row.shifted(offset),
+            first_col: *first_col,
+            last_row: last_row.shifted(offset),
+            last_col: *last_col,
+            abs_first_col: *abs_first_col,
+            abs_first_row: *abs_first_row,
+            abs_last_col: *abs_last_col,
+            abs_last_row: *abs_last_row,
+        },
+        AffineRef::ColRange { .. } | AffineRef::Invalid { .. } => r.clone(),
+        AffineRef::RowRange {
+            sheet,
+            missing_sheet,
+            first_row,
+            last_row,
+            abs_first,
+            abs_last,
+        } => AffineRef::RowRange {
+            sheet: *sheet,
+            missing_sheet: missing_sheet.clone(),
+            first_row: first_row.shifted(offset),
+            last_row: last_row.shifted(offset),
+            abs_first: *abs_first,
+            abs_last: *abs_last,
+        },
+    }
+}
+
+fn shift_affine_expr(expr: &AffineExpr, offset: u32) -> AffineExpr {
+    match expr {
+        AffineExpr::Literal(_)
+        | AffineExpr::ArrayLiteral { .. }
+        | AffineExpr::Name(_)
+        | AffineExpr::ScopedName { .. }
+        | AffineExpr::MissingArg => expr.clone(),
+        AffineExpr::Reference(r) => AffineExpr::Reference(shift_affine_ref(r, offset)),
+        AffineExpr::Paren(inner) => AffineExpr::Paren(Box::new(shift_affine_expr(inner, offset))),
+        AffineExpr::Unary { op, expr: inner } => AffineExpr::Unary {
+            op: *op,
+            expr: Box::new(shift_affine_expr(inner, offset)),
+        },
+        AffineExpr::Binary { op, left, right } => AffineExpr::Binary {
+            op: *op,
+            left: Box::new(shift_affine_expr(left, offset)),
+            right: Box::new(shift_affine_expr(right, offset)),
+        },
+        AffineExpr::Call { name, args } => AffineExpr::Call {
+            name: name.clone(),
+            args: args.iter().map(|a| shift_affine_expr(a, offset)).collect(),
+        },
+        AffineExpr::SpillRef(inner) => {
+            AffineExpr::SpillRef(Box::new(shift_affine_expr(inner, offset)))
+        }
+    }
+}
+
+fn affine_ref_can_merge(left: &AffineRef, left_len: u32, right: &AffineRef) -> bool {
+    match (left, right) {
+        (
+            AffineRef::Cell {
+                sheet: s0,
+                missing_sheet: ms0,
+                row: row0,
+                col: col0,
+                abs_col: ac0,
+                abs_row: ar0,
+            },
+            AffineRef::Cell {
+                sheet: s1,
+                missing_sheet: ms1,
+                row: row1,
+                col: col1,
+                abs_col: ac1,
+                abs_row: ar1,
+            },
+        ) => {
+            s0 == s1
+                && ms0 == ms1
+                && col0 == col1
+                && ac0 == ac1
+                && ar0 == ar1
+                && row0.can_merge(left_len, *row1)
+        }
+        (
+            AffineRef::Area {
+                sheet: s0,
+                missing_sheet: ms0,
+                first_row: fr0,
+                first_col: fc0,
+                last_row: lr0,
+                last_col: lc0,
+                abs_first_col: afc0,
+                abs_first_row: afr0,
+                abs_last_col: alc0,
+                abs_last_row: alr0,
+            },
+            AffineRef::Area {
+                sheet: s1,
+                missing_sheet: ms1,
+                first_row: fr1,
+                first_col: fc1,
+                last_row: lr1,
+                last_col: lc1,
+                abs_first_col: afc1,
+                abs_first_row: afr1,
+                abs_last_col: alc1,
+                abs_last_row: alr1,
+            },
+        ) => {
+            s0 == s1
+                && ms0 == ms1
+                && fc0 == fc1
+                && lc0 == lc1
+                && afc0 == afc1
+                && afr0 == afr1
+                && alc0 == alc1
+                && alr0 == alr1
+                && fr0.can_merge(left_len, *fr1)
+                && lr0.can_merge(left_len, *lr1)
+        }
+        (AffineRef::ColRange { .. }, AffineRef::ColRange { .. })
+        | (AffineRef::Invalid { .. }, AffineRef::Invalid { .. }) => left == right,
+        (
+            AffineRef::RowRange {
+                sheet: s0,
+                missing_sheet: ms0,
+                first_row: fr0,
+                last_row: lr0,
+                abs_first: af0,
+                abs_last: al0,
+            },
+            AffineRef::RowRange {
+                sheet: s1,
+                missing_sheet: ms1,
+                first_row: fr1,
+                last_row: lr1,
+                abs_first: af1,
+                abs_last: al1,
+            },
+        ) => {
+            s0 == s1
+                && ms0 == ms1
+                && af0 == af1
+                && al0 == al1
+                && fr0.can_merge(left_len, *fr1)
+                && lr0.can_merge(left_len, *lr1)
+        }
+        _ => false,
+    }
+}
+
+fn affine_expr_can_merge(left: &AffineExpr, left_len: u32, right: &AffineExpr) -> bool {
+    match (left, right) {
+        (AffineExpr::Literal(x), AffineExpr::Literal(y)) => lit_bits_eq(x, y),
+        (
+            AffineExpr::ArrayLiteral {
+                rows: r0,
+                cols: c0,
+                elements: el0,
+            },
+            AffineExpr::ArrayLiteral {
+                rows: r1,
+                cols: c1,
+                elements: el1,
+            },
+        ) => r0 == r1 && c0 == c1 && lits_bits_eq(el0, el1),
+        (AffineExpr::Reference(a), AffineExpr::Reference(b)) => {
+            affine_ref_can_merge(a, left_len, b)
+        }
+        (AffineExpr::Name(a), AffineExpr::Name(b)) => a == b,
+        (AffineExpr::Paren(a), AffineExpr::Paren(b))
+        | (AffineExpr::SpillRef(a), AffineExpr::SpillRef(b)) => {
+            affine_expr_can_merge(a, left_len, b)
+        }
+        (AffineExpr::Unary { op: op0, expr: a }, AffineExpr::Unary { op: op1, expr: b }) => {
+            op0 == op1 && affine_expr_can_merge(a, left_len, b)
+        }
+        (
+            AffineExpr::Binary {
+                op: op0,
+                left: l0,
+                right: r0,
+            },
+            AffineExpr::Binary {
+                op: op1,
+                left: l1,
+                right: r1,
+            },
+        ) => {
+            op0 == op1
+                && affine_expr_can_merge(l0, left_len, l1)
+                && affine_expr_can_merge(r0, left_len, r1)
+        }
+        (AffineExpr::Call { name: n0, args: a0 }, AffineExpr::Call { name: n1, args: a1 }) => {
+            n0 == n1
+                && a0.len() == a1.len()
+                && a0
+                    .iter()
+                    .zip(a1)
+                    .all(|(x, y)| affine_expr_can_merge(x, left_len, y))
+        }
+        (
+            AffineExpr::ScopedName {
+                sheet: s0,
+                missing_sheet: ms0,
+                name: n0,
+            },
+            AffineExpr::ScopedName {
+                sheet: s1,
+                missing_sheet: ms1,
+                name: n1,
+            },
+        ) => s0 == s1 && ms0 == ms1 && n0 == n1,
+        (AffineExpr::MissingArg, AffineExpr::MissingArg) => true,
+        _ => false,
+    }
+}
+
+fn validate_affine_expr(expr: &AffineExpr, depth: usize, len: u32) -> Result<(), OpError> {
+    if depth > MAX_NESTING_DEPTH {
+        return Err(OpError::InvalidFormula);
+    }
+    match expr {
+        AffineExpr::Literal(Literal::Number(n)) => {
+            if !n.is_finite() {
+                return Err(OpError::NonFiniteNumber);
+            }
+            Ok(())
+        }
+        AffineExpr::Literal(_)
+        | AffineExpr::Name(_)
+        | AffineExpr::ScopedName { .. }
+        | AffineExpr::MissingArg => Ok(()),
+        AffineExpr::Reference(r) => match r {
+            AffineRef::Cell { row, .. } => row.validate(len),
+            AffineRef::Area {
+                first_row,
+                last_row,
+                ..
+            }
+            | AffineRef::RowRange {
+                first_row,
+                last_row,
+                ..
+            } => {
+                first_row.validate(len)?;
+                last_row.validate(len)
+            }
+            AffineRef::ColRange { .. } | AffineRef::Invalid { .. } => Ok(()),
+        },
+        AffineExpr::ArrayLiteral {
+            rows,
+            cols,
+            elements,
+        } => {
+            let expected = (*rows as usize).checked_mul(*cols as usize);
+            if *rows == 0 || *cols == 0 || expected != Some(elements.len()) {
+                return Err(OpError::InvalidFormula);
+            }
+            for item in elements {
+                if let Literal::Number(n) = item
+                    && !n.is_finite()
+                {
+                    return Err(OpError::NonFiniteNumber);
+                }
+            }
+            Ok(())
+        }
+        AffineExpr::Paren(inner)
+        | AffineExpr::Unary { expr: inner, .. }
+        | AffineExpr::SpillRef(inner) => validate_affine_expr(inner, depth.saturating_add(1), len),
+        AffineExpr::Binary { left, right, .. } => {
+            validate_affine_expr(left, depth.saturating_add(1), len)?;
+            validate_affine_expr(right, depth.saturating_add(1), len)
+        }
+        AffineExpr::Call { args, .. } => {
+            if args.len() > MAX_FUNCTION_ARGS {
+                return Err(OpError::InvalidFormula);
+            }
+            let next_depth = depth.saturating_add(1);
+            for arg in args {
+                validate_affine_expr(arg, next_depth, len)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn affine_expr_bytes(expr: &AffineExpr) -> usize {
+    let base = size_of::<AffineExpr>();
+    match expr {
+        AffineExpr::Literal(Literal::Text(s)) | AffineExpr::Name(s) => {
+            base.saturating_add(s.capacity())
+        }
+        AffineExpr::ScopedName {
+            missing_sheet,
+            name,
+            ..
+        } => base
+            .saturating_add(name.capacity())
+            .saturating_add(missing_sheet.as_ref().map_or(0, String::capacity)),
+        AffineExpr::Literal(_) | AffineExpr::Reference(_) | AffineExpr::MissingArg => base,
+        AffineExpr::ArrayLiteral { elements, .. } => {
+            base.saturating_add(elements.capacity().saturating_mul(size_of::<Literal>()))
+        }
+        AffineExpr::Paren(inner)
+        | AffineExpr::Unary { expr: inner, .. }
+        | AffineExpr::SpillRef(inner) => base.saturating_add(affine_expr_bytes(inner)),
+        AffineExpr::Binary { left, right, .. } => base
+            .saturating_add(affine_expr_bytes(left))
+            .saturating_add(affine_expr_bytes(right)),
+        AffineExpr::Call { name, args } => args
+            .iter()
+            .fold(base.saturating_add(name.capacity()), |acc, a| {
+                acc.saturating_add(affine_expr_bytes(a))
+            }),
+    }
+}
+
+fn write_affine_expr_digest(expr: &AffineExpr, offset: u32, d: &mut Digest64) {
+    match expr {
+        AffineExpr::Literal(lit) => {
+            d.write_bytes(&[1]);
+            write_lit_digest(lit, d);
+        }
+        AffineExpr::ArrayLiteral {
+            rows,
+            cols,
+            elements,
+        } => {
+            d.write_bytes(&[2]);
+            d.write_u32(*rows);
+            d.write_u32(*cols);
+            for lit in elements {
+                write_lit_digest(lit, d);
+            }
+        }
+        AffineExpr::Reference(r) => {
+            d.write_bytes(&[3]);
+            write_affine_ref_digest(r, offset, d);
+        }
+        AffineExpr::Name(s) => {
+            d.write_bytes(&[4]);
+            d.write_bytes(s.as_bytes());
+        }
+        AffineExpr::Paren(inner) => {
+            d.write_bytes(&[5]);
+            write_affine_expr_digest(inner, offset, d);
+        }
+        AffineExpr::Unary { op, expr: inner } => {
+            let tag = match op {
+                UnaryOp::Plus => 1_u8,
+                UnaryOp::Neg => 2_u8,
+                UnaryOp::ImplicitIntersection => 3_u8,
+                UnaryOp::Percent => 4_u8,
+            };
+            d.write_bytes(&[6, tag]);
+            write_affine_expr_digest(inner, offset, d);
+        }
+        AffineExpr::Binary { op, left, right } => {
+            d.write_bytes(&[7]);
+            d.write_bytes(op.as_str().as_bytes());
+            write_affine_expr_digest(left, offset, d);
+            write_affine_expr_digest(right, offset, d);
+        }
+        AffineExpr::Call { name, args } => {
+            d.write_bytes(&[8]);
+            d.write_bytes(name.as_bytes());
+            d.write_u32(u32::try_from(args.len()).unwrap_or(u32::MAX));
+            for arg in args {
+                write_affine_expr_digest(arg, offset, d);
+            }
+        }
+        AffineExpr::SpillRef(inner) => {
+            d.write_bytes(&[9]);
+            write_affine_expr_digest(inner, offset, d);
+        }
+        AffineExpr::ScopedName {
+            sheet,
+            missing_sheet,
+            name,
+        } => {
+            d.write_bytes(&[10]);
+            match sheet {
+                None => d.write_bytes(&[0]),
+                Some(sid) => {
+                    d.write_bytes(&[1]);
+                    d.write_u32(sid.0);
+                }
+            }
+            match missing_sheet.as_deref() {
+                None => d.write_bytes(&[0]),
+                Some(ms) => {
+                    d.write_bytes(&[1]);
+                    d.write_u32(u32::try_from(ms.len()).unwrap_or(u32::MAX));
+                    d.write_bytes(ms.as_bytes());
+                }
+            }
+            d.write_u32(u32::try_from(name.len()).unwrap_or(u32::MAX));
+            d.write_bytes(name.as_bytes());
+        }
+        AffineExpr::MissingArg => d.write_bytes(&[13]),
+    }
+}
+
+fn write_affine_ref_digest(r: &AffineRef, offset: u32, d: &mut Digest64) {
+    match r {
+        AffineRef::Cell {
+            sheet,
+            row,
+            col,
+            abs_col,
+            abs_row,
+            ..
+        } => {
+            d.write_bytes(&[1, u8::from(*abs_col), u8::from(*abs_row)]);
+            d.write_u32(sheet.map_or(u32::MAX, |s| s.0));
+            d.write_u64(row.resolve(offset).0);
+            d.write_u64(col.0);
+        }
+        AffineRef::Area {
+            sheet,
+            first_row,
+            first_col,
+            last_row,
+            last_col,
+            abs_first_col,
+            abs_first_row,
+            abs_last_col,
+            abs_last_row,
+            ..
+        } => {
+            d.write_bytes(&[
+                2,
+                u8::from(*abs_first_col),
+                u8::from(*abs_first_row),
+                u8::from(*abs_last_col),
+                u8::from(*abs_last_row),
+            ]);
+            d.write_u32(sheet.map_or(u32::MAX, |s| s.0));
+            d.write_u64(first_row.resolve(offset).0);
+            d.write_u64(first_col.0);
+            d.write_u64(last_row.resolve(offset).0);
+            d.write_u64(last_col.0);
+        }
+        AffineRef::ColRange {
+            sheet,
+            first_col,
+            last_col,
+            abs_first,
+            abs_last,
+            ..
+        } => {
+            d.write_bytes(&[3, u8::from(*abs_first), u8::from(*abs_last)]);
+            d.write_u32(sheet.map_or(u32::MAX, |s| s.0));
+            d.write_u64(first_col.0);
+            d.write_u64(last_col.0);
+        }
+        AffineRef::RowRange {
+            sheet,
+            first_row,
+            last_row,
+            abs_first,
+            abs_last,
+            ..
+        } => {
+            d.write_bytes(&[4, u8::from(*abs_first), u8::from(*abs_last)]);
+            d.write_u32(sheet.map_or(u32::MAX, |s| s.0));
+            d.write_u64(first_row.resolve(offset).0);
+            d.write_u64(last_row.resolve(offset).0);
+        }
+        AffineRef::Invalid { sheet_name } => {
+            d.write_bytes(&[5]);
+            if let Some(s) = sheet_name {
+                d.write_bytes(s.as_bytes());
+            }
+        }
+    }
+}
+
+fn collect_affine_row_anchor(
+    anchor: AffineRow,
+    ref_sheet: Option<SheetId>,
+    strip: &TemplateStrip<AffineFormula>,
+    target_sheet: SheetId,
+    ids: &[IdRun],
+    out: &mut BTreeSet<WorkbookCellKey>,
+) -> bool {
+    if ref_sheet.unwrap_or(strip.sheet) != target_sheet {
+        return false;
+    }
+    if anchor.stride == 0 {
+        if id_in_runs(anchor.base, ids) {
+            for offset in 0..strip.len {
+                let row = RowId(strip.start_row.0.saturating_add(u64::from(offset)));
+                out.insert((strip.sheet, row, strip.col));
+            }
+            return true;
+        }
+        return false;
+    }
+    let a_stream = id_stream(anchor.base);
+    let a_end = anchor.base.saturating_add(u64::from(strip.len));
+    for run in ids {
+        if id_stream(run.first_id) != a_stream {
+            continue;
+        }
+        let r_end = run.first_id.saturating_add(u64::from(run.len));
+        let lo = anchor.base.max(run.first_id);
+        let hi = a_end.min(r_end);
+        for raw_r in lo..hi {
+            let off = raw_r.saturating_sub(anchor.base);
+            let row = RowId(strip.start_row.0.saturating_add(off));
+            out.insert((strip.sheet, row, strip.col));
+        }
+    }
+    false
+}
+
+fn collect_affine_row_endpoints(
+    expr: &AffineExpr,
+    strip: &TemplateStrip<AffineFormula>,
+    target_sheet: SheetId,
+    ids: &[IdRun],
+    out: &mut BTreeSet<WorkbookCellKey>,
+) -> bool {
+    match expr {
+        AffineExpr::Literal(_)
+        | AffineExpr::ArrayLiteral { .. }
+        | AffineExpr::Name(_)
+        | AffineExpr::ScopedName { .. }
+        | AffineExpr::MissingArg => false,
+        AffineExpr::Reference(r) => match r {
+            AffineRef::Area {
+                sheet,
+                first_row,
+                last_row,
+                ..
+            }
+            | AffineRef::RowRange {
+                sheet,
+                first_row,
+                last_row,
+                ..
+            } => {
+                if collect_affine_row_anchor(*first_row, *sheet, strip, target_sheet, ids, out) {
+                    return true;
+                }
+                if last_row != first_row {
+                    return collect_affine_row_anchor(
+                        *last_row,
+                        *sheet,
+                        strip,
+                        target_sheet,
+                        ids,
+                        out,
+                    );
+                }
+                false
+            }
+            AffineRef::Cell { .. } | AffineRef::ColRange { .. } | AffineRef::Invalid { .. } => {
+                false
+            }
+        },
+        AffineExpr::Paren(inner)
+        | AffineExpr::Unary { expr: inner, .. }
+        | AffineExpr::SpillRef(inner) => {
+            collect_affine_row_endpoints(inner, strip, target_sheet, ids, out)
+        }
+        AffineExpr::Binary { left, right, .. } => {
+            collect_affine_row_endpoints(left, strip, target_sheet, ids, out)
+                || collect_affine_row_endpoints(right, strip, target_sheet, ids, out)
+        }
+        AffineExpr::Call { args, .. } => {
+            for arg in args {
+                if collect_affine_row_endpoints(arg, strip, target_sheet, ids, out) {
+                    return true;
+                }
+            }
+            false
+        }
+    }
+}
+
+fn affine_expr_touches_col_endpoints(
+    expr: &AffineExpr,
+    strip_sheet: SheetId,
+    target_sheet: SheetId,
+    ids: &[IdRun],
+) -> bool {
+    match expr {
+        AffineExpr::Literal(_)
+        | AffineExpr::ArrayLiteral { .. }
+        | AffineExpr::Name(_)
+        | AffineExpr::ScopedName { .. }
+        | AffineExpr::MissingArg => false,
+        AffineExpr::Reference(r) => match r {
+            AffineRef::Area {
+                sheet,
+                first_col,
+                last_col,
+                ..
+            }
+            | AffineRef::ColRange {
+                sheet,
+                first_col,
+                last_col,
+                ..
+            } => {
+                sheet.unwrap_or(strip_sheet) == target_sheet
+                    && (id_in_runs(first_col.0, ids) || id_in_runs(last_col.0, ids))
+            }
+            AffineRef::Cell { .. } | AffineRef::RowRange { .. } | AffineRef::Invalid { .. } => {
+                false
+            }
+        },
+        AffineExpr::Paren(inner)
+        | AffineExpr::Unary { expr: inner, .. }
+        | AffineExpr::SpillRef(inner) => {
+            affine_expr_touches_col_endpoints(inner, strip_sheet, target_sheet, ids)
+        }
+        AffineExpr::Binary { left, right, .. } => {
+            affine_expr_touches_col_endpoints(left, strip_sheet, target_sheet, ids)
+                || affine_expr_touches_col_endpoints(right, strip_sheet, target_sheet, ids)
+        }
+        AffineExpr::Call { args, .. } => args
+            .iter()
+            .any(|a| affine_expr_touches_col_endpoints(a, strip_sheet, target_sheet, ids)),
     }
 }
 
@@ -4303,7 +5801,7 @@ mod tests {
         let wb_base_1m: Workbook<BoundFormula> = Workbook::from_sheet(sheet_1m, None);
 
         let ops_10 = build_fill_plan(
-            src_f,
+            src_f.as_ref(),
             &wb_base_1m,
             s0,
             1,
@@ -4317,7 +5815,7 @@ mod tests {
             },
         );
         let ops_1m = build_fill_plan(
-            src_f,
+            src_f.as_ref(),
             &wb_base_1m,
             s0,
             1,
@@ -4358,7 +5856,7 @@ mod tests {
             .workbook()
             .formula(s0, RowId(1), ColId(1))
             .unwrap()
-            .clone();
+            .into_owned();
         let plan = build_fill_plan(
             &seam_src,
             eng_seam.workbook(),
@@ -4389,7 +5887,7 @@ mod tests {
                 },
             );
             let actual = eng_seam.workbook().formula(s0, rid, ColId(1)).unwrap();
-            assert_eq!(actual, &expected, "mismatch at pos {pos}");
+            assert_eq!(actual.as_ref(), &expected, "mismatch at pos {pos}");
         }
     }
 
@@ -4498,5 +5996,110 @@ mod tests {
         } else {
             panic!("expected BoundRef::Area");
         }
+    }
+
+    #[test]
+    fn strip_compression_roundtrips_fill_split_merge_and_digest_parity() {
+        use reticula_core::ops::{CellEdit, CellInput, FormatPatch, ScalarValue};
+        use reticula_core::sheet::Sheet;
+
+        use super::templatize_formula;
+
+        let mut sheet = Sheet::standard(SheetId(0), String::from("Sheet1"));
+        *sheet.row_axis_mut() =
+            reticula_core::axis::Axis::with_base(100_050, reticula_core::axis::MAX_ROW_AXIS_LEN);
+        *sheet.col_axis_mut() =
+            reticula_core::axis::Axis::with_base(10, reticula_core::axis::MAX_COL_AXIS_LEN);
+        let mut wb = Workbook::<BoundFormula>::from_sheet(sheet, None);
+        let s0 = SheetId(0);
+
+        let f_sliding =
+            BoundFormula::parse_and_bind("=A1+$B$1+SUM(C1:C5)", FormulaMode::Dynamic, &wb, s0)
+                .unwrap();
+        let f_lookup = BoundFormula::parse_and_bind(
+            "=VLOOKUP(A1,$B$2:$C$100,2,FALSE)",
+            FormulaMode::Dynamic,
+            &wb,
+            s0,
+        )
+        .unwrap();
+        let t_sliding = templatize_formula(&f_sliding, RowId(0), ColId(3));
+        let t_lookup = templatize_formula(&f_lookup, RowId(0), ColId(4));
+
+        // Fill 100,000 rows in ColId(3) and 1,000 rows in ColId(4).
+        let inv1 = wb
+            .apply(Op::FillFormula {
+                sheet: s0,
+                rows: vec![IdRun::new(0, 100_000).unwrap()],
+                cols: vec![IdRun::new(3, 1).unwrap()],
+                template: t_sliding,
+            })
+            .unwrap();
+        wb.apply(Op::FillFormula {
+            sheet: s0,
+            rows: vec![IdRun::new(0, 1_000).unwrap()],
+            cols: vec![IdRun::new(4, 1).unwrap()],
+            template: t_lookup,
+        })
+        .unwrap();
+
+        assert_eq!(wb.formulas().len(), 101_000);
+        assert_eq!(wb.formulas().strip_count(), 2);
+        assert_eq!(wb.formulas().single_count(), 0);
+        assert!(wb.formulas().estimated_bytes() < 4_096);
+        assert_eq!(
+            wb.content_digest(),
+            wb.compute_content_digest_from_scratch()
+        );
+
+        // Overwrite a middle cell to split the 100k strip, then undo to re-coalesce it.
+        let inv_edit = wb
+            .apply(Op::SetCells {
+                sheet: s0,
+                edits: vec![CellEdit {
+                    row: RowId(50_000),
+                    col: ColId(3),
+                    input: CellInput::Scalar(ScalarValue::Number(7.0)),
+                    format: FormatPatch::Keep,
+                }],
+            })
+            .unwrap();
+        assert_eq!(wb.formulas().len(), 100_999);
+        assert_eq!(wb.formulas().strip_count(), 3);
+        assert_eq!(
+            wb.content_digest(),
+            wb.compute_content_digest_from_scratch()
+        );
+
+        wb.apply_inverse(inv_edit).unwrap();
+        assert_eq!(wb.formulas().len(), 101_000);
+        assert_eq!(wb.formulas().strip_count(), 2);
+        assert_eq!(wb.formulas().single_count(), 0);
+        assert_eq!(
+            wb.content_digest(),
+            wb.compute_content_digest_from_scratch()
+        );
+
+        // Check range endpoint handoff when moving an anchor row touched by fixed VLOOKUP & sliding SUM.
+        let inv_move = wb
+            .apply(Op::MoveRows {
+                sheet: s0,
+                ids: vec![IdRun::new(99, 1).unwrap()],
+                after: Some(RowId(10)),
+            })
+            .unwrap();
+        assert_eq!(
+            wb.content_digest(),
+            wb.compute_content_digest_from_scratch()
+        );
+        wb.apply_inverse(inv_move).unwrap();
+        assert_eq!(
+            wb.content_digest(),
+            wb.compute_content_digest_from_scratch()
+        );
+
+        wb.apply_inverse(inv1).unwrap();
+        assert_eq!(wb.formulas().len(), 1_000);
+        assert_eq!(wb.formulas().strip_count(), 1);
     }
 }

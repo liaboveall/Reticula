@@ -42,23 +42,32 @@ fn frozen_v3_snapshot_wal_and_sync_frames_decode_to_exact_expected_digests() {
                 .contains_key(&NamedRangeKey::new(Some(s0), "LocalMax"))
         );
         assert!(matches!(
-            base_wb.formula(s0, RowId(1), ColId(1)).map(|f| &f.root),
+            base_wb.formula(s0, RowId(1), ColId(1)).as_deref().map(|f| &f.root),
             Some(BoundExpr::Call { args, .. }) if matches!(args.first(), Some(BoundExpr::SpillRef(_)))
         ));
         assert!(matches!(
-            base_wb.formula(s0, RowId(1), ColId(2)).map(|f| &f.root),
+            base_wb
+                .formula(s0, RowId(1), ColId(2))
+                .as_deref()
+                .map(|f| &f.root),
             Some(BoundExpr::ScopedName { .. })
         ));
         assert!(matches!(
-            base_wb.formula(s0, RowId(0), ColId(3)).map(|f| &f.root),
+            base_wb.formula(s0, RowId(0), ColId(3)).as_deref().map(|f| &f.root),
             Some(BoundExpr::Call { args, .. }) if args.iter().any(|a| matches!(a, BoundExpr::MissingArg))
         ));
         assert!(matches!(
-            base_wb.formula(s0, RowId(1), ColId(3)).map(|f| &f.root),
+            base_wb
+                .formula(s0, RowId(1), ColId(3))
+                .as_deref()
+                .map(|f| &f.root),
             Some(BoundExpr::PreservedCached { .. })
         ));
         assert!(matches!(
-            base_wb.formula(s0, RowId(2), ColId(3)).map(|f| &f.root),
+            base_wb
+                .formula(s0, RowId(2), ColId(3))
+                .as_deref()
+                .map(|f| &f.root),
             Some(BoundExpr::Opaque { .. })
         ));
     }

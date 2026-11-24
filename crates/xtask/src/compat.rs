@@ -408,7 +408,7 @@ fn freeze_v2() -> Result {
     let f_a3 = eng
         .workbook()
         .formula(s0, RowId(2), ColId(0))
-        .cloned()
+        .map(std::borrow::Cow::into_owned)
         .ok_or_else(|| "missing formula A3".to_owned())?;
 
     let peer_edit_a2 = Op::SetCells {

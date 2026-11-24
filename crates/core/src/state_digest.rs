@@ -420,6 +420,35 @@ pub fn hash_formula_cell<F: FormulaPayload>(
     (u128::from(h) << 64) | u128::from(l)
 }
 
+/// Computes the 128-bit hash of a formula cell instantiated from a
+/// compressed strip template without materialising a temporary AST allocation.
+#[must_use]
+pub fn hash_strip_formula_cell<F: FormulaPayload>(
+    sheet_id: SheetId,
+    row: RowId,
+    col: ColId,
+    template: &F::StripTemplate,
+    offset: u32,
+) -> u128 {
+    let mut lo = Digest64::new();
+    lo.write_u64(TAG_FORMULA_CELL ^ LANE_LO_MASK);
+    lo.write_u32(sheet_id.0);
+    lo.write_u64(row.0);
+    lo.write_u64(col.0);
+    F::write_strip_cell_digest(template, offset, &mut lo);
+
+    let mut hi = Digest64::new();
+    hi.write_u64(TAG_FORMULA_CELL.rotate_left(32) ^ LANE_HI_MASK);
+    hi.write_u32(sheet_id.0);
+    hi.write_u64(row.0);
+    hi.write_u64(col.0);
+    F::write_strip_cell_digest(template, offset, &mut hi);
+
+    let l = lo.finish();
+    let h = mix64(hi.finish() ^ l.rotate_left(17));
+    (u128::from(h) << 64) | u128::from(l)
+}
+
 /// Computes the 128-bit hash of a defined named range (covering scope,
 /// canonical lowercase key, display spelling, formula payload, optional
 /// comment, and hidden flag).

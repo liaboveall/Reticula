@@ -6,6 +6,7 @@
 //! all structural and size invariants so any rejected operation leaves the
 //! workbook bit-for-bit unchanged and never panics.
 
+use alloc::borrow::Cow;
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;
 use alloc::string::String;
@@ -19,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use crate::axis::{Axis, AxisError, AxisRun, MAX_COL_AXIS_LEN, MAX_ROW_AXIS_LEN};
 use crate::digest::Digest64;
 use crate::format::NumberFormat;
+use crate::formula_store::{FormulaStore, TemplateStrip};
 use crate::id::{ColId, IdAllocator, IdRun, RowId, SheetId, id_counter, id_stream, pack_sheet_id};
 use crate::sheet::{
     MAX_COL_WIDTH, MAX_FREEZE_COUNT, MAX_ROW_HEIGHT, MAX_SHEET_NAME_UTF16, MIN_COL_WIDTH,
@@ -29,7 +31,7 @@ use crate::state_digest::{
     compute_order_digest as compute_sheets_order_digest, hash_cell_format, hash_cell_style,
     hash_col_format, hash_col_style, hash_col_width, hash_formula_cell, hash_named_range,
     hash_row_format, hash_row_height, hash_row_style, hash_scalar_cell, hash_sheet_meta,
-    sheet_content_and_scalar_count,
+    hash_strip_formula_cell, sheet_content_and_scalar_count,
 };
 use crate::style::StylePatch;
 use crate::value::{CalcError, Value};
@@ -257,10 +259,19 @@ pub struct RawFormula {
 }
 
 /// Trait implemented by formula representations stored in [`Workbook`] (both
+/// Uninhabited [`FormulaPayload::StripTemplate`] marker for payload types that
+/// store every cell independently without 1D column strip compression.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NoStripTemplate {}
+
 /// [`RawFormula`] in `reticula-core` and `BoundFormula` in `reticula-formula`).
 pub trait FormulaPayload: Clone + PartialEq {
     /// Compact relative-ID formula template carried by [`Op::FillFormula`].
     type Template: Clone + core::fmt::Debug + PartialEq + Serialize + DeserializeOwned;
+
+    /// Identity-affine 1D vertical column strip template compressed inside
+    /// [`FormulaStore`].
+    type StripTemplate: Clone + core::fmt::Debug + PartialEq;
 
     /// Approximate heap bytes owned by this formula entry.
     fn estimated_bytes(&self) -> usize;
@@ -277,6 +288,74 @@ pub trait FormulaPayload: Clone + PartialEq {
 
     /// Instantiates `template` for target cell `(row, col)`.
     fn expand_template(template: &Self::Template, row: RowId, col: ColId) -> Self;
+
+    /// Attempts to factor two vertically adjacent formulas `(f0, f1)` (where
+    /// `f0` resides at `RowId(r0)` and `f1` resides at `RowId(r0 + 1)` in the
+    /// same identity stream) into an identity-affine [`Self::StripTemplate`].
+    fn try_pair_strip_template(_f0: &Self, _f1: &Self) -> Option<Self::StripTemplate> {
+        None
+    }
+
+    /// Returns `true` when `self` equals the instantiation of `template` at
+    /// `0`-based vertical strip `offset`.
+    fn matches_strip_template(&self, _template: &Self::StripTemplate, _offset: u32) -> bool {
+        false
+    }
+
+    /// Instantiates `template` for `0`-based vertical strip `offset`.
+    fn instantiate_strip_template(template: &Self::StripTemplate, offset: u32) -> Self;
+
+    /// Returns an equivalent strip template shifted forward by `offset` rows
+    /// (used when splitting a [`TemplateStrip`] at an internal cell).
+    fn shift_strip_template(template: &Self::StripTemplate, _offset: u32) -> Self::StripTemplate {
+        template.clone()
+    }
+
+    /// Returns `true` when `right` seamlessly continues `left` after `left_len` rows.
+    fn strips_can_merge(
+        _left: &Self::StripTemplate,
+        _left_len: u32,
+        _right: &Self::StripTemplate,
+    ) -> bool {
+        false
+    }
+
+    /// Validates static invariants and stream bounds of `template` across `len` rows.
+    fn validate_strip_template(_template: &Self::StripTemplate, _len: u32) -> Result<(), OpError> {
+        Ok(())
+    }
+
+    /// Approximate heap bytes owned by one [`Self::StripTemplate`] (excluding the
+    /// fixed [`TemplateStrip`] wrapper).
+    fn strip_template_bytes(_template: &Self::StripTemplate) -> usize {
+        0
+    }
+
+    /// Feeds the deterministic canonical digest of `template` at `offset` directly
+    /// into `digest` without allocating an expanded payload when overridden.
+    fn write_strip_cell_digest(template: &Self::StripTemplate, offset: u32, digest: &mut Digest64) {
+        Self::instantiate_strip_template(template, offset).write_digest(digest);
+    }
+
+    /// Collects cell keys inside `strip` whose row range endpoints intersect
+    /// `ids` on `target_sheet`.
+    fn collect_strip_row_endpoints(
+        _strip: &TemplateStrip<Self::StripTemplate>,
+        _target_sheet: SheetId,
+        _ids: &[IdRun],
+        _out: &mut BTreeSet<WorkbookCellKey>,
+    ) {
+    }
+
+    /// Collects cell keys inside `strip` whose column range endpoints intersect
+    /// `ids` on `target_sheet`.
+    fn collect_strip_col_endpoints(
+        _strip: &TemplateStrip<Self::StripTemplate>,
+        _target_sheet: SheetId,
+        _ids: &[IdRun],
+        _out: &mut BTreeSet<WorkbookCellKey>,
+    ) {
+    }
 
     /// Appends `(target_sheet, row_anchor)` and `(target_sheet, col_anchor)`
     /// range endpoints referenced by this formula so [`Workbook`] can execute
@@ -351,6 +430,11 @@ pub trait FormulaPayload: Clone + PartialEq {
 
 impl FormulaPayload for RawFormula {
     type Template = Self;
+    type StripTemplate = NoStripTemplate;
+
+    fn instantiate_strip_template(template: &Self::StripTemplate, _offset: u32) -> Self {
+        match *template {}
+    }
 
     fn estimated_bytes(&self) -> usize {
         self.source.capacity().saturating_add(size_of::<Self>())
@@ -1154,18 +1238,11 @@ impl LazyContentDigest {
 /// dependency endpoints for E25 anchor handoffs, the monotonic identity
 /// allocator and memory estimate.
 #[derive(Clone, Debug)]
-pub struct Workbook<F = RawFormula> {
+pub struct Workbook<F: FormulaPayload = RawFormula> {
     sheets: Vec<Sheet>,
-    formulas: BTreeMap<WorkbookCellKey, F>,
-    formulas_bytes: usize,
+    formulas: FormulaStore<F>,
     named_ranges: BTreeMap<NamedRangeKey, NamedRangeDef<F>>,
     named_ranges_bytes: usize,
-    /// Reverse lookup `(target_sheet, row_anchor) -> formula_keys` for `O(affected)`
-    /// E25 anchor handoff on `MoveRows`.
-    row_range_endpoints: BTreeMap<(SheetId, RowId), BTreeSet<WorkbookCellKey>>,
-    /// Reverse lookup `(target_sheet, col_anchor) -> formula_keys` for `O(affected)`
-    /// E25 anchor handoff on `MoveCols`.
-    col_range_endpoints: BTreeMap<(SheetId, ColId), BTreeSet<WorkbookCellKey>>,
     allocator: IdAllocator,
     next_sheet_id: u32,
     seed_origin: Option<SeedOrigin>,
@@ -1188,12 +1265,9 @@ impl<F: FormulaPayload> Workbook<F> {
             sheet_content_and_scalar_count(&sheet, |_, _| false);
         Self {
             sheets: vec![sheet],
-            formulas: BTreeMap::new(),
-            formulas_bytes: 0,
+            formulas: FormulaStore::new(),
             named_ranges: BTreeMap::new(),
             named_ranges_bytes: 0,
-            row_range_endpoints: BTreeMap::new(),
-            col_range_endpoints: BTreeMap::new(),
             allocator: IdAllocator::local(),
             next_sheet_id: 1,
             seed_origin: None,
@@ -1212,12 +1286,9 @@ impl<F: FormulaPayload> Workbook<F> {
         };
         Self {
             sheets: vec![sheet],
-            formulas: BTreeMap::new(),
-            formulas_bytes: 0,
+            formulas: FormulaStore::new(),
             named_ranges: BTreeMap::new(),
             named_ranges_bytes: 0,
-            row_range_endpoints: BTreeMap::new(),
-            col_range_endpoints: BTreeMap::new(),
             allocator: IdAllocator::local(),
             next_sheet_id: next_id,
             seed_origin,
@@ -1228,7 +1299,7 @@ impl<F: FormulaPayload> Workbook<F> {
     /// Reconstructs a workbook from decoded snapshot parts (with no named ranges).
     pub fn from_parts(
         sheets: Vec<Sheet>,
-        formulas: BTreeMap<WorkbookCellKey, F>,
+        formulas: impl Into<FormulaStore<F>>,
         allocator: IdAllocator,
         next_sheet_id: u32,
         seed_origin: Option<SeedOrigin>,
@@ -1246,12 +1317,13 @@ impl<F: FormulaPayload> Workbook<F> {
     /// Reconstructs a workbook from decoded snapshot parts including defined named ranges.
     pub fn from_parts_with_names(
         sheets: Vec<Sheet>,
-        formulas: BTreeMap<WorkbookCellKey, F>,
+        formulas: impl Into<FormulaStore<F>>,
         named_ranges: BTreeMap<NamedRangeKey, NamedRangeDef<F>>,
         allocator: IdAllocator,
         next_sheet_id: u32,
         seed_origin: Option<SeedOrigin>,
     ) -> Result<Self, OpError> {
+        let formulas: FormulaStore<F> = formulas.into();
         if sheets.is_empty() || sheets.len() > MAX_SHEETS {
             return Err(OpError::TooManySheets);
         }
@@ -1274,15 +1346,7 @@ impl<F: FormulaPayload> Workbook<F> {
             return Err(OpError::CannotDeleteLastSheet);
         }
 
-        let mut formulas_bytes = 0usize;
-        let mut row_range_endpoints: BTreeMap<(SheetId, RowId), BTreeSet<WorkbookCellKey>> =
-            BTreeMap::new();
-        let mut col_range_endpoints: BTreeMap<(SheetId, ColId), BTreeSet<WorkbookCellKey>> =
-            BTreeMap::new();
-        let mut r_eps = Vec::new();
-        let mut c_eps = Vec::new();
-
-        for (&key @ (sheet_id, row, col), formula) in &formulas {
+        for (&(sheet_id, row, col), formula) in formulas.singles() {
             let sheet = sheets
                 .iter()
                 .find(|s| s.id() == sheet_id)
@@ -1291,16 +1355,27 @@ impl<F: FormulaPayload> Workbook<F> {
                 return Err(OpError::TargetNotFound);
             }
             formula.validate()?;
-            formulas_bytes = formulas_bytes.saturating_add(formula_entry_bytes(formula));
-            r_eps.clear();
-            c_eps.clear();
-            formula.collect_range_endpoints(sheet_id, &mut r_eps, &mut c_eps);
-            for ep in &r_eps {
-                row_range_endpoints.entry(*ep).or_default().insert(key);
+        }
+
+        for strip in formulas.col_strips().values() {
+            if strip.len < 2 {
+                return Err(OpError::InvalidFormula);
             }
-            for ep in &c_eps {
-                col_range_endpoints.entry(*ep).or_default().insert(key);
+            let Some(row_run) = IdRun::new(strip.start_row.0, strip.len) else {
+                return Err(OpError::InvalidFormula);
+            };
+            let sheet = sheets
+                .iter()
+                .find(|s| s.id() == strip.sheet)
+                .ok_or(OpError::SheetNotFound)?;
+            if !sheet.col_axis().contains_id(strip.col.0) {
+                return Err(OpError::TargetNotFound);
             }
+            sheet
+                .row_axis()
+                .validate_existing_runs(&[row_run])
+                .map_err(|_| OpError::TargetNotFound)?;
+            F::validate_strip_template(&strip.template, strip.len)?;
         }
 
         let mut named_ranges_bytes = 0usize;
@@ -1331,11 +1406,8 @@ impl<F: FormulaPayload> Workbook<F> {
         let wb = Self {
             sheets,
             formulas,
-            formulas_bytes,
             named_ranges,
             named_ranges_bytes,
-            row_range_endpoints,
-            col_range_endpoints,
             allocator,
             next_sheet_id,
             seed_origin,
@@ -1459,7 +1531,7 @@ impl<F: FormulaPayload> Workbook<F> {
             digest = digest.wrapping_add(sd);
             count = count.saturating_add(sc);
         }
-        for (&(sid, row, col), formula) in &self.formulas {
+        for (&(sid, row, col), formula) in self.formulas.singles() {
             if let Some(sheet) = self.sheet(sid) {
                 let cached = sheet.value_by_id(row, col);
                 let cached_scalar = match cached {
@@ -1477,6 +1549,37 @@ impl<F: FormulaPayload> Workbook<F> {
             }
             digest = digest.wrapping_add(hash_formula_cell(sid, row, col, formula));
             count = count.saturating_add(1);
+        }
+        for strip in self.formulas.col_strips().values() {
+            let sid = strip.sheet;
+            let col = strip.col;
+            let sheet = self.sheet(sid);
+            for offset in 0..strip.len {
+                let row = RowId(strip.start_row.0.saturating_add(u64::from(offset)));
+                if let Some(sh) = sheet {
+                    let cached = sh.value_by_id(row, col);
+                    let cached_scalar = match cached {
+                        Value::Empty => None,
+                        Value::Number(n) => Some(CanonicalScalar::Number(n)),
+                        Value::Text(id) => Some(CanonicalScalar::Text(sh.strings().get(id))),
+                        Value::Bool(flag) => Some(CanonicalScalar::Bool(flag)),
+                        Value::Error(err) => Some(CanonicalScalar::Error(err)),
+                        Value::Array(_) => Some(CanonicalScalar::Error(CalcError::Spill)),
+                    };
+                    if let Some(scalar) = cached_scalar {
+                        digest = digest.wrapping_sub(hash_scalar_cell(sid, row, col, scalar));
+                        count = count.saturating_sub(1);
+                    }
+                }
+                digest = digest.wrapping_add(hash_strip_formula_cell::<F>(
+                    sid,
+                    row,
+                    col,
+                    &strip.template,
+                    offset,
+                ));
+                count = count.saturating_add(1);
+            }
         }
         for (nr_key, nr_def) in &self.named_ranges {
             digest = digest.wrapping_add(hash_named_range(
@@ -1504,9 +1607,9 @@ impl<F: FormulaPayload> Workbook<F> {
         StateDigest::from_parts(self.ensure_digest_ready().0, self.compute_order_digest())
     }
 
-    /// Stored formula map across the workbook.
+    /// Stored formula store across the workbook.
     #[must_use]
-    pub const fn formulas(&self) -> &BTreeMap<WorkbookCellKey, F> {
+    pub const fn formulas(&self) -> &FormulaStore<F> {
         &self.formulas
     }
 
@@ -1550,8 +1653,14 @@ impl<F: FormulaPayload> Workbook<F> {
 
     /// Looks up the formula at `(sheet, row, col)`.
     #[must_use]
-    pub fn formula(&self, sheet: SheetId, row: RowId, col: ColId) -> Option<&F> {
+    pub fn formula(&self, sheet: SheetId, row: RowId, col: ColId) -> Option<Cow<'_, F>> {
         self.formulas.get(&(sheet, row, col))
+    }
+
+    /// Returns `true` when `(sheet, row, col)` contains a formula.
+    #[must_use]
+    pub fn has_formula(&self, sheet: SheetId, row: RowId, col: ColId) -> bool {
+        self.formulas.contains_key(&(sheet, row, col))
     }
 
     /// Bulk-inserts a pre-validated formula and its initial cached value during
@@ -1570,7 +1679,7 @@ impl<F: FormulaPayload> Workbook<F> {
                 return false;
             };
             if let Some(old_f) = self.formulas.get(&(sheet, row, col)) {
-                (hash_formula_cell(sheet, row, col, old_f), 1_u64)
+                (hash_formula_cell(sheet, row, col, old_f.as_ref()), 1_u64)
             } else {
                 let val = target.value_by_id(row, col);
                 scalar_cell_digest_and_pop(sheet, row, col, target, val)
@@ -1646,7 +1755,7 @@ impl<F: FormulaPayload> Workbook<F> {
             .iter()
             .fold(0usize, |acc, s| acc.saturating_add(s.estimated_bytes()));
         sheets_mem
-            .saturating_add(self.formulas_bytes)
+            .saturating_add(self.formulas.estimated_bytes())
             .saturating_add(self.named_ranges_bytes)
     }
 
@@ -1666,9 +1775,9 @@ impl<F: FormulaPayload> Workbook<F> {
         // 1. Solidify formula references against current tombstones before
         // removing tombstoned sheets/rows/cols from the workbook.
         let sheets_snapshot = self.sheets.clone();
-        let keys: Vec<WorkbookCellKey> = self.formulas.keys().copied().collect();
+        let keys: Vec<WorkbookCellKey> = self.formulas.keys().collect();
         for key in keys {
-            if let Some(mut f) = self.formulas.get(&key).cloned()
+            if let Some(mut f) = self.formulas.get(&key).map(Cow::into_owned)
                 && f.finalize_purged_tombstones(key.0, &sheets_snapshot)
             {
                 self.put_formula(key, f);
@@ -1698,8 +1807,7 @@ impl<F: FormulaPayload> Workbook<F> {
             let dead_keys: Vec<WorkbookCellKey> = self
                 .formulas
                 .keys()
-                .filter(|&&(s, _, _)| dead_sheets.contains(&s))
-                .copied()
+                .filter(|(s, _, _)| dead_sheets.contains(s))
                 .collect();
             for k in dead_keys {
                 self.take_formula(k);
@@ -1730,7 +1838,7 @@ impl<F: FormulaPayload> Workbook<F> {
                 let to_drop: Vec<WorkbookCellKey> = self
                     .formulas
                     .range(start..=end)
-                    .filter_map(|(&k @ (_, r, c), _)| {
+                    .filter_map(|(k @ (_, r, c), _)| {
                         if row_set.contains(&r) || col_set.contains(&c) {
                             Some(k)
                         } else {
@@ -1763,7 +1871,7 @@ impl<F: FormulaPayload> Workbook<F> {
         let scalar = value_to_scalar(sheet, val);
         let input = if let Some(formula) = self.formulas.get(&(sheet_id, row, col)) {
             CellInput::Formula {
-                formula: formula.clone(),
+                formula: formula.into_owned(),
                 cached: scalar,
             }
         } else {
@@ -1925,7 +2033,12 @@ impl<F: FormulaPayload> Workbook<F> {
                 let mut delta = new_ax.wrapping_sub(old_ax);
                 for (key, formula) in rewritten {
                     if let Some(cur_f) = self.formulas.get(&key) {
-                        delta = delta.wrapping_sub(hash_formula_cell(key.0, key.1, key.2, cur_f));
+                        delta = delta.wrapping_sub(hash_formula_cell(
+                            key.0,
+                            key.1,
+                            key.2,
+                            cur_f.as_ref(),
+                        ));
                     }
                     delta = delta.wrapping_add(hash_formula_cell(key.0, key.1, key.2, &formula));
                     self.put_formula(key, formula);
@@ -1947,7 +2060,12 @@ impl<F: FormulaPayload> Workbook<F> {
                 let mut delta = new_ax.wrapping_sub(old_ax);
                 for (key, formula) in rewritten {
                     if let Some(cur_f) = self.formulas.get(&key) {
-                        delta = delta.wrapping_sub(hash_formula_cell(key.0, key.1, key.2, cur_f));
+                        delta = delta.wrapping_sub(hash_formula_cell(
+                            key.0,
+                            key.1,
+                            key.2,
+                            cur_f.as_ref(),
+                        ));
                     }
                     delta = delta.wrapping_add(hash_formula_cell(key.0, key.1, key.2, &formula));
                     self.put_formula(key, formula);
@@ -2069,7 +2187,7 @@ impl<F: FormulaPayload> Workbook<F> {
                 let start = (sheet, RowId(0), ColId(0));
                 let end = (sheet, RowId(u64::MAX), ColId(u64::MAX));
                 let keys: Vec<WorkbookCellKey> =
-                    self.formulas.range(start..=end).map(|(&k, _)| k).collect();
+                    self.formulas.range(start..=end).map(|(k, _)| k).collect();
                 for k in keys {
                     self.take_formula(k);
                 }
@@ -2276,7 +2394,7 @@ impl<F: FormulaPayload> Workbook<F> {
 
         // Formulas.
         d.write_u32(u32::try_from(self.formulas.len()).unwrap_or(u32::MAX));
-        for (&(sheet_id, row, col), formula) in &self.formulas {
+        for ((sheet_id, row, col), formula) in &self.formulas {
             d.write_u32(sheet_id.0);
             d.write_u64(row.0);
             d.write_u64(col.0);
@@ -2409,7 +2527,7 @@ impl<F: FormulaPayload> Workbook<F> {
                 let input_ok = if let Some(cur_f) =
                     self.formulas.get(&(sheet_id, edit.row, edit.col))
                 {
-                    matches!(&edit.expected_input, CellInput::Formula { formula, .. } if cur_f == formula)
+                    matches!(&edit.expected_input, CellInput::Formula { formula, .. } if cur_f.as_ref() == formula)
                 } else {
                     let cur_input =
                         match value_to_scalar(sheet, sheet.value_by_id(edit.row, edit.col)) {
@@ -2473,7 +2591,7 @@ impl<F: FormulaPayload> Workbook<F> {
             }
             let start_key = (sheet_id, RowId(0), ColId(0));
             let end_key = (sheet_id, RowId(u64::MAX), ColId(u64::MAX));
-            for (&(_, r, c), _) in self.formulas.range(start_key..=end_key) {
+            for ((_, r, c), _) in self.formulas.range(start_key..=end_key) {
                 if id_in_runs(r.0, rows) && id_in_runs(c.0, cols) {
                     affected.insert((r, c));
                 }
@@ -2644,7 +2762,7 @@ impl<F: FormulaPayload> Workbook<F> {
                 .map(|s| s.row_axis().clone())
                 .ok_or(OpError::SheetNotFound)?;
             for key in candidates {
-                if let Some(prior_f) = self.formulas.get(&key).cloned() {
+                if let Some(prior_f) = self.formulas.get(&key).map(Cow::into_owned) {
                     let mut next_f = prior_f.clone();
                     if next_f.handoff_row_anchors(key.0, sheet_id, &axis_clone, ids, after) {
                         formula_delta = formula_delta
@@ -2706,7 +2824,7 @@ impl<F: FormulaPayload> Workbook<F> {
                 .map(|s| s.col_axis().clone())
                 .ok_or(OpError::SheetNotFound)?;
             for key in candidates {
-                if let Some(prior_f) = self.formulas.get(&key).cloned() {
+                if let Some(prior_f) = self.formulas.get(&key).map(Cow::into_owned) {
                     let mut next_f = prior_f.clone();
                     if next_f.handoff_col_anchors(key.0, sheet_id, &axis_clone, ids, after) {
                         formula_delta = formula_delta
@@ -2743,34 +2861,7 @@ impl<F: FormulaPayload> Workbook<F> {
         sheet_id: SheetId,
         ids: &[IdRun],
     ) -> BTreeSet<WorkbookCellKey> {
-        let mut out = BTreeSet::new();
-        let total_moved: usize = ids
-            .iter()
-            .fold(0usize, |acc, r| acc.saturating_add(r.len as usize));
-        let sheet_eps_bound = self
-            .row_range_endpoints
-            .range((sheet_id, RowId(0))..=(sheet_id, RowId(u64::MAX)))
-            .take(total_moved.saturating_add(1))
-            .count();
-        if total_moved < sheet_eps_bound {
-            for run in ids {
-                for raw_id in run.iter() {
-                    if let Some(keys) = self.row_range_endpoints.get(&(sheet_id, RowId(raw_id))) {
-                        out.extend(keys.iter().copied());
-                    }
-                }
-            }
-        } else {
-            for (&(_, r), keys) in self
-                .row_range_endpoints
-                .range((sheet_id, RowId(0))..=(sheet_id, RowId(u64::MAX)))
-            {
-                if id_in_runs(r.0, ids) {
-                    out.extend(keys.iter().copied());
-                }
-            }
-        }
-        out
+        self.formulas.collect_row_endpoint_candidates(sheet_id, ids)
     }
 
     fn collect_col_endpoint_candidates(
@@ -2778,34 +2869,7 @@ impl<F: FormulaPayload> Workbook<F> {
         sheet_id: SheetId,
         ids: &[IdRun],
     ) -> BTreeSet<WorkbookCellKey> {
-        let mut out = BTreeSet::new();
-        let total_moved: usize = ids
-            .iter()
-            .fold(0usize, |acc, r| acc.saturating_add(r.len as usize));
-        let sheet_eps_bound = self
-            .col_range_endpoints
-            .range((sheet_id, ColId(0))..=(sheet_id, ColId(u64::MAX)))
-            .take(total_moved.saturating_add(1))
-            .count();
-        if total_moved < sheet_eps_bound {
-            for run in ids {
-                for raw_id in run.iter() {
-                    if let Some(keys) = self.col_range_endpoints.get(&(sheet_id, ColId(raw_id))) {
-                        out.extend(keys.iter().copied());
-                    }
-                }
-            }
-        } else {
-            for (&(_, c), keys) in self
-                .col_range_endpoints
-                .range((sheet_id, ColId(0))..=(sheet_id, ColId(u64::MAX)))
-            {
-                if id_in_runs(c.0, ids) {
-                    out.extend(keys.iter().copied());
-                }
-            }
-        }
-        out
+        self.formulas.collect_col_endpoint_candidates(sheet_id, ids)
     }
 
     /// Returns `(cell_key, formula)` for every formula whose range endpoint
@@ -2818,7 +2882,7 @@ impl<F: FormulaPayload> Workbook<F> {
     ) -> Vec<(WorkbookCellKey, F)> {
         self.collect_row_endpoint_candidates(sheet_id, ids)
             .into_iter()
-            .filter_map(|k| self.formulas.get(&k).cloned().map(|f| (k, f)))
+            .filter_map(|k| self.formulas.get(&k).map(|f| (k, f.into_owned())))
             .collect()
     }
 
@@ -2832,7 +2896,7 @@ impl<F: FormulaPayload> Workbook<F> {
     ) -> Vec<(WorkbookCellKey, F)> {
         self.collect_col_endpoint_candidates(sheet_id, ids)
             .into_iter()
-            .filter_map(|k| self.formulas.get(&k).cloned().map(|f| (k, f)))
+            .filter_map(|k| self.formulas.get(&k).map(|f| (k, f.into_owned())))
             .collect()
     }
 
@@ -3202,17 +3266,30 @@ impl<F: FormulaPayload> Workbook<F> {
             sheet.row_axis().validate_existing_runs(&rows)?;
             sheet.col_axis().validate_existing_runs(&cols)?;
         }
-        let added_bytes = total_cells.saturating_mul(
-            per_cell_bytes.saturating_add(size_of::<WorkbookCellKey>().saturating_mul(2)),
-        );
+        let mut added_bytes = 0usize;
+        let single_cell_cost =
+            per_cell_bytes.saturating_add(size_of::<WorkbookCellKey>().saturating_mul(2));
+        for c_run in &cols {
+            for raw_c in c_run.iter() {
+                let col = ColId(raw_c);
+                for r_run in &rows {
+                    if r_run.len >= 2
+                        && let Some(tmpl) = try_fill_strip_template::<F>(template, *r_run, col)
+                    {
+                        added_bytes = added_bytes.saturating_add(
+                            size_of::<TemplateStrip<F::StripTemplate>>()
+                                .saturating_add(F::strip_template_bytes(&tmpl))
+                                .saturating_add(48),
+                        );
+                    } else {
+                        added_bytes = added_bytes
+                            .saturating_add((r_run.len as usize).saturating_mul(single_cell_cost));
+                    }
+                }
+            }
+        }
         if self.estimated_bytes().saturating_add(added_bytes) > MAX_WORKBOOK_BYTES {
             return Err(OpError::MemoryLimitExceeded);
-        }
-        if total_cells >= 4_096 {
-            let reserve = added_bytes
-                .saturating_add(total_cells.saturating_mul(256))
-                .min(768 * 1024 * 1024);
-            let _ = crate::memory::try_reserve_heap(reserve);
         }
 
         // Capture only previously non-empty/formatted cells in `rows × cols` so
@@ -3237,7 +3314,7 @@ impl<F: FormulaPayload> Workbook<F> {
             }
             let start_key = (sheet_id, RowId(0), ColId(0));
             let end_key = (sheet_id, RowId(u64::MAX), ColId(u64::MAX));
-            for (&(_, r, c), _) in self.formulas.range(start_key..=end_key) {
+            for ((_, r, c), _) in self.formulas.range(start_key..=end_key) {
                 if id_in_runs(r.0, &rows) && id_in_runs(c.0, &cols) {
                     affected.insert((r, c));
                 }
@@ -3283,20 +3360,46 @@ impl<F: FormulaPayload> Workbook<F> {
                 sheet.set_value_by_id(snap.row, snap.col, Value::Empty);
             }
         }
+        for snap in &prior_non_empty {
+            if matches!(snap.input, CellInput::Formula { .. }) {
+                self.take_formula((sheet_id, snap.row, snap.col));
+            }
+        }
         let mut pop_plus = 0_u64;
         for c_run in &cols {
             for raw_c in c_run.iter() {
                 let col = ColId(raw_c);
                 for r_run in &rows {
-                    for raw_r in r_run.iter() {
-                        let row = RowId(raw_r);
-                        let expanded = F::expand_template(template, row, col);
+                    if r_run.len >= 2
+                        && let Some(tmpl) = try_fill_strip_template::<F>(template, *r_run, col)
+                    {
                         if track_digest {
-                            delta = delta
-                                .wrapping_add(hash_formula_cell(sheet_id, row, col, &expanded));
-                            pop_plus = pop_plus.saturating_add(1);
+                            for offset in 0..r_run.len {
+                                let row = RowId(r_run.first_id.saturating_add(u64::from(offset)));
+                                delta = delta.wrapping_add(hash_strip_formula_cell::<F>(
+                                    sheet_id, row, col, &tmpl, offset,
+                                ));
+                                pop_plus = pop_plus.saturating_add(1);
+                            }
                         }
-                        self.put_formula((sheet_id, row, col), expanded);
+                        self.formulas.insert_strip(
+                            sheet_id,
+                            RowId(r_run.first_id),
+                            col,
+                            r_run.len,
+                            tmpl,
+                        );
+                    } else {
+                        for raw_r in r_run.iter() {
+                            let row = RowId(raw_r);
+                            let expanded = F::expand_template(template, row, col);
+                            if track_digest {
+                                delta = delta
+                                    .wrapping_add(hash_formula_cell(sheet_id, row, col, &expanded));
+                                pop_plus = pop_plus.saturating_add(1);
+                            }
+                            self.put_formula((sheet_id, row, col), expanded);
+                        }
                     }
                 }
             }
@@ -3550,62 +3653,11 @@ impl<F: FormulaPayload> Workbook<F> {
     }
 
     fn put_formula(&mut self, key: WorkbookCellKey, formula: F) {
-        self.unregister_formula_endpoints(key);
-        let mut r_eps = Vec::new();
-        let mut c_eps = Vec::new();
-        formula.collect_range_endpoints(key.0, &mut r_eps, &mut c_eps);
-        for ep in r_eps {
-            self.row_range_endpoints.entry(ep).or_default().insert(key);
-        }
-        for ep in c_eps {
-            self.col_range_endpoints.entry(ep).or_default().insert(key);
-        }
-
-        let added = formula_entry_bytes(&formula);
-        if let Some(old) = self.formulas.insert(key, formula) {
-            self.formulas_bytes = self
-                .formulas_bytes
-                .saturating_sub(formula_entry_bytes(&old));
-        }
-        self.formulas_bytes = self.formulas_bytes.saturating_add(added);
+        let _ = self.formulas.insert(key, formula);
     }
 
     fn take_formula(&mut self, key: WorkbookCellKey) {
-        self.unregister_formula_endpoints(key);
-        if let Some(old) = self.formulas.remove(&key) {
-            self.formulas_bytes = self
-                .formulas_bytes
-                .saturating_sub(formula_entry_bytes(&old));
-        }
-    }
-
-    fn unregister_formula_endpoints(&mut self, key: WorkbookCellKey) {
-        let Some(existing) = self.formulas.get(&key) else {
-            return;
-        };
-        let mut r_eps = Vec::new();
-        let mut c_eps = Vec::new();
-        existing.collect_range_endpoints(key.0, &mut r_eps, &mut c_eps);
-        for ep in r_eps {
-            let mut empty = false;
-            if let Some(set) = self.row_range_endpoints.get_mut(&ep) {
-                set.remove(&key);
-                empty = set.is_empty();
-            }
-            if empty {
-                self.row_range_endpoints.remove(&ep);
-            }
-        }
-        for ep in c_eps {
-            let mut empty = false;
-            if let Some(set) = self.col_range_endpoints.get_mut(&ep) {
-                set.remove(&key);
-                empty = set.is_empty();
-            }
-            if empty {
-                self.col_range_endpoints.remove(&ep);
-            }
-        }
+        let _ = self.formulas.remove(&key);
     }
 
     fn write_validated_cell(
@@ -3620,7 +3672,7 @@ impl<F: FormulaPayload> Workbook<F> {
         let (old_cell_h, old_pop, old_fmt_h) = if track {
             let sheet = self.sheet(sheet_id).ok_or(OpError::SheetNotFound)?;
             let (ch, pop) = if let Some(old_f) = self.formulas.get(&(sheet_id, row, col)) {
-                (hash_formula_cell(sheet_id, row, col, old_f), 1_u64)
+                (hash_formula_cell(sheet_id, row, col, old_f.as_ref()), 1_u64)
             } else {
                 let val = sheet.value_by_id(row, col);
                 scalar_cell_digest_and_pop(sheet_id, row, col, sheet, val)
@@ -4212,16 +4264,17 @@ impl<F: FormulaPayload> Workbook<F> {
         }
 
         let mut staged_stationary = Vec::new();
-        for (&key, prior_f) in &self.formulas {
+        for (key, prior_f) in &self.formulas {
             if src_union_dst.contains(&key) {
                 continue;
             }
-            let mut next_f = prior_f.clone();
+            let prior_owned = prior_f.into_owned();
+            let mut next_f = prior_owned.clone();
             if next_f.rewrite_for_move_cells(key.0, false, &ctx) {
                 next_f.validate()?;
-                old_mem = old_mem.saturating_add(formula_entry_bytes(prior_f));
+                old_mem = old_mem.saturating_add(formula_entry_bytes(&prior_owned));
                 new_mem = new_mem.saturating_add(formula_entry_bytes(&next_f));
-                staged_stationary.push((key, prior_f.clone(), next_f));
+                staged_stationary.push((key, prior_owned, next_f));
             }
         }
 
@@ -4314,7 +4367,7 @@ impl<F: FormulaPayload> Workbook<F> {
         let mut delta = 0_u128;
         for (key, prior_f) in rewritten_formulas {
             if let Some(cur_f) = self.formulas.get(&key) {
-                delta = delta.wrapping_sub(hash_formula_cell(key.0, key.1, key.2, cur_f));
+                delta = delta.wrapping_sub(hash_formula_cell(key.0, key.1, key.2, cur_f.as_ref()));
             }
             delta = delta.wrapping_add(hash_formula_cell(key.0, key.1, key.2, &prior_f));
             self.put_formula(key, prior_f);
@@ -4421,6 +4474,30 @@ fn count_ids_checked(runs: &[IdRun], cap: usize) -> Result<usize, OpError> {
         }
     }
     Ok(total)
+}
+
+fn try_fill_strip_template<F: FormulaPayload>(
+    template: &F::Template,
+    r_run: IdRun,
+    col: ColId,
+) -> Option<F::StripTemplate> {
+    if r_run.len < 2 {
+        return None;
+    }
+    let f0 = F::expand_template(template, RowId(r_run.first_id), col);
+    let f1 = F::expand_template(template, RowId(r_run.first_id.saturating_add(1)), col);
+    let strip_tmpl = F::try_pair_strip_template(&f0, &f1)?;
+    F::validate_strip_template(&strip_tmpl, r_run.len).ok()?;
+    let last_off = r_run.len.saturating_sub(1);
+    let f_last = F::expand_template(
+        template,
+        RowId(r_run.first_id.saturating_add(u64::from(last_off))),
+        col,
+    );
+    if !f_last.matches_strip_template(&strip_tmpl, last_off) {
+        return None;
+    }
+    Some(strip_tmpl)
 }
 
 fn formula_entry_bytes<F: FormulaPayload>(formula: &F) -> usize {

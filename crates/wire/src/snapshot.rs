@@ -3,6 +3,7 @@
 //! stub snapshots (`14-m1b.md` 7.1), and backward-compatible `v0` decoding
 //! (`14-m1b.md` 5.5).
 
+use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec;
@@ -12,6 +13,7 @@ use core::ops::Bound::{Excluded, Unbounded};
 use reticula_core::KERNEL_VERSION;
 use reticula_core::axis::AxisRun;
 use reticula_core::format::NumberFormat;
+use reticula_core::formula_store::FormulaStore;
 use reticula_core::id::{ColId, IdAllocator, RowId, SheetId};
 use reticula_core::ops::{
     MAX_CELL_TEXT_UTF16, MAX_NAMED_RANGE_COMMENT_CHARS, MAX_NAMED_RANGES, MAX_SHEETS,
@@ -731,17 +733,18 @@ impl SnapshotEncoder {
                 Some(last) => live_workbook.formulas().range((Excluded(last), Unbounded)),
             };
             let mut batch = Vec::new();
-            for (&key, f) in iter.take(limit) {
+            for (key, f) in iter.take(limit) {
                 if batch.is_empty() {
                     batch.reserve(limit.min(live_workbook.formulas().len()));
                 }
                 self.formula_cursor = Some(key);
-                self.has_v3_formulas |= formula_uses_v3(f);
+                self.has_v3_formulas |= formula_uses_v3(&f);
                 batch.push(WireFormulaEntryV3 {
                     sheet: key.0.0,
                     row: key.1.0,
                     col: key.2.0,
-                    formula: WireBoundFormulaV3::try_from(f).map_err(|_| SnapshotError::Codec)?,
+                    formula: WireBoundFormulaV3::try_from(f.as_ref())
+                        .map_err(|_| SnapshotError::Codec)?,
                 });
             }
             return Ok(batch);
@@ -750,12 +753,13 @@ impl SnapshotEncoder {
         // Merge live `formulas()` with `formula_before_image` in sorted key order.
         if self.formulas_collected.is_none() {
             let mut merged: BTreeMap<WorkbookCellKey, (WireBoundFormulaV3, bool)> = BTreeMap::new();
-            for (&k, f) in live_workbook.formulas() {
+            for (k, f) in live_workbook.formulas() {
                 merged.insert(
                     k,
                     (
-                        WireBoundFormulaV3::try_from(f).map_err(|_| SnapshotError::Codec)?,
-                        formula_uses_v3(f),
+                        WireBoundFormulaV3::try_from(f.as_ref())
+                            .map_err(|_| SnapshotError::Codec)?,
+                        formula_uses_v3(&f),
                     ),
                 );
             }
@@ -890,7 +894,7 @@ pub fn decode_snapshot_workbook_only(
     let (payload, _, _, _, _) =
         decode_snapshot_raw_with_limits(bytes, usize::MAX, MAX_WORKBOOK_BYTES)?;
     match payload {
-        RawSnapshotPayload::Workbook(wb) => Ok(wb),
+        RawSnapshotPayload::Workbook(wb) => Ok(*wb),
         RawSnapshotPayload::SeedStub(_) => Err(SnapshotError::UnsupportedVersion),
     }
 }
@@ -906,7 +910,7 @@ pub fn decode_snapshot_for_collab(
 }
 
 enum RawSnapshotPayload {
-    Workbook(Workbook<BoundFormula>),
+    Workbook(Box<Workbook<BoundFormula>>),
     SeedStub(WireSeedOriginV1),
 }
 
@@ -918,7 +922,7 @@ fn decode_snapshot_any_with_limits(
     let (payload, kernel_version, format_version, watermarks, permutes) =
         decode_snapshot_raw_with_limits(bytes, max_cells, max_bytes)?;
     let engine = match payload {
-        RawSnapshotPayload::Workbook(wb) => FormulaEngine::from_workbook_clean(wb),
+        RawSnapshotPayload::Workbook(wb) => FormulaEngine::from_workbook_clean(*wb),
         RawSnapshotPayload::SeedStub(wire_origin) => {
             let engine = FormulaEngine::open_sample(wire_origin.seed, wire_origin.rows);
             if engine.workbook().populated_cell_count() > max_cells as u64
@@ -974,7 +978,7 @@ fn decode_snapshot_raw_with_limits(
             return Err(SnapshotError::Validation);
         }
         return Ok((
-            RawSnapshotPayload::Workbook(wb),
+            RawSnapshotPayload::Workbook(Box::new(wb)),
             kernel_version,
             SNAPSHOT_VERSION_V0,
             Vec::new(),
@@ -1368,7 +1372,7 @@ fn decode_snapshot_raw_with_limits(
     }
 
     Ok((
-        RawSnapshotPayload::Workbook(workbook),
+        RawSnapshotPayload::Workbook(Box::new(workbook)),
         kernel_version,
         SNAPSHOT_VERSION_V1,
         watermarks,
@@ -1805,11 +1809,11 @@ fn check_direct_text_len(s: &str) -> Result<(), SnapshotError> {
 fn decode_formulas_section(
     bytes: &[u8],
     scratch: &mut Vec<u8>,
-    mut running_bytes: usize,
+    running_bytes: usize,
     max_bytes: usize,
     section_cap: usize,
     allow_v3: bool,
-) -> Result<BTreeMap<WorkbookCellKey, BoundFormula>, SnapshotError> {
+) -> Result<FormulaStore<BoundFormula>, SnapshotError> {
     let total_formulas =
         usize::try_from(read_u32_le(bytes, 0)?).map_err(|_| SnapshotError::Validation)?;
     let chunk_count =
@@ -1820,13 +1824,13 @@ fn decode_formulas_section(
         if chunk_count != 0 || cursor != bytes.len() {
             return Err(SnapshotError::Validation);
         }
-        return Ok(BTreeMap::new());
+        return Ok(FormulaStore::new());
     }
     if chunk_count == 0 || chunk_count > total_formulas {
         return Err(SnapshotError::Validation);
     }
 
-    let mut formulas: BTreeMap<WorkbookCellKey, BoundFormula> = BTreeMap::new();
+    let mut formulas: FormulaStore<BoundFormula> = FormulaStore::new();
     for _ in 0..chunk_count {
         let raw_len =
             usize::try_from(read_u32_le(bytes, cursor)?).map_err(|_| SnapshotError::Validation)?;
@@ -1854,12 +1858,11 @@ fn decode_formulas_section(
                 .formula
                 .validate()
                 .map_err(|_| SnapshotError::Validation)?;
-            running_bytes = running_bytes.saturating_add(entry.formula.estimated_bytes());
-            if running_bytes > max_bytes {
-                return Err(SnapshotError::Validation);
-            }
             let key = (SheetId(entry.sheet), RowId(entry.row), ColId(entry.col));
             if formulas.insert(key, entry.formula).is_some() {
+                return Err(SnapshotError::Validation);
+            }
+            if running_bytes.saturating_add(formulas.estimated_bytes()) > max_bytes {
                 return Err(SnapshotError::Validation);
             }
         }
@@ -2061,7 +2064,10 @@ mod tests {
         let mut streamed = vec![0_u8; encoder.header_len];
 
         // Mutate cells & formulas on the live engine mid-flight!
-        let prior_f = eng.workbook().formula(s1, RowId(1), ColId(0)).cloned();
+        let prior_f = eng
+            .workbook()
+            .formula(s1, RowId(1), ColId(0))
+            .map(alloc::borrow::Cow::into_owned);
         encoder.record_formula_before_edit((s1, RowId(1), ColId(0)), prior_f);
         eng.edit_cell_raw(s1, RowId(1), ColId(0), "=999999")
             .unwrap();

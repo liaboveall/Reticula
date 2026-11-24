@@ -12,6 +12,7 @@
 //!   any intervening edit resets paused `EVALUATING` frames back to `DIRTY`
 //!   without losing work already completed in earlier slices.
 
+use alloc::borrow::Cow;
 use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
@@ -286,9 +287,9 @@ impl FormulaEngine {
         let mut volatile_set = BTreeSet::new();
         let mut filter_sensitive_set = BTreeSet::new();
 
-        for (&key, formula) in workbook.formulas() {
+        for (key, formula) in workbook.formulas() {
             let fid = u32::try_from(slots.len()).unwrap_or(0);
-            let (reg, flags) = dep_graph.register_detailed(fid, key.0, formula);
+            let (reg, flags) = dep_graph.register_detailed(fid, key.0, &formula);
             if flags.volatile {
                 volatile_set.insert(fid);
             }
@@ -1199,7 +1200,7 @@ impl FormulaEngine {
                 }
                 .write_a1(&mut address);
                 let bound = self.workbook.formula(sid, row_id, col_id);
-                let formula = bound.map(|f| f.unparse(&self.workbook, sid));
+                let formula = bound.as_ref().map(|f| f.unparse(&self.workbook, sid));
                 let mut precedents = Vec::new();
                 if let Some(f) = bound {
                     let mut seen = BTreeSet::new();
@@ -1411,7 +1412,10 @@ impl FormulaEngine {
                     }
                     self.remove_slot_by_key(key);
                     self.notify_cell_written_for_spills(key, &mut root_dirty);
-                    if let Some(new_f) = self.workbook.formula(*sheet, cell.row, cell.col).cloned()
+                    if let Some(new_f) = self
+                        .workbook
+                        .formula(*sheet, cell.row, cell.col)
+                        .map(Cow::into_owned)
                     {
                         let fid = self.insert_slot(key, &new_f, false);
                         root_dirty.push(fid);
@@ -1781,7 +1785,11 @@ impl FormulaEngine {
                 let _ = self.call_stack.pop();
                 continue;
             };
-            let Some(formula) = self.workbook.formula(key.0, key.1, key.2).cloned() else {
+            let Some(formula) = self
+                .workbook
+                .formula(key.0, key.1, key.2)
+                .map(Cow::into_owned)
+            else {
                 self.set_state(cur_fid, STATE_CLEAN);
                 let _ = self.call_stack.pop();
                 continue;
@@ -2360,7 +2368,8 @@ impl FormulaEngine {
                                 self.states.push(STATE_CLEAN);
                                 fresh
                             };
-                            let (reg, flags) = self.dep_graph.register_detailed(fid, key.0, new_f);
+                            let (reg, flags) =
+                                self.dep_graph.register_detailed(fid, key.0, new_f.as_ref());
                             if flags.volatile {
                                 self.volatile_set.insert(fid);
                             }
@@ -2460,7 +2469,7 @@ impl FormulaEngine {
             for raw_r in run.iter() {
                 let start = (sheet, RowId(raw_r), ColId(0));
                 let end = (sheet, RowId(raw_r), ColId(u64::MAX));
-                for (&k, _) in self.workbook.formulas().range(start..=end) {
+                for (k, _) in self.workbook.formulas().range(start..=end) {
                     if let Some(&fid) = self.cell_to_fid.get(&k) {
                         root_dirty.push(fid);
                     }
@@ -2479,7 +2488,7 @@ impl FormulaEngine {
         self.collect_name_dep_structural_cols_toggled(sheet, ids, &mut root_dirty);
         let start = (sheet, RowId(0), ColId(0));
         let end = (sheet, RowId(u64::MAX), ColId(u64::MAX));
-        for (&k @ (_, _, col), _) in self.workbook.formulas().range(start..=end) {
+        for (k @ (_, _, col), _) in self.workbook.formulas().range(start..=end) {
             if ids.iter().any(|r| r.contains(col.0))
                 && let Some(&fid) = self.cell_to_fid.get(&k)
             {
@@ -2500,7 +2509,11 @@ impl FormulaEngine {
         let mut root_dirty = Vec::new();
         for &(key, _) in rewritten {
             self.remove_slot_by_key(key);
-            if let Some(updated_f) = self.workbook.formula(key.0, key.1, key.2).cloned() {
+            if let Some(updated_f) = self
+                .workbook
+                .formula(key.0, key.1, key.2)
+                .map(Cow::into_owned)
+            {
                 let fid = self.insert_slot(key, &updated_f, false);
                 root_dirty.push(fid);
             }
@@ -2571,7 +2584,7 @@ impl FormulaEngine {
             if let Some(new_f) = self
                 .workbook
                 .formula(sheet, backup.row, backup.col)
-                .cloned()
+                .map(Cow::into_owned)
             {
                 let fid = self.insert_slot(key, &new_f, false);
                 root_dirty.push(fid);
@@ -2605,7 +2618,11 @@ impl FormulaEngine {
             }
             self.remove_slot_by_key(key);
             self.notify_cell_written_for_spills(key, &mut root_dirty);
-            if let Some(new_f) = self.workbook.formula(key.0, key.1, key.2).cloned() {
+            if let Some(new_f) = self
+                .workbook
+                .formula(key.0, key.1, key.2)
+                .map(Cow::into_owned)
+            {
                 let fid = self.insert_slot(key, &new_f, false);
                 root_dirty.push(fid);
             }
