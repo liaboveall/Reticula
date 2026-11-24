@@ -21,13 +21,40 @@ use core::hash::BuildHasherDefault;
 use hashbrown::HashMap;
 use hashbrown::hash_map::Entry;
 use reticula_core::axis::Axis;
-use reticula_core::id::{ColId, IdRun, RowId, SheetId};
+use reticula_core::id::{ColId, IdRun, RowId, SheetId, id_stream};
 use reticula_core::ops::{Workbook, WorkbookCellKey};
 use rustc_hash::FxHasher;
 use smallvec::SmallVec;
 
-use crate::binder::{BoundExpr, BoundFormula, BoundRef};
+use crate::binder::{
+    AffineExpr, AffineFormula, AffineRef, AffineRow, BoundExpr, BoundFormula, BoundRef,
+};
 use crate::functions::catalog::{is_filter_sensitive_function, is_volatile_function};
+
+/// Bit `31` flag identifying a compressed [`StripSlot`] node inside [`DepGraph`]
+/// and dirty queues (`0..STRIP_BIT` index regular per-cell `FormulaSlot`s).
+pub const STRIP_BIT: u32 = 0x8000_0000;
+
+/// Returns `true` when `fid` addresses a compressed column strip node.
+#[inline]
+#[must_use]
+pub const fn is_strip_fid(fid: u32) -> bool {
+    (fid & STRIP_BIT) != 0
+}
+
+/// Constructs a strip node identifier from a `0`-based `StripSlot` index.
+#[inline]
+#[must_use]
+pub const fn strip_fid(strip_idx: u32) -> u32 {
+    strip_idx | STRIP_BIT
+}
+
+/// Extracts the `0`-based `StripSlot` index from a strip node identifier.
+#[inline]
+#[must_use]
+pub const fn strip_index(fid: u32) -> u32 {
+    fid & !STRIP_BIT
+}
 
 type FxMap<K, V> = HashMap<K, V, BuildHasherDefault<FxHasher>>;
 
@@ -175,10 +202,74 @@ impl FormulaRegistration {
     }
 }
 
+/// Affine single-cell subscription targeting a column strip (`sid`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StripCellSub {
+    /// Strip slot index (`0`-based, without [`STRIP_BIT`]).
+    pub sid: u32,
+    /// Number of rows covered by the subscribing strip.
+    pub strip_len: u32,
+    /// Affine row rule mapping strip row offset to target row identity.
+    pub row: AffineRow,
+}
+
+/// Affine range subscription targeting a column strip (`sid`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StripAreaSub {
+    /// Strip slot index (`0`-based, without [`STRIP_BIT`]).
+    pub sid: u32,
+    /// Number of rows covered by the subscribing strip.
+    pub strip_len: u32,
+    /// Affine start row anchor.
+    pub first_row: AffineRow,
+    /// Affine end row anchor.
+    pub last_row: AffineRow,
+    /// Fixed inclusive column bounds (`None` represents a full-row range across all columns).
+    pub cols: Option<(ColId, ColId)>,
+}
+
+/// Reverse dependency handles retained for a compressed column strip so
+/// unregistering touches only the strip's own edges in `O(AST refs)`.
+#[derive(Clone, Debug, Default)]
+pub struct StripRegistration {
+    cell_subs: SmallVec<[(SheetId, ColId, StripCellSub); 4]>,
+    area_subs: SmallVec<[(SheetId, StripAreaSub); 2]>,
+    fixed_ranges: Option<Box<RangeRegistrations>>,
+    structural_sheet: Option<SheetId>,
+}
+
+impl StripRegistration {
+    fn fixed_ranges_mut(&mut self) -> &mut RangeRegistrations {
+        self.fixed_ranges
+            .get_or_insert_with(|| Box::new(RangeRegistrations::default()))
+    }
+
+    /// Whether this strip statically subscribes to any cell or range on `target`.
+    #[must_use]
+    pub fn references_sheet(&self, target: SheetId) -> bool {
+        if self.cell_subs.iter().any(|&(s, _, _)| s == target)
+            || self.area_subs.iter().any(|&(s, _)| s == target)
+        {
+            return true;
+        }
+        let Some(ranges) = self.fixed_ranges.as_deref() else {
+            return false;
+        };
+        ranges.col_spans.iter().any(|&(s, _, _, _)| s == target)
+            || ranges.areas.iter().any(|&(s, _)| s == target)
+            || ranges.full_cols.iter().any(|&(s, _)| s == target)
+            || ranges.full_rows.iter().any(|&(s, _)| s == target)
+    }
+}
+
 /// Reverse dependency graph keyed by dense `FormulaId` (`u32`).
 #[derive(Clone, Debug, Default)]
 pub struct DepGraph {
     single_deps: FxMap<WorkbookCellKey, DepList>,
+    col_single_dep_count: FxMap<(SheetId, ColId), u32>,
+    strip_cell_deps: FxMap<(SheetId, ColId), Vec<StripCellSub>>,
+    sheet_strip_cell_cols: BTreeMap<SheetId, BTreeSet<ColId>>,
+    strip_area_deps: BTreeMap<SheetId, Vec<StripAreaSub>>,
     col_ranges: FxMap<(SheetId, ColId), Vec<RowSpanSub>>,
     sheet_col_range_keys: BTreeMap<SheetId, BTreeSet<ColId>>,
     multi_col_ranges: BTreeMap<SheetId, Vec<AreaSub>>,
@@ -291,31 +382,14 @@ impl DepGraph {
                     slot.get_mut().push(fid);
                 }
             }
+            let cnt = self
+                .col_single_dep_count
+                .entry((cell_key.0, cell_key.2))
+                .or_insert(0);
+            *cnt = cnt.saturating_add(1);
         }
         if let Some(ranges) = reg.ranges.as_deref() {
-            for &(sheet, col, r1, r2) in &ranges.col_spans {
-                self.col_ranges
-                    .entry((sheet, col))
-                    .or_default()
-                    .push(RowSpanSub {
-                        fid,
-                        first_row: r1,
-                        last_row: r2,
-                    });
-                self.sheet_col_range_keys
-                    .entry(sheet)
-                    .or_default()
-                    .insert(col);
-            }
-            for &(sheet, sub) in &ranges.areas {
-                self.multi_col_ranges.entry(sheet).or_default().push(sub);
-            }
-            for &(sheet, sub) in &ranges.full_cols {
-                self.full_col_deps.entry(sheet).or_default().push(sub);
-            }
-            for &(sheet, sub) in &ranges.full_rows {
-                self.full_row_deps.entry(sheet).or_default().push(sub);
-            }
+            self.register_ranges(fid, ranges);
         }
         if flags.structural {
             reg.structural_sheet = Some(host_sheet);
@@ -349,47 +423,16 @@ impl DepGraph {
             {
                 self.single_deps.remove(cell_key);
             }
+            let col_key = (cell_key.0, cell_key.2);
+            if let Some(cnt) = self.col_single_dep_count.get_mut(&col_key) {
+                *cnt = cnt.saturating_sub(1);
+                if *cnt == 0 {
+                    self.col_single_dep_count.remove(&col_key);
+                }
+            }
         }
         if let Some(ranges) = reg.ranges.as_deref() {
-            for &(sheet, col, r1, r2) in &ranges.col_spans {
-                if let Some(list) = self.col_ranges.get_mut(&(sheet, col)) {
-                    let target = RowSpanSub {
-                        fid,
-                        first_row: r1,
-                        last_row: r2,
-                    };
-                    if let Some(idx) = list.iter().position(|x| *x == target) {
-                        list.swap_remove(idx);
-                    }
-                    if list.is_empty() {
-                        self.col_ranges.remove(&(sheet, col));
-                        if let Some(cols) = self.sheet_col_range_keys.get_mut(&sheet) {
-                            cols.remove(&col);
-                        }
-                    }
-                }
-            }
-            for &(sheet, sub) in &ranges.areas {
-                if let Some(list) = self.multi_col_ranges.get_mut(&sheet)
-                    && let Some(idx) = list.iter().position(|x| *x == sub)
-                {
-                    list.swap_remove(idx);
-                }
-            }
-            for &(sheet, sub) in &ranges.full_cols {
-                if let Some(list) = self.full_col_deps.get_mut(&sheet)
-                    && let Some(idx) = list.iter().position(|x| *x == sub)
-                {
-                    list.swap_remove(idx);
-                }
-            }
-            for &(sheet, sub) in &ranges.full_rows {
-                if let Some(list) = self.full_row_deps.get_mut(&sheet)
-                    && let Some(idx) = list.iter().position(|x| *x == sub)
-                {
-                    list.swap_remove(idx);
-                }
-            }
+            self.unregister_ranges(fid, ranges);
         }
         if let Some(sheet) = reg.structural_sheet
             && let Some(set) = self.structural_set.get_mut(&sheet)
@@ -416,6 +459,160 @@ impl DepGraph {
                         self.spill_deps.remove(&anchor);
                     }
                 }
+            }
+        }
+    }
+
+    /// Registers an identity-affine vertical strip template under `sid` (`0`-based)
+    /// without allocating per-row `FormulaRegistration`s or `single_deps` entries.
+    pub fn register_strip(
+        &mut self,
+        sid: u32,
+        host_sheet: SheetId,
+        strip_len: u32,
+        formula: &AffineFormula,
+    ) -> (StripRegistration, FormulaFlags) {
+        let mut reg = StripRegistration::default();
+        let mut flags = WalkFlags::default();
+        let raw_fid = strip_fid(sid);
+        collect_affine_refs(
+            &formula.root,
+            host_sheet,
+            sid,
+            strip_len,
+            &mut reg,
+            &mut flags,
+        );
+
+        for &(sheet, col, sub) in &reg.cell_subs {
+            self.strip_cell_deps
+                .entry((sheet, col))
+                .or_default()
+                .push(sub);
+            self.sheet_strip_cell_cols
+                .entry(sheet)
+                .or_default()
+                .insert(col);
+        }
+        for &(sheet, sub) in &reg.area_subs {
+            self.strip_area_deps.entry(sheet).or_default().push(sub);
+        }
+        if let Some(ranges) = reg.fixed_ranges.as_deref() {
+            self.register_ranges(raw_fid, ranges);
+        }
+        if flags.structural {
+            reg.structural_sheet = Some(host_sheet);
+            self.structural_set
+                .entry(host_sheet)
+                .or_default()
+                .insert(raw_fid);
+        }
+        (
+            reg,
+            FormulaFlags {
+                volatile: flags.volatile,
+                filter_sensitive: flags.filter_sensitive,
+            },
+        )
+    }
+
+    /// Removes all reverse edges recorded in `reg` for strip `sid`.
+    pub fn unregister_strip(&mut self, sid: u32, reg: &StripRegistration) {
+        let raw_fid = strip_fid(sid);
+        for &(sheet, col, sub) in &reg.cell_subs {
+            if let Some(list) = self.strip_cell_deps.get_mut(&(sheet, col)) {
+                if let Some(idx) = list.iter().position(|x| *x == sub) {
+                    list.swap_remove(idx);
+                }
+                if list.is_empty() {
+                    self.strip_cell_deps.remove(&(sheet, col));
+                    if let Some(cols) = self.sheet_strip_cell_cols.get_mut(&sheet) {
+                        cols.remove(&col);
+                    }
+                }
+            }
+        }
+        for &(sheet, sub) in &reg.area_subs {
+            if let Some(list) = self.strip_area_deps.get_mut(&sheet)
+                && let Some(idx) = list.iter().position(|x| *x == sub)
+            {
+                list.swap_remove(idx);
+            }
+        }
+        if let Some(ranges) = reg.fixed_ranges.as_deref() {
+            self.unregister_ranges(raw_fid, ranges);
+        }
+        if let Some(sheet) = reg.structural_sheet
+            && let Some(set) = self.structural_set.get_mut(&sheet)
+        {
+            set.remove(&raw_fid);
+        }
+    }
+
+    fn register_ranges(&mut self, fid: u32, ranges: &RangeRegistrations) {
+        for &(sheet, col, r1, r2) in &ranges.col_spans {
+            self.col_ranges
+                .entry((sheet, col))
+                .or_default()
+                .push(RowSpanSub {
+                    fid,
+                    first_row: r1,
+                    last_row: r2,
+                });
+            self.sheet_col_range_keys
+                .entry(sheet)
+                .or_default()
+                .insert(col);
+        }
+        for &(sheet, sub) in &ranges.areas {
+            self.multi_col_ranges.entry(sheet).or_default().push(sub);
+        }
+        for &(sheet, sub) in &ranges.full_cols {
+            self.full_col_deps.entry(sheet).or_default().push(sub);
+        }
+        for &(sheet, sub) in &ranges.full_rows {
+            self.full_row_deps.entry(sheet).or_default().push(sub);
+        }
+    }
+
+    fn unregister_ranges(&mut self, fid: u32, ranges: &RangeRegistrations) {
+        for &(sheet, col, r1, r2) in &ranges.col_spans {
+            if let Some(list) = self.col_ranges.get_mut(&(sheet, col)) {
+                let target = RowSpanSub {
+                    fid,
+                    first_row: r1,
+                    last_row: r2,
+                };
+                if let Some(idx) = list.iter().position(|x| *x == target) {
+                    list.swap_remove(idx);
+                }
+                if list.is_empty() {
+                    self.col_ranges.remove(&(sheet, col));
+                    if let Some(cols) = self.sheet_col_range_keys.get_mut(&sheet) {
+                        cols.remove(&col);
+                    }
+                }
+            }
+        }
+        for &(sheet, sub) in &ranges.areas {
+            if let Some(list) = self.multi_col_ranges.get_mut(&sheet)
+                && let Some(idx) = list.iter().position(|x| *x == sub)
+            {
+                list.swap_remove(idx);
+            }
+        }
+        for &(sheet, sub) in &ranges.full_cols {
+            if let Some(list) = self.full_col_deps.get_mut(&sheet)
+                && let Some(idx) = list.iter().position(|x| *x == sub)
+            {
+                list.swap_remove(idx);
+            }
+        }
+        for &(sheet, sub) in &ranges.full_rows {
+            if let Some(list) = self.full_row_deps.get_mut(&sheet)
+                && let Some(idx) = list.iter().position(|x| *x == sub)
+            {
+                list.swap_remove(idx);
             }
         }
     }
@@ -849,6 +1046,709 @@ impl DepGraph {
                 }
             }
         }
+    }
+
+    /// Variant of [`Self::for_each_cell_dependent`] dispatching single-cell
+    /// formulas to `emit_single` and compressed column strips (with narrowed
+    /// dirty offset intervals) to `emit_strip`.
+    pub fn for_each_cell_dependent_target(
+        &self,
+        key: WorkbookCellKey,
+        workbook: &Workbook<BoundFormula>,
+        mut emit_single: impl FnMut(u32),
+        mut emit_strip: impl FnMut(u32, u32, u32),
+    ) {
+        self.for_each_cell_dependent(key, workbook, |fid| {
+            dispatch_fid(fid, 0, u32::MAX, &mut emit_single, &mut emit_strip);
+        });
+        let (sheet_id, row, col) = key;
+        if let Some(list) = self.strip_cell_deps.get(&(sheet_id, col)) {
+            for &sub in list {
+                emit_strip_cell_sub(sub, row, &mut emit_strip);
+            }
+        }
+        if let Some(area_list) = self.strip_area_deps.get(&sheet_id)
+            && let Some(sheet) = workbook.sheet(sheet_id)
+        {
+            let row_axis = sheet.row_axis();
+            let col_axis = sheet.col_axis();
+            if let (Some(r_ord), Some(c_ord)) =
+                (row_axis.axis_order_of(row.0), col_axis.axis_order_of(col.0))
+            {
+                for sub in area_list {
+                    if let Some((fc, lc)) = sub.cols
+                        && !span_contains_order(col_axis, fc.0, lc.0, c_ord)
+                    {
+                        continue;
+                    }
+                    if let Some((lo, hi)) =
+                        narrow_strip_area_for_ord_span(sub, row_axis, r_ord, r_ord)
+                    {
+                        emit_strip(sub.sid, lo, hi);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Emits all formula and strip dependents triggered when a contiguous
+    /// run `row_run` in column `(sheet_id, col)` changes values (`O(1)` when
+    /// only strip dependents exist on that column).
+    #[allow(clippy::too_many_arguments)]
+    pub fn for_each_col_run_dependent_target(
+        &self,
+        sheet_id: SheetId,
+        col: ColId,
+        row_run: IdRun,
+        exclude_sid: Option<u32>,
+        workbook: &Workbook<BoundFormula>,
+        mut emit_single: impl FnMut(u32),
+        mut emit_strip: impl FnMut(u32, u32, u32),
+    ) {
+        if self
+            .col_single_dep_count
+            .get(&(sheet_id, col))
+            .copied()
+            .unwrap_or(0)
+            > 0
+        {
+            if row_run.len <= 4_096 {
+                for raw_r in row_run.iter() {
+                    if let Some(list) = self.single_deps.get(&(sheet_id, RowId(raw_r), col)) {
+                        list.for_each(|fid| {
+                            dispatch_fid(fid, 0, u32::MAX, &mut emit_single, &mut emit_strip);
+                        });
+                    }
+                }
+            } else {
+                for (&(s, r, c), list) in &self.single_deps {
+                    if s == sheet_id && c == col && row_run.contains(r.0) {
+                        list.for_each(|fid| {
+                            dispatch_fid(fid, 0, u32::MAX, &mut emit_single, &mut emit_strip);
+                        });
+                    }
+                }
+            }
+        }
+
+        if let Some(list) = self.strip_cell_deps.get(&(sheet_id, col)) {
+            for &sub in list {
+                if Some(sub.sid) != exclude_sid {
+                    emit_strip_cell_sub_for_run(sub, row_run, &mut emit_strip);
+                }
+            }
+        }
+
+        let runs_slice = core::slice::from_ref(&row_run);
+        if let Some(sheet) = workbook.sheet(sheet_id) {
+            let row_axis = sheet.row_axis();
+            let col_axis = sheet.col_axis();
+            if let Some(list) = self.col_ranges.get(&(sheet_id, col)) {
+                for sub in list {
+                    if span_overlaps_runs(row_axis, sub.first_row.0, sub.last_row.0, runs_slice) {
+                        dispatch_fid(sub.fid, 0, u32::MAX, &mut emit_single, &mut emit_strip);
+                    }
+                }
+            }
+            if let Some(c_ord) = col_axis.axis_order_of(col.0) {
+                if let Some(list) = self.multi_col_ranges.get(&sheet_id) {
+                    for sub in list {
+                        if span_contains_order(col_axis, sub.first_col.0, sub.last_col.0, c_ord)
+                            && span_overlaps_runs(
+                                row_axis,
+                                sub.first_row.0,
+                                sub.last_row.0,
+                                runs_slice,
+                            )
+                        {
+                            dispatch_fid(sub.fid, 0, u32::MAX, &mut emit_single, &mut emit_strip);
+                        }
+                    }
+                }
+                if let Some(list) = self.full_col_deps.get(&sheet_id) {
+                    for sub in list {
+                        if span_contains_order(col_axis, sub.first_col.0, sub.last_col.0, c_ord) {
+                            dispatch_fid(sub.fid, 0, u32::MAX, &mut emit_single, &mut emit_strip);
+                        }
+                    }
+                }
+                if let Some(list) = self.full_row_deps.get(&sheet_id) {
+                    for sub in list {
+                        if span_overlaps_runs(row_axis, sub.first_row.0, sub.last_row.0, runs_slice)
+                        {
+                            dispatch_fid(sub.fid, 0, u32::MAX, &mut emit_single, &mut emit_strip);
+                        }
+                    }
+                }
+                if let Some(area_list) = self.strip_area_deps.get(&sheet_id) {
+                    for sub in area_list {
+                        if Some(sub.sid) == exclude_sid {
+                            continue;
+                        }
+                        if let Some((fc, lc)) = sub.cols
+                            && !span_contains_order(col_axis, fc.0, lc.0, c_ord)
+                        {
+                            continue;
+                        }
+                        if let Some((lo, hi)) =
+                            narrow_strip_area_for_runs(sub, row_axis, runs_slice)
+                        {
+                            emit_strip(sub.sid, lo, hi);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Variant of [`Self::on_rows_inserted`] emitting singles and strips separately.
+    pub fn on_rows_inserted_target(
+        &self,
+        sheet_id: SheetId,
+        inserted: IdRun,
+        workbook: &Workbook<BoundFormula>,
+        mut emit_single: impl FnMut(u32),
+        mut emit_strip: impl FnMut(u32, u32, u32),
+    ) {
+        self.on_rows_inserted(sheet_id, inserted, workbook, |fid| {
+            dispatch_fid(fid, 0, u32::MAX, &mut emit_single, &mut emit_strip);
+        });
+        if let Some(area_list) = self.strip_area_deps.get(&sheet_id)
+            && let Some(sheet) = workbook.sheet(sheet_id)
+            && let Some(ins_order) = sheet.row_axis().axis_order_of(inserted.first_id)
+        {
+            let row_axis = sheet.row_axis();
+            for sub in area_list {
+                if let Some((lo, hi)) =
+                    narrow_strip_area_strictly_straddling(sub, row_axis, ins_order)
+                {
+                    emit_strip(sub.sid, lo, hi);
+                }
+            }
+        }
+    }
+
+    /// Variant of [`Self::on_cols_inserted`] emitting singles and strips separately.
+    pub fn on_cols_inserted_target(
+        &self,
+        sheet_id: SheetId,
+        inserted: IdRun,
+        workbook: &Workbook<BoundFormula>,
+        mut emit_single: impl FnMut(u32),
+        mut emit_strip: impl FnMut(u32, u32, u32),
+    ) {
+        self.on_cols_inserted(sheet_id, inserted, workbook, |fid| {
+            dispatch_fid(fid, 0, u32::MAX, &mut emit_single, &mut emit_strip);
+        });
+        if let Some(area_list) = self.strip_area_deps.get(&sheet_id)
+            && let Some(sheet) = workbook.sheet(sheet_id)
+            && let Some(ins_order) = sheet.col_axis().axis_order_of(inserted.first_id)
+        {
+            let col_axis = sheet.col_axis();
+            for sub in area_list {
+                let touched = match sub.cols {
+                    None => true,
+                    Some((fc, lc)) => span_strictly_straddles(col_axis, fc.0, lc.0, ins_order),
+                };
+                if touched {
+                    emit_strip(sub.sid, 0, sub.strip_len);
+                }
+            }
+        }
+    }
+
+    /// Variant of [`Self::on_rows_toggled`] emitting singles and strips separately.
+    pub fn on_rows_toggled_target(
+        &self,
+        sheet_id: SheetId,
+        runs: &[IdRun],
+        workbook: &Workbook<BoundFormula>,
+        mut emit_single: impl FnMut(u32),
+        mut emit_strip: impl FnMut(u32, u32, u32),
+    ) {
+        self.on_rows_toggled(sheet_id, runs, workbook, |fid| {
+            dispatch_fid(fid, 0, u32::MAX, &mut emit_single, &mut emit_strip);
+        });
+        if let Some(cols) = self.sheet_strip_cell_cols.get(&sheet_id) {
+            for &col in cols {
+                if let Some(list) = self.strip_cell_deps.get(&(sheet_id, col)) {
+                    for &sub in list {
+                        for &run in runs {
+                            emit_strip_cell_sub_for_run(sub, run, &mut emit_strip);
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(area_list) = self.strip_area_deps.get(&sheet_id)
+            && let Some(sheet) = workbook.sheet(sheet_id)
+        {
+            let row_axis = sheet.row_axis();
+            for sub in area_list {
+                if let Some((lo, hi)) = narrow_strip_area_for_runs(sub, row_axis, runs) {
+                    emit_strip(sub.sid, lo, hi);
+                }
+            }
+        }
+    }
+
+    /// Variant of [`Self::on_cols_toggled`] emitting singles and strips separately.
+    pub fn on_cols_toggled_target(
+        &self,
+        sheet_id: SheetId,
+        runs: &[IdRun],
+        workbook: &Workbook<BoundFormula>,
+        mut emit_single: impl FnMut(u32),
+        mut emit_strip: impl FnMut(u32, u32, u32),
+    ) {
+        self.on_cols_toggled(sheet_id, runs, workbook, |fid| {
+            dispatch_fid(fid, 0, u32::MAX, &mut emit_single, &mut emit_strip);
+        });
+        for run in runs {
+            for raw_col in run.iter() {
+                if let Some(list) = self.strip_cell_deps.get(&(sheet_id, ColId(raw_col))) {
+                    for &sub in list {
+                        emit_strip(sub.sid, 0, sub.strip_len);
+                    }
+                }
+            }
+        }
+        if let Some(area_list) = self.strip_area_deps.get(&sheet_id)
+            && let Some(sheet) = workbook.sheet(sheet_id)
+        {
+            let col_axis = sheet.col_axis();
+            for sub in area_list {
+                let touched = match sub.cols {
+                    None => true,
+                    Some((fc, lc)) => span_overlaps_runs(col_axis, fc.0, lc.0, runs),
+                };
+                if touched {
+                    emit_strip(sub.sid, 0, sub.strip_len);
+                }
+            }
+        }
+    }
+
+    /// Variant of [`Self::on_sheet_reordered`] emitting singles and strips separately.
+    pub fn on_sheet_reordered_target(
+        &self,
+        sheet_id: SheetId,
+        mut emit_single: impl FnMut(u32),
+        mut emit_strip: impl FnMut(u32, u32, u32),
+    ) {
+        self.on_sheet_reordered(sheet_id, |fid| {
+            dispatch_fid(fid, 0, u32::MAX, &mut emit_single, &mut emit_strip);
+        });
+        if let Some(area_list) = self.strip_area_deps.get(&sheet_id) {
+            for sub in area_list {
+                emit_strip(sub.sid, 0, sub.strip_len);
+            }
+        }
+    }
+
+    /// Variant of [`Self::on_rect_written`] emitting singles and strips separately.
+    pub fn on_rect_written_target(
+        &self,
+        sheet_id: SheetId,
+        rows: &[IdRun],
+        cols: &[IdRun],
+        workbook: &Workbook<BoundFormula>,
+        mut emit_single: impl FnMut(u32),
+        mut emit_strip: impl FnMut(u32, u32, u32),
+    ) {
+        self.on_rect_written(sheet_id, rows, cols, workbook, |fid| {
+            dispatch_fid(fid, 0, u32::MAX, &mut emit_single, &mut emit_strip);
+        });
+        for c_run in cols {
+            for raw_c in c_run.iter() {
+                if let Some(list) = self.strip_cell_deps.get(&(sheet_id, ColId(raw_c))) {
+                    for &sub in list {
+                        for &r_run in rows {
+                            emit_strip_cell_sub_for_run(sub, r_run, &mut emit_strip);
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(area_list) = self.strip_area_deps.get(&sheet_id)
+            && let Some(sheet) = workbook.sheet(sheet_id)
+        {
+            let row_axis = sheet.row_axis();
+            let col_axis = sheet.col_axis();
+            for sub in area_list {
+                let col_hits = match sub.cols {
+                    None => true,
+                    Some((fc, lc)) => span_overlaps_runs(col_axis, fc.0, lc.0, cols),
+                };
+                if col_hits && let Some((lo, hi)) = narrow_strip_area_for_runs(sub, row_axis, rows)
+                {
+                    emit_strip(sub.sid, lo, hi);
+                }
+            }
+        }
+    }
+}
+
+#[inline]
+fn dispatch_fid(
+    fid: u32,
+    strip_lo: u32,
+    strip_hi: u32,
+    emit_single: &mut impl FnMut(u32),
+    emit_strip: &mut impl FnMut(u32, u32, u32),
+) {
+    if is_strip_fid(fid) {
+        emit_strip(strip_index(fid), strip_lo, strip_hi);
+    } else {
+        emit_single(fid);
+    }
+}
+
+fn emit_strip_cell_sub(sub: StripCellSub, row: RowId, emit_strip: &mut impl FnMut(u32, u32, u32)) {
+    if sub.row.stride == 0 {
+        if row.0 == sub.row.base {
+            emit_strip(sub.sid, 0, sub.strip_len);
+        }
+    } else if id_stream(row.0) == id_stream(sub.row.base) && row.0 >= sub.row.base {
+        let diff = row.0.saturating_sub(sub.row.base);
+        if diff < u64::from(sub.strip_len)
+            && let Ok(off) = u32::try_from(diff)
+        {
+            emit_strip(sub.sid, off, off.saturating_add(1));
+        }
+    }
+}
+
+fn emit_strip_cell_sub_for_run(
+    sub: StripCellSub,
+    run: IdRun,
+    emit_strip: &mut impl FnMut(u32, u32, u32),
+) {
+    if sub.row.stride == 0 {
+        if run.contains(sub.row.base) {
+            emit_strip(sub.sid, 0, sub.strip_len);
+        }
+    } else if id_stream(sub.row.base) == id_stream(run.first_id) {
+        let sub_end = sub.row.base.saturating_add(u64::from(sub.strip_len));
+        let run_end = run.first_id.saturating_add(u64::from(run.len));
+        let lo = sub.row.base.max(run.first_id);
+        let hi = sub_end.min(run_end);
+        if lo < hi {
+            let lo_off = u32::try_from(lo.saturating_sub(sub.row.base)).unwrap_or(0);
+            let hi_off = u32::try_from(hi.saturating_sub(sub.row.base)).unwrap_or(sub.strip_len);
+            emit_strip(sub.sid, lo_off, hi_off);
+        }
+    }
+}
+
+fn collect_affine_refs(
+    expr: &AffineExpr,
+    host_sheet: SheetId,
+    sid: u32,
+    strip_len: u32,
+    reg: &mut StripRegistration,
+    flags: &mut WalkFlags,
+) {
+    let raw_fid = strip_fid(sid);
+    match expr {
+        AffineExpr::Literal(_)
+        | AffineExpr::ArrayLiteral { .. }
+        | AffineExpr::Name(_)
+        | AffineExpr::ScopedName { .. }
+        | AffineExpr::SpillRef(_)
+        | AffineExpr::MissingArg => {}
+        AffineExpr::Reference(r) => match r {
+            AffineRef::Invalid { .. } => {}
+            AffineRef::Cell {
+                sheet, row, col, ..
+            } => {
+                let s = sheet.unwrap_or(host_sheet);
+                let sub = StripCellSub {
+                    sid,
+                    strip_len,
+                    row: *row,
+                };
+                if !reg.cell_subs.contains(&(s, *col, sub)) {
+                    reg.cell_subs.push((s, *col, sub));
+                }
+            }
+            AffineRef::Area {
+                sheet,
+                first_row,
+                first_col,
+                last_row,
+                last_col,
+                ..
+            } => {
+                let s = sheet.unwrap_or(host_sheet);
+                if first_row.stride == 0 && last_row.stride == 0 {
+                    let r1 = RowId(first_row.base);
+                    let r2 = RowId(last_row.base);
+                    let ranges = reg.fixed_ranges_mut();
+                    if first_col == last_col {
+                        let entry = (s, *first_col, r1, r2);
+                        if !ranges.col_spans.contains(&entry) {
+                            ranges.col_spans.push(entry);
+                        }
+                    } else {
+                        let sub = AreaSub {
+                            fid: raw_fid,
+                            first_row: r1,
+                            last_row: r2,
+                            first_col: *first_col,
+                            last_col: *last_col,
+                        };
+                        if !ranges.areas.contains(&(s, sub)) {
+                            ranges.areas.push((s, sub));
+                        }
+                    }
+                } else {
+                    let sub = StripAreaSub {
+                        sid,
+                        strip_len,
+                        first_row: *first_row,
+                        last_row: *last_row,
+                        cols: Some((*first_col, *last_col)),
+                    };
+                    if !reg.area_subs.contains(&(s, sub)) {
+                        reg.area_subs.push((s, sub));
+                    }
+                }
+            }
+            AffineRef::ColRange {
+                sheet,
+                first_col,
+                last_col,
+                ..
+            } => {
+                let s = sheet.unwrap_or(host_sheet);
+                let sub = ColSpanSub {
+                    fid: raw_fid,
+                    first_col: *first_col,
+                    last_col: *last_col,
+                };
+                let ranges = reg.fixed_ranges_mut();
+                if !ranges.full_cols.contains(&(s, sub)) {
+                    ranges.full_cols.push((s, sub));
+                }
+            }
+            AffineRef::RowRange {
+                sheet,
+                first_row,
+                last_row,
+                ..
+            } => {
+                let s = sheet.unwrap_or(host_sheet);
+                if first_row.stride == 0 && last_row.stride == 0 {
+                    let sub = RowSpanSub {
+                        fid: raw_fid,
+                        first_row: RowId(first_row.base),
+                        last_row: RowId(last_row.base),
+                    };
+                    let ranges = reg.fixed_ranges_mut();
+                    if !ranges.full_rows.contains(&(s, sub)) {
+                        ranges.full_rows.push((s, sub));
+                    }
+                } else {
+                    let sub = StripAreaSub {
+                        sid,
+                        strip_len,
+                        first_row: *first_row,
+                        last_row: *last_row,
+                        cols: None,
+                    };
+                    if !reg.area_subs.contains(&(s, sub)) {
+                        reg.area_subs.push((s, sub));
+                    }
+                }
+            }
+        },
+        AffineExpr::Paren(inner) | AffineExpr::Unary { expr: inner, .. } => {
+            collect_affine_refs(inner, host_sheet, sid, strip_len, reg, flags);
+        }
+        AffineExpr::Binary { left, right, .. } => {
+            collect_affine_refs(left, host_sheet, sid, strip_len, reg, flags);
+            collect_affine_refs(right, host_sheet, sid, strip_len, reg, flags);
+        }
+        AffineExpr::Call { name, args } => {
+            if name == "ROW" || name == "COLUMN" {
+                flags.structural = true;
+            }
+            if is_volatile_function(name) {
+                flags.volatile = true;
+            }
+            if is_filter_sensitive_function(name) {
+                flags.filter_sensitive = true;
+            }
+            for arg in args {
+                collect_affine_refs(arg, host_sheet, sid, strip_len, reg, flags);
+            }
+        }
+    }
+}
+
+fn narrow_strip_area_endpoints(sub: &StripAreaSub, row_axis: &Axis) -> Option<(bool, u32, u32)> {
+    let o1 = row_axis.axis_order_of(sub.first_row.base)?;
+    let o2 = row_axis.axis_order_of(sub.last_row.base)?;
+    let c1 =
+        sub.first_row.stride == 0 || row_axis.single_run_covers(sub.first_row.base, sub.strip_len);
+    let c2 =
+        sub.last_row.stride == 0 || row_axis.single_run_covers(sub.last_row.base, sub.strip_len);
+    Some((c1 && c2, o1, o2))
+}
+
+fn narrow_strip_area_for_ord_span(
+    sub: &StripAreaSub,
+    row_axis: &Axis,
+    t_lo: u32,
+    t_hi: u32,
+) -> Option<(u32, u32)> {
+    if sub.strip_len == 0 || t_lo > t_hi {
+        return None;
+    }
+    let (contiguous, o1, o2) = narrow_strip_area_endpoints(sub, row_axis)?;
+    if !contiguous {
+        return Some((0, sub.strip_len));
+    }
+    let last_valid = sub.strip_len.saturating_sub(1);
+    match (sub.first_row.stride, sub.last_row.stride) {
+        (1, 1) => {
+            let (lo_b, hi_b) = if o1 <= o2 { (o1, o2) } else { (o2, o1) };
+            if t_hi < lo_b {
+                return None;
+            }
+            let min_off = t_lo.saturating_sub(hi_b);
+            let max_off = t_hi.saturating_sub(lo_b).min(last_valid);
+            if min_off > max_off {
+                None
+            } else {
+                Some((min_off, max_off.saturating_add(1)))
+            }
+        }
+        (0, 1) => narrow_fixed_sliding_span(o1, o2, sub.strip_len, t_lo, t_hi),
+        (1, 0) => narrow_fixed_sliding_span(o2, o1, sub.strip_len, t_lo, t_hi),
+        _ => Some((0, sub.strip_len)),
+    }
+}
+
+fn narrow_fixed_sliding_span(
+    fixed_ord: u32,
+    slide_base_ord: u32,
+    strip_len: u32,
+    t_lo: u32,
+    t_hi: u32,
+) -> Option<(u32, u32)> {
+    let last_valid = strip_len.saturating_sub(1);
+    let mut any = false;
+    let mut best_lo = u32::MAX;
+    let mut best_hi_incl = 0_u32;
+
+    // Forward offsets: `slide_base_ord + off >= fixed_ord`, interval `[fixed_ord, slide_base_ord + off]`.
+    if t_hi >= fixed_ord {
+        let min_forward_off = fixed_ord
+            .saturating_sub(slide_base_ord)
+            .max(t_lo.saturating_sub(slide_base_ord));
+        if min_forward_off <= last_valid {
+            any = true;
+            best_lo = best_lo.min(min_forward_off);
+            best_hi_incl = best_hi_incl.max(last_valid);
+        }
+    }
+    // Inverted offsets: `slide_base_ord + off < fixed_ord`, interval `[slide_base_ord + off, fixed_ord]`.
+    if t_lo <= fixed_ord && slide_base_ord < fixed_ord && t_hi >= slide_base_ord {
+        let split_max = fixed_ord
+            .saturating_sub(slide_base_ord)
+            .saturating_sub(1)
+            .min(last_valid);
+        let max_inv_off = t_hi.saturating_sub(slide_base_ord).min(split_max);
+        any = true;
+        best_lo = 0;
+        best_hi_incl = best_hi_incl.max(max_inv_off);
+    }
+
+    any.then(|| (best_lo, best_hi_incl.saturating_add(1)))
+}
+
+fn narrow_strip_area_for_runs(
+    sub: &StripAreaSub,
+    row_axis: &Axis,
+    runs: &[IdRun],
+) -> Option<(u32, u32)> {
+    if sub.strip_len == 0 || runs.is_empty() {
+        return None;
+    }
+    let (contiguous, o1, o2) = narrow_strip_area_endpoints(sub, row_axis)?;
+    if !contiguous {
+        return Some((0, sub.strip_len));
+    }
+    let mut any = false;
+    let mut out_lo = u32::MAX;
+    let mut out_hi = 0_u32;
+    for run in runs {
+        if let (Some(o_first), Some(last_id)) = (
+            row_axis.axis_order_of(run.first_id),
+            run.id_at(run.len.saturating_sub(1)),
+        ) && row_axis.single_run_covers(run.first_id, run.len)
+            && let Some(o_last) = row_axis.axis_order_of(last_id)
+            && o_first <= o_last
+        {
+            if let Some((lo, hi)) = narrow_strip_area_for_ord_span(sub, row_axis, o_first, o_last) {
+                any = true;
+                out_lo = out_lo.min(lo);
+                out_hi = out_hi.max(hi);
+            }
+            continue;
+        }
+        // Fallback when `run` wraps or was split by MoveRows.
+        for id in run.iter() {
+            if let Some(ord) = row_axis.axis_order_of(id)
+                && let Some((lo, hi)) = narrow_strip_area_for_ord_span(sub, row_axis, ord, ord)
+            {
+                any = true;
+                out_lo = out_lo.min(lo);
+                out_hi = out_hi.max(hi);
+                if out_lo == 0 && out_hi == sub.strip_len {
+                    return Some((0, sub.strip_len));
+                }
+            }
+        }
+    }
+    let _ = (o1, o2);
+    any.then_some((out_lo, out_hi))
+}
+
+fn narrow_strip_area_strictly_straddling(
+    sub: &StripAreaSub,
+    row_axis: &Axis,
+    ins_order: u32,
+) -> Option<(u32, u32)> {
+    if sub.strip_len == 0 {
+        return None;
+    }
+    let (contiguous, o1, o2) = narrow_strip_area_endpoints(sub, row_axis)?;
+    if !contiguous {
+        return Some((0, sub.strip_len));
+    }
+    let last_valid = sub.strip_len.saturating_sub(1);
+    match (sub.first_row.stride, sub.last_row.stride) {
+        (1, 1) => {
+            let (lo_b, hi_b) = if o1 <= o2 { (o1, o2) } else { (o2, o1) };
+            // Strict straddle: `lo_b + off < ins_order < hi_b + off`.
+            if ins_order <= lo_b || lo_b == hi_b {
+                return None;
+            }
+            let min_off = ins_order.saturating_add(1).saturating_sub(hi_b);
+            let max_off = ins_order
+                .saturating_sub(lo_b)
+                .saturating_sub(1)
+                .min(last_valid);
+            if min_off > max_off {
+                None
+            } else {
+                Some((min_off, max_off.saturating_add(1)))
+            }
+        }
+        _ => narrow_strip_area_for_ord_span(sub, row_axis, ins_order, ins_order),
     }
 }
 

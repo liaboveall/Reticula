@@ -1104,6 +1104,21 @@ impl Axis {
         self.locate_id(id).map(|loc| loc.axis_order)
     }
 
+    /// Returns `true` when the entire `[first_id .. first_id + len)` span sits
+    /// inside a single contiguous [`AxisRun`], meaning `axis_order_of(first_id + off)`
+    /// equals `axis_order_of(first_id) + off` for every `0 <= off < len`.
+    #[must_use]
+    pub fn single_run_covers(&self, first_id: u64, len: u32) -> bool {
+        if len == 0 {
+            return true;
+        }
+        let Some(loc) = self.locate_id(first_id) else {
+            return false;
+        };
+        self.leaf_run_at(loc.leaf_id, loc.run_idx)
+            .is_some_and(|lr| lr.run.ids.len.saturating_sub(loc.offset) >= len)
+    }
+
     /// Whether `id` exists on the axis and has tombstone count `0`.
     #[must_use]
     pub fn is_live(&self, id: u64) -> bool {

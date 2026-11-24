@@ -1704,6 +1704,30 @@ impl<F: FormulaPayload> Workbook<F> {
         true
     }
 
+    /// Bulk-inserts a pre-validated identity-affine column strip during sample
+    /// generation (caller must have already populated any cached cell values on
+    /// `sheet`).
+    pub fn insert_seeded_strip(
+        &mut self,
+        sheet: SheetId,
+        start_row: RowId,
+        col: ColId,
+        len: u32,
+        template: F::StripTemplate,
+    ) {
+        if len < 2 {
+            for off in 0..len {
+                let row = RowId(start_row.0.saturating_add(u64::from(off)));
+                let f = F::instantiate_strip_template(&template, off);
+                self.put_formula((sheet, row, col), f);
+            }
+            return;
+        }
+        self.digest_cache.invalidate();
+        self.formulas
+            .insert_strip(sheet, start_row, col, len, template);
+    }
+
     /// Updates the cached value of `(sheet, row, col)` during formula
     /// recalculation without altering the stored formula entry.
     pub fn set_cached_value(
