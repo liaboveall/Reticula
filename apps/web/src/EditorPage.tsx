@@ -3104,6 +3104,7 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
           ((selection === null || selection.rowId === null) && !editSessionRef.current)
         }
         isEditing={editingText !== null}
+        inspected={matchingInspected !== null}
         isSpillShadow={matchingInspected?.isSpillShadow === true}
         analysis={formulaAnalysis?.analysis ?? null}
         analysisSource={formulaAnalysis?.source ?? null}

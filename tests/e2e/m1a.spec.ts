@@ -1,4 +1,5 @@
 import { expect, type Page, test } from "@playwright/test";
+import { fillFormulaBar } from "./formula-bar-helpers.ts";
 
 async function settled(page: Page): Promise<void> {
   await page.waitForFunction(() => {
@@ -43,9 +44,7 @@ test("editing V1 recalculates 100,001 dependent formulas and updates V2", async 
   // Select V1 via the quick-jump button, edit via formula bar to `5%`, and commit.
   await page.getByTestId("jump-v1").click();
   await expect(page.getByTestId("name-box")).toHaveText("V1");
-  const formulaInput = page.getByTestId("formula-input");
-  await formulaInput.fill("5%");
-  await formulaInput.press("Enter");
+  await fillFormulaBar(page, "5%");
 
   await expect(page.getByTestId("recalc-status")).toContainText("recalculated 100,001 cells in");
   await settled(page);
@@ -120,9 +119,7 @@ test("range selection, Delete clear, and invalid formula rejection work cleanly"
   expect(await page.evaluate(() => window.__reticula?.textAt(2, 2))).toBe("");
 
   // Malformed formula shows rejection alert without breaking the sheet.
-  const formulaInput = page.getByTestId("formula-input");
-  await formulaInput.fill("=SUM(1,");
-  await formulaInput.press("Enter");
+  await fillFormulaBar(page, "=SUM(1,");
   await expect(page.getByTestId("rejected-banner")).toBeVisible();
 });
 

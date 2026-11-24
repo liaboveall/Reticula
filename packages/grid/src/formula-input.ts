@@ -158,6 +158,16 @@ export class FormulaBarEditor {
             }
           }),
           EditorView.domEventHandlers({
+            focus: (_event, view) => {
+              // CodeMirror defers its focus-change update by 10 ms; flush it
+              // synchronously on focus so a programmatic focus + select-all
+              // (such as Playwright `fill()`) cannot have its DOM selection
+              // collapsed back to offset 0 mid-edit.
+              if (view.hasFocus) {
+                view.update([]);
+              }
+              return false;
+            },
             keydown: (event, view) => {
               if (
                 event.isComposing ||
@@ -249,7 +259,29 @@ export class FormulaBarEditor {
     const view = this.#view;
     // Let CodeMirror ingest pending native input before redrawing decorations.
     if (!view.composing && view.contentDOM.textContent === this.value) {
-      view.dispatch({ effects: setFormulaAnalysisEffect.of(analysis) });
+      let selection: { anchor: number; head: number } | undefined;
+      if (view.hasFocus) {
+        const domSel = view.contentDOM.ownerDocument.getSelection();
+        if (
+          domSel?.anchorNode &&
+          domSel.focusNode &&
+          view.contentDOM.contains(domSel.anchorNode) &&
+          view.contentDOM.contains(domSel.focusNode)
+        ) {
+          const anchor = view.posAtDOM(domSel.anchorNode, domSel.anchorOffset);
+          const head = view.posAtDOM(domSel.focusNode, domSel.focusOffset);
+          const cur = view.state.selection.main;
+          if (anchor !== cur.anchor || head !== cur.head) {
+            selection = { anchor, head };
+          }
+        }
+      }
+      this.#suppressChange = true;
+      view.dispatch({
+        effects: setFormulaAnalysisEffect.of(analysis),
+        ...(selection ? { selection } : {}),
+      });
+      this.#suppressChange = false;
     }
   }
 

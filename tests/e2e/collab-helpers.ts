@@ -6,6 +6,7 @@ import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { expect, type Page } from "@playwright/test";
+import { fillFormulaBar } from "./formula-bar-helpers.ts";
 
 export type DevAccount = "alice" | "bob" | "carol";
 
@@ -247,16 +248,7 @@ export async function editCell(
   );
   await flushWorkerAndReact(page);
   await expect(page.getByTestId("name-box")).toHaveText(address);
-  const formulaInput = page.getByTestId("formula-input");
-  await expect(formulaInput).toHaveAttribute("contenteditable", "true");
-  // Settle CodeMirror's delayed focus-change update before replacing text so its
-  // selection sync cannot collapse Playwright's `fill()` selection to offset 0.
-  await formulaInput.click();
-  await expect(page.locator(".formula-cm-wrap.focused")).toBeVisible();
-  await flushWorkerAndReact(page);
-  await formulaInput.fill(raw);
-  await expect(formulaInput).toHaveText(raw);
-  await formulaInput.press("Enter");
+  await fillFormulaBar(page, raw);
   await flushWorkerAndReact(page);
   await settled(page);
 }

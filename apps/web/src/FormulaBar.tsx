@@ -27,6 +27,7 @@ export interface FormulaBarProps {
   readonly placeholder: string;
   readonly disabled: boolean;
   readonly isEditing: boolean;
+  readonly inspected?: boolean;
   readonly isSpillShadow?: boolean;
   readonly analysis: WireFormulaAnalysis | null;
   readonly analysisSource?: string | null;
@@ -52,6 +53,7 @@ export function FormulaBar({
   placeholder,
   disabled,
   isEditing,
+  inspected,
   isSpillShadow,
   analysis,
   analysisSource,
@@ -276,7 +278,11 @@ export function FormulaBar({
 
   return (
     <div className="formulabar-wrap">
-      <div className="formulabar" data-disabled={disabled ? "" : undefined}>
+      <div
+        className="formulabar"
+        data-disabled={disabled ? "" : undefined}
+        data-inspected={inspected ? "" : undefined}
+      >
         <output className="name-box" data-testid="name-box" aria-label="Selected cell or range">
           {nameBoxText}
         </output>

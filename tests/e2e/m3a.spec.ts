@@ -9,6 +9,7 @@ import {
   signInDev,
   startCollabServer,
 } from "./collab-helpers.ts";
+import { fillFormulaBar } from "./formula-bar-helpers.ts";
 
 async function openWorkbook(page: Page, docQuery: string): Promise<void> {
   await page.goto(`/app?hooks&${docQuery}`);
@@ -50,6 +51,7 @@ async function editCellViaBar(
   raw: string,
   expectedText?: string,
 ): Promise<void> {
+  await settled(page);
   const beforeSeq = await page.evaluate(() => Number(window.__reticula?.docStatus().walSeq ?? "0"));
   await page.evaluate(
     ([r, c]) => {
@@ -58,10 +60,7 @@ async function editCellViaBar(
     [row, col] as const,
   );
   await expect(page.getByTestId("name-box")).toHaveText(address);
-  const formulaInput = page.getByTestId("formula-input");
-  await expect(formulaInput).toHaveAttribute("contenteditable", "true");
-  await formulaInput.fill(raw);
-  await formulaInput.press("Enter");
+  await fillFormulaBar(page, raw);
   await page.waitForFunction(
     (seq) => Number(window.__reticula?.docStatus().walSeq ?? "0") > seq,
     beforeSeq,
