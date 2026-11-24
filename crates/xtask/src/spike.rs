@@ -10,6 +10,9 @@ pub fn run(name: &str, options: &[String]) -> Result {
     if matches!(name, "s1" | "s2") {
         return grid(name, options);
     }
+    if name == "s11" {
+        return zoomed_out(options);
+    }
     if name == "s6" {
         return s6_agent_loop(&Flags::parse(options, &["mock"], &["out"])?);
     }
@@ -28,7 +31,7 @@ pub fn run(name: &str, options: &[String]) -> Result {
     match name {
         "determinism" => determinism(),
         other => Err(format!(
-            "unknown spike `{other}`; available: determinism, s1, s2, s6, s9, s9-builds, s10"
+            "unknown spike `{other}`; available: determinism, s1, s2, s6, s9, s9-builds, s10, s11"
         )),
     }
 }
@@ -124,6 +127,15 @@ fn grid(name: &str, options: &[String]) -> Result {
         .arg(name)
         .args(options)
         .run()
+}
+
+/// Measures drawing about ten thousand visible cells, on a 2D canvas and with
+/// the WebGPU prototype.
+fn zoomed_out(options: &[String]) -> Result {
+    wasm::build(Profile::Release)?;
+    web::build_spikes()?;
+    util::step("s11");
+    node().arg("spikes/grid/zoomed.mjs").args(options).run()
 }
 
 /// Measures a first visit: the production build, served compressed over a
