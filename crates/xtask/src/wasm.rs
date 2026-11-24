@@ -19,9 +19,15 @@ pub enum Profile {
 }
 
 pub fn build(profile: Profile) -> Result {
-    util::step(match profile {
-        Profile::Dev => "wasm (debug)",
-        Profile::Release => "wasm (release)",
+    build_with_options(profile, false)
+}
+
+pub fn build_with_options(profile: Profile, parallel: bool) -> Result {
+    util::step(match (profile, parallel) {
+        (Profile::Dev, false) => "wasm (debug)",
+        (Profile::Release, false) => "wasm (release)",
+        (Profile::Dev, true) => "wasm (debug + parallel atomics)",
+        (Profile::Release, true) => "wasm (release + parallel atomics)",
     });
 
     build_package(
@@ -30,6 +36,7 @@ pub fn build(profile: Profile) -> Result {
         CORE_OUT_DIR,
         CORE_MODULE,
         profile,
+        parallel,
     )?;
     build_package(
         "reticula-sim-wasm",
@@ -37,6 +44,7 @@ pub fn build(profile: Profile) -> Result {
         SIM_OUT_DIR,
         SIM_MODULE,
         profile,
+        false,
     )?;
     build_package(
         "reticula-xlsx-wasm",
@@ -44,6 +52,7 @@ pub fn build(profile: Profile) -> Result {
         XLSX_OUT_DIR,
         XLSX_MODULE,
         profile,
+        false,
     )?;
 
     if profile == Profile::Release {
@@ -62,15 +71,38 @@ fn build_package(
     out_dir: &str,
     module_path: &str,
     profile: Profile,
+    parallel: bool,
 ) -> Result {
-    let mut build = cargo().args([
-        "build",
-        "--locked",
-        "--package",
-        package,
-        "--target",
-        "wasm32-unknown-unknown",
-    ]);
+    let mut build = if parallel {
+        cargo().args([
+            "+nightly",
+            "build",
+            "-Z",
+            "build-std=panic_abort,std",
+            "--locked",
+            "--package",
+            package,
+            "--features",
+            "parallel",
+            "--target",
+            "wasm32-unknown-unknown",
+        ])
+    } else {
+        cargo().args([
+            "build",
+            "--locked",
+            "--package",
+            package,
+            "--target",
+            "wasm32-unknown-unknown",
+        ])
+    };
+    if parallel {
+        build = build.env(
+            "RUSTFLAGS",
+            "-C target-feature=+atomics,+bulk-memory,+mutable-globals",
+        );
+    }
     let mut bindgen =
         Cmd::new(tool("wasm-bindgen")).args(["--target", "web", "--out-dir", out_dir]);
     let directory = match profile {

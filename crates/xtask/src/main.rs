@@ -36,7 +36,9 @@ Commands:
                           --server runs the server's PostgreSQL tests, against
                           RETICULA_TEST_DATABASE_URL or the development database.
   deny                    Dependency licences, advisories and sources.
-  wasm [--dev]            Build the WebAssembly module and its bindings.
+  wasm [--dev] [--parallel]
+                          Build the WebAssembly module and its bindings (`--parallel` enables
+                          nightly atomics + rayon worker threads on `reticula-wasm`).
   codegen [--check]       Write the TypeScript files generated from the Rust sources;
                           --check only reports whether they are up to date.
   digest [--update]       Print the determinism digest; --update records it as expected.
@@ -121,12 +123,15 @@ fn run(args: &[String]) -> Result {
             rust::deny()
         }
         "wasm" => {
-            let flags = Flags::parse(rest, &["dev"], &[])?;
-            wasm::build(if flags.has("dev") {
-                Profile::Dev
-            } else {
-                Profile::Release
-            })
+            let flags = Flags::parse(rest, &["dev", "parallel"], &[])?;
+            wasm::build_with_options(
+                if flags.has("dev") {
+                    Profile::Dev
+                } else {
+                    Profile::Release
+                },
+                flags.has("parallel"),
+            )
         }
         "codegen" => codegen::run(Flags::parse(rest, &["check"], &[])?.has("check")),
         "digest" => digest(&Flags::parse(rest, &["update"], &[])?),

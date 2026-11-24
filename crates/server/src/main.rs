@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 
 use axum::Router;
 use axum::extract::Request;
-use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE, REFERRER_POLICY};
+use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE, HeaderName, REFERRER_POLICY};
 use axum::http::{HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::Response;
@@ -30,9 +30,21 @@ const IMMUTABLE_CACHE: HeaderValue =
     HeaderValue::from_static("public, max-age=31536000, immutable");
 const NO_CACHE: HeaderValue = HeaderValue::from_static("no-cache");
 const WASM_MIME: HeaderValue = HeaderValue::from_static("application/wasm");
+const COOP_HEADER: HeaderName = HeaderName::from_static("cross-origin-opener-policy");
+const COEP_HEADER: HeaderName = HeaderName::from_static("cross-origin-embedder-policy");
+const CORP_HEADER: HeaderName = HeaderName::from_static("cross-origin-resource-policy");
+const SAME_ORIGIN: HeaderValue = HeaderValue::from_static("same-origin");
+const REQUIRE_CORP: HeaderValue = HeaderValue::from_static("require-corp");
 
-/// Builds the Axum router serving precompressed assets and health endpoints.
+/// Builds the Axum router serving precompressed assets and health endpoints
+/// with Cross-Origin Isolation headers disabled (default).
 pub fn build_app(static_dir: &Path, api: Option<ApiState>) -> Router {
+    build_app_with_coi(static_dir, api, false)
+}
+
+/// Builds the Axum router with optional Cross-Origin Isolation headers
+/// (`COOP`/`COEP`/`CORP`), controlled via `RETICULA_COI` (`false` by default).
+pub fn build_app_with_coi(static_dir: &Path, api: Option<ApiState>, coi_enabled: bool) -> Router {
     let index_fallback = ServeFile::new(static_dir.join("index.html"))
         .precompressed_br()
         .precompressed_gzip();
@@ -47,7 +59,7 @@ pub fn build_app(static_dir: &Path, api: Option<ApiState>) -> Router {
         Some(api) => http::router(api),
         None => Router::new().fallback(|| async { StatusCode::SERVICE_UNAVAILABLE }),
     };
-    Router::new()
+    let router = Router::new()
         .route("/healthz", get(healthz))
         .merge(metrics_router)
         .nest("/api", routes)
@@ -64,11 +76,53 @@ pub fn build_app(static_dir: &Path, api: Option<ApiState>) -> Router {
             }),
         )
         .fallback_service(static_service)
-        .layer(middleware::from_fn(apply_asset_headers))
+        .layer(middleware::from_fn(apply_asset_headers));
+    if coi_enabled {
+        router.layer(middleware::from_fn(apply_coi_headers))
+    } else {
+        router
+    }
 }
 
 async fn healthz() -> &'static str {
     "ok\n"
+}
+
+async fn apply_coi_headers(req: Request, next: Next) -> Response {
+    let uri_path = req.uri().path().to_owned();
+    let mut response = next.run(req).await;
+    if uri_path == "/metrics"
+        || uri_path == "/healthz"
+        || uri_path == "/readyz"
+        || uri_path == "/api"
+        || uri_path.starts_with("/api/")
+    {
+        return response;
+    }
+
+    let content_type = response
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let mime = content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    let ext = Path::new(&uri_path).extension();
+    let is_html = mime == "text/html" || (!uri_path.starts_with("/assets/") && ext.is_none());
+    let is_js = mime.contains("javascript")
+        || ext.is_some_and(|e| e.eq_ignore_ascii_case("js") || e.eq_ignore_ascii_case("mjs"));
+
+    let headers = response.headers_mut();
+    headers.insert(CORP_HEADER, SAME_ORIGIN);
+    if is_html || is_js {
+        headers.insert(COOP_HEADER, SAME_ORIGIN);
+        headers.insert(COEP_HEADER, REQUIRE_CORP);
+    }
+    response
 }
 
 async fn apply_asset_headers(req: Request, next: Next) -> Response {
@@ -246,7 +300,11 @@ async fn main() {
         None
     };
 
-    let app = build_app(&static_dir, api);
+    let coi_enabled = env::var("RETICULA_COI").is_ok_and(|raw| {
+        let trimmed = raw.trim();
+        trimmed == "1" || trimmed.eq_ignore_ascii_case("true")
+    });
+    let app = build_app_with_coi(&static_dir, api, coi_enabled);
     let listener = TcpListener::bind(bind_addr)
         .await
         .unwrap_or_else(|e| panic!("failed to bind {bind_addr}: {e}"));
@@ -504,6 +562,110 @@ mod tests {
         assert!(tcp_resp.starts_with("HTTP/1.1 503 Service Unavailable\r\n"));
 
         handle.abort();
+        let _ = fs::remove_dir_all(&site);
+    }
+
+    #[tokio::test]
+    async fn coi_headers_are_absent_by_default_and_emitted_when_enabled() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        let site = make_temp_site();
+        fs::write(site.join("assets/style.css"), b"body{margin:0}").unwrap();
+
+        let app_off = build_app_with_coi(&site, None, false);
+        for path in [
+            "/",
+            "/app",
+            "/sw.js",
+            "/assets/app-123.js",
+            "/assets/kern-456.wasm",
+        ] {
+            let resp = app_off
+                .clone()
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let headers = resp.headers();
+            assert!(
+                !headers.contains_key("cross-origin-opener-policy"),
+                "{path}"
+            );
+            assert!(
+                !headers.contains_key("cross-origin-embedder-policy"),
+                "{path}"
+            );
+            assert!(
+                !headers.contains_key("cross-origin-resource-policy"),
+                "{path}"
+            );
+        }
+
+        let app_on = build_app_with_coi(&site, None, true);
+        for isolated_path in ["/", "/app", "/sw.js", "/assets/app-123.js"] {
+            let resp = app_on
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(isolated_path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let headers = resp.headers();
+            assert_eq!(
+                headers
+                    .get("cross-origin-opener-policy")
+                    .map(|v| v.to_str().unwrap()),
+                Some("same-origin"),
+                "{isolated_path}"
+            );
+            assert_eq!(
+                headers
+                    .get("cross-origin-embedder-policy")
+                    .map(|v| v.to_str().unwrap()),
+                Some("require-corp"),
+                "{isolated_path}"
+            );
+            assert_eq!(
+                headers
+                    .get("cross-origin-resource-policy")
+                    .map(|v| v.to_str().unwrap()),
+                Some("same-origin"),
+                "{isolated_path}"
+            );
+        }
+
+        for static_path in ["/assets/kern-456.wasm", "/assets/style.css"] {
+            let resp = app_on
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(static_path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let headers = resp.headers();
+            assert!(
+                !headers.contains_key("cross-origin-opener-policy"),
+                "{static_path}"
+            );
+            assert!(
+                !headers.contains_key("cross-origin-embedder-policy"),
+                "{static_path}"
+            );
+            assert_eq!(
+                headers
+                    .get("cross-origin-resource-policy")
+                    .map(|v| v.to_str().unwrap()),
+                Some("same-origin"),
+                "{static_path}"
+            );
+        }
+
         let _ = fs::remove_dir_all(&site);
     }
 }

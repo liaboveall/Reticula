@@ -4588,6 +4588,22 @@ pub(crate) fn build_sheet_info_from_engine(
     (info, styles_len)
 }
 
+#[cfg(all(
+    feature = "parallel",
+    target_arch = "wasm32",
+    target_feature = "atomics"
+))]
+pub use wasm_bindgen_rayon::init_thread_pool;
+
+/// Reports the active Rayon worker pool size when built with `--features parallel`
+/// (`1` before `initThreadPool` or when running single-threaded).
+#[cfg(feature = "parallel")]
+#[wasm_bindgen(js_name = parallelThreadsAvailable)]
+#[must_use]
+pub fn parallel_threads_available() -> usize {
+    rayon::current_num_threads()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
