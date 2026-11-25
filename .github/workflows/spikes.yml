@@ -27,21 +27,3 @@ jobs:
         with:
           tool: wasm-bindgen@0.2.130
       - run: cargo xtask spike determinism
-
-  webgpu:
-    name: webgpu (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [windows-2025, ubuntu-24.04, macos-26]
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        with:
-          node-version: 26
-      - name: Install pnpm
-        run: npm install --global "$(node --print "require('./package.json').packageManager")"
-      - run: pnpm install --frozen-lockfile
-      - run: pnpm exec playwright install --with-deps chromium firefox webkit
-      - run: node spikes/gpu/probe.mjs
