@@ -200,6 +200,7 @@ export class SceneBuilder {
     const frozen = frozenPixels(metrics, sheet, size, layout);
     this.#styles.use(frame.styles ?? NO_STYLES, frame.theme);
     const setting = this.#settingOf(look, frozen.frozenCols);
+    this.#layouts.begin(frame.cache);
 
     const rects = this.#rects;
     rects.clear();
@@ -874,7 +875,7 @@ export class SceneBuilder {
     const map = frame.filterRowMap ?? null;
     const filter = map?.hasHiddenRows ? (frame.filterState ?? null) : null;
     // Digits reach no further from the middle than the baseline is below it.
-    const numberHeight = Math.ceil(2 * (look.lifts[HEADER_FONT] ?? 0)) + 2 * hairline;
+    const numberHeight = Math.ceil(2 * look.lineOf(HEADER_FONT).lift) + 2 * hairline;
     const rowStep = labelStep(metrics.rowHeight * scale, numberHeight);
     for (const strip of strips) {
       const clip = { left: 0, top: strip.top, right: left, bottom: strip.bottom };
@@ -972,15 +973,15 @@ export class SceneBuilder {
     }
     const width = this.measure.width(look.fonts[HEADER_FONT] ?? "", text);
     const x = (left + right - width) / 2;
-    const lineHeight = look.lineHeights[HEADER_FONT] ?? 0;
+    const line = look.lineOf(HEADER_FONT);
     const middle = (top + bottom) / 2;
-    const baseline = Math.round(middle + (look.lifts[HEADER_FONT] ?? 0));
+    const baseline = Math.round(middle + line.lift);
     const run = this.#labels.push(text, x, width, baseline, HEADER_FONT, color, 0);
     if (
       x - 1 < boxLeft ||
       x + width + 1 > boxRight ||
-      middle - lineHeight / 2 < boxTop ||
-      middle + lineHeight / 2 > boxBottom
+      middle - line.height / 2 < boxTop ||
+      middle + line.height / 2 > boxBottom
     ) {
       this.#labels.setClip(run, boxLeft, boxTop, boxRight, boxBottom);
     }

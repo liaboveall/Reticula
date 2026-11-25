@@ -43,13 +43,13 @@ export class Canvas2dRenderer implements GridRenderer {
     if (this.canvas.width !== width || this.canvas.height !== height) {
       this.canvas.width = width;
       this.canvas.height = height;
+      // That has undone it.
+      resetText(this.#context);
     }
   }
 
   draw(frame: Frame): FrameCounts {
     const context = this.#context;
-    // Resizing the canvas and losing the context undo this.
-    resetText(context);
     this.#font = -1;
     this.#color = -1;
     const scene = this.#scenes.build(frame);
@@ -91,7 +91,15 @@ export class Canvas2dRenderer implements GridRenderer {
           const top = Math.max(y, clip.top);
           const width = Math.min(x + spec.width, clip.right) - left;
           const height = Math.min(y + spec.height, clip.bottom) - top;
-          if (width > 0 && height > 0) {
+          if (spec.kind === "corner" && width === spec.width && height === spec.height) {
+            // Copying it would take several times as long, in every frame.
+            context.fillStyle = cssColor(spec.color);
+            context.beginPath();
+            context.lineTo(x + width, y);
+            context.lineTo(x + width, y + height);
+            context.lineTo(x, y + height);
+            context.fill();
+          } else if (width > 0 && height > 0) {
             const sprite = this.#sprites.get(spec);
             context.drawImage(sprite, left - x, top - y, width, height, left, top, width, height);
           }
@@ -117,6 +125,7 @@ export class Canvas2dRenderer implements GridRenderer {
 
   #onRestored = (): void => {
     this.#lost = false;
+    resetText(this.#context);
     this.#measure.reset();
     this.#scenes.reset();
     this.#sprites.reset();
@@ -206,10 +215,10 @@ export class Canvas2dRenderer implements GridRenderer {
     step: PageStep | null,
   ): number {
     const context = this.#context;
-    const { fonts, lineHeights } = scene.look;
+    const { fonts } = scene.look;
     const { texts } = runs;
     // Pixels of a text may reach past its ends, if by less than its height.
-    const slack = lineHeights[0] ?? 0;
+    const slack = scene.look.lineOf(0).height;
     const firstRow = step?.firstRow ?? 0;
     const endRow = step?.endRow ?? Number.POSITIVE_INFINITY;
     const least = step ? step.clip.left - slack : Number.NEGATIVE_INFINITY;

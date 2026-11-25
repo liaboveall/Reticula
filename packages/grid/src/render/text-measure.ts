@@ -87,28 +87,34 @@ const ALPHABETS = [
   { first: 0x400, last: 0x45f, sample: "Тогда AРУчёт ГД" },
 ];
 
+/** Characters before this one are kept the widths of. */
+const FEW = 0x500;
+
+/** A character that most of those of its alphabet are exactly as wide as, at any size. */
+const SQUARE = "永";
+
+/** The size in a CSS `font`. */
+const SIZE = /[\d.]+(?=px)/;
+
 /** The widths of one font's texts. */
 class FontWidths {
   readonly font: string;
+  /** What each of the first characters moves the pen; `NaN` until it is needed. */
+  readonly advances = new Float64Array(FEW).fill(Number.NaN);
+  /** Which characters are as wide as `SQUARE` (1) and which are not (2), at whatever size of the font. */
+  readonly squares: Uint8Array;
+  /** What `SQUARE` moves the pen, and what those do that are not as wide. */
+  square = Number.NaN;
+  readonly others = new Map<number, number>();
+  /** Which of the alphabets add up. */
+  readonly addUp: (boolean | undefined)[] = [];
   /** By text; the older ones are still to be had but no longer added to. */
   newer = new Map<string, number>();
   older: ReadonlyMap<string, number> = new Map();
-  /** What each character moves the pen; `NaN` until it is needed. Grows with the characters. */
-  advances = new Float64Array(0x80).fill(Number.NaN);
-  /** Which of the alphabets add up. */
-  readonly addUp: (boolean | undefined)[] = [];
 
-  constructor(font: string) {
+  constructor(font: string, squares: Uint8Array = new Uint8Array(0x10000)) {
     this.font = font;
-  }
-
-  setAdvance(code: number, advance: number): void {
-    if (code >= this.advances.length) {
-      const grown = new Float64Array(code < 0x500 ? 0x500 : 0xa000).fill(Number.NaN);
-      grown.set(this.advances);
-      this.advances = grown;
-    }
-    this.advances[code] = advance;
+    this.squares = squares;
   }
 }
 
@@ -117,9 +123,11 @@ export class TextMeasurer implements TextMeasure {
   #open: () => CanvasRenderingContext2D;
   #limit: number;
   #context: CanvasRenderingContext2D | null = null;
+  /** By font but for its size. */
+  #squares = new Map<string, Uint8Array>();
   #fonts = new Map<string, FontWidths>();
   #current = new FontWidths("");
-  /** Texts among the newer ones of all fonts. */
+  /** The most texts there can be among the newer ones of all fonts. */
   #newer = 0;
   #lines = new Map<string, FontLine>();
 
@@ -149,6 +157,7 @@ export class TextMeasurer implements TextMeasure {
   /** Forgets everything that was measured, and in what language. */
   reset(): void {
     this.#context = null;
+    this.#squares.clear();
     this.#fonts.clear();
     this.#current = new FontWidths("");
     this.#newer = 0;
@@ -160,13 +169,24 @@ export class TextMeasurer implements TextMeasure {
       this.#current = this.#fontWidths(font);
     }
     const widths = this.#current;
-    const sum = this.#sum(widths, text);
+    // Nearly always all of the characters are known: every text in view is
+    // measured as often as it is laid out.
+    const { advances, squares, square } = widths;
+    const { length } = text;
+    let sum = 0;
+    for (let index = 0; index < length; index++) {
+      const code = text.charCodeAt(index);
+      sum += code < FEW ? (advances[code] as number) : squares[code] === 1 ? square : Number.NaN;
+    }
+    if (Number.isNaN(sum)) {
+      sum = this.#sum(widths, text);
+    }
     if (sum >= 0) {
       return sum;
     }
     let width = widths.newer.get(text);
     if (width === undefined) {
-      width = widths.older.get(text) ?? this.#using(font).measureText(text).width;
+      width = widths.older.get(text) ?? this.#measure(font, text).width;
       if (this.#newer >= this.#limit / 2) {
         this.#age();
       }
@@ -179,7 +199,7 @@ export class TextMeasurer implements TextMeasure {
   line(font: string): FontLine {
     let line = this.#lines.get(font);
     if (!line) {
-      const measured = this.#using(font).measureText("Hg");
+      const measured = this.#measure(font, "Hg");
       line = {
         ascent: measured.fontBoundingBoxAscent,
         descent: measured.fontBoundingBoxDescent,
@@ -190,7 +210,7 @@ export class TextMeasurer implements TextMeasure {
   }
 
   ink(font: string, text: string): Ink {
-    const measured = this.#using(font).measureText(text);
+    const measured = this.#measure(font, text);
     return {
       left: measured.actualBoundingBoxLeft,
       right: measured.actualBoundingBoxRight,
@@ -234,9 +254,13 @@ export class TextMeasurer implements TextMeasure {
     let widths = this.#fonts.get(font);
     if (!widths) {
       if (this.#fonts.size >= MAX_FONTS) {
-        this.reset();
+        this.#fonts.clear();
       }
-      widths = new FontWidths(font);
+      // Measuring a character at a size for the first time takes long, and there
+      // are thousands of these.
+      const name = font.replace(SIZE, "");
+      widths = new FontWidths(font, this.#squares.get(name));
+      this.#squares.set(name, widths.squares);
       this.#fonts.set(font, widths);
     }
     return widths;
@@ -253,22 +277,13 @@ export class TextMeasurer implements TextMeasure {
 
   /** The width of a text as the sum of its characters', or a negative number if it may not be. */
   #sum(widths: FontWidths, text: string): number {
-    let { advances } = widths;
-    const { length } = text;
     let sum = 0;
-    for (let index = 0; index < length; index++) {
-      const code = text.charCodeAt(index);
-      const advance = code < advances.length ? (advances[code] as number) : Number.NaN;
-      if (advance >= 0) {
-        sum += advance;
-        continue;
-      }
-      const measured = this.#advance(widths, code);
-      if (measured < 0) {
+    for (let index = 0; index < text.length; index++) {
+      const advance = this.#advance(widths, text.charCodeAt(index));
+      if (advance < 0) {
         return -1;
       }
-      sum += measured;
-      advances = widths.advances;
+      sum += advance;
     }
     return sum;
   }
@@ -280,30 +295,51 @@ export class TextMeasurer implements TextMeasure {
     if (sample === undefined) {
       return -1;
     }
-    const measured = (text: string) => this.#using(widths.font).measureText(text).width;
-    if (widths.addUp[index] === undefined) {
+    const { font, advances, squares, others, addUp } = widths;
+    const measured = (text: string) => this.#measure(font, text).width;
+    if (addUp[index] === undefined) {
       const whole = measured(sample);
       // For the sum, which asks the same.
-      widths.addUp[index] = true;
-      widths.addUp[index] = Math.abs(this.#sum(widths, sample) - whole) < 0.01 * sample.length;
-      if (!widths.addUp[index]) {
-        widths.advances.fill(Number.NaN);
+      addUp[index] = true;
+      addUp[index] = Math.abs(this.#sum(widths, sample) - whole) < 0.01 * sample.length;
+      if (!addUp[index]) {
+        advances.fill(Number.NaN);
+        widths.square = Number.NaN;
       }
     }
-    if (!widths.addUp[index]) {
+    if (!addUp[index]) {
       return -1;
     }
-    let advance = code < widths.advances.length ? widths.advances[code] : undefined;
-    if (advance === undefined || Number.isNaN(advance)) {
-      advance = measured(String.fromCharCode(code));
-      widths.setAdvance(code, advance);
+    let advance = code < FEW ? advances[code] : others.get(code);
+    if (advance !== undefined && !Number.isNaN(advance)) {
+      return advance;
+    }
+    const text = String.fromCharCode(code);
+    if (code < FEW) {
+      advance = measured(text);
+      advances[code] = advance;
+      return advance;
+    }
+    if (Number.isNaN(widths.square)) {
+      widths.square = measured(SQUARE);
+    }
+    if (squares[code] === 1 || text === SQUARE) {
+      squares[code] = 1;
+      return widths.square;
+    }
+    advance = measured(text);
+    if (squares[code] === 0 && advance === widths.square) {
+      squares[code] = 1;
+    } else {
+      squares[code] = 2;
+      others.set(code, advance);
     }
     return advance;
   }
 
-  #using(font: string): CanvasRenderingContext2D {
+  #measure(font: string, text: string): TextMetrics {
     this.#context ??= this.#open();
     this.#context.font = font;
-    return this.#context;
+    return this.#context.measureText(text);
   }
 }

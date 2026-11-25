@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
-import { axes, cacheOf, colors, frameOf, measure, PLAIN, pageOf } from "../fixtures.ts";
+import { SparseAxis } from "../../layout.ts";
+import { axes, cacheOf, colors, frameOf, METRICS, measure, PLAIN, pageOf } from "../fixtures.ts";
 import type { Frame } from "../frame.ts";
 import { bandsOf, type PageStep, type Scene, SceneBuilder } from "../scene.ts";
 import { Atlas } from "./atlas.ts";
@@ -89,18 +90,31 @@ function open() {
     glyphs.atlas.plan.now++;
     for (const step of scene.steps) {
       if (step.kind === "fills" || step.kind === "borders") {
-        pages.rects(step.layout, step.kind);
+        pages.rects(scene.look, step.layout, step.kind);
       } else if (step.kind === "texts") {
         const { first, end } = bandsOf(step);
         for (let index = first; index < end; index++) {
-          pages.band(scene.look, step.layout, index, viewOf(step));
+          pages.make(scene.look, step.layout, index, viewOf(step));
         }
       }
     }
+    pages.flush();
     return scene;
   };
   const uploads = () => device.recorder.named("writeBuffer");
-  return { device, glyphs, pages, show, uploads, scenes };
+  /** The first group of rows of the first page that a scene shows. */
+  const bandOf = ({ steps, look }: Scene) => {
+    const step = steps.find((step) => step.kind === "texts");
+    if (step?.kind !== "texts") {
+      throw new Error("no texts");
+    }
+    const view = viewOf(step);
+    return {
+      state: pages.stateOf(look, step.layout, 0, view),
+      shown: pages.shown(look, step.layout, 0, view),
+    };
+  };
+  return { device, glyphs, pages, show, uploads, scenes, bandOf };
 }
 
 function viewOf({ x, clip }: PageStep) {
@@ -131,7 +145,8 @@ describe("the pages' quads", () => {
       show(frameOf({ ...SIZES, cache, scroll: { top, left } }));
     }
     expect(pages.bandsBuilt).toBe(2);
-    expect(uploads()).toHaveLength(2);
+    // What is made in one frame is uploaded together.
+    expect(uploads()).toHaveLength(1);
     show(frameOf({ ...SIZES, cache, scroll: { top: 190, left: 400 } }));
     expect(pages.bandsBuilt).toBe(3);
     show(frameOf({ ...SIZES, cache, scroll: { top: 30, left: 0 } }));
@@ -201,10 +216,14 @@ describe("the pages' quads", () => {
     }
     pages.begin(cache);
     glyphs.begin(Number.POSITIVE_INFINITY);
-    const near = pages.band(scene.look, step.layout, 0, { origin: 0, left: 0, right: 300 });
-    const far = pages.band(scene.look, step.layout, 0, { origin: 0, left: 1500, right: 1800 });
-    expect(near.block?.chunk).toBe(far.block?.chunk);
-    const [first, second] = [near.block, far.block];
+    const at = (left: number) => {
+      const view = { origin: 0, left, right: left + 300 };
+      pages.make(scene.look, step.layout, 0, view);
+      return pages.shown(scene.look, step.layout, 0, view)?.block;
+    };
+    const [first, second] = [at(0), at(1500)];
+    expect(first?.chunk).toBe(second?.chunk);
+    expect(first).not.toBe(second);
     expect((first?.first ?? 0) + (first?.count ?? 0)).toBeLessThanOrEqual(second?.first ?? -1);
     scenes.build(frame);
   });
@@ -237,19 +256,112 @@ describe("the pages' quads", () => {
     expect(pages.bandsBuilt).toBe(2);
   });
 
-  test("with bars in them are made again once there is time, and not before", () => {
-    const { pages, show, glyphs } = open();
+  test("with bars in them are shown until they are made again", () => {
+    const { pages, show, glyphs, bandOf } = open();
     const cache = cacheOf(CELLS, 1, 1);
     const frame = frameOf({ ...SIZES, cache });
-    show(frame, 0);
+    const first = show(frame, 0);
     expect(glyphs.deferred).toBeGreaterThan(0);
+    expect(bandOf(first)).toMatchObject({ state: "stale", shown: { complete: false } });
     const { bandsBuilt } = pages;
-    show(frame, 0);
-    expect(pages.bandsBuilt).toBe(bandsBuilt);
+    const second = show(frame);
+    expect(pages.bandsBuilt).toBe(bandsBuilt + 1);
+    expect(bandOf(second)).toMatchObject({ state: "ready", shown: { complete: true } });
     show(frame);
     expect(pages.bandsBuilt).toBe(bandsBuilt + 1);
-    show(frame);
-    expect(pages.bandsBuilt).toBe(bandsBuilt + 1);
+  });
+
+  describe("when the sheet is zoomed", () => {
+    const zoomed = (zoom: number, changes: Partial<Frame> = {}) => {
+      const metrics = { ...METRICS, rowHeight: 20 * zoom, colWidth: 75 * zoom };
+      const layout = {
+        ...axes(),
+        rowAxis: new SparseAxis(metrics.rowHeight),
+        colAxis: new SparseAxis(metrics.colWidth),
+      };
+      return frameOf({ ...SIZES, zoom, metrics, layout, ...changes });
+    };
+
+    test("stand for the new ones until those are made", () => {
+      const { pages, show, scenes, bandOf } = open();
+      const cache = cacheOf(CELLS, 1, 1);
+      const before = show(zoomed(1, { cache }));
+      const old = bandOf(before);
+      expect(old.state).toBe("ready");
+      pages.begin(cache);
+      const scene = scenes.build(zoomed(1.5, { cache }));
+      expect(bandOf(scene)).toEqual({ state: "stale", shown: old.shown });
+      // Bars would not be better.
+      show(zoomed(1.5, { cache }), 0);
+      expect(bandOf(scene)).toEqual({ state: "stale", shown: old.shown });
+      const after = bandOf(show(zoomed(1.5, { cache })));
+      expect(after.state).toBe("ready");
+      expect(after.shown).not.toBe(old.shown);
+    });
+
+    test("give back their room when they no longer stand for any", () => {
+      const { pages, show } = open();
+      const cache = cacheOf(CELLS, 1, 1);
+      show(zoomed(1, { cache }));
+      const { bytes } = pages;
+      for (let round = 0; round < 200; round++) {
+        show(zoomed(1 + (round % 7) / 10, { cache }));
+      }
+      expect(pages.bytes).toBe(bytes);
+    });
+
+    test("stand for nothing if that is not all that changed", () => {
+      const { pages, show, scenes, bandOf } = open();
+      const cache = cacheOf(CELLS, 1, 1);
+      show(zoomed(1, { cache }));
+      pages.begin(cache);
+      const theme = { ...frameOf().theme, background: "#101010" };
+      expect(bandOf(scenes.build(zoomed(1.5, { cache, theme }))).state).toBe("missing");
+      show(zoomed(1, { cache }));
+      pages.begin(cache);
+      const layout = axes([], [[0, 90]]);
+      expect(bandOf(scenes.build(frameOf({ ...SIZES, cache, zoom: 1, layout }))).state).toBe(
+        "missing",
+      );
+      show(zoomed(1, { cache }));
+      cache.accept(pageOf({ ...CELLS, "1:1": "changed" }, 0, 0));
+      pages.begin(cache);
+      expect(bandOf(scenes.build(zoomed(1.5, { cache }))).state).toBe("missing");
+    });
+
+    test("stand for nothing once a size changes at the zoom they are waiting for", () => {
+      const { pages, show, scenes, bandOf } = open();
+      const cache = cacheOf(CELLS, 1, 1);
+      show(zoomed(1, { cache }));
+      pages.begin(cache);
+      expect(bandOf(scenes.build(zoomed(1.5, { cache }))).state).toBe("stale");
+      pages.begin(cache);
+      const frame = zoomed(1.5, { cache });
+      const colAxis = new SparseAxis(75 * 1.5, [[0, 20]]);
+      const resized = { ...frame, layout: { ...axes(), ...frame.layout, colAxis } };
+      expect(bandOf(scenes.build(resized)).state).toBe("missing");
+    });
+
+    test("stand for nothing if what they are copied from had to make room", () => {
+      const { pages, show, scenes, glyphs, bandOf } = open();
+      const cache = cacheOf(CELLS, 1, 1);
+      show(zoomed(1, { cache }));
+      const { plan } = glyphs.atlas;
+      plan.generations = plan.generations.map((generation) => generation + 1);
+      pages.begin(cache);
+      expect(bandOf(scenes.build(zoomed(1.5, { cache }))).state).toBe("missing");
+    });
+
+    test("can be let go of", () => {
+      const { pages, show, scenes, bandOf } = open();
+      const cache = cacheOf(CELLS, 1, 1);
+      show(zoomed(1, { cache }));
+      expect(pages.dropStale()).toBe(false);
+      const scene = scenes.build(zoomed(1.5, { cache }));
+      expect(bandOf(scene).state).toBe("stale");
+      expect(pages.dropStale()).toBe(true);
+      expect(bandOf(scene)).toEqual({ state: "missing", shown: null });
+    });
   });
 
   test("say which rows they are in, and lines through texts are in any", () => {

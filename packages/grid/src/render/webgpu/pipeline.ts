@@ -12,18 +12,22 @@ export const INSTANCE_BYTES = 24;
 /** Size of the screen: two floats. */
 export const SCREEN_BYTES = 8;
 
-/** An origin, the rows that are shown, and what dynamic offsets have to be multiples of. */
-export const PART_BYTES = 16;
+/** An origin, a scale, the rows that are shown, and what dynamic offsets have to be multiples of. */
+export const PART_BYTES = 24;
 export const PART_STRIDE = 256;
 
-// The position of a quad is whole pixels, and so is that of a texel: both are
-// computed in integers, and no texel is ever sampled between two.
+// The position of a quad is whole pixels, and so is that of a texel: texels are
+// counted in integers, and none is ever sampled between two. But for parts that
+// are stretched, which stand for ones that are being made.
 const SHADER = /* wgsl */ `
 struct Screen { size: vec2f };
-struct Part { origin: vec2i, rows: vec2u };
+struct Part { origin: vec2f, scale: vec2f, rows: vec2u };
+
+const STRETCHED: i32 = 256;
 
 @group(0) @binding(0) var<uniform> screen: Screen;
 @group(0) @binding(1) var atlas: texture_2d_array<f32>;
+@group(0) @binding(2) var between: sampler;
 @group(1) @binding(0) var<uniform> part: Part;
 
 struct Quad {
@@ -31,6 +35,7 @@ struct Quad {
   @location(0) @interpolate(flat) color: vec4f,
   @location(1) @interpolate(flat) texel: vec2i,
   @location(2) @interpolate(flat) layer: i32,
+  @location(3) spot: vec2f,
 };
 
 @vertex
@@ -44,8 +49,8 @@ fn place(
   let row = flags & 0x7fu;
   let hidden = row != 0x7fu && (row < part.rows.x || row >= part.rows.y);
   let size = select(vec2i(box.xy), vec2i(), hidden);
-  let origin = part.origin + at;
-  let point = vec2f(origin + size * vec2i(i32(index & 1u), i32(index >> 1u)));
+  let corner = size * vec2i(i32(index & 1u), i32(index >> 1u));
+  let point = part.origin + vec2f(at + corner) * part.scale;
   var quad: Quad;
   quad.position = vec4f(
     point.x / screen.size.x * 2.0 - 1.0,
@@ -54,8 +59,12 @@ fn place(
     1.0,
   );
   quad.color = vec4f(color.rgb * color.a, color.a);
-  quad.texel = vec2i(box.zw) - origin;
+  quad.texel = vec2i(box.zw) - at - vec2i(part.origin);
   quad.layer = select(-1, i32(flags >> 8u), (flags & 0x80u) != 0u);
+  if (quad.layer >= 0 && any(part.scale != vec2f(1.0))) {
+    quad.layer += STRETCHED;
+  }
+  quad.spot = vec2f(vec2i(box.zw) + corner);
   return quad;
 }
 
@@ -63,6 +72,10 @@ fn place(
 fn paint(quad: Quad) -> @location(0) vec4f {
   if (quad.layer < 0) {
     return quad.color;
+  }
+  if (quad.layer >= STRETCHED) {
+    let spot = quad.spot / vec2f(textureDimensions(atlas));
+    return textureSampleLevel(atlas, between, spot, quad.layer - STRETCHED, 0.0);
   }
   return textureLoad(atlas, vec2i(quad.position.xy) + quad.texel, quad.layer, 0);
 }
@@ -72,6 +85,7 @@ fn paint(quad: Quad) -> @location(0) vec4f {
 export class Pipelines {
   readonly screenLayout: GPUBindGroupLayout;
   readonly partLayout: GPUBindGroupLayout;
+  readonly sampler: GPUSampler;
   #device: GPUDevice;
   #module: GPUShaderModule;
   #layout: GPUPipelineLayout;
@@ -84,8 +98,10 @@ export class Pipelines {
       entries: [
         { binding: 0, visibility: STAGE.vertex, buffer: {} },
         { binding: 1, visibility: STAGE.fragment, texture: { viewDimension: "2d-array" } },
+        { binding: 2, visibility: STAGE.fragment, sampler: {} },
       ],
     });
+    this.sampler = device.createSampler({ magFilter: "linear", minFilter: "linear" });
     this.partLayout = device.createBindGroupLayout({
       entries: [
         {

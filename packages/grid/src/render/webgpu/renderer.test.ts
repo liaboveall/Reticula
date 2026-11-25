@@ -1,14 +1,19 @@
 import { PAGE_ROWS } from "@reticula/protocol/viewport";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
-import { axes, cacheOf, frameOf, measure, PLAIN, pageOf } from "../fixtures.ts";
+import { SparseAxis, viewMetrics } from "../../layout.ts";
+import { axes, cacheOf, colors, frameOf, METRICS, measure, PLAIN, pageOf } from "../fixtures.ts";
 import type { Frame } from "../frame.ts";
 import type { TextMeasurer } from "../text-measure.ts";
 import { Gpu } from "./device.ts";
-import { FakeDevice, fakeBrowser, quadsOf } from "./fakes.ts";
+import { FakeDevice, fakeBrowser, partOf, quadsOf } from "./fakes.ts";
+import { faint } from "./glyphs.ts";
+import { RetainedPages } from "./pages.ts";
 import { WebGpuRenderer } from "./renderer.ts";
 
 beforeEach(() => {
   fakeBrowser();
+  // However slow the machine, there is time for everything unless told otherwise.
+  vi.spyOn(performance, "now").mockReturnValue(0);
 });
 
 afterEach(() => {
@@ -221,6 +226,202 @@ describe("texts there is no time to draw", () => {
     expect(device.submitted).toHaveLength(1);
   });
 });
+
+describe("a frame that has no time for all of its texts", () => {
+  const cache = cacheOf(CELLS, 4, 3);
+  const size = { width: 700, height: 600 };
+  const zoomed = (zoom: number, changes: Partial<Frame> = {}): Frame =>
+    frameOf({
+      ...SIZES,
+      cache,
+      size,
+      zoom,
+      metrics: viewMetrics(METRICS, zoom, 1),
+      layout: {
+        ...axes(),
+        rowAxis: new SparseAxis(METRICS.rowHeight, [], 1, zoom),
+        colAxis: new SparseAxis(METRICS.colWidth, [], 1, zoom),
+      },
+      ...changes,
+    });
+
+  /** Has making each group of rows take a while, and nothing else. */
+  function timed(each: number) {
+    let now = 0;
+    vi.spyOn(performance, "now").mockImplementation(() => now);
+    const { make } = RetainedPages.prototype;
+    const states: string[] = [];
+    vi.spyOn(RetainedPages.prototype, "make").mockImplementation(function (
+      this: RetainedPages,
+      ...args
+    ) {
+      states.push(this.stateOf(...args));
+      now += clock.each;
+      make.apply(this, args);
+    });
+    const clock = { each, states };
+    return clock;
+  }
+
+  const settle = ({ renderer, onIncomplete }: ReturnType<typeof open>, frame: Frame): number => {
+    for (let count = 1; count < 100; count++) {
+      onIncomplete.mockClear();
+      renderer.draw(frame);
+      if (onIncomplete.mock.calls.length === 0) {
+        return count;
+      }
+    }
+    throw new Error("some of the texts never come");
+  };
+
+  /** What is drawn of pages, and where. */
+  const pagesDrawn = ({ device, frames }: ReturnType<typeof open>) => {
+    const [own] = frames();
+    return frames()
+      .filter(({ buffer }) => buffer !== own?.buffer)
+      .map((draw) => ({ ...partOf(device, draw.part), quads: quadsDrawn(device, draw) }));
+  };
+  const ownDrawn = ({ device, frames }: ReturnType<typeof open>) => {
+    const [own] = frames();
+    return frames()
+      .filter(({ buffer }) => buffer === own?.buffer)
+      .flatMap((draw) => quadsDrawn(device, draw));
+  };
+  const BAR = faint(colors.parse(frameOf().theme.text));
+
+  test("makes those it has time for, and shows bars for the others", () => {
+    const opened = open();
+    const clock = timed(5);
+    opened.renderer.draw(zoomed(1));
+    expect(opened.renderer.counters).toMatchObject({ bandsBuilt: 3, deferredFrames: 1 });
+    expect(opened.onIncomplete).toHaveBeenCalledTimes(1);
+    const bars = ownDrawn(opened).filter(({ color, textured }) => !textured && color === BAR);
+    // Every cell in view has a text, but for those of three groups of eight rows.
+    const drawn = opened.renderer.draw(zoomed(1)).cells;
+    expect(bars.length).toBe(drawn - 3 * 8 * 9);
+    for (const { x, y, width, height } of bars) {
+      expect(x).toBeGreaterThanOrEqual(45 + 6);
+      expect(x + width).toBeLessThanOrEqual(700 - 10);
+      // Below the groups of rows that are there.
+      expect(y).toBeGreaterThanOrEqual(30 + 3 * 8 * 20);
+      expect(y + height).toBeLessThanOrEqual(600 - 10);
+    }
+    clock.each = 0;
+    settle(opened, zoomed(1));
+    expect(ownDrawn(opened).some(({ color }) => color === BAR)).toBe(false);
+  });
+
+  test("stretches those there were before the sheet was zoomed, until it has made them anew", () => {
+    const opened = open();
+    const clock = timed(0);
+    settle(opened, zoomed(1));
+    const before = pagesDrawn(opened);
+    const { deferredFrames, pageUploads } = opened.renderer.counters;
+    // While it is being zoomed, the next frame may have no use for what one makes.
+    clock.each = 100;
+    const zoom = 1.5;
+    opened.renderer.draw(zoomed(zoom, { size: { width: 450, height: 400 } }));
+    expect(opened.onIncomplete).toHaveBeenCalledTimes(1);
+    expect(opened.renderer.counters.deferredFrames).toBe(deferredFrames + 1);
+    const stretched = pagesDrawn(opened).filter(({ down }) => down !== 1);
+    expect(stretched.length).toBeGreaterThan(0);
+    for (const { x, across, down, quads } of stretched) {
+      expect([x, across, down]).toEqual([68, 113 / 75, 1.5].map(Math.fround));
+      // The very quads that were drawn before.
+      const [first] = quads;
+      expect(before.some((each) => each.quads.some((quad) => sameQuad(quad, first)))).toBe(true);
+    }
+    // The only ones that were begun would have been bars.
+    expect(opened.renderer.counters.pageUploads).toBe(pageUploads);
+
+    clock.each = 0;
+    settle(opened, zoomed(zoom));
+    const fresh = open();
+    settle(fresh, zoomed(zoom));
+    const shapes = (each: ReturnType<typeof pagesDrawn>) =>
+      each.flatMap(({ quads, ...part }) =>
+        quads.map(({ x, y, width, height, row, textured, color }) =>
+          [part, x, y, width, height, row, textured, color].map((one) => JSON.stringify(one)),
+        ),
+      );
+    expect(shapes(pagesDrawn(opened)).sort()).toEqual(shapes(pagesDrawn(fresh)).sort());
+    expect(pagesDrawn(opened).every(({ across, down }) => across === 1 && down === 1)).toBe(true);
+    expect(opened.renderer.counters.deferredFrames).toBe(deferredFrames + 1);
+  });
+
+  test("makes those first that nothing stands for", () => {
+    const opened = open();
+    const clock = timed(0);
+    settle(opened, zoomed(1));
+    clock.states.length = 0;
+    opened.renderer.draw(zoomed(0.5));
+    const { states } = clock;
+    expect(states.filter((state) => state === "stale").length).toBeGreaterThan(2);
+    expect(states.indexOf("stale")).toBeGreaterThan(2);
+    expect(states.lastIndexOf("missing")).toBeLessThan(states.indexOf("stale"));
+  });
+
+  test("has less time while the sheet is zoomed, and goes on when that is over", () => {
+    const opened = open();
+    const clock = timed(0);
+    settle(opened, zoomed(1));
+    clock.each = 4;
+    const made = (frame: Frame) => {
+      clock.states.length = 0;
+      opened.renderer.draw(frame);
+      return clock.states.length;
+    };
+    const zooms = [0.9, 0.8, 0.5, 0.5];
+    expect(zooms.map((zoom) => made(zoomed(zoom)))).toEqual([2, 2, 2, 3]);
+    // Another theme is not another zoom.
+    const theme = { ...frameOf().theme, text: "#123456" };
+    expect(made(zoomed(0.5, { theme }))).toBe(3);
+  });
+
+  test("shows the headers' labels all the same", () => {
+    const opened = open();
+    const clock = timed(0);
+    settle(opened, zoomed(1));
+    const labels = ownDrawn(opened).filter(({ textured }) => textured).length;
+    clock.each = 1000;
+    opened.renderer.draw(zoomed(1.25));
+    expect(opened.renderer.counters.deferredFrames).toBe(1);
+    expect(ownDrawn(opened).filter(({ textured }) => textured).length).toBeGreaterThan(labels / 2);
+    expect(ownDrawn(opened).some(({ color, x }) => color === BAR && x < 45)).toBe(false);
+  });
+
+  test("makes room for them at the cost of what stands for others", () => {
+    const opened = open();
+    const clock = timed(0);
+    settle(opened, zoomed(1));
+    const { plan } = opened.gpu.glyphs.atlas;
+    // All of the atlas but a part of a strip holds what is in view.
+    plan.use = () => {};
+    let full = true;
+    const { reserve } = opened.gpu.glyphs.atlas;
+    vi.spyOn(opened.gpu.glyphs.atlas, "reserve").mockImplementation(function (
+      this: typeof opened.gpu.glyphs.atlas,
+      width,
+      height,
+    ) {
+      if (full) {
+        full = false;
+        this.full = true;
+        return null;
+      }
+      return reserve.call(this, width, height);
+    });
+    const dropped = vi.spyOn(RetainedPages.prototype, "dropStale");
+    clock.states.length = 0;
+    opened.renderer.draw(zoomed(1.5));
+    expect(dropped).toHaveReturnedWith(true);
+    expect(clock.states).toContain("missing");
+    expect(opened.renderer.counters.extraSubmits).toBe(0);
+    expect(opened.onIncomplete).not.toHaveBeenCalled();
+  });
+});
+
+const sameQuad = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
 
 test("more than the atlas holds is drawn in several steps, all of it", () => {
   const { device, renderer, onIncomplete, frames } = open();

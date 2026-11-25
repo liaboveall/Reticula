@@ -22,7 +22,7 @@ export interface RendererCounters {
   readonly atlasUploadedBytes: number;
   readonly atlasLayers: number;
   readonly atlasEvictions: number;
-  /** Frames in which bars stood for texts there was no time to draw. */
+  /** Frames in which bars, or what there was at another zoom, stood for texts there was no time to make. */
   readonly deferredFrames: number;
   /** Bytes of textures and buffers, without the canvas. */
   readonly bytes: number;

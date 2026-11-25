@@ -144,6 +144,58 @@ describe("an atlas", () => {
     expect(atlas.uploadedBytes).toBe((40 * 52 + 8 * 40) * 4);
   });
 
+  test("says what uploading will take, going by what it took for pictures before", () => {
+    const { atlas, upload } = fakeAtlas();
+    let now = 0;
+    vi.spyOn(performance, "now").mockImplementation(() => now);
+    upload.mockImplementation(() => {
+      now += 4;
+    });
+    const draw = (count: number) => {
+      for (let drawn = 0; drawn < count; drawn++) {
+        atlas.reserve(4, 4);
+      }
+    };
+    draw(40);
+    expect(atlas.due).toBe(0);
+    atlas.flush();
+    draw(10);
+    expect(atlas.due).toBeCloseTo((10 * (4 / 40)) / 2, 9);
+    // Of so few, that says nothing.
+    atlas.flush();
+    expect(atlas.due).toBe(0);
+    draw(40);
+    expect(atlas.due).toBeCloseTo((40 * (4 / 40)) / 2, 9);
+    vi.restoreAllMocks();
+  });
+
+  test("does not go on expecting uploads to be slow because one was", () => {
+    const { atlas, upload } = fakeAtlas();
+    let now = 0;
+    let takes = 100;
+    vi.spyOn(performance, "now").mockImplementation(() => now);
+    upload.mockImplementation(() => {
+      now += takes;
+    });
+    /** As many as a frame of five milliseconds has time for. */
+    const frame = () => {
+      let drawn = 0;
+      for (; drawn < 60 && atlas.due < 5; drawn++) {
+        atlas.reserve(4, 4);
+      }
+      atlas.flush();
+      return drawn;
+    };
+    expect(frame()).toBe(60);
+    takes = 1;
+    expect(frame()).toBeLessThan(10);
+    for (let count = 0; count < 10; count++) {
+      frame();
+    }
+    expect(frame()).toBe(60);
+    vi.restoreAllMocks();
+  });
+
   test("writes only what has been drawn when that costs by the pixel", () => {
     const { atlas, upload } = fakeAtlas("write");
     atlas.reserve(10, 12);

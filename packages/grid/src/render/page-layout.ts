@@ -1,3 +1,4 @@
+import type { PageCache } from "../cache.ts";
 import type { SheetLayout } from "../layout.ts";
 import type { Page } from "../page.ts";
 import { type Look, NO_COLOR, type StyleTable } from "./look.ts";
@@ -248,22 +249,24 @@ export class PageLayout {
   readonly page: Page;
   readonly geometry: PageGeometry;
   #setting: PageSetting;
+  #spare: TextRuns[];
   #stylesVersion: number;
   #stylesLength: number;
   #layout: SheetLayout;
   #fills: RectList | null = null;
   #borders: RectList | null = null;
   #texts: TextRuns | null = null;
-  /** Where the texts of each band start: after the most that those before it can have. */
+  /** Where the texts of each band start: after the most that those before it can have. Then the end. */
   #bandStarts: number[] = [];
   #bands: (TextBand | undefined)[] = [];
   #drawn: Uint16Array | null = null;
 
-  constructor(page: Page, layout: SheetLayout, setting: PageSetting) {
+  constructor(page: Page, layout: SheetLayout, setting: PageSetting, spare: TextRuns[] = []) {
     this.page = page;
     this.geometry = geometryOf(page, layout, setting.look.scale);
     this.#layout = layout;
     this.#setting = setting;
+    this.#spare = spare;
     this.#stylesVersion = setting.styles.version;
     this.#stylesLength = setting.styles.length;
   }
@@ -302,43 +305,40 @@ export class PageLayout {
   }
 
   get fills(): RectList {
-    this.#fills ??= this.#isPlain()
+    this.#fills ??= this.page.styleIds.every((id) => id === 0)
       ? EMPTY
       : layoutFills(this.page, this.geometry, this.#setting.styles);
     return this.#fills;
   }
 
   get borders(): RectList {
-    this.#borders ??= this.#isPlain()
-      ? EMPTY
-      : layoutBorders(this.page, this.geometry, this.#setting.styles, this.#setting.look);
+    // That is what a page without styles has for fills.
+    this.#borders ??=
+      this.fills === EMPTY
+        ? EMPTY
+        : layoutBorders(this.page, this.geometry, this.#setting.styles, this.#setting.look);
     return this.#borders;
-  }
-
-  get bandCount(): number {
-    return Math.ceil(this.page.rowCount / BAND_ROWS);
   }
 
   /** The page's texts, as far as its bands have been asked for. */
   get texts(): TextRuns {
     if (!this.#texts) {
-      const { texts, colCount, rowCount, overflows } = this.page;
-      let most = 0;
-      for (let row = 0; row < rowCount; row++) {
-        if (row % BAND_ROWS === 0) {
-          this.#bandStarts.push(most);
-        }
-        // No more than one text overflows into a row.
-        most += overflows.length > 0 ? 1 : 0;
-        for (let cell = row * colCount; cell < (row + 1) * colCount; cell++) {
-          most += texts[cell] ? 1 : 0;
-        }
-      }
-      this.#texts = new TextRuns(most);
-      // Bands far down the page may be the first to be laid out.
-      this.#texts.texts = new Array<string>(most).fill("");
+      this.#drawn ??= this.#countCells();
+      const most = this.#bandStarts.at(-1) ?? 0;
+      const spare = this.#spare.pop();
+      this.#texts = spare && spare.x.length >= most ? spare : new TextRuns(most);
     }
     return this.#texts;
+  }
+
+  /** Forgets the texts. */
+  release(): void {
+    if (this.#texts && this.#spare.length < MOST_SPARE) {
+      this.#texts.clear();
+      this.#spare.push(this.#texts);
+    }
+    this.#texts = null;
+    this.#bands = [];
   }
 
   /** Which of the texts are those of a band of rows, with what overflows into it from the left. */
@@ -364,34 +364,41 @@ export class PageLayout {
   /** How many cells of a range of the page's rows and columns show text of their own. */
   cellsWithText(firstRow: number, endRow: number, firstCol: number, endCol: number): number {
     this.#drawn ??= this.#countCells();
-    const at = (row: number, col: number) =>
-      this.#drawn?.[row * (this.page.colCount + 1) + col] ?? 0;
+    const drawn = this.#drawn;
+    const at = (row: number, col: number) => drawn[row * (this.page.colCount + 1) + col] ?? 0;
     return (
       at(endRow, endCol) - at(firstRow, endCol) - at(endRow, firstCol) + at(firstRow, firstCol)
     );
   }
 
-  /** Sums over the rows and columns before each corner of a cell. */
+  /**
+   * Counts the texts. Returns sums of those that are drawn, over the rows and
+   * columns before each corner of a cell.
+   */
   #countCells(): Uint16Array {
-    const { rowCount, colCount, texts } = this.page;
+    const { rowCount, colCount, texts, overflows } = this.page;
     const { xs } = this.geometry;
     const stride = colCount + 1;
     const least = 2 * this.#setting.look.padding;
     const sums = new Uint16Array((rowCount + 1) * stride);
+    let most = 0;
     for (let row = 0; row < rowCount; row++) {
+      if (row % BAND_ROWS === 0) {
+        this.#bandStarts.push(most);
+      }
+      // No more than one text overflows into a row.
+      most += overflows.length > 0 ? 1 : 0;
       let sum = 0;
       for (let col = 0; col < colCount; col++) {
-        if (texts[row * colCount + col] && (xs[col + 1] ?? 0) - (xs[col] ?? 0) > least) {
-          sum++;
+        if (texts[row * colCount + col]) {
+          most++;
+          sum += (xs[col + 1] ?? 0) - (xs[col] ?? 0) > least ? 1 : 0;
         }
         sums[(row + 1) * stride + col + 1] = (sums[row * stride + col + 1] ?? 0) + sum;
       }
     }
+    this.#bandStarts.push(most);
     return sums;
-  }
-
-  #isPlain(): boolean {
-    return this.page.styleIds.every((id) => id === 0);
   }
 
   #lacksStyles(): boolean {
@@ -405,14 +412,34 @@ export class PageLayout {
 
 const EMPTY = new RectList(1);
 
-/** The layouts of the pages that are held; a page that is let go takes its own with it. */
+/** How many pages' room for texts is kept for others. */
+const MOST_SPARE = 16;
+
+/** The layouts of the pages that are held. */
 export class PageLayouts {
-  #layouts = new WeakMap<Page, PageLayout>();
+  #layouts = new Map<Page, PageLayout>();
+  /**
+   * Room for texts that pages no longer need. Memory that has been written to is
+   * faster to lay out texts in than new memory, and leaves no garbage: when the
+   * sheet is scrolled fast, every frame lays out a screen of them.
+   */
+  #spare: TextRuns[] = [];
+
+  /** Forgets the pages that are not held any more, and what was laid out of them. */
+  begin(cache: PageCache): void {
+    for (const [page, held] of this.#layouts) {
+      if (cache.pageOf(page.firstRow, page.firstCol) !== page) {
+        held.release();
+        this.#layouts.delete(page);
+      }
+    }
+  }
 
   get(page: Page, layout: SheetLayout, setting: PageSetting): PageLayout {
     let held = this.#layouts.get(page);
     if (!held?.isValidFor(layout, setting)) {
-      held = new PageLayout(page, layout, setting);
+      held?.release();
+      held = new PageLayout(page, layout, setting, this.#spare);
       this.#layouts.set(page, held);
     }
     return held;

@@ -109,6 +109,88 @@ describe("widths", () => {
   });
 });
 
+describe("widths at another size", () => {
+  const TEXTS = ["1234.50", "-0.5", "Widget", "数据线", "SKU 数 7", "café", "Учёт"];
+  const SIZES = [13, 26, 19.5, 6.5, 13, 14];
+
+  /** A context where a character is as wide as it is said to be, for a size. */
+  function open(advance: (character: string, size: number) => number) {
+    const asked: string[] = [];
+    const context = {
+      font: "",
+      measureText(text: string) {
+        asked.push(`${this.font}|${text}`);
+        const size = Number.parseFloat(this.font);
+        const advances = Array.from(text, (character) => advance(character, size));
+        return { width: advances.reduce((sum, each) => sum + each, 0) };
+      },
+    };
+    const measurer = new TextMeasurer(() => context as unknown as CanvasRenderingContext2D);
+    return { asked, measurer };
+  }
+  const isHan = (character: string) => character.charCodeAt(0) >= 0x4e00;
+
+  test("are what they would be if there had been no other size before", () => {
+    const { open } = fakeContext();
+    const measurer = new TextMeasurer(open);
+    for (const size of SIZES) {
+      const font = `${size}px sans-serif`;
+      for (const text of TEXTS) {
+        // The pen of a text that ends somewhere starts a width before that, and
+        // its picture depends on where exactly.
+        expect(measurer.width(font, text)).toBe(new TextMeasurer(open).width(font, text));
+        expect(measurer.width(font, text)).toBeCloseTo(measure.width(font, text), 9);
+      }
+    }
+  });
+
+  test("of characters as wide as they are high are told by one of them", () => {
+    const { asked, measurer } = open((character, size) => (isHan(character) ? size : size / 2));
+    const texts = Array.from({ length: 500 }, (_, index) =>
+      String.fromCharCode(0x4e00 + 7 * index, 0x4e01 + 7 * index),
+    );
+    for (const text of texts) {
+      expect(measurer.width("13px serif", text)).toBe(26);
+    }
+    const before = asked.length;
+    expect(before).toBeGreaterThan(1000);
+    for (const text of texts) {
+      expect(measurer.width("26px serif", text)).toBe(52);
+    }
+    expect(asked.length - before).toBeLessThan(40);
+    // Those of another font may be other ones.
+    expect(measurer.width("26px other", texts[0] ?? "")).toBe(52);
+    expect(asked.filter((each) => each === `26px other|${texts[0]?.[0]}`)).toHaveLength(1);
+  });
+
+  test("of characters that are not are measured at each size", () => {
+    const { measurer } = open((character, size) =>
+      isHan(character) ? size + (character === "数" ? (size > 20 ? 3 : 1) : 0) : size / 2,
+    );
+    expect(measurer.width("13px serif", "数据")).toBe(27);
+    expect(measurer.width("26px serif", "数据")).toBe(55);
+    expect(measurer.width("13px serif", "数据")).toBe(27);
+  });
+
+  test("are measured where they are rounded, or spaced by size", () => {
+    const ems: Record<string, number> = { f: 0.278, t: 0.278, i: 0.222, l: 0.222, " ": 0.278 };
+    const em = (character: string) => (isHan(character) ? 1 : (ems[character] ?? 0.556));
+    for (const advance of [
+      (character: string, size: number) => Math.round(em(character) * size),
+      (character: string, size: number) => Math.round((em(character) * size + 4 / size) * 64) / 64,
+    ]) {
+      const { measurer } = open(advance);
+      for (const size of SIZES) {
+        for (const text of ["1234.50", "Widget", "fill it", "5.1 of 数据"]) {
+          const width = Array.from(text).reduce((sum, each) => sum + advance(each, size), 0);
+          // Exactly: what is a hair more than whole pixels would make columns wider.
+          expect(measurer.width(`${size}px sans-serif`, text)).toBe(width);
+        }
+      }
+    }
+  });
+});
+
 describe("fitting a column", () => {
   test("goes by its widest text in the font it is drawn in, and no further than a limit", () => {
     const { open } = fakeContext();

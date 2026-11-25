@@ -56,7 +56,13 @@ async function settled(page: Page): Promise<void> {
     const stats = window.__reticula?.stats();
     return stats !== undefined && stats.pagesHeld > 0 && stats.missingCells === 0;
   });
-  await nextFrames(page);
+  // Frames go on being drawn until there has been time for every text.
+  let deferred: number | undefined;
+  for (let before: number | null | undefined = null; deferred !== before; ) {
+    before = deferred;
+    await nextFrames(page);
+    deferred = (await stats(page)).renderer.counters?.deferredFrames;
+  }
 }
 
 function nextFrames(page: Page): Promise<void> {
@@ -279,6 +285,36 @@ test("scrolling within what has been drawn uploads nothing but the frame's own q
   expect(after.pageUploads).toBe(before.pageUploads);
   expect(after.bandsBuilt).toBe(before.bandsBuilt);
   expect(after.atlasUploads).toBe(before.atlasUploads);
+});
+
+test("what is stretched while the sheet is zoomed is drawn anew when that is over", async ({
+  page,
+  browser,
+}) => {
+  const reference = await openReference(browser);
+  await open(page, "&renderer=webgpu");
+  await drawnWith(page, "webgpu");
+  const { deferredFrames } = await counters(page);
+  // As if every frame took a thousand times as long.
+  await page.evaluate(() => {
+    const now = performance.now.bind(performance);
+    performance.now = () => 1000 * now();
+  });
+  for (const each of [page, reference]) {
+    for (let step = 0; step < 3; step++) {
+      await each.getByTestId("zoom-out").click();
+    }
+    await each.waitForFunction(() => window.__reticula?.stats().zoom === 0.75);
+  }
+  expect((await counters(page)).deferredFrames).toBeGreaterThan(deferredFrames);
+  await page.evaluate(() => Reflect.deleteProperty(performance, "now"));
+
+  await settled(page);
+  await settled(reference);
+  const settledFrames = (await counters(page)).deferredFrames;
+  const drawn = await picture(page, 3, 1);
+  expect(apart(drawn, await picture(reference, 3, 1))).toBeLessThanOrEqual(TOLERANCE);
+  expect((await counters(page)).deferredFrames).toBe(settledFrames);
 });
 
 test("when the device is lost, the next frame is drawn on a 2D canvas", async ({

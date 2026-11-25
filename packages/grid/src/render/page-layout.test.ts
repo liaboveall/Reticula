@@ -1,8 +1,17 @@
 import { describe, expect, test } from "vitest";
-import { axes, colors, measure, PLAIN, pageOf, type TestCells, theme } from "./fixtures.ts";
+import {
+  axes,
+  cacheOf,
+  colors,
+  measure,
+  PLAIN,
+  pageOf,
+  type TestCells,
+  theme,
+} from "./fixtures.ts";
 import type { GridCellStyle } from "./frame.ts";
 import { makeLook, StyleTable } from "./look.ts";
-import { PageLayout, PageLayouts, type PageSetting } from "./page-layout.ts";
+import { BAND_ROWS, PageLayout, PageLayouts, type PageSetting } from "./page-layout.ts";
 import type { RectList } from "./rects.ts";
 
 function settingOf(styles: readonly GridCellStyle[], scale = 1, frozenCols = 0): PageSetting {
@@ -244,5 +253,64 @@ describe("what is kept of a page", () => {
     expect(kept.cellsWithText(0, 64, 0, 16)).toBe(3);
     expect(kept.cellsWithText(1, 6, 1, 10)).toBe(2);
     expect(kept.cellsWithText(0, 64, 2, 9)).toBe(0);
+  });
+});
+
+describe("room for texts", () => {
+  const runsOf = (layout: PageLayout) =>
+    Array.from({ length: layout.page.rowCount / BAND_ROWS }, (_, index) => {
+      const { first, end } = layout.band(index);
+      const { texts, x, width, baseline, clipped } = layout.texts;
+      return Array.from({ length: end - first }, (_, at) =>
+        [texts, x, width, baseline, clipped].map((field) => field[first + at]),
+      );
+    });
+  const texts = (prefix: string, rows: number) =>
+    Object.fromEntries(
+      Array.from({ length: rows * 16 }, (_, cell) => [
+        `${Math.floor(cell / 16)}:${cell % 16}`,
+        `${prefix}${cell}`,
+      ]),
+    );
+
+  test("is taken over from a page that is let go", () => {
+    const layouts = new PageLayouts();
+    const setting = settingOf([]);
+    const held = (cells: TestCells, count: number) => {
+      const cache = cacheOf(cells, 1, 1);
+      const page = cache.get(0, 0);
+      if (!page) {
+        throw new Error("there is no page");
+      }
+      layouts.begin(cache);
+      const layout = layouts.get(page, axes(), setting);
+      const fresh = new PageLayout(page, axes(), setting);
+      expect(runsOf(layout)).toEqual(runsOf(fresh));
+      expect(runsOf(layout).flat()).toHaveLength(count);
+      return layout.texts;
+    };
+    const first = held(texts("a long text ", 64), 1024);
+    expect(held(texts("b", 10), 160).x).toBe(first.x);
+    expect(held(texts("c", 64), 1024).x).toBe(first.x);
+  });
+
+  test("is not taken from a page that is still held", () => {
+    const layouts = new PageLayouts();
+    const setting = settingOf([]);
+    const cache = cacheOf(texts("a", 128), 2, 1);
+    const [one, other] = [cache.get(0, 0), cache.get(1, 0)];
+    if (!one || !other) {
+      throw new Error("there are no pages");
+    }
+    const kept = layouts.get(one, axes(), setting);
+    const { x } = kept.texts;
+    layouts.begin(cache);
+    expect(layouts.get(one, axes(), setting)).toBe(kept);
+    expect(layouts.get(other, axes(), setting).texts.x).not.toBe(x);
+    // Laid out anew, it has no use for what it had.
+    const before = runsOf(kept);
+    const again = layouts.get(one, axes([[0, 50]]), setting);
+    expect(again.texts.x).toBe(x);
+    expect(runsOf(again)).not.toEqual(before);
   });
 });

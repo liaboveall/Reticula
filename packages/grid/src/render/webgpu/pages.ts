@@ -80,7 +80,10 @@ export interface Block {
 }
 
 /** The texts of some rows of a page as quads. */
-interface Band {
+export interface Band {
+  /** What they were laid out as, and with; their page may have been laid out at another zoom since. */
+  readonly layout: PageLayout;
+  readonly look: Look;
   readonly block: Block | null;
   /** Layers of the atlas they copy from, and what generation those were of. */
   readonly layers: number;
@@ -103,7 +106,8 @@ export interface PageView {
 
 interface Retained {
   readonly page: Page;
-  readonly layout: PageLayout;
+  layout: PageLayout;
+  look: Look;
   fills: Block | null | undefined;
   borders: Block | null | undefined;
   readonly bands: (Band | undefined)[];
@@ -111,10 +115,22 @@ interface Retained {
   used: number;
 }
 
+/** Quads on their way to the GPU: as many from one on, to a place in a chunk. */
+interface Write {
+  readonly chunk: Chunk;
+  readonly first: number;
+  readonly from: number;
+  count: number;
+}
+
+/** Whether a band is to be had, with something to show until it is made, or without. */
+export type BandState = "ready" | "stale" | "missing";
+
 /**
  * The quads of the pages in view and around it. A page has its own for as long
  * as it has its layout, which is as long as it looks the same: wherever it is
- * scrolled to, nothing is uploaded.
+ * scrolled to, nothing is uploaded. When it is zoomed, those it had are kept to
+ * stand for the new ones.
  */
 export class RetainedPages {
   /** Uploads, and how many quads they had. */
@@ -126,7 +142,11 @@ export class RetainedPages {
   #guard: <T>(allocate: () => T) => T;
   #chunks: Chunk[] = [];
   #pages = new Map<Page, Retained>();
+  /** The one that was asked for last in this frame. */
+  #last: Retained | null = null;
+  /** Quads that have yet to be uploaded, and where they go. */
   #writer = new InstanceWriter();
+  #writes: Write[] = [];
   #kept = 0;
   #frame = 0;
   /** Not needed any more, but for what has yet to be submitted. */
@@ -151,6 +171,7 @@ export class RetainedPages {
   /** Starts a frame: lets go of what is not held any more, or too much. */
   begin(cache: PageCache): void {
     this.#frame++;
+    this.#last = null;
     for (const block of this.#discarded) {
       this.#free(block);
     }
@@ -175,43 +196,82 @@ export class RetainedPages {
     }
   }
 
-  rects(layout: PageLayout, kind: "fills" | "borders"): Block | null {
-    const retained = this.#retained(layout);
+  rects(look: Look, layout: PageLayout, kind: "fills" | "borders"): Block | null {
+    const retained = this.#retained(look, layout);
     let block = retained[kind];
     if (block === undefined) {
       const list = layout[kind];
-      this.#writer.length = 0;
+      const { length } = this.#writer;
       this.#writer.rects(list, 0, list.length);
-      block = this.#store();
+      block = this.#store(length);
       retained[kind] = block;
     }
     return block;
   }
 
-  /** Whether a band is to be had without building it. */
-  has(layout: PageLayout, index: number, view: PageView): boolean {
-    return this.#found(layout, index, view) !== null;
+  stateOf(look: Look, layout: PageLayout, index: number, view: PageView): BandState {
+    const band = this.shown(look, layout, index, view);
+    return !band ? "missing" : band.layout === layout && band.complete ? "ready" : "stale";
   }
 
-  /** If there is a band, notes that what it copies from must not make room for others. */
-  keep(layout: PageLayout, index: number, view: PageView): void {
-    const band = this.#found(layout, index, view);
-    if (band) {
-      this.#glyphs.atlas.plan.use(band.layers);
-    }
-  }
-
-  /** The texts of a band. */
-  band(look: Look, layout: PageLayout, index: number, view: PageView): Band {
-    const retained = this.#retained(layout);
-    let band = retained.bands[index];
-    if (!band || !(this.#holds(band, view) && (band.complete || !this.#glyphs.hasTime))) {
-      this.#discard(band?.block);
-      band = this.#build(look, layout, index, view, band);
-      retained.bands[index] = band;
+  /**
+   * The texts of a band as far as they have been made: some may be bars, and all
+   * of them what they were at another zoom. What they copy from does not make
+   * room for others in this frame.
+   */
+  shown(look: Look, layout: PageLayout, index: number, view: PageView): Band | null {
+    const band = this.#retained(look, layout).bands[index];
+    if (!band || !(band.layout === layout ? this.#holds(band, view) : this.#standsIn(band, look))) {
+      return null;
     }
     this.#glyphs.atlas.plan.use(band.layers);
     return band;
+  }
+
+  /** Makes the texts of a band, if they are not there yet. */
+  make(look: Look, layout: PageLayout, index: number, view: PageView): void {
+    const { bands } = this.#retained(look, layout);
+    const before = bands[index];
+    if (this.stateOf(look, layout, index, view) === "ready") {
+      return;
+    }
+    const { length } = this.#writer;
+    const band = this.#build(look, layout, index, view, before);
+    if (!band.complete && before && this.#standsIn(before, look)) {
+      // Texts at another zoom are better than bars.
+      this.#writer.length = length;
+      return;
+    }
+    this.#discard(before?.block);
+    bands[index] = { ...band, block: this.#store(length) };
+    this.#glyphs.atlas.plan.use(band.layers);
+  }
+
+  /** Uploads what has been made since the last time. */
+  flush(): void {
+    for (const { chunk, first, from, count } of this.#writes) {
+      const bytes = this.#writer.bytes(from, count);
+      this.#device.queue.writeBuffer(chunk.buffer, first * INSTANCE_BYTES, bytes);
+      this.uploads++;
+      this.uploadedQuads += count;
+    }
+    this.#writes = [];
+    this.#writer.length = 0;
+  }
+
+  /** Lets go of all that only stands for something else. Returns whether there was any. */
+  dropStale(): boolean {
+    let dropped = false;
+    for (const { layout, bands } of this.#pages.values()) {
+      for (const [index, band] of bands.entries()) {
+        if (band && band.layout !== layout) {
+          this.#discard(band.block);
+          bands[index] = undefined;
+          dropped = true;
+        }
+      }
+    }
+    return dropped;
   }
 
   destroy(): void {
@@ -222,10 +282,13 @@ export class RetainedPages {
     this.#pages.clear();
   }
 
-  #found(layout: PageLayout, index: number, view: PageView): Band | null {
-    const retained = this.#pages.get(layout.page);
-    const band = retained?.layout === layout ? retained.bands[index] : undefined;
-    return band?.complete && this.#holds(band, view) ? band : null;
+  /** Whether a band shows its texts as they are at another zoom. */
+  #standsIn(band: Band, look: Look): boolean {
+    return (
+      band.look !== look &&
+      band.look.theme === look.theme &&
+      this.#glyphs.atlas.plan.holds(band.layers, band.generations)
+    );
   }
 
   #holds(band: Band, { left, right }: PageView): boolean {
@@ -242,12 +305,11 @@ export class RetainedPages {
     index: number,
     { origin, left, right }: PageView,
     before: Band | undefined,
-  ): Band {
+  ): Omit<Band, "block"> {
     const { first, end, firstStrike, endStrike } = layout.band(index);
     const runs = layout.texts;
     const glyphs = this.#glyphs;
     const writer = this.#writer;
-    writer.length = 0;
     glyphs.layers = 0;
     glyphs.partial = false;
     const { deferred } = glyphs;
@@ -256,7 +318,11 @@ export class RetainedPages {
     const spare = right - left;
     let from = left - spare;
     let to = right + spare;
-    if (before && before.left > from - 2 * spare && before.right < to + 2 * spare) {
+    if (
+      before?.layout === layout &&
+      before.left > from - 2 * spare &&
+      before.right < to + 2 * spare
+    ) {
       from = Math.min(from, before.left);
       to = Math.max(to, before.right);
     }
@@ -293,7 +359,8 @@ export class RetainedPages {
     writer.rects(runs.strikes, firstStrike, endStrike);
     this.bandsBuilt++;
     return {
-      block: this.#store(),
+      layout,
+      look,
       layers: glyphs.layers,
       generations: glyphs.atlas.plan.generations,
       complete: glyphs.deferred === deferred,
@@ -303,24 +370,40 @@ export class RetainedPages {
     };
   }
 
-  #retained(layout: PageLayout): Retained {
+  #retained(look: Look, layout: PageLayout): Retained {
+    if (this.#last?.layout === layout) {
+      return this.#last;
+    }
     const { page } = layout;
     let retained = this.#pages.get(page);
     if (retained && retained.layout !== layout) {
-      this.#drop(retained);
-      retained = undefined;
+      this.#discard(retained.fills);
+      this.#discard(retained.borders);
+      retained.fills = undefined;
+      retained.borders = undefined;
+      // Those of another zoom are where its sizes were, not where they are now.
+      const isZoomed = retained.look !== look;
+      retained.layout = layout;
+      retained.look = look;
+      for (const [index, band] of retained.bands.entries()) {
+        if (band && !(isZoomed && this.#standsIn(band, look))) {
+          this.#discard(band.block);
+          retained.bands[index] = undefined;
+        }
+      }
     }
     if (!retained) {
-      retained = { page, layout, fills: undefined, borders: undefined, bands: [], used: 0 };
+      retained = { page, layout, look, fills: undefined, borders: undefined, bands: [], used: 0 };
       this.#pages.set(page, retained);
     }
     retained.used = this.#frame;
+    this.#last = retained;
     return retained;
   }
 
-  /** Uploads what has been written. */
-  #store(): Block | null {
-    const count = this.#writer.length;
+  /** Finds a place for the quads from one on. */
+  #store(from: number): Block | null {
+    const count = this.#writer.length - from;
     if (count === 0) {
       return null;
     }
@@ -346,13 +429,17 @@ export class RetainedPages {
       this.#chunks.push(chunk);
       block = { chunk, first: chunk.stretches.take(count) ?? 0, count };
     }
-    this.#device.queue.writeBuffer(
-      block.chunk.buffer,
-      block.first * INSTANCE_BYTES,
-      this.#writer.bytes(),
-    );
-    this.uploads++;
-    this.uploadedQuads += count;
+    const { chunk, first } = block;
+    const last = this.#writes.at(-1);
+    if (
+      last?.chunk === chunk &&
+      last.first + last.count === first &&
+      last.from + last.count === from
+    ) {
+      last.count += count;
+    } else {
+      this.#writes.push({ chunk, first, from, count });
+    }
     this.#kept += count * INSTANCE_BYTES;
     return block;
   }

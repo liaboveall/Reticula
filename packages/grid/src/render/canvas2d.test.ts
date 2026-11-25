@@ -130,6 +130,41 @@ function open(onRestored?: () => void) {
 const CELLS = { "1:1": "left", "2:1": "a text that is too long for it", "2:3": "7" };
 const frame = frameOf({ scale: 1.5, cache: cacheOf(CELLS, 1, 1) });
 
+const filtered = {
+  ...frame,
+  filterState: {
+    headerRow: 0,
+    lastRow: 10,
+    firstCol: 0,
+    lastCol: 2,
+    activeCols: [1],
+    hiddenRowSpans: [],
+  },
+};
+
+test("the mark in the corner is drawn where it belongs, or as much of it as there is room for", () => {
+  const { renderer, canvas } = open();
+  renderer.draw(frame);
+  const points = canvas.named("lineTo").map(({ args }) => args);
+  const [right, top] = points[0] as [number, number];
+  const [left, bottom] = points[2] as [number, number];
+  expect(points).toEqual([
+    [right, top],
+    [right, bottom],
+    [left, bottom],
+  ]);
+  // As far from both edges of the headers as it is long in either direction.
+  const { headerWidth, headerHeight } = frame.metrics;
+  expect([right, bottom]).toEqual(
+    [headerWidth, headerHeight].map((edge) => Math.round(edge * 1.5) - Math.round(5 * 1.5)),
+  );
+  expect(right - left).toBe(bottom - top);
+  expect(canvas.named("drawImage")).toEqual([]);
+  renderer.draw({ ...frame, metrics: { ...frame.metrics, headerHeight: 8 } });
+  expect(canvas.named("lineTo")).toHaveLength(points.length);
+  expect(canvas.named("drawImage")).toHaveLength(1);
+});
+
 describe("the canvas", () => {
   test("has alpha, so that its text is grey, and is painted opaque all the same", () => {
     const { renderer, canvas } = open();
@@ -141,9 +176,9 @@ describe("the canvas", () => {
 
   test("is drawn on in whole device pixels, without a transform", () => {
     const { renderer, canvas } = open();
-    renderer.draw(frame);
+    renderer.draw(filtered);
     expect(canvas.named("setTransform")).toEqual([]);
-    for (const name of ["fillRect", "rect", "drawImage"]) {
+    for (const name of ["fillRect", "rect", "lineTo", "drawImage"]) {
       expect(canvas.named(name).length).toBeGreaterThan(0);
       for (const call of canvas.named(name)) {
         for (const arg of call.args.filter((value) => typeof value === "number")) {
@@ -254,9 +289,9 @@ describe("a lost context", () => {
   test("is left to come back, and everything is made again when it has", () => {
     const onRestored = vi.fn();
     const { renderer, canvas } = open(onRestored);
-    renderer.draw(frame);
+    renderer.draw(filtered);
     const before = canvases.length;
-    renderer.draw(frame);
+    renderer.draw(filtered);
     expect(canvases).toHaveLength(before);
 
     const lost = new Event("contextlost", { cancelable: true });
@@ -264,15 +299,19 @@ describe("a lost context", () => {
     expect(lost.defaultPrevented).toBe(false);
     expect(onRestored).not.toHaveBeenCalled();
     const texts = canvas.named("fillText").length;
-    expect(renderer.draw(frame).cells).toBe(3);
+    expect(renderer.draw(filtered).cells).toBe(3);
     expect(canvas.named("fillText")).toHaveLength(texts);
+    // It comes back as if it were new.
+    canvas.context.fontKerning = "auto";
     canvas.dispatchEvent(new Event("contextrestored"));
     expect(onRestored).toHaveBeenCalledOnce();
 
-    renderer.draw(frame);
-    // The corner's mark is drawn anew, and all the text, which is measured anew.
-    expect(canvases).toHaveLength(before + 2);
-    expect(canvas.named("fillText").length).toBeGreaterThan(texts);
+    renderer.draw(filtered);
+    // The signs of the filter are drawn anew, and all the text, which is measured anew.
+    expect(canvases).toHaveLength(before + 3);
+    const drawn = canvas.named("fillText").slice(texts);
+    expect(drawn.length).toBeGreaterThan(0);
+    expect(drawn.every(({ fontKerning }) => fontKerning === "none")).toBe(true);
   });
 
   test("is of no interest once the renderer is gone", () => {

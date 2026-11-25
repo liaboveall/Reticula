@@ -24,11 +24,11 @@ export class InstanceWriter {
   }
 
   /** The quads from one on, as bytes. They hold until more are added. */
-  bytes(first = 0): Uint8Array<ArrayBuffer> {
+  bytes(first = 0, count = this.length - first): Uint8Array<ArrayBuffer> {
     return new Uint8Array(
       this.#words.buffer as ArrayBuffer,
       first * INSTANCE_BYTES,
-      (this.length - first) * INSTANCE_BYTES,
+      count * INSTANCE_BYTES,
     );
   }
 
@@ -77,20 +77,18 @@ export class InstanceWriter {
 
   /** The part of a sprite that is inside `clip`, if there is one. */
   sprite(sprite: Sprite, x: number, y: number, clip: PixelBox | null, row = ANY_ROW): void {
-    let { u, v, width, height } = sprite;
-    let left = x;
-    let top = y;
-    if (clip) {
-      left = Math.max(x, clip.left);
-      top = Math.max(y, clip.top);
-      width = Math.min(x + width, clip.right) - left;
-      height = Math.min(y + height, clip.bottom) - top;
-      u += left - x;
-      v += top - y;
+    const { u, v, width, height } = sprite;
+    const flags = row | TEXTURED | (sprite.layer << LAYER_SHIFT);
+    if (!clip) {
+      this.#push(x, y, width, height, u, v, 0, flags);
+      return;
     }
-    if (width > 0 && height > 0) {
-      const flags = row | TEXTURED | (sprite.layer << LAYER_SHIFT);
-      this.#push(left, top, width, height, u, v, 0, flags);
+    const left = Math.max(x, clip.left);
+    const top = Math.max(y, clip.top);
+    const across = Math.min(x + width, clip.right) - left;
+    const down = Math.min(y + height, clip.bottom) - top;
+    if (across > 0 && down > 0) {
+      this.#push(left, top, across, down, u + left - x, v + top - y, 0, flags);
     }
   }
 
@@ -138,7 +136,8 @@ export class FrameBuffer {
   #vertices: GPUBuffer | null = null;
   #parts: GPUBuffer | null = null;
   #group: GPUBindGroup | null = null;
-  #records = new Int32Array((64 * PART_STRIDE) / 4);
+  #places = new Float32Array((64 * PART_STRIDE) / 4);
+  #rows = new Uint32Array(this.#places.buffer);
   #count = 0;
 
   constructor(device: GPUDevice, partLayout: GPUBindGroupLayout) {
@@ -171,18 +170,24 @@ export class FrameBuffer {
     this.part(0, 0, 0, ANY_ROW);
   }
 
-  /** Where a part of the frame is, and which of its rows are shown. Returns its offset. */
-  part(x: number, y: number, firstRow: number, endRow: number): number {
+  /**
+   * Where a part of the frame is, which of its rows are shown, and how much it
+   * is stretched. Returns its offset.
+   */
+  part(x: number, y: number, firstRow: number, endRow: number, across = 1, down = 1): number {
     const at = (this.#count * PART_STRIDE) / 4;
-    if (at === this.#records.length) {
-      const records = new Int32Array(at * 2);
-      records.set(this.#records);
-      this.#records = records;
+    if (at === this.#places.length) {
+      const places = new Float32Array(at * 2);
+      places.set(this.#places);
+      this.#places = places;
+      this.#rows = new Uint32Array(places.buffer);
     }
-    this.#records[at] = x;
-    this.#records[at + 1] = y;
-    this.#records[at + 2] = firstRow;
-    this.#records[at + 3] = endRow;
+    this.#places[at] = x;
+    this.#places[at + 1] = y;
+    this.#places[at + 2] = across;
+    this.#places[at + 3] = down;
+    this.#rows[at + 4] = firstRow;
+    this.#rows[at + 5] = endRow;
     return this.#count++ * PART_STRIDE;
   }
 
@@ -200,7 +205,7 @@ export class FrameBuffer {
         entries: [{ binding: 0, resource: { buffer: parts, size: PART_BYTES } }],
       });
     }
-    queue.writeBuffer(parts, 0, this.#records, 0, (this.#count * PART_STRIDE) / 4);
+    queue.writeBuffer(parts, 0, this.#places, 0, (this.#count * PART_STRIDE) / 4);
   }
 
   destroy(): void {

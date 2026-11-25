@@ -11,6 +11,12 @@ export const NO_COLOR: PackedColor = 0;
 /** Index among the fonts of the one of the headers' labels, after the variants of the sheet's. */
 export const HEADER_FONT = 4;
 
+export interface Line {
+  /** From the middle of a row down to its baseline. */
+  readonly lift: number;
+  readonly height: number;
+}
+
 /** A theme at a scale and a zoom: colours packed, sizes in device pixels. */
 export interface Look {
   readonly theme: Theme;
@@ -19,10 +25,8 @@ export interface Look {
   readonly zoom: number;
   /** The sheet's font by variant (`BOLD`, `ITALIC`), and the headers'. */
   readonly fonts: readonly string[];
-  /** From the middle of a row down to its baseline, by font. */
-  readonly lifts: readonly number[];
-  /** Height of a line of text, by font. */
-  readonly lineHeights: readonly number[];
+  /** A line of text in one of the fonts. */
+  readonly lineOf: (font: number) => Line;
   readonly plateFont: string;
   /** Space between a cell's edge and its text. */
   readonly padding: number;
@@ -60,7 +64,15 @@ export function makeLook(
     ...variants.map((variant) => fontOf(theme, variant, scale * zoom)),
     fontOf(theme, 0, scale * headerZoom(zoom)),
   ];
-  const lines = fonts.map((font) => measure.line(font));
+  // Finding out about a font for the first time takes about a millisecond, and
+  // few sheets have texts in all of them.
+  const lines: Line[] = [];
+  const measured = (font: number) => {
+    const { ascent, descent } = measure.line(fonts[font] ?? "");
+    const line = { lift: (ascent - descent) / 2, height: Math.ceil(ascent + descent) };
+    lines[font] = line;
+    return line;
+  };
   const slots = [0, 1, 2, 3, 4, 5, 6, 7];
   const selection = colors.parse(theme.selection);
   const selectionFill = colors.parse(theme.selectionFill);
@@ -69,8 +81,7 @@ export function makeLook(
     scale,
     zoom,
     fonts,
-    lifts: lines.map((line) => (line.ascent - line.descent) / 2),
-    lineHeights: lines.map((line) => Math.ceil(line.ascent + line.descent)),
+    lineOf: (font) => lines[font] ?? measured(font),
     plateFont: `600 ${11 * scale}px ${theme.fontFamily}`,
     padding: Math.round(PADDING * zoom * scale),
     hairline: Math.max(1, Math.round(scale)),

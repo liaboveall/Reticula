@@ -34,13 +34,26 @@ export interface TextSetting {
 
 const NO_RECTS = new RectList(1);
 
+interface Field<T> {
+  [index: number]: T;
+  slice(first: number, end: number): ArrayLike<T>;
+}
+
+/** Has the items of a list from one on be others of them. */
+function reorder<T>(field: Field<T>, first: number, order: readonly number[]): void {
+  const before = field.slice(first, first + order.length);
+  order.forEach((from, index) => {
+    field[first + index] = before[from - first] as T;
+  });
+}
+
 /**
  * Texts to draw, each with the position of its pen: whole device pixels along
  * the baseline's normal, fractions of them along the baseline.
  */
 export class TextRuns {
   length = 0;
-  texts: string[] = [];
+  texts: string[];
   /** Left end of the pen's way. */
   x: Float64Array;
   /** How far the pen moves. */
@@ -59,6 +72,8 @@ export class TextRuns {
   strikes = NO_RECTS;
 
   constructor(capacity = 64) {
+    // Those far down a page may be the first to be laid out.
+    this.texts = new Array<string>(capacity).fill("");
     const block = new ArrayBuffer(capacity * 44);
     let at = 0;
     const take = (bytes: number): number => {
@@ -75,9 +90,10 @@ export class TextRuns {
     this.clipped = new Uint8Array(block, take(1), capacity);
   }
 
+  /** Forgets the texts, but not how many there is room for. */
   clear(): void {
     this.length = 0;
-    this.texts.length = 0;
+    this.texts.fill("");
     this.strikes = NO_RECTS;
   }
 
@@ -135,21 +151,15 @@ export class TextRuns {
         states.set(state, [run]);
       }
     }
-    const before = new TextRuns(this.x.length);
-    before.#copy(this);
-    run = first;
-    for (const from of [...states.values()].flat()) {
-      this.texts[run] = before.texts[from] ?? "";
-      this.x[run] = before.x[from] ?? 0;
-      this.width[run] = before.width[from] ?? 0;
-      this.baseline[run] = before.baseline[from] ?? 0;
-      font[run] = before.font[from] ?? 0;
-      color[run] = before.color[from] ?? 0;
-      this.row[run] = before.row[from] ?? 0;
-      this.clipped[run] = before.clipped[from] ?? 0;
-      this.clip.set(before.clip.subarray(from * 4, from * 4 + 4), run * 4);
-      run++;
+    const order = [...states.values()].flat();
+    const { texts, x, width, baseline, row, clipped, clip } = this;
+    reorder(texts, first, order);
+    for (const field of [x, width, baseline, font, color, row, clipped]) {
+      reorder(field, first, order);
     }
+    const sides = [0, 1, 2, 3];
+    const clips = order.flatMap((from) => sides.map((side) => from * 4 + side));
+    reorder(clip, first * 4, clips);
   }
 
   #copy(from: TextRuns): void {
@@ -257,7 +267,7 @@ export function layoutText(
     if (right <= 0) {
       continue;
     }
-    const baseline = Math.round((top + bottom) / 2 + (look.lifts[style.font] ?? 0));
+    const baseline = Math.round((top + bottom) / 2 + look.lineOf(style.font).lift);
     const run = runs.push(record.text, x, width, baseline, style.font, inkOf(style, look), row);
     runs.setClip(run, 0, top, right, bottom);
     if (style.strikethrough) {
@@ -316,10 +326,11 @@ export function layoutText(
           continue;
         }
       }
-      const baseline = Math.round((top + bottom) / 2 + (look.lifts[style.font] ?? 0));
+      const line = look.lineOf(style.font);
+      const baseline = Math.round((top + bottom) / 2 + line.lift);
       const run = runs.push(text, x, width, baseline, style.font, color, row);
       const clipLeft = align === ALIGN_LEFT ? left : left + padding;
-      if (!fits || (look.lineHeights[style.font] ?? 0) > bottom - top) {
+      if (!fits || line.height > bottom - top) {
         runs.setClip(run, clipLeft, top, right, bottom);
       }
       if (style.strikethrough) {

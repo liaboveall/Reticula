@@ -49,16 +49,17 @@ interface FakeGroup {
 
 /** The buffers and textures of a bind group. */
 function resourcesOf({ descriptor }: FakeGroup): FakeResource[] {
-  return [...descriptor.entries].map(({ resource }) => {
-    const { buffer, texture } = resource as unknown as {
+  return [...descriptor.entries].flatMap(({ resource }) => {
+    const { buffer, texture } = (resource ?? {}) as {
       buffer?: FakeResource;
       texture?: FakeResource;
     };
     const bound = buffer ?? texture;
-    if (!bound) {
+    // Samplers are neither, and are never destroyed.
+    if (!bound && resource !== null) {
       throw new Error("bound to nothing");
     }
-    return bound;
+    return bound ?? [];
   });
 }
 
@@ -131,6 +132,7 @@ export class FakeDevice extends EventTarget {
   }
 
   createShaderModule = () => ({});
+  createSampler = () => null;
   createBindGroupLayout = () => ({});
   createPipelineLayout = () => ({});
   createBindGroup = (descriptor: GPUBindGroupDescriptor) => ({ descriptor });
@@ -321,4 +323,19 @@ export function quadsOf(bytes: Uint8Array) {
     });
   }
   return quads;
+}
+
+/** A part as the shader reads it, of the frame whose parts were uploaded last. */
+export function partOf(device: FakeDevice, offset: number) {
+  const records = device.recorder
+    .named("writeBuffer")
+    .map(({ args }) => args[2])
+    .filter((data) => data instanceof Float32Array && data.length > 2)
+    .at(-1);
+  if (!(records instanceof Float32Array)) {
+    throw new Error("no parts have been uploaded");
+  }
+  const view = new DataView(records.buffer, offset);
+  const [x, y, across, down] = [0, 4, 8, 12].map((at) => view.getFloat32(at, true));
+  return { x, y, across, down, rows: [view.getUint32(16, true), view.getUint32(20, true)] };
 }

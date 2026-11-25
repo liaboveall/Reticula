@@ -1,7 +1,8 @@
-import { PAGE_COLS, PAGE_ROWS } from "@reticula/protocol/viewport";
+import { FLAG_NUMBER, PAGE_COLS, PAGE_ROWS } from "@reticula/protocol/viewport";
 import type { Scroll } from "../../layout.ts";
 import { Colors, serializer } from "../color.ts";
 import type { Frame, FrameCounts } from "../frame.ts";
+import type { Look } from "../look.ts";
 import { BAND_ROWS, edgeOf, type PageLayout } from "../page-layout.ts";
 import type { PixelBox } from "../rects.ts";
 import { bandsOf, type PageStep, type Scene, SceneBuilder, type SceneStep } from "../scene.ts";
@@ -9,10 +10,19 @@ import { type TextMeasurer, textContext } from "../text-measure.ts";
 import type { GridRenderer, RendererCounters } from "../types.ts";
 import type { Gpu, Lease } from "./device.ts";
 import { ANY_ROW, FrameBuffer } from "./frame-buffer.ts";
-import { type Block, type PageView, RetainedPages } from "./pages.ts";
+import { faint } from "./glyphs.ts";
+import { type BandState, type Block, type PageView, RetainedPages } from "./pages.ts";
 
-/** Milliseconds a frame may spend on drawing text into the atlas. */
-const RASTER_BUDGET = 4;
+/**
+ * Milliseconds a frame may spend on making texts: laying them out, packing and
+ * drawing them. They leave time for the rest of a frame at 60 Hz, and are enough
+ * for another screen of texts whose characters have been drawn before.
+ */
+const BUDGET = 12;
+/** And while the sheet is being zoomed, when the next frame may have no use for them. */
+const ZOOM_BUDGET = 5;
+/** As many more may go into the headers, which are there for the first time in many of those. */
+const HEADER_BUDGET = 2;
 
 /** Some quads to draw: the frame's own, or those of a page. */
 interface Call {
@@ -24,8 +34,8 @@ interface Call {
   readonly clip: PixelBox | null;
 }
 
-/** A band of a page that may come into view, and which of its columns of pixels will. */
-interface BandAhead {
+/** A band of a page that is or may come into view, and which of its columns of pixels will. */
+interface BandInView {
   readonly layout: PageLayout;
   readonly index: number;
   readonly view: PageView;
@@ -58,6 +68,9 @@ export class Painter {
   #crowded = false;
   /** Whether a part of this frame has been submitted already. */
   #started = false;
+  /** What the last frame was drawn with. */
+  #look: Look | null = null;
+  #budget = BUDGET;
 
   constructor(gpu: Gpu, format: GPUTextureFormat) {
     this.#gpu = gpu;
@@ -84,20 +97,24 @@ export class Painter {
     frame: Frame,
     scene: Scene,
     view: GPUTextureView | null,
-    ahead: Iterable<BandAhead> = [],
+    ahead: Iterable<BandInView> = [],
   ): boolean {
     const { glyphs } = this.#gpu;
     const { bandsBuilt } = this.pages;
     this.pages.begin(frame.cache);
     this.drawCalls = 0;
     this.quads = 0;
-    if (this.#crowded || !this.#compose(scene, false, view)) {
+    const isZoomed = this.#look !== scene.look && this.#look?.theme === scene.look.theme;
+    this.#budget = isZoomed ? ZOOM_BUDGET : BUDGET;
+    this.#look = scene.look;
+    const hasRoom = () => !this.#crowded && this.#compose(scene, false, view);
+    if (!hasRoom() && !(this.pages.dropStale() && hasRoom())) {
       // Within the budget, bars would never go away: every frame, some texts
       // would make room for others that are in view as well.
       this.#crowded = !this.#compose(scene, true, view);
     }
     const complete = this.#complete || this.#crowded;
-    if (this.pages.bandsBuilt === bandsBuilt) {
+    if (complete && this.pages.bandsBuilt === bandsBuilt) {
       this.#prebuild(scene, ahead);
     }
     if (view) {
@@ -105,6 +122,7 @@ export class Painter {
       this.frames++;
     } else {
       glyphs.atlas.flush();
+      this.pages.flush();
     }
     if (!complete) {
       this.deferredFrames++;
@@ -128,20 +146,38 @@ export class Painter {
     let roomy = true;
     plan.now++;
     glyphs.atlas.full = false;
-    glyphs.begin(crowded ? Number.POSITIVE_INFINITY : RASTER_BUDGET);
+    glyphs.begin(crowded ? Number.POSITIVE_INFINITY : this.#budget);
     this.#buffers.clear();
     this.#calls = [];
     this.#mark = 0;
     this.#clipped = 0;
     this.#complete = true;
     // None of what is there already may be emptied for what is not.
+    const lacking: Record<BandState, BandInView[]> = { ready: [], stale: [], missing: [] };
     for (const step of scene.steps) {
       if (step.kind === "texts") {
         const { first, end } = bandsOf(step);
-        for (let band = first; band < end; band++) {
-          this.pages.keep(step.layout, band, viewOf(step));
+        const { layout } = step;
+        const pageView = viewOf(step);
+        for (let index = first; index < end; index++) {
+          const state = this.pages.stateOf(scene.look, layout, index, pageView);
+          if (state !== "ready") {
+            lacking[state].push({ layout, index, view: pageView });
+          }
         }
       }
+    }
+    if (!crowded) {
+      for (const { layout, index, view } of [...lacking.missing, ...lacking.stale]) {
+        if (!glyphs.hasTime) {
+          break;
+        }
+        this.pages.make(scene.look, layout, index, view);
+        if (glyphs.atlas.full) {
+          return false;
+        }
+      }
+      glyphs.allow(HEADER_BUDGET);
     }
     for (const step of scene.steps) {
       if (step.kind === "texts") {
@@ -149,21 +185,18 @@ export class Painter {
         const { first, end } = bandsOf(step);
         const pageView = viewOf(step);
         for (let index = first; index < end; index++) {
-          const add = () => this.pages.band(scene.look, step.layout, index, pageView);
-          let band = add();
-          if (glyphs.atlas.full) {
-            if (!crowded) {
-              return false;
+          if (crowded) {
+            const make = () => this.pages.make(scene.look, step.layout, index, pageView);
+            make();
+            if (glyphs.atlas.full) {
+              roomy = false;
+              this.#makeRoom(scene, view);
+              part = this.#part(step);
+              make();
+              glyphs.atlas.full = false;
             }
-            roomy = false;
-            this.#makeRoom(scene, view);
-            part = this.#part(step);
-            band = add();
-            glyphs.atlas.full = false;
           }
-          this.#clipped += band.clipped;
-          this.#complete &&= band.complete;
-          this.#call(band.block, part, step.clip);
+          this.#band(scene.look, step, index, pageView, part);
         }
       } else if (!this.#step(scene, step)) {
         if (!crowded) {
@@ -178,11 +211,75 @@ export class Painter {
     return roomy;
   }
 
-  /** Builds bands that are not in view yet, as many of them as are of one page. */
-  #prebuild(scene: Scene, ahead: Iterable<BandAhead>): void {
+  /** Makes calls of a band, or of what there is in its place. */
+  #band(look: Look, step: PageStep, index: number, view: PageView, part: number): void {
+    const { layout, x, y, firstRow, endRow } = step;
+    const band = this.pages.shown(look, layout, index, view);
+    if (!band) {
+      this.#complete = false;
+      this.#bars(look, step, index);
+      return;
+    }
+    let place = part;
+    if (band.layout !== layout) {
+      // Where it would be if all that is in it were enlarged with the sheet.
+      const { geometry: from } = band.layout;
+      const { geometry: to } = layout;
+      const top = index * BAND_ROWS;
+      const bottom = Math.min(layout.page.rowCount, top + BAND_ROWS);
+      const ratio = (now: number, before: number) => (before > 0 ? now / before : 1);
+      const at = ({ ys }: typeof to, row: number) => ys[row] ?? 0;
+      const across = ratio(to.xs.at(-1) ?? 0, from.xs.at(-1) ?? 0);
+      const down = ratio(at(to, bottom) - at(to, top), at(from, bottom) - at(from, top));
+      const start = y + at(to, top) - at(from, top) * down;
+      place = this.#buffers.part(x, start, firstRow, endRow, across, down);
+    }
+    this.#clipped += band.clipped;
+    this.#complete &&= band.complete && band.layout === layout;
+    this.#call(band.block, place, step.clip);
+  }
+
+  /** Bars about where a band's texts will be, of which nothing has been laid out yet. */
+  #bars(look: Look, { layout, x, y, clip, firstRow, endRow }: PageStep, index: number): void {
+    const { page, geometry } = layout;
+    const { xs, ys } = geometry;
+    const { instances } = this.#buffers;
+    const color = faint(look.text);
+    const { padding } = look;
+    const end = Math.min(endRow, (index + 1) * BAND_ROWS);
+    for (let row = Math.max(firstRow, index * BAND_ROWS); row < end; row++) {
+      const height = (ys[row + 1] ?? 0) - (ys[row] ?? 0);
+      const thickness = Math.ceil(height / 4);
+      const top = y + (ys[row] ?? 0) + ((height - thickness) >> 1);
+      for (let col = 0; col < page.colCount; col++) {
+        const cell = row * page.colCount + col;
+        const left = (xs[col] ?? 0) + padding;
+        const right = (xs[col + 1] ?? 0) - padding;
+        const { length } = page.texts[cell] ?? "";
+        if (length === 0 || left >= right) {
+          continue;
+        }
+        const width = Math.min(right - left, Math.ceil((length * height) / 3));
+        const isNumber = ((page.flags[cell] ?? 0) & FLAG_NUMBER) !== 0;
+        const start = x + (isNumber ? right - width : left);
+        const from = Math.max(clip.left, start);
+        const to = Math.min(clip.right, start + width);
+        const above = Math.max(clip.top, top);
+        const below = Math.min(clip.bottom, top + thickness);
+        if (from < to && above < below) {
+          instances.rect(from, above, to - from, below - above, color);
+        }
+      }
+    }
+  }
+
+  /** Makes bands that are not in view yet, as many of them as are of one page. */
+  #prebuild(scene: Scene, ahead: Iterable<BandInView>): void {
     let built: PageLayout | null = null;
     for (const { layout, index, view } of ahead) {
-      if (built ? layout !== built : this.pages.has(layout, index, view)) {
+      const isReady =
+        built === null && this.pages.stateOf(scene.look, layout, index, view) === "ready";
+      if (built ? layout !== built : isReady) {
         if (built) {
           return;
         }
@@ -192,7 +289,7 @@ export class Painter {
         return;
       }
       built = layout;
-      this.pages.band(scene.look, layout, index, view);
+      this.pages.make(scene.look, layout, index, view);
       if (this.#gpu.glyphs.atlas.full) {
         return;
       }
@@ -212,7 +309,11 @@ export class Painter {
         break;
       case "fills":
       case "borders":
-        this.#call(this.pages.rects(step.layout, step.kind), this.#part(step), step.clip);
+        this.#call(
+          this.pages.rects(scene.look, step.layout, step.kind),
+          this.#part(step),
+          step.clip,
+        );
         break;
       case "labels":
         this.#labels(scene, step.runs);
@@ -324,6 +425,7 @@ export class Painter {
     const { width, height } = scene;
     this.#flushOwn();
     glyphs.atlas.flush();
+    this.pages.flush();
     this.#buffers.upload(width, height);
     if (!this.#group || this.#groupVersion !== glyphs.atlas.version) {
       this.#groupVersion = glyphs.atlas.version;
@@ -332,6 +434,7 @@ export class Painter {
         entries: [
           { binding: 0, resource: { buffer: this.#buffers.screen } },
           { binding: 1, resource: glyphs.atlas.view },
+          { binding: 2, resource: pipelines.sampler },
         ],
       });
     }
@@ -470,7 +573,7 @@ export class WebGpuRenderer implements GridRenderer {
   }
 
   /** What comes into view next if the sheet is scrolled on. */
-  *#ahead(frame: Frame): Generator<BandAhead> {
+  *#ahead(frame: Frame): Generator<BandInView> {
     const { visible, scroll, scale, cache, layout: sheet } = frame;
     const down = Math.sign(scroll.top - this.#scroll.top);
     const across = Math.sign(scroll.left - this.#scroll.left);

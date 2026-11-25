@@ -107,35 +107,23 @@ function unitsOf(context: CanvasRenderingContext2D): number {
   return unitsPerPixel(advances);
 }
 
-/** The pen of a text that starts at `x`, in the precision of a 2D canvas, on which the phases depend. */
-class Pen {
-  #units: number;
-  #start: number;
-  #moved = 0;
+// The pen is in the precision of a 2D canvas, on which the phases depend, and so
+// is how far it has moved: in units, or in pixels where there are none.
 
-  constructor(x: number, units: number) {
-    this.#units = units;
-    this.#start = units > 0 ? Math.fround(Math.fround(x) * units) : Math.fround(x);
-  }
+function penAt(x: number, units: number): number {
+  return units > 0 ? Math.fround(Math.fround(x) * units) : Math.fround(x);
+}
 
-  get at(): number {
-    const at = Math.fround(this.#start + this.#moved);
-    return this.#units > 0 ? Math.fround(at / this.#units) : at;
-  }
-
-  /** How far it is from where it started. */
-  get moved(): number {
-    return this.#units > 0 ? this.#moved / this.#units : this.#moved;
-  }
-
-  move(advance: number): void {
-    const units = this.#units;
-    this.#moved = Math.fround(this.#moved + (units > 0 ? Math.round(advance * units) : advance));
-  }
+function movedBy(moved: number, advance: number, units: number): number {
+  return Math.fround(moved + (units > 0 ? Math.round(advance * units) : advance));
 }
 
 /** The phase that the pen is nearest to, in phases from the left edge. */
-function stepOf(at: number, phases: number): number {
+function stepOf(start: number, moved: number, units: number, phases: Phases): number {
+  let at = Math.fround(start + moved);
+  if (units > 0) {
+    at = Math.fround(at / units);
+  }
   return Math.floor(Math.fround(at + 0.5 / phases) * phases);
 }
 
@@ -164,10 +152,12 @@ function phasesOf(font: string, text: string): Phases | null {
   const rules = [4, 1] as const;
   const units = unitsOf(context);
   for (const [index, phases] of rules.entries()) {
-    const pen = new Pen(start, units);
+    const pen = penAt(start, units);
+    let moved = 0;
     for (const character of text) {
-      context.fillText(character, stepOf(pen.at, phases) / phases, baseline(index + 1));
-      pen.move(context.measureText(character).width);
+      const x = stepOf(pen, moved, units, phases) / phases;
+      context.fillText(character, x, baseline(index + 1));
+      moved = movedBy(moved, context.measureText(character).width, units);
     }
   }
   const { data } = context.getImageData(0, 0, CHECK.width, 3 * CHECK.line);
@@ -338,8 +328,10 @@ export class Glyphs {
   #pictures = new Map<string, Sprite>();
   #font = "";
   #color = "";
-  /** Milliseconds left of what a frame may spend on drawing into the atlas. */
-  #left = 0;
+  /** Until when the frame may make anything. */
+  #deadline = 0;
+  /** Set when nothing else fits into the atlas, this frame. */
+  #closed = false;
 
   constructor(
     open: (onEvict: (layer: number) => void) => Atlas,
@@ -351,15 +343,23 @@ export class Glyphs {
     this.#unitsOf = units;
   }
 
-  /** Starts a frame, which may take this many milliseconds for new pictures. */
+  /** Starts a frame, which may take this many milliseconds for what is new in it. */
   begin(budget: number): void {
-    this.#left = budget;
+    this.#deadline = performance.now() + budget;
+    this.#closed = false;
     this.atlas.unlimited = budget === Number.POSITIVE_INFINITY;
   }
 
-  /** Whether the frame has time for more new pictures. */
+  /** Lets the frame take some milliseconds more from now, whatever it has taken so far. */
+  allow(time: number): void {
+    this.#deadline = Math.max(this.#deadline, performance.now() + time);
+  }
+
+  /** Whether the frame has time for more that is new. */
   get hasTime(): boolean {
-    return this.atlas.unlimited || this.#left > 0;
+    return (
+      this.atlas.unlimited || (!this.#closed && performance.now() + this.atlas.due < this.#deadline)
+    );
   }
 
   /** Finds out how a font comes out, so that no frame has to wait for that. */
@@ -423,18 +423,22 @@ export class Glyphs {
     { origin, x, baseline, width, clip, row }: RunPlace,
   ): boolean | null {
     const { fast } = set;
+    const { units } = glyphs;
     const { phases } = glyphs.check;
-    const pen = new Pen(origin + x, glyphs.units);
-    for (let index = 0; index < text.length; index++) {
+    const pen = penAt(origin + x, units);
+    const { length } = text;
+    let moved = 0;
+    let found = 0;
+    for (let index = 0; index < length; index++) {
       const code = text.charCodeAt(index);
       // The nearest phase: the one that a 2D canvas draws it at.
-      const steps = stepOf(pen.at, phases);
-      const whole = Math.floor(steps / phases);
+      const steps = stepOf(pen, moved, units, phases);
+      const whole = phases === 4 ? steps >> 2 : steps;
       const phase = steps - whole * phases;
       const key = code * 4 + phase;
       let glyph = code < FAST ? fast[key] : set.glyphs.get(key);
       if (glyph) {
-        this.hits++;
+        found++;
       } else {
         const drawn = this.#glyph(glyphs, set, code, phase / phases);
         if (!drawn) {
@@ -447,10 +451,11 @@ export class Glyphs {
         this.layers |= 1 << glyph.layer;
         out.sprite(glyph, whole - origin + glyph.dx, baseline + glyph.dy, clip, row);
       }
-      pen.move(glyph.advance);
+      moved = movedBy(moved, glyph.advance, units);
     }
+    this.hits += found;
     // Anything else in how the font sets texts shows in their widths.
-    return Math.abs(pen.moved - width) <= 0.01 * (text.length + 1);
+    return Math.abs((units > 0 ? moved / units : moved) - width) <= 0.01 * (length + 1);
   }
 
   /** The picture of a character; `false` if it has none, `null` if it cannot be drawn now. */
@@ -458,14 +463,12 @@ export class Glyphs {
     if (!this.hasTime) {
       return null;
     }
-    const started = performance.now();
     const text = String.fromCharCode(code);
     const context = this.#using(glyphs, set);
     let size = glyphs.sizes.get(code);
     if (!size) {
       size = sizeOf(context.measureText(text));
       glyphs.sizes.set(code, size);
-      this.#left -= performance.now() - started;
     }
     const { advance } = size;
     const ink = inkOf(size, phase);
@@ -553,19 +556,17 @@ export class Glyphs {
 
   /** Draws into the atlas, if there is room. */
   #draw(width: number, height: number, paint: (x: number, y: number) => void): Sprite | null {
-    const started = performance.now();
     // What the quads so far were made from must not make room for the next one.
     this.atlas.plan.use(this.layers);
     const place = this.atlas.reserve(width, height);
     if (!place) {
-      // Nothing else will fit either, this frame.
-      this.#left = 0;
+      // Nothing else will fit either.
+      this.#closed = true;
       return null;
     }
     const { layer, top } = this.atlas.plan;
     paint(place.x, place.y);
     this.misses++;
-    this.#left -= performance.now() - started;
     return { layer, u: place.x, v: top + place.y, width, height };
   }
 
@@ -652,6 +653,10 @@ function bar(out: InstanceWriter, size: number, color: PackedColor, place: RunPl
     clip?.top ?? Number.NEGATIVE_INFINITY,
   );
   const bottom = Math.min(baseline, clip?.bottom ?? Number.POSITIVE_INFINITY);
-  const faint = ((color & 0xffffff) | ((alphaOf(color) >> 2) << 24)) >>> 0;
-  out.rect(left, top, right - left, bottom - top, faint, row);
+  out.rect(left, top, right - left, bottom - top, faint(color), row);
+}
+
+/** The colour of what stands for text of a colour. */
+export function faint(color: PackedColor): PackedColor {
+  return ((color & 0xffffff) | ((alphaOf(color) >> 2) << 24)) >>> 0;
 }

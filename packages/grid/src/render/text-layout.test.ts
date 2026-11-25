@@ -16,7 +16,7 @@ import {
 } from "./fixtures.ts";
 import type { GridCellStyle } from "./frame.ts";
 import { makeLook, StyleTable } from "./look.ts";
-import { PageLayout, type PageSetting } from "./page-layout.ts";
+import { BAND_ROWS, PageLayout, type PageSetting } from "./page-layout.ts";
 import { bandsOf, type Scene } from "./scene.ts";
 import { TextRuns } from "./text-layout.ts";
 
@@ -58,7 +58,7 @@ function runsOf(
   const setting = settingOf(scale, styles, frozenCols);
   const page = new PageLayout(pageOf(cells, 0, pageCol), layout, setting);
   const runs: Run[] = [];
-  for (let band = 0; band < page.bandCount; band++) {
+  for (let band = 0; band * BAND_ROWS < page.page.rowCount; band++) {
     const { texts } = page;
     const { first, end } = page.band(band);
     for (let run = first; run < end; run++) {

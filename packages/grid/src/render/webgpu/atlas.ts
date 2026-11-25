@@ -9,6 +9,9 @@ export const STRIP_HEIGHT = 512;
 export const MAX_LAYERS = 4;
 export const LAYER_BYTES = LAYER_SIZE * LAYER_SIZE * 4;
 
+/** Pictures whose upload says something about the next one. */
+const LEAST_TIMED = 32;
+
 /** A picture in the atlas. */
 export interface Sprite {
   layer: number;
@@ -182,6 +185,10 @@ export class Atlas {
   uploads = 0;
   uploadedBytes = 0;
   evictions = 0;
+  /** Milliseconds a picture takes to be uploaded, going by the last ones: most of drawing it. */
+  #cost = 0;
+  /** Pictures that have yet to be. */
+  #pending = 0;
   #device: GPUDevice;
   #guard: <T>(allocate: () => T) => T;
   #texture: GPUTexture;
@@ -206,6 +213,11 @@ export class Atlas {
   /** Bytes on the GPU. */
   get size(): number {
     return this.plan.layers * LAYER_BYTES;
+  }
+
+  /** Milliseconds that uploading what has been drawn will take. */
+  get due(): number {
+    return this.#pending * this.#cost;
   }
 
   /**
@@ -237,6 +249,7 @@ export class Atlas {
       place = this.plan.place(width, height);
     }
     if (place) {
+      this.#pending++;
       const { x, y } = place;
       const box = this.#dirty.find((other) => other.top === y);
       if (box) {
@@ -255,6 +268,7 @@ export class Atlas {
     if (boxes.length === 0) {
       return;
     }
+    const started = performance.now();
     if (this.raster.kind === "copy") {
       // Every copy costs about the same, however large it is.
       boxes = [
@@ -276,6 +290,13 @@ export class Atlas {
       });
       this.uploadedBytes += width * height * 4;
     }
+    const cost = (performance.now() - started) / this.#pending;
+    // Of a few, most is what any upload takes. But if that is less, so is the
+    // rest: there would never again be time for many after one slow upload.
+    if (this.#pending >= LEAST_TIMED || cost < this.#cost) {
+      this.#cost = (this.#cost + cost) / 2;
+    }
+    this.#pending = 0;
     this.uploads++;
     this.#dirty = [];
   }

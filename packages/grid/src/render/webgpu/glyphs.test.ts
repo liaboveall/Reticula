@@ -279,6 +279,30 @@ describe("a frame that has no time left", () => {
     expect(run("国酱").every(({ textured }) => textured)).toBe(true);
   });
 
+  test("has none for what would take it to upload", () => {
+    const { glyphs, run, drawn } = open();
+    glyphs.begin(4);
+    vi.spyOn(glyphs.atlas, "due", "get").mockImplementation(() => 3 * drawn().length);
+    expect(run("永东国")[0]?.textured).toBe(false);
+    expect(drawn()).toHaveLength(2);
+  });
+
+  test("may be allowed more", () => {
+    const { glyphs } = open();
+    glyphs.begin(4);
+    now = 10;
+    expect(glyphs.hasTime).toBe(false);
+    glyphs.allow(2);
+    expect(glyphs.hasTime).toBe(true);
+    now = 12;
+    expect(glyphs.hasTime).toBe(false);
+    // Not less than it had.
+    glyphs.begin(8);
+    glyphs.allow(2);
+    now = 19;
+    expect(glyphs.hasTime).toBe(true);
+  });
+
   test("draws some of a text's characters, but shows none of them", () => {
     const { glyphs, run } = open();
     glyphs.begin(4);

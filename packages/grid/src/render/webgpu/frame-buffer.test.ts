@@ -1,7 +1,7 @@
 import { describe, expect, test } from "vitest";
 import { packColor } from "../color.ts";
 import { RectList } from "../rects.ts";
-import { FakeDevice, quadsOf } from "./fakes.ts";
+import { FakeDevice, partOf, quadsOf } from "./fakes.ts";
 import { ANY_ROW, FrameBuffer, InstanceWriter } from "./frame-buffer.ts";
 import { INSTANCE_BYTES } from "./pipeline.ts";
 
@@ -82,17 +82,24 @@ describe("a frame's buffers", () => {
   test("have room for as many parts as there are, each where dynamic offsets may point", () => {
     const device = new FakeDevice();
     const buffers = new FrameBuffer(device.asDevice, {} as GPUBindGroupLayout);
-    for (let part = 1; part <= 100; part++) {
+    for (let part = 1; part < 100; part++) {
       expect(buffers.part(part, -part, 3, 9)).toBe(part * 256);
     }
+    expect(buffers.part(100, 2.5, 8, 16, 1.25, 0.75)).toBe(100 * 256);
     buffers.upload(640, 480);
     const { group, size } = buffers;
     const parts = device.recorder.named("writeBuffer").at(-1)?.args;
-    const records = parts?.[2] as Int32Array;
     expect(parts?.[4]).toBe((101 * 256) / 4);
-    expect([...records.slice((100 * 256) / 4, (100 * 256) / 4 + 4)]).toEqual([100, -100, 3, 9]);
     // The frame's own quads are where they say, in any row.
-    expect([...records.slice(0, 4)]).toEqual([0, 0, 0, ANY_ROW]);
+    expect(partOf(device, 0)).toEqual({ x: 0, y: 0, across: 1, down: 1, rows: [0, ANY_ROW] });
+    expect(partOf(device, 99 * 256)).toEqual({ x: 99, y: -99, across: 1, down: 1, rows: [3, 9] });
+    expect(partOf(device, 100 * 256)).toEqual({
+      x: 100,
+      y: 2.5,
+      across: 1.25,
+      down: 0.75,
+      rows: [8, 16],
+    });
     buffers.clear();
     buffers.upload(640, 480);
     expect(buffers.group).toBe(group);

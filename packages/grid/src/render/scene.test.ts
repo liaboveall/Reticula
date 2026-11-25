@@ -1,5 +1,6 @@
 import { FLAG_NUMBER } from "@reticula/protocol/viewport";
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
+import { PageCache } from "../cache.ts";
 import { FilterRowMap } from "../filter.ts";
 import { type SheetLayout, SparseAxis, viewMetrics } from "../layout.ts";
 import { ZOOM_STEPS } from "../zoom.ts";
@@ -31,7 +32,7 @@ const labels = (scene: Scene) => {
     throw new Error("no labels");
   }
   const { runs } = step;
-  return runs.texts.map((text, run) => ({
+  return runs.texts.slice(0, runs.length).map((text, run) => ({
     text,
     x: runs.x[run] ?? 0,
     color: runs.color[run] ?? 0,
@@ -718,7 +719,40 @@ describe("labels of headers that are too small for them", () => {
   });
 });
 
+test("a font is not asked for its lines before there is a text in it", () => {
+  const line = vi.fn(measure.line);
+  const builder = new SceneBuilder({ ...measure, line }, colors);
+  const bold = { ...PLAIN, bold: true };
+  const layOut = (style: number) => {
+    const cache = cacheOf({ "0:0": { text: "a", style } }, 1, 1);
+    for (const step of sceneOf(frameOf({ cache, styles: [PLAIN, bold] }), builder).steps) {
+      if (step.kind === "texts") {
+        step.layout.band(0);
+      }
+    }
+    return new Set(line.mock.calls.map(([font]) => font));
+  };
+  expect(layOut(0)).toEqual(new Set([`13px ${theme.fontFamily}`]));
+  expect(layOut(1)).toEqual(new Set([`13px ${theme.fontFamily}`, `700 13px ${theme.fontFamily}`]));
+});
+
 describe("between frames", () => {
+  test("a page is laid out again when it has come back", () => {
+    const builder = new SceneBuilder(measure, colors);
+    const layoutsOf = (cache: PageCache) =>
+      sceneOf(frameOf({ cache }), builder).steps.flatMap((step) =>
+        step.kind === "texts" ? [step.layout] : [],
+      );
+    const held = cacheOf({ "1:1": "a" }, 1, 1);
+    const [first] = layoutsOf(held);
+    expect(first?.band(0)).toMatchObject({ first: 0, end: 1 });
+    expect(layoutsOf(new PageCache())).toEqual([]);
+    const [second] = layoutsOf(held);
+    expect(second).not.toBe(first);
+    second?.band(0);
+    expect(second?.texts.texts[0]).toBe("a");
+  });
+
   test("a page is not laid out again because the sheet was scrolled", () => {
     const builder = new SceneBuilder(measure, colors);
     const cache = cacheOf({ "1:1": "a", "30:3": "b" }, 1, 1);
