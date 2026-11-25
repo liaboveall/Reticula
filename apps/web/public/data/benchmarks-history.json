@@ -155,6 +155,45 @@
         "b7aInsertCrossP50Ms": 2.17,
         "b7aInsertTopUs": 4.7
       }
+    },
+    {
+      "browser": "chrome 158.0.8127.37",
+      "commit": "d4ee458",
+      "cpu": "13th Gen Intel(R) Core(TM) i9-13980HX",
+      "date": "2026-11-25",
+      "native": {
+        "b11ProbeP95Ms": null,
+        "b11Save20mMs": 473.54,
+        "b12Load50mMs": 269.08,
+        "b12PeakWasmMiB": null,
+        "b12Recalc100kMs": 0.56,
+        "b12Save50mMs": 390.21,
+        "b1Load20mMs": 255.22,
+        "b2Sum1mMs": 1.58,
+        "b3FullRecalc1mMs": 5.48,
+        "b4Incremental100kP50Ms": 0.3,
+        "b4Incremental100kP95Ms": 0.34,
+        "b5Chain1mMs": 15.8,
+        "b7aInsertCrossP50Ms": 1.59,
+        "b7aInsertTopUs": 3.0
+      },
+      "suite": "m6-engine",
+      "wasmChrome": {
+        "b11ProbeP95Ms": 10.25,
+        "b11Save20mMs": 504.46,
+        "b12Load50mMs": 393.16,
+        "b12PeakWasmMiB": 552.63,
+        "b12Recalc100kMs": 1.08,
+        "b12Save50mMs": 608.57,
+        "b1Load20mMs": 316.32,
+        "b2Sum1mMs": 2.19,
+        "b3FullRecalc1mMs": 7.51,
+        "b4Incremental100kP50Ms": 0.62,
+        "b4Incremental100kP95Ms": 1.24,
+        "b5Chain1mMs": 19.09,
+        "b7aInsertCrossP50Ms": 2.05,
+        "b7aInsertTopUs": 4.4
+      }
     }
   ],
   "gpuRuns": [
@@ -2395,6 +2434,19 @@
       "wasmB9aTotalP50Ms": 6.23,
       "wasmB9aTotalP95Ms": 10.01,
       "wasmB9bTotalP50Ms": 157.68
+    },
+    {
+      "commit": "d4ee458",
+      "date": "2026-11-25",
+      "nativeB9aFrameP50Ms": 1.91,
+      "nativeB9aTotalP50Ms": 2.27,
+      "nativeB9bTotalP50Ms": 67.82,
+      "stage": "M6",
+      "suite": "m6-sync",
+      "wasmB9aFrameP50Ms": 2.11,
+      "wasmB9aTotalP50Ms": 2.64,
+      "wasmB9aTotalP95Ms": 3.11,
+      "wasmB9bTotalP50Ms": 73.72
     }
   ]
 }

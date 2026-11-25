@@ -979,8 +979,9 @@ function SyncEvolutionSvg({ syncRuns }: { readonly syncRuns: readonly SyncRun[] 
             <text x={x} y={Math.max(12, yw - 8)} fontSize="9" textAnchor="middle" fill="#0f766e">
               {t("{ms}ms", { ms: (r.wasmB9aTotalP50Ms ?? 0).toFixed(1) })}
             </text>
+            {/* The milestone; the table below has the rest. */}
             <text x={x} y={148} fontSize="9" textAnchor="middle" fill="currentColor">
-              {r.stage}
+              {r.stage.split(" ")[0]}
             </text>
           </g>
         );

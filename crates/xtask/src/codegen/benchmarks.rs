@@ -767,6 +767,7 @@ fn sync_stage_label(commit: &str, suite: &str) -> &'static str {
         "0429bfd" => "M2a in-place",
         "9eb1390" => "M2b worker incremental",
         _ if suite.starts_with("m3a") => "M3a wire v3 + permute",
+        _ if suite.starts_with("m6") => "M6",
         _ => "Sync replay",
     }
 }
