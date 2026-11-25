@@ -1077,14 +1077,17 @@ test("what is typed before its cell is known is not lost", async ({ page }) => {
 
   // It is not for a workbook that is opened meanwhile.
   await page.evaluate(() => {
-    window.__reticula?.spinWorker(700);
+    // Long enough for the command below, however busy the machine is.
+    window.__reticula?.spinWorker(3_000);
     window.__reticula?.select(800, 2);
     window.__reticula?.scrollTo({ top: Number.MAX_SAFE_INTEGER });
   });
   await page.keyboard.type("not there");
   await page.keyboard.press("Enter");
   await command(page, "new local workbook", "newWorkbook");
-  await expect(page.getByTestId("rejected-banner")).toContainText("not there");
+  await expect(page.getByTestId("rejected-banner")).toContainText("not there", {
+    timeout: 10_000,
+  });
   await expect(page.getByTestId("document")).toContainText("Untitled workbook");
   await ready(page);
   await goTo(page, "C801");

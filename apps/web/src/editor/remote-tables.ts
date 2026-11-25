@@ -14,6 +14,7 @@ import {
   type QueuedUpload,
   queuedUploads,
   remove,
+  removeAll,
   writeText,
 } from "../tables/delete.ts";
 import type { TableFailure } from "../tables/failure.ts";
@@ -100,7 +101,7 @@ export class RemoteTables {
         this.#tell();
       } else {
         // Copies were kept when they might be.
-        await this.#leave(tables);
+        void this.#leave(tables);
       }
     } catch {
       // It was never had.
@@ -178,7 +179,7 @@ export class RemoteTables {
     // Another list for another role.
     this.#version = undefined;
     await Promise.all([...this.#readers].map((reader) => reader.retarget(this.#target)));
-    await this.#leave(role === "viewer" ? this.#listed : []);
+    void this.#leave(role === "viewer" ? this.#listed : []);
     this.#handlers.onRole?.(role);
   }
 
@@ -199,10 +200,15 @@ export class RemoteTables {
     const isKept = canWrite && !this.#stopping.signal.aborted;
     try {
       const dir = await copiesDir(userId, isKept);
-      await Promise.all(tables.map(({ sha256 }) => remove(dir, sha256)));
-      await (isKept
-        ? writeText(dir, `${docId}.json`, JSON.stringify([this.#version, this.#listed]))
-        : remove(dir, `${docId}.json`));
+      const isGone = await removeAll(
+        dir,
+        tables.map(({ sha256 }) => sha256),
+      );
+      if (isKept) {
+        await writeText(dir, `${docId}.json`, JSON.stringify([this.#version, this.#listed]));
+      } else if (isGone) {
+        await remove(dir, `${docId}.json`);
+      }
     } catch {
       // There are none, or there cannot be any.
     }

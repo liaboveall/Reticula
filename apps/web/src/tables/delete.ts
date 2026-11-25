@@ -45,6 +45,27 @@ export function remove(dir: FileSystemDirectoryHandle, name: string): Promise<bo
   );
 }
 
+/** Tries something for a while, until it comes out: a file may be in use by a page that closes. */
+async function patiently(run: () => Promise<boolean>): Promise<boolean> {
+  for (let waited = 0; waited < PATIENCE_MS; waited += RETRY_MS) {
+    if (await run()) {
+      return true;
+    }
+    await new Promise((resolve) => setTimeout(resolve, RETRY_MS));
+  }
+  return false;
+}
+
+/** Removes some things from a directory, also those that are in use a little longer. */
+export function removeAll(
+  dir: FileSystemDirectoryHandle,
+  names: readonly string[],
+): Promise<boolean> {
+  return patiently(async () =>
+    (await Promise.all(names.map((name) => remove(dir, name)))).every(Boolean),
+  );
+}
+
 /** Writes a file that is there from one moment to the next, or not at all. */
 export async function writeText(
   dir: FileSystemDirectoryHandle,
@@ -165,7 +186,7 @@ export async function deleteTables(docId: string): Promise<boolean> {
   if ((await queuedUploads()).some(({ from }) => from?.docId === docId)) {
     return false;
   }
-  const removeAll = async (): Promise<boolean> => {
+  const removeTables = async (): Promise<boolean> => {
     const tables = await topDir("tables").catch(() => null);
     try {
       await tables?.removeEntry(docId, { recursive: true });
@@ -178,9 +199,9 @@ export async function deleteTables(docId: string): Promise<boolean> {
   };
   return navigator.locks?.request
     ? navigator.locks.request(tablesLock(docId), { ifAvailable: true }, (lock) =>
-        lock ? removeAll() : false,
+        lock ? removeTables() : false,
       )
-    : removeAll();
+    : removeTables();
 }
 
 /** The directory with somebody's copies of tables on the server. */
@@ -225,8 +246,14 @@ export async function dropCopies(exceptUserId?: string): Promise<boolean> {
 export async function dropCopiesOf(docId: string): Promise<void> {
   for (const [userId, dir] of await copiesOfOthers()) {
     const [, tables = []] = await lastList(userId, docId).catch(() => []);
-    for (const name of [...tables.map(({ sha256 }) => sha256), `${docId}.json`]) {
-      await remove(dir, name);
+    // Without the list nobody would know of those that are left.
+    if (
+      await removeAll(
+        dir,
+        tables.map(({ sha256 }) => sha256),
+      )
+    ) {
+      await remove(dir, `${docId}.json`);
     }
   }
 }
@@ -242,10 +269,5 @@ export async function deleteCopies(exceptUserId?: string): Promise<void> {
     channel.postMessage({ kind: SIGNED_OUT });
     channel.close();
   }
-  for (let waited = 0; waited < PATIENCE_MS; waited += RETRY_MS) {
-    if (await dropCopies(exceptUserId)) {
-      return;
-    }
-    await new Promise((resolve) => setTimeout(resolve, RETRY_MS));
-  }
+  await patiently(() => dropCopies(exceptUserId));
 }

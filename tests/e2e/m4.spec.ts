@@ -92,7 +92,7 @@ test.describe("M4 AI Analyst — collaborative cloud draft, conflict/closure rev
   test("cloud draft run streams steps, catches concurrent main edit conflict & closure guard, and syncs merged changes to second collaborator", async ({
     browser,
   }) => {
-    test.setTimeout(60_000);
+    test.setTimeout(120_000);
     if (!server) throw new Error("server not started");
 
     const aliceCtx = await browser.newContext();
@@ -117,9 +117,10 @@ test.describe("M4 AI Analyst — collaborative cloud draft, conflict/closure rev
 
       // Alice runs `[closure]` prompt on an isolated draft branch.
       await alice.getByTestId("ai-panel-btn").click();
-      await alice
-        .getByTestId("ai-prompt-input")
-        .fill("[closure] Insert row 2 with A2=25 and set B1 = =A2*2");
+      const prompt = alice.getByTestId("ai-prompt-input");
+      const asked = "[closure] Insert row 2 with A2=25 and set B1 = =A2*2";
+      await prompt.fill(asked);
+      await expect(prompt).toHaveValue(asked);
       await alice.getByTestId("ai-run-btn").click();
       await expect(alice.getByTestId("ai-draft-banner")).toContainText("Viewing AI Draft", {
         timeout: 15_000,

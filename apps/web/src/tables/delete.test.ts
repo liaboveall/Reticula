@@ -132,6 +132,31 @@ describe("copies of tables on the server", () => {
     await dropCopiesOf("doc");
   });
 
+  it("are deleted a little later when they are in use, and known of until then", async () => {
+    vi.useFakeTimers();
+    const list = JSON.stringify(["1.1", [{ sha256: "sum" }]]);
+    copies("a").put("doc.json", list);
+    const open = (isOpen: boolean) => {
+      const file = copies("a").files.get("sum");
+      if (file) {
+        file.open = isOpen;
+      }
+    };
+    open(true);
+    // For longer than it is tried: the list stays, for another time.
+    const dropped = dropCopiesOf("doc");
+    await vi.advanceTimersByTimeAsync(4_000);
+    await dropped;
+    expect([...copies("a").files.keys()]).toEqual(["sum", "doc.json"]);
+    // By a page that closes.
+    const again = dropCopiesOf("doc");
+    await vi.advanceTimersByTimeAsync(500);
+    open(false);
+    await vi.advanceTimersByTimeAsync(500);
+    await again;
+    expect(copies("a").files.size).toBe(0);
+  });
+
   it("are no longer used by any tab once somebody has signed out", async () => {
     FakeChannel.all.clear();
     const heard: unknown[] = [];
