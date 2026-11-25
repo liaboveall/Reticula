@@ -29,7 +29,17 @@ export interface NavigationJumps {
   readonly toUsedEnd?: ((extend: boolean) => void) | undefined;
 }
 
-type NavigationKey = Pick<KeyboardEvent, "key" | "shiftKey" | "ctrlKey" | "metaKey" | "altKey">;
+type Modifiers = Pick<KeyboardEvent, "ctrlKey" | "metaKey">;
+
+type NavigationKey = Pick<KeyboardEvent, "key" | "shiftKey" | "altKey"> & Modifiers;
+
+/** Whether Cmd is for what Ctrl is for elsewhere: on an iPad with a keyboard, too. */
+export const IS_MAC = typeof navigator !== "undefined" && /^Mac|^iP/.test(navigator.platform);
+
+/** Whether the modifier of commands is held, and not the other one: Ctrl has uses of its own on macOS. */
+export function isCommand({ ctrlKey, metaKey }: Modifiers, isMac = IS_MAC): boolean {
+  return ctrlKey !== metaKey && metaKey === isMac;
+}
 
 /** Rows and columns that a key moves the selection by. */
 export const STEPS: Readonly<Record<string, readonly [number, number]>> = {
@@ -51,14 +61,16 @@ export function navigate(
   grid: NavigationTarget,
   event: NavigationKey,
   jumps: NavigationJumps = {},
+  isMac = IS_MAC,
 ): boolean {
   const { key, shiftKey: extend } = event;
   const cell = extend ? (grid.selectionFocus ?? grid.selection) : grid.selection;
-  if (event.altKey) {
+  const command = isCommand(event, isMac);
+  if (event.altKey || (!command && (event.ctrlKey || event.metaKey))) {
     return false;
   }
   const { rows, cols } = grid.sheetSize;
-  if (event.ctrlKey || event.metaKey) {
+  if (command) {
     const direction = DIRECTIONS[key];
     if (direction) {
       if (jumps.toEdge) {

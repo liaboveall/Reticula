@@ -47,7 +47,7 @@ export {
   type Span,
   SparseAxis,
 } from "./layout.ts";
-export type { JumpDirection } from "./navigation.ts";
+export { IS_MAC, type JumpDirection } from "./navigation.ts";
 export type {
   DiffHighlightKind,
   DiffHighlightMap,

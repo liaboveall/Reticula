@@ -9,7 +9,9 @@ import type {
 } from "@reticula/protocol";
 import { freezeChoices, numberFormats } from "../editor/formats.ts";
 import { freezeChoiceOf } from "../editor/freeze.ts";
+import type { CellIds } from "../editor/held-commits.ts";
 import type { FreezeChoice } from "../editor/types.ts";
+import type { EngineMessage } from "../engine/client.ts";
 import { fmtInt, getLocale, type Locale, setLocale, t } from "../i18n/index.ts";
 import { LANGUAGES } from "../i18n/languages.ts";
 import { rendererPreference, setRendererPreference } from "../renderer.ts";
@@ -45,7 +47,7 @@ export interface Command {
   readonly checked?: (handle: EditorHandle) => boolean;
   /** Whether it has nothing to do with what is being typed into a cell. */
   readonly whileEditing?: boolean;
-  /** Returns `false` if it came to nothing. The sheet is the one in view, unless it is told. */
+  /** Returns `false`, or a promise of it, if it came to nothing. The sheet is the one in view, unless it is told. */
   readonly run: (handle: EditorHandle, sheet?: number) => unknown;
 }
 
@@ -174,41 +176,103 @@ function copyFill(dir: FillDirection) {
   };
 }
 
+/** How long to wait for the engine to answer. */
+const PATIENCE_MS = 1_000;
+
+/**
+ * Where the cells in use end on a sheet, once the engine has done all it has
+ * been asked for before. `null` if that takes too long. An answer that comes
+ * while there are others to come first is one to somebody else.
+ */
+async function usedEnd(
+  handle: EditorHandle,
+  sheet: number,
+  isNext: (message: EngineMessage) => boolean = () => true,
+): Promise<{ readonly row: number; readonly col: number } | null> {
+  let stop = () => {};
+  const end = await new Promise<{ row: number; col: number } | null>((resolve) => {
+    stop = handle.intercept((message) => {
+      if (!isNext(message) || message.kind !== "edgeJumped" || message.sheet !== sheet) {
+        return false;
+      }
+      resolve(message);
+      return true;
+    });
+    setTimeout(resolve, PATIENCE_MS, null);
+    handle.send({ kind: "jumpUsedEnd", sheet, select: false });
+  });
+  stop();
+  return end;
+}
+
 /**
  * Continues what is at one side of the selection over the rest of it. Which
  * part that is, is seen from what is empty: the rows or columns from that side
- * on with anything in them.
+ * on with anything in them. The engine is asked: what has been entered a moment
+ * ago may not be shown yet.
  */
 function fillSeries(direction: "down" | "up" | "right" | "left") {
-  return (handle: EditorHandle) => {
+  return async (handle: EditorHandle): Promise<boolean> => {
     const grid = handle.grid();
     const dst = grid?.selectionRange;
     if (!grid || !dst) {
       return false;
     }
+    const sheet = handle.sheetId();
+    const { rows, cols } = grid.sheetSize;
     const isVertical = direction === "down" || direction === "up";
     const length = isVertical ? dst.endRow - dst.firstRow : dst.endCol - dst.firstCol;
+    const across = isVertical ? dst.endCol - dst.firstCol : dst.endRow - dst.firstRow;
     const isForward = direction === "down" || direction === "right";
-    const hasAny = (line: number) => {
+    const cellsOf = (line: number): CellIds[] => {
       const at = isForward ? line : length - 1 - line;
-      const across = isVertical ? dst.endCol - dst.firstCol : dst.endRow - dst.firstRow;
+      const cells: CellIds[] = [];
       for (let cross = 0; cross < across; cross++) {
-        const text = isVertical
-          ? grid.textAt(dst.firstRow + at, dst.firstCol + cross)
-          : grid.textAt(dst.firstRow + cross, dst.firstCol + at);
+        const rowId = grid.rowIdAt(dst.firstRow + (isVertical ? at : cross));
+        const colId = grid.colIdAt(dst.firstCol + (isVertical ? cross : at));
         // What has not been loaded is out of view, and not known to be anything.
-        if (text === null) {
-          return false;
+        if (rowId === null || colId === null) {
+          break;
         }
-        if (text !== "") {
-          return true;
+        cells.push({ rowId, colId });
+      }
+      return cells;
+    };
+    const keyOf = ({ rowId, colId }: CellIds) => `${rowId} ${colId}`;
+    const asked = new Set<string>();
+    const inUse = new Set<string>();
+    // The first one is taken to be in use.
+    const lines: CellIds[][] = [[]];
+    let filled = 1;
+    for (let next = 8; filled === lines.length && filled < length; next *= 2) {
+      for (const end = Math.min(length, filled + next); lines.length < end; ) {
+        const cells = cellsOf(lines.length);
+        lines.push(cells);
+        for (const cell of cells) {
+          asked.add(keyOf(cell));
+          handle.send({ kind: "inspectCell", sheet, ...cell });
         }
       }
-      return false;
-    };
-    let filled = 1;
-    while (filled < length && hasAny(filled)) {
-      filled++;
+      const isAnswered = await usedEnd(handle, sheet, (message) => {
+        if (message.kind === "cellInspected" && message.sheet === sheet) {
+          // Of several answers, the last one is the one that has been asked for here.
+          const key = keyOf(message);
+          asked.delete(key);
+          inUse.delete(key);
+          if (message.raw !== "" || message.display !== "") {
+            inUse.add(key);
+          }
+        }
+        return asked.size === 0;
+      });
+      const size = grid.sheetSize;
+      // Where rows or columns have come or gone meanwhile, others may be in their places.
+      if (!isAnswered || handle.sheetId() !== sheet || size.rows !== rows || size.cols !== cols) {
+        return false;
+      }
+      while (lines[filled]?.some((cell) => inUse.has(keyOf(cell)))) {
+        filled++;
+      }
     }
     const size = filled === length ? 1 : filled;
     const src: Span = {
@@ -487,30 +551,15 @@ function moveSheet(direction: -1 | 1) {
   };
 }
 
-/** How long to wait for the engine to say whether there is anything on a sheet. */
-const PATIENCE_MS = 1_000;
-
 /** Whether a sheet may have anything on it, as far as that can be told. */
 async function mayHaveContent(handle: EditorHandle, sheet: number): Promise<boolean> {
   const inView = sheet === handle.sheetId();
   if (inView && handle.grid()?.textAt(0, 0) !== "") {
     return true;
   }
-  let stop = () => {};
-  const answer = await new Promise<boolean>((resolve) => {
-    stop = handle.intercept((message) => {
-      if (message.kind !== "edgeJumped" || message.sheet !== sheet) {
-        return false;
-      }
-      // The last cell in use is the first one if there is none, and also if that is the only one.
-      resolve(!inView || message.row > 0 || message.col > 0);
-      return true;
-    });
-    setTimeout(resolve, PATIENCE_MS, true);
-    handle.send({ kind: "jumpUsedEnd", sheet, select: false });
-  });
-  stop();
-  return answer;
+  const end = await usedEnd(handle, sheet);
+  // It is the first cell if there is none, and also if that is the only one.
+  return end === null || !inView || end.row > 0 || end.col > 0;
 }
 
 async function deleteSheet(handle: EditorHandle, sheet?: number): Promise<void> {
@@ -1122,7 +1171,15 @@ export function run(handle: EditorHandle, id: string, sheet?: number): void {
   if (!command.whileEditing) {
     handle.commitPending();
   }
-  if (!isEnabled(command, handle.state(), sheet) || command.run(handle, sheet) === false) {
-    announce(t("Not possible here: {command}", { command: command.title() }));
+  const say = (outcome: unknown) => {
+    if (outcome === false) {
+      announce(t("Not possible here: {command}", { command: command.title() }));
+    }
+  };
+  const outcome = isEnabled(command, handle.state(), sheet) && command.run(handle, sheet);
+  if (outcome instanceof Promise) {
+    void outcome.then(say);
+  } else {
+    say(outcome);
   }
 }

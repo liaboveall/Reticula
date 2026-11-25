@@ -4052,16 +4052,21 @@ fn describe_lex_error(err: LexError) -> &'static str {
     }
 }
 
-fn describe_axis_error(err: AxisError) -> &'static str {
-    match err {
+fn format_axis_error(err: AxisError) -> String {
+    let axis_err = match err {
+        AxisError::LimitExceeded => {
+            return String::from(
+                "This worksheet has no room for that: it can have 2,000,000 rows and 16,384 columns, including deleted ones.",
+            );
+        }
         AxisError::InvalidRun => "invalid run of rows or columns",
-        AxisError::LimitExceeded => "too many rows or columns",
         AxisError::AnchorNotFound => "insertion point not found",
         AxisError::DuplicateId => "row or column already exists",
         AxisError::TargetNotFound => "row or column not found",
         AxisError::InvalidInverse => "nothing to restore",
         AxisError::InvalidMove => "destination within the moved rows or columns",
-    }
+    };
+    format!("Axis limit or target error ({axis_err}).")
 }
 
 fn format_wal_corruption(corr: &WalCorruptionV3) -> String {
@@ -4105,10 +4110,7 @@ fn format_op_error(err: OpError) -> String {
         OpError::TooManyEdits => String::from("Operation exceeds per-transaction cell limit."),
         OpError::DuplicateCellTarget => String::from("Operation contains duplicate target cells."),
         OpError::TargetNotFound => String::from("Target row or column no longer exists."),
-        OpError::Axis(axis_err) => {
-            let axis_err = describe_axis_error(axis_err);
-            format!("Axis limit or target error ({axis_err}).")
-        }
+        OpError::Axis(axis_err) => format_axis_error(axis_err),
         OpError::InvalidDimensionOrFormat => {
             String::from("Dimension, freeze count, or format is out of bounds.")
         }
@@ -5261,15 +5263,63 @@ mod tests {
         }
         for err in [
             AxisError::InvalidRun,
-            AxisError::LimitExceeded,
             AxisError::AnchorNotFound,
             AxisError::DuplicateId,
             AxisError::TargetNotFound,
             AxisError::InvalidInverse,
             AxisError::InvalidMove,
         ] {
-            assert!(describe_axis_error(err).starts_with(|c: char| c.is_ascii_lowercase()));
+            let text = format_axis_error(err);
+            let reason = text.strip_prefix("Axis limit or target error (").unwrap();
+            assert!(reason.starts_with(|c: char| c.is_ascii_lowercase()));
         }
+    }
+
+    #[test]
+    fn a_column_too_many_is_refused_with_what_there_is_room_for() {
+        let mut eng = Engine::new();
+        eng.handle_command(EngineCommand::OpenEmpty);
+        let insert = |eng: &mut Engine| {
+            eng.handle_command(EngineCommand::InsertCols {
+                sheet: 0,
+                after_col_id: None,
+                count: 1,
+            })
+        };
+        let refused = insert(&mut eng);
+        let Some(EngineEvent::Rejected { reason }) = refused else {
+            panic!("expected a rejection, got {refused:?}");
+        };
+        assert_eq!(
+            reason,
+            "This worksheet has no room for that: it can have 2,000,000 rows and 16,384 columns, including deleted ones."
+        );
+        assert_eq!(
+            (
+                reticula_core::axis::MAX_ROW_AXIS_LEN,
+                reticula_core::axis::MAX_COL_AXIS_LEN
+            ),
+            (2_000_000, 16_384)
+        );
+        // A deleted column still counts.
+        eng.handle_command(EngineCommand::DeleteCols {
+            sheet: 0,
+            cols: vec![WireIdRun {
+                first_id: 3,
+                len: 2,
+            }],
+        });
+        assert!(matches!(
+            insert(&mut eng),
+            Some(EngineEvent::Rejected { .. })
+        ));
+        // Rows may be added to as many as a worksheet starts with.
+        let inserted = eng.handle_command(EngineCommand::InsertRows {
+            sheet: 0,
+            after_row_id: None,
+            count: 1,
+        });
+        assert!(matches!(inserted, Some(EngineEvent::SheetChanged { .. })));
     }
 
     #[test]

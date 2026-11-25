@@ -17,6 +17,9 @@ import {
 } from "./keyboard-helpers.ts";
 import { type DevServer, startDevServer } from "./ui-harness.ts";
 
+// Playwright does not intercept what a page requests in WebKit once a Service Worker controls it.
+test.use({ serviceWorkers: "block" });
+
 const isModal = (dialog: Locator) =>
   dialog.evaluate(
     (element) => element.matches("dialog:modal") && element.closest("[inert]") === null,
@@ -654,20 +657,77 @@ test.describe("the editor's dialogs and drawers", () => {
     await activate(page, apply);
     await expect(page.getByTestId("ai-draft-banner")).toBeHidden({ timeout: 10_000 });
     await expect.poll(() => announced(page)).toMatch(/^Merged selected changes from/);
-    await expectFocusInside(panel);
+    // With its draft the recording is done with: nothing could be applied a second time.
+    await expect(demo).toBeFocused();
+    await expect(page.getByTestId("ai-replay-play")).toHaveCount(0);
+    await expect(panel.locator(".ai-card")).toContainText("Merged selected changes from");
     await expect.poll(() => textAt(page, 2, 1)).toBe("520");
 
     // Another one, to be given up.
-    const allDemos = panel.getByRole("button", { name: "All Demos" });
-    await tabTo(page, allDemos, { back: true });
-    await page.keyboard.press("Enter");
-    await expect(demo).toBeFocused();
     await page.keyboard.press("Enter");
     await expect(page.getByTestId("ai-replay-play")).toBeFocused();
     await activate(page, page.getByTestId("ai-replay-review-btn"));
     await activate(page, page.getByTestId("ai-draft-discard"));
     await expect(page.getByTestId("ai-draft-banner")).toBeHidden({ timeout: 10_000 });
     await expect(demo).toBeFocused();
+  });
+
+  test("a recording is put away when its draft is left", async ({ page }, testInfo) => {
+    await openWorkbook(page, `keys-left-${testInfo.project.name}`, ["kept"]);
+    const panel = page.getByRole("complementary", { name: "AI Analyst" });
+    const play = page.getByTestId("ai-replay-play");
+    const banner = page.getByTestId("ai-draft-banner");
+    await page.getByTestId("ai-panel-btn").focus();
+    await page.keyboard.press("Enter");
+    const demo = page.getByTestId("ai-demo-conflict-and-closure-demo");
+    await activate(page, demo);
+    await expect(banner).toBeVisible({ timeout: 10_000 });
+    await activate(page, page.getByTestId("ai-replay-step"));
+    await page.getByTestId("ai-banner-exit-btn").focus();
+    await page.keyboard.press("Enter");
+    await expect(banner).toBeHidden({ timeout: 10_000 });
+    await expect(demo).toBeVisible();
+    await expect(play).toHaveCount(0);
+    await expect(panel.getByRole("button", { name: "Apply" })).toHaveCount(0);
+    await expect.poll(() => textAt(page, 0, 0)).toBe("kept");
+
+    // It is there again with a draft of its own, as is the next one that is selected.
+    await demo.focus();
+    await page.keyboard.press("Enter");
+    await expect(banner).toBeVisible({ timeout: 10_000 });
+    await expect(play).toHaveText("Play Replay");
+    await tabTo(page, panel.getByRole("button", { name: "All Demos" }), { back: true });
+    await page.keyboard.press("Enter");
+    await expect(demo).toBeFocused();
+    await page.keyboard.press("Enter");
+    await expect(banner).toBeVisible({ timeout: 10_000 });
+    await expect(play).toBeVisible();
+    await page.getByTestId("ai-replay-review-btn").focus();
+    await page.keyboard.press("Enter");
+    await expect(page.getByTestId("ai-diff-review")).toBeVisible();
+    await page.getByTestId("ai-banner-exit-btn").focus();
+    await page.keyboard.press("Enter");
+    await expect(banner).toBeHidden({ timeout: 10_000 });
+    await expect(page.getByTestId("ai-diff-review")).toHaveCount(0);
+    await expect(play).toHaveCount(0);
+    await expect.poll(() => textAt(page, 0, 0)).toBe("kept");
+  });
+
+  test("what could not be loaded is said in the language shown", async ({ page }, testInfo) => {
+    await page.route("**/data/ai-replays/index.json", (route) => route.fulfill({ status: 503 }));
+    await openWorkbook(page, `keys-said-${testInfo.project.name}`, ["1"]);
+    await page.getByTestId("ai-panel-btn").focus();
+    await page.keyboard.press("Enter");
+    const said = page.getByTestId("ai-panel").locator(".ai-card");
+    await expect(said).toHaveText("Could not load AI demos (503)");
+    await page.keyboard.press("Escape");
+    await focusInGrid(page);
+    await page.keyboard.press("ControlOrMeta+/");
+    await expect(page.getByTestId("palette-input")).toBeFocused();
+    await page.keyboard.type("chinese");
+    await page.keyboard.press("Enter");
+    await expect(page.locator("html")).toHaveAttribute("lang", "zh-CN");
+    await expect(said).toHaveText(/^\p{Script=Han}.*503/u);
   });
 
   test("a draft is not taken into another workbook, and recordings are asked for again", async ({

@@ -3,7 +3,7 @@ import { EditorView } from "@codemirror/view";
 import type { WireFormulaAnalysis } from "@reticula/protocol";
 import { formulaDecorationExtension, setFormulaAnalysisEffect } from "./formula-input.ts";
 import type { Grid } from "./grid.ts";
-import { type JumpDirection, navigate, STEPS } from "./navigation.ts";
+import { isCommand, type JumpDirection, navigate, STEPS } from "./navigation.ts";
 import { PADDING } from "./render/frame.ts";
 import type { TapEvent } from "./touch-input.ts";
 
@@ -42,10 +42,16 @@ export type EditorEvent =
   | { readonly kind: "clipboard"; readonly type: "copy" | "cut" | "paste" };
 
 export interface CellEditorOptions {
-  /** The text to start from when a cell is opened for editing (`F2` or double-click). */
-  readonly textOf: (cell: CellPosition) => string;
-  /** Called with what was typed when an edit is accepted. */
-  readonly onCommit: (cell: CellPosition, text: string) => void;
+  /**
+   * The text to start from when a cell is opened for editing (`F2` or double-click).
+   * `null` if that is not known yet: `supplyText` is to be called when it may be.
+   */
+  readonly textOf: (cell: CellPosition) => string | null;
+  /**
+   * Called with what was typed when an edit is accepted. It goes behind what is
+   * in the cell, if that has not been supplied by then.
+   */
+  readonly onCommit: (cell: CellPosition, text: string, isRest: boolean) => void;
   /** Called when the user presses `Delete` or `Backspace` while navigating. */
   readonly onClear?: () => void;
   /** Called whenever the live editor text or active editing cell changes (for formula bar sync). */
@@ -86,6 +92,8 @@ export class CellEditor {
   #view: EditorView;
   #cell: CellPosition | null = null;
   #mode: "input" | "edit" = "input";
+  /** Whether what is in the cell is yet to come, and to be put before what is typed meanwhile. */
+  #isWaiting = false;
   #suppressAutoStart = false;
   #suppressNotify = false;
   /** Whether a finger was the last to do anything here. */
@@ -158,6 +166,8 @@ export class CellEditor {
                 this.#cell,
                 this.#view.state.selection.main.head,
               );
+              // What has been composed is in the text by then.
+              setTimeout(() => this.supplyText());
             },
             copy: (event) => this.#onClipboard(event, "copy"),
             cut: (event) => this.#onClipboard(event, "cut"),
@@ -239,7 +249,8 @@ export class CellEditor {
     if (!cell) {
       return;
     }
-    const text = initialText ?? this.#options.textOf(cell);
+    const known = initialText ?? this.#options.textOf(cell);
+    const text = known ?? "";
     this.#suppressAutoStart = true;
     this.#view.dispatch({
       changes: { from: 0, to: this.#view.state.doc.length, insert: text },
@@ -251,9 +262,24 @@ export class CellEditor {
     } else {
       this.#mode = "edit";
     }
+    this.#isWaiting = known === null;
     this.#options.onTextChange?.(this.text, this.#cell, this.#view.state.selection.main.head);
     if (focusEditor) {
       this.#view.focus();
+    }
+  }
+
+  /** To be called when `textOf` may know of a cell what it did not when that was opened. */
+  supplyText(): void {
+    // What is being composed stays as it is until it is done.
+    const text =
+      this.#isWaiting && this.#cell && !this.composing ? this.#options.textOf(this.#cell) : null;
+    if (text !== null) {
+      this.#isWaiting = false;
+      this.#view.dispatch({
+        changes: { from: 0, insert: text },
+        selection: { anchor: text.length + this.cursorUtf16 },
+      });
     }
   }
 
@@ -388,6 +414,7 @@ export class CellEditor {
 
   #finish(notify = true): void {
     this.#cell = null;
+    this.#isWaiting = false;
     this.#mode = "input";
     delete this.#box.dataset.editing;
     this.#suppressAutoStart = true;
@@ -413,10 +440,13 @@ export class CellEditor {
     if (!cell) {
       return null;
     }
-    const text = this.text;
+    const { text } = this;
+    const isRest = this.#isWaiting;
     this.#finish();
-    this.#options.onCommit(cell, text);
-    this.#note({ kind: "committed", cell, text });
+    if (text || !isRest) {
+      this.#options.onCommit(cell, text, isRest);
+      this.#note({ kind: "committed", cell, text });
+    }
     return cell;
   }
 
@@ -438,8 +468,7 @@ export class CellEditor {
       event.preventDefault();
       return "swallowed";
     }
-    const mod = event.ctrlKey || event.metaKey;
-    const plain = !mod && !event.altKey;
+    const plain = !event.ctrlKey && !event.metaKey && !event.altKey;
 
     if (this.#cell) {
       if (
@@ -478,8 +507,8 @@ export class CellEditor {
       return "passed";
     }
 
-    // Undo / Redo / Select All while navigating (`Ctrl/Cmd + Z/Y/A`).
-    if (mod && !event.altKey) {
+    // Undo / Redo while navigating (`Ctrl + Z/Y`, with `Cmd` on macOS).
+    if (isCommand(event) && !event.altKey) {
       const lower = event.key.toLowerCase();
       if (lower === "z") {
         event.preventDefault();

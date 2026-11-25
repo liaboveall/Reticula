@@ -11,7 +11,7 @@ import simWasmUrl from "@reticula/protocol/sim-wasm?url";
 import { type FormEvent, useCallback, useEffect, useRef, useState } from "react";
 import { plainSelectionText } from "../editor/cell-announcer.ts";
 import { translateEngineText } from "../i18n/engine-text.ts";
-import { t } from "../i18n/index.ts";
+import { type Message, t } from "../i18n/index.ts";
 import { tx } from "../i18n/react.ts";
 import { errorText } from "../pages/errors.ts";
 import { roleName } from "../pages/labels.ts";
@@ -106,18 +106,24 @@ function announceSelection(host: HTMLElement, selection: Selection, last: string
   return text;
 }
 
+/** What the simulator says of a failure. */
+function failureOf(err: unknown): Message {
+  const text = err instanceof Error ? err.message : String(err);
+  return { say: () => translateEngineText(text) };
+}
+
 export default function SimLabPage({ onNavigate }: SimLabPageProps) {
   const [wasmReady, setWasmReady] = useState(false);
   const [mode, setMode] = useState<SimMode>("interactive");
   const [replicaCount, setReplicaCount] = useState<2 | 3>(2);
   const [labState, setLabState] = useState<SimLabState | null>(null);
   const [drafts, setDrafts] = useState<Record<number, EditDraft>>({});
-  const [labError, setLabError] = useState<string | null>(null);
+  const [labError, setLabError] = useState<Message | null>(null);
 
   const [seedInput, setSeedInput] = useState("42");
   const [autoRunning, setAutoRunning] = useState(false);
   const [autoProgress, setAutoProgress] = useState<AutoSimProgress | null>(null);
-  const [autoError, setAutoError] = useState<string | null>(null);
+  const [autoError, setAutoError] = useState<Message | null>(null);
 
   const mainRef = useKeptFocus();
   const labRef = useRef<InteractiveSimLab | null>(null);
@@ -210,7 +216,7 @@ export default function SimLabPage({ onNavigate }: SimLabPageProps) {
       })
       .catch((err) => {
         if (active) {
-          setLabError(errorText(err, t("Could not load simulator WASM.")));
+          setLabError({ say: () => errorText(err, t("Could not load simulator WASM.")) });
         }
       });
     return () => {
@@ -267,7 +273,7 @@ export default function SimLabPage({ onNavigate }: SimLabPageProps) {
       setLabState(nextState);
       syncAllReplicas(lab, false);
     } catch (err) {
-      setLabError(err instanceof Error ? err.message : String(err));
+      setLabError(failureOf(err));
     }
   };
 
@@ -295,7 +301,7 @@ export default function SimLabPage({ onNavigate }: SimLabPageProps) {
     setAutoError(null);
     const seed = parseSeed(seedInput.trim() || "42");
     if (seed === null) {
-      setAutoError(t("Seed must be an unsigned 64-bit integer."));
+      setAutoError({ say: () => t("Seed must be an unsigned 64-bit integer.") });
       return;
     }
     const runner = new AutoSimRunner(seed);
@@ -313,14 +319,14 @@ export default function SimLabPage({ onNavigate }: SimLabPageProps) {
         if (progress.finished) {
           setAutoRunning(false);
           if (progress.error) {
-            setAutoError(progress.error);
+            setAutoError(failureOf(progress.error));
           }
           return;
         }
         rafRef.current = window.requestAnimationFrame(tick);
       } catch (err) {
         setAutoRunning(false);
-        setAutoError(err instanceof Error ? err.message : String(err));
+        setAutoError(failureOf(err));
       }
     };
     rafRef.current = window.requestAnimationFrame(tick);
@@ -388,7 +394,7 @@ export default function SimLabPage({ onNavigate }: SimLabPageProps) {
             <div className="page-card">
               {labError ? (
                 <div className="page-error" role="alert" data-testid="sim-lab-error">
-                  {translateEngineText(labError)}
+                  {labError.say()}
                 </div>
               ) : (
                 <p role="status">{t("Loading simulator WebAssembly module…")}</p>
@@ -398,7 +404,7 @@ export default function SimLabPage({ onNavigate }: SimLabPageProps) {
             <>
               {labError && (
                 <div className="page-error" role="alert" data-testid="sim-lab-error">
-                  {translateEngineText(labError)}
+                  {labError.say()}
                 </div>
               )}
 
@@ -654,7 +660,7 @@ export default function SimLabPage({ onNavigate }: SimLabPageProps) {
             <section className="page-card">
               {autoError && (
                 <div className="page-error" role="alert" data-testid="sim-autorun-error">
-                  {translateEngineText(autoError)}
+                  {autoError.say()}
                 </div>
               )}
 

@@ -6,7 +6,7 @@ import type { SafeModeInfo } from "./engine/client.ts";
 import { readRawDocFilesFromOpfs, type WorkbookCatalogEntry } from "./engine/storage.ts";
 import { translateEngineText } from "./i18n/engine-text.ts";
 import { fmtDateTime } from "./i18n/formats.ts";
-import { fmtInt, t } from "./i18n/index.ts";
+import { fmtInt, type Message, t } from "./i18n/index.ts";
 import { tx } from "./i18n/react.ts";
 import { announce } from "./ui/announcer.ts";
 import { Dialog } from "./ui/Dialog.tsx";
@@ -41,8 +41,8 @@ interface WorkbookDialogsProps {
   readonly onExportXlsx: () => void;
   readonly onImportRtcl: (title: string, bytes: ArrayBuffer) => void;
   readonly onImportCsv: (title: string, sheetName: string, bytes: ArrayBuffer) => void;
-  readonly onImportNotice?: (message: string) => void;
-  readonly onImportRejected: (reason: string) => void;
+  readonly onImportNotice?: (message: Message) => void;
+  readonly onImportRejected: (reason: string | Message) => void;
   readonly onSafeModeOpenFrozen: (docId: string) => void;
   readonly onSafeModeSkipTail: (docId: string, skipCount: number, salvageMid: boolean) => void;
 }
@@ -385,19 +385,19 @@ function WorkbookDialogs({
         const buf = await file.arrayBuffer();
         const result = await importXlsxBytes(new Uint8Array(buf));
         if (result.report.unsupported.length > 0 || result.report.preservedFormulaCount > 0) {
-          const items = result.report.unsupported.map((u) => translateEngineText(u.detail));
-          if (result.report.preservedFormulaCount > 0) {
-            items.push(
-              t("{n} external/unknown formula(s) preserved with cached values", {
-                n: result.report.preservedFormulaCount,
+          const { unsupported, preservedFormulaCount: n } = result.report;
+          const items = () => [
+            ...unsupported.map((u) => translateEngineText(u.detail)),
+            ...(n > 0
+              ? [t("{n} external/unknown formula(s) preserved with cached values", { n })]
+              : []),
+          ];
+          onImportNotice?.({
+            say: () =>
+              t("Imported with Excel compatibility notes: {notes}", {
+                notes: items().join(t("; |separator")),
               }),
-            );
-          }
-          onImportNotice?.(
-            t("Imported with Excel compatibility notes: {notes}", {
-              notes: items.join(t("; |separator")),
-            }),
-          );
+          });
         }
         onImportRtcl(baseTitle, result.snapshot);
       } catch (err) {
@@ -406,11 +406,12 @@ function WorkbookDialogs({
       return;
     }
     if (file.size > MAX_CSV_RAW_BYTES) {
-      onImportRejected(
-        t("CSV file ({size}) exceeds the 256 MiB local workbook limit.", {
-          size: formatBytes(file.size),
-        }),
-      );
+      onImportRejected({
+        say: () =>
+          t("CSV file ({size}) exceeds the 256 MiB local workbook limit.", {
+            size: formatBytes(file.size),
+          }),
+      });
       return;
     }
     const buf = await file.arrayBuffer();
@@ -644,8 +645,8 @@ export type LocalModalsProps = Pick<
   | "onClose"
 > & {
   readonly handle: EditorHandle;
-  readonly onNotice: (message: string) => void;
-  readonly onRejected: (reason: string) => void;
+  readonly onNotice: (message: Message) => void;
+  readonly onRejected: (reason: string | Message) => void;
 };
 
 /** The same, in the editor. */

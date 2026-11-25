@@ -65,6 +65,7 @@ function editor({ state = {}, range = span(2, 3, 1, 2), texts = {} }: Fake = {})
   };
   const grid = {
     zoom: 1,
+    sheetSize: { rows: 100, cols: 20 },
     selection: { row: range.firstRow, col: range.firstCol },
     selectionRange: range,
     textAt: (row: number, col: number) => {
@@ -287,6 +288,14 @@ describe("the commands", () => {
 });
 
 describe("filling", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
   it("copies the first row or column over the rest, or the one before a single one", () => {
     const copied = (id: string, range: Span) => outcome(id, { range });
     const fill = (firstRow: number, rowCount: number, firstCol: number, colCount: number) => ({
@@ -311,28 +320,129 @@ describe("filling", () => {
     expect(copied("fillRight", span(2, 6, 0, 1))).toEqual([]);
   });
 
-  it("continues what is at one side of the selection", () => {
+  const inspected = (rowId: string, colId: string, raw: string, display = raw) =>
+    ({ kind: "cellInspected", sheet: 1, rowId, colId, raw, display }) as unknown as EngineMessage;
+
+  /** Runs a command with an engine that answers in order what it is asked. */
+  async function filled(
+    id: string,
+    fake: Fake,
+    engine = fake.texts ?? {},
+    stale: EngineMessage[] = [],
+  ) {
+    const { handle, log, say } = editor(fake);
+    const answers = [...stale];
+    const send = (command: EngineCommand) => {
+      if (command.kind === "inspectCell") {
+        const { rowId, colId } = command;
+        const raw = engine[`${rowId.slice(1)}:${colId.slice(1)}`] ?? "";
+        answers.push(inspected(rowId, colId, raw));
+      } else if (command.kind === "jumpUsedEnd") {
+        answers.push({ kind: "edgeJumped", sheet: command.sheet, row: 9, col: 9, select: false });
+        setTimeout(() => answers.splice(0).forEach(say));
+      }
+      return true;
+    };
+    run(Object.assign(handle, { send }), id);
+    await vi.advanceTimersByTimeAsync(10_000);
+    return log.filter((entry) => entry !== "commit");
+  }
+
+  it("continues what is at one side of the selection", async () => {
     const range = span(1, 6, 2, 4);
     const texts = { "1:2": "1", "2:3": "x", "5:2": "9", "4:2": "8", "3:3": "y" };
-    const source = (id: string, some: Fake) => (outcome(id, some)[0] as { src: Span }).src;
+    const source = async (id: string, fake: Fake) =>
+      ((await filled(id, fake))[0] as { src: Span } | undefined)?.src;
     // The second row counts, with something in its second column. The third is not empty either.
-    expect(source("fillSeriesDown", { range, texts })).toEqual(span(1, 2, 2, 4));
+    expect(await source("fillSeriesDown", { range, texts })).toEqual(span(1, 2, 2, 4));
     const gap = { ...texts, "3:3": "" };
-    expect(source("fillSeriesDown", { range, texts: gap })).toEqual(span(1, 3, 2, 4));
-    expect(source("fillSeriesUp", { range, texts: gap })).toEqual(span(4, 6, 2, 4));
-    expect(source("fillSeriesRight", { range: span(1, 2, 0, 5), texts: { "1:0": "1" } })).toEqual(
-      span(1, 2, 0, 1),
-    );
-    expect(
-      source("fillSeriesLeft", { range: span(1, 2, 0, 5), texts: { "1:4": "1", "1:3": "2" } }),
-    ).toEqual(span(1, 2, 3, 5));
+    expect(await source("fillSeriesDown", { range, texts: gap })).toEqual(span(1, 3, 2, 4));
+    expect(await source("fillSeriesUp", { range, texts: gap })).toEqual(span(4, 6, 2, 4));
+    const right = { range: span(1, 2, 0, 5), texts: { "1:0": "1" } };
+    expect(await source("fillSeriesRight", right)).toEqual(span(1, 2, 0, 1));
+    const left = { range: span(1, 2, 0, 5), texts: { "1:4": "1", "1:3": "2" } };
+    expect(await source("fillSeriesLeft", left)).toEqual(span(1, 2, 3, 5));
     // What has not been loaded is not known to be anything.
     const unknown = { "0:0": "1", "1:0": "2", "2:0": null };
-    expect(source("fillSeriesDown", { range: span(0, 9, 0, 1), texts: unknown })).toEqual(
+    expect(await source("fillSeriesDown", { range: span(0, 9, 0, 1), texts: unknown })).toEqual(
       span(0, 2, 0, 1),
+    );
+    // Of what goes on for long, all is found.
+    const long = Object.fromEntries(Array.from({ length: 30 }, (_, row) => [`${row}:0`, "1"]));
+    expect(await source("fillSeriesDown", { range: span(0, 90, 0, 1), texts: long })).toEqual(
+      span(0, 30, 0, 1),
     );
     expect(outcome("fillSeriesDown", { range: span(0, 1, 0, 3) })).toEqual([]);
     expect(outcome("fillSeriesRight", { range: span(0, 3, 0, 1) })).toEqual([]);
+  });
+
+  it("continues what the engine has, whatever is shown of it", async () => {
+    const range = span(0, 5, 0, 1);
+    const shown = { range, texts: { "0:0": "1" } };
+    // Typed a moment before, and not shown yet. An answer may still come from before that.
+    const engine = { "0:0": "1", "1:0": "3" };
+    const entered = await filled("fillSeriesDown", shown, engine, [inspected("r1", "c0", "")]);
+    expect(entered).toEqual([{ src: span(0, 2, 0, 1), dst: range }]);
+    // Cleared a moment before.
+    const texts = { "0:0": "1", "1:0": "3" };
+    const cleared = await filled("fillSeriesDown", { range, texts }, { "0:0": "1" }, [
+      inspected("r1", "c0", "3"),
+    ]);
+    expect(cleared).toEqual([{ src: span(0, 1, 0, 1), dst: range }]);
+    // A formula may show nothing. What comes before the answers is for somebody else.
+    const formula = editor({ ...shown, range: span(0, 3, 0, 1) });
+    const jumped: EngineMessage = { kind: "edgeJumped", sheet: 1, row: 1, col: 0, select: false };
+    run(formula.handle, "fillSeriesDown");
+    expect(formula.say(jumped)).toBe(false);
+    expect(formula.say(inspected("r1", "c0", '=""', ""))).toBe(false);
+    expect(formula.say(jumped)).toBe(false);
+    expect(formula.say(inspected("r2", "c0", ""))).toBe(false);
+    expect(formula.say(jumped)).toBe(true);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(formula.log.at(-1)).toEqual({ src: span(0, 2, 0, 1), dst: span(0, 3, 0, 1) });
+    expect(formula.say(jumped)).toBe(false);
+  });
+
+  it("changes nothing where the engine does not say what there is", async () => {
+    const { handle, log } = editor({ range: span(0, 5, 0, 1), texts: { "0:0": "1" } });
+    run(handle, "fillSeriesDown");
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(log.filter((entry) => (entry as { src?: Span }).src)).toEqual([]);
+    expect(announced).toEqual(["Not possible here: Fill Series Down"]);
+
+    // The sheet in view is another one by the time of the answer.
+    const other = editor({ range: span(0, 5, 0, 1), texts: { "0:0": "1" } });
+    run(other.handle, "fillSeriesDown");
+    Object.assign(other.handle, { sheetId: () => 2 });
+    for (const row of ["r1", "r2", "r3", "r4"]) {
+      other.say(inspected(row, "c0", ""));
+    }
+    const answer = { kind: "edgeJumped", sheet: 1, row: 0, col: 0, select: false } as const;
+    expect(other.say(answer)).toBe(true);
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(other.log.filter((entry) => (entry as { src?: Span }).src)).toEqual([]);
+
+    // Somebody has inserted a row or a column by then.
+    for (const sheetSize of [
+      { rows: 101, cols: 20 },
+      { rows: 100, cols: 21 },
+    ]) {
+      const moved = editor({ range: span(0, 2, 0, 1), texts: { "0:0": "1" } });
+      const answer = () => {
+        moved.say(inspected("r1", "c0", ""));
+        moved.say({ kind: "edgeJumped", sheet: 1, row: 0, col: 0, select: false });
+      };
+      run(moved.handle, "fillSeriesDown");
+      answer();
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(moved.log.at(-1)).toEqual({ src: span(0, 1, 0, 1), dst: span(0, 2, 0, 1) });
+      const fills = moved.log.length;
+      run(moved.handle, "fillSeriesDown");
+      Object.assign(moved.handle.grid() ?? {}, { sheetSize });
+      answer();
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(moved.log.slice(fills).filter((entry) => (entry as { src?: Span }).src)).toEqual([]);
+    }
   });
 });
 

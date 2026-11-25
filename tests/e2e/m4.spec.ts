@@ -42,8 +42,8 @@ test.describe("M4 AI Analyst — visitor pure-client replays (no sign-in)", () =
       .poll(() => page.evaluate(() => window.__reticula?.textAt(1, 4)), { timeout: 10_000 })
       .toBe("South");
 
-    // 2. Demo #10: Conflict & Reference Closure Lab.
-    await page.getByRole("button", { name: "All Demos" }).click();
+    // 2. Demo #10: Conflict & Reference Closure Lab. The merged one is put away.
+    await expect(page.getByTestId("ai-replay-play")).toHaveCount(0);
     await page.getByTestId("ai-demo-conflict-and-closure-demo").click();
     await expect(page.getByTestId("ai-draft-banner")).toBeVisible();
     await page.getByTestId("ai-replay-review-btn").click();

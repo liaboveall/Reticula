@@ -62,10 +62,7 @@ function queryWorkerBuildId(worker: ServiceWorker): Promise<string | null> {
 }
 
 export function createSwClient(options: SwClientOptions): SwClientHandle {
-  const swContainer =
-    typeof navigator !== "undefined" && "serviceWorker" in navigator
-      ? navigator.serviceWorker
-      : null;
+  const swContainer = "serviceWorker" in navigator ? navigator.serviceWorker : null;
 
   if (!swContainer || !import.meta.env.PROD) {
     return {

@@ -11,6 +11,7 @@ import {
   getAgentRun,
   listAgentRuns,
   type MergeConflictBody,
+  type MergePreviewResponse,
   type MergeSelection,
   mergeBranch,
   type PersistedStep,
@@ -20,7 +21,7 @@ import {
 import { type RefObject, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { personText } from "../collab/labels.ts";
 import { translateEngineText } from "../i18n/engine-text.ts";
-import { t } from "../i18n/index.ts";
+import { type Message, t } from "../i18n/index.ts";
 import { ActionButton } from "../ui/ActionButton.tsx";
 import { announce } from "../ui/announcer.ts";
 import { useDrawer } from "../ui/drawer.ts";
@@ -37,6 +38,7 @@ import {
   previewLocalReplayMerge,
   type ReplayBundle,
   type ReplayIndexEntry,
+  ReplayLoadError,
   type ReplayPresenceHint,
 } from "./replay-player.ts";
 
@@ -82,12 +84,33 @@ function presenceFromHint(h: ReplayPresenceHint): RemotePresenceOverlay {
   };
 }
 
-function failureText(err: unknown): string {
-  if (err instanceof ApiError) {
-    return t("Reticula API returned {status}", { status: err.status });
+/** Says why something failed, whatever the language is by then. */
+function failureOf(err: unknown): Message {
+  if (err instanceof ReplayLoadError) {
+    return err;
   }
-  return err instanceof Error ? translateEngineText(err.message) : String(err);
+  return {
+    say: () => {
+      if (err instanceof ApiError) {
+        return t("Reticula API returned {status}", { status: err.status });
+      }
+      return err instanceof Error ? translateEngineText(err.message) : String(err);
+    },
+  };
 }
+
+/** What the engine or the server says of it, if that is something, or else why it failed. */
+function failureSaid(text: unknown, err: unknown): Message {
+  return typeof text === "string" ? { say: () => translateEngineText(text) } : failureOf(err);
+}
+
+const NOTHING_TO_MERGE: MergePreviewResponse = {
+  canMerge: false,
+  mainHeadSeq: "0",
+  closureIssues: [],
+  unresolvedConflicts: [],
+  estimatedOps: 0,
+};
 
 type TabKey = "cloud" | "demos";
 
@@ -117,6 +140,8 @@ export default function AiPanel({
   const followCursorRef = useRef(followCursor);
   followCursorRef.current = followCursor;
   const prevDraftActiveRef = useRef(draftActive);
+  /** Whether the draft is being left for the list of recordings. */
+  const isLeavingRef = useRef(false);
 
   // Cloud mode state
   const [prompt, setPrompt] = useState("");
@@ -125,7 +150,7 @@ export default function AiPanel({
   const [steps, setSteps] = useState<PersistedStep[]>([]);
   const [streamText, setStreamText] = useState("");
   const [cloudDiff, setCloudDiff] = useState<BranchDiff | null>(null);
-  const [cloudError, setCloudError] = useState<string | null>(null);
+  const [cloudError, setCloudError] = useState<Message | null>(null);
   const [cloudBusy, setCloudBusy] = useState(false);
   const sseRef = useRef<EventSource | null>(null);
 
@@ -135,7 +160,7 @@ export default function AiPanel({
   const [replayIdx, setReplayIdx] = useState(-1);
   const [playing, setPlaying] = useState(false);
   const [replayReview, setReplayReview] = useState(false);
-  const [replayMsg, setReplayMsg] = useState<string | null>(null);
+  const [replayMsg, setReplayMsg] = useState<Message | null>(null);
 
   const headingRef = useRef<HTMLHeadingElement>(null);
   const promptRef = useRef<HTMLTextAreaElement>(null);
@@ -174,7 +199,7 @@ export default function AiPanel({
 
   useEffect(() => {
     if (replayMsg !== null) {
-      announce(replayMsg);
+      announce(replayMsg.say());
     }
   }, [replayMsg]);
 
@@ -226,12 +251,13 @@ export default function AiPanel({
         setDemos(idx.items);
         setReplayMsg(null);
       })
-      .catch((err) => setReplayMsg(failureText(err)));
+      .catch((err) => setReplayMsg(failureOf(err)));
   }, [open, shownTab, demos.length]);
 
   useEffect(() => () => closeSse(), [closeSse]);
 
-  // If the user clicks "Back to Main" on the editor banner, clear any open review drawer & SSE stream.
+  // Without its draft there is nothing to do with a recording: "Back to Main" has been pressed, it
+  // has been merged, or another workbook has been opened.
   useEffect(() => {
     const wasActive = prevDraftActiveRef.current;
     prevDraftActiveRef.current = draftActive;
@@ -240,6 +266,11 @@ export default function AiPanel({
       setPlaying(false);
       setCloudDiff(null);
       setReplayReview(false);
+      // One that has been selected since the list was asked for has a draft that is yet to open.
+      if (!isLeavingRef.current) {
+        setBundle(null);
+      }
+      isLeavingRef.current = false;
       onSetAiPresence(null);
       onSetDiffHighlights(null);
     }
@@ -250,7 +281,7 @@ export default function AiPanel({
       const d = await branchDiff(docId, branchId);
       if (runsOfRef.current === docId) setCloudDiff(d);
     } catch (err) {
-      if (runsOfRef.current === docId) setCloudError(failureText(err));
+      if (runsOfRef.current === docId) setCloudError(failureOf(err));
     }
   }, []);
 
@@ -317,7 +348,7 @@ export default function AiPanel({
               void loadCloudReview(docId, run.branchId);
             }
           } else if (d.error) {
-            setCloudError(translateEngineText(d.error));
+            setCloudError(failureSaid(d.error, null));
           }
           es.close();
           if (sseRef.current === es) sseRef.current = null;
@@ -353,16 +384,16 @@ export default function AiPanel({
     } catch (err) {
       if (runsOfRef.current !== collabDocId) return;
       if (err instanceof ApiError && err.status === 503) {
-        setCloudError(
-          t(
-            "Cloud AI is not configured on this server yet. Try the 10 built-in interactive demos below.",
-          ),
-        );
+        setCloudError({
+          say: () =>
+            t(
+              "Cloud AI is not configured on this server yet. Try the 10 built-in interactive demos below.",
+            ),
+        });
       } else if (err instanceof ApiError && err.body && typeof err.body === "object") {
-        const { error } = err.body as Partial<ErrorBody>;
-        setCloudError(typeof error === "string" ? translateEngineText(error) : failureText(err));
+        setCloudError(failureSaid((err.body as Partial<ErrorBody>).error, err));
       } else {
-        setCloudError(failureText(err));
+        setCloudError(failureOf(err));
       }
     } finally {
       setCloudBusy(false);
@@ -397,13 +428,7 @@ export default function AiPanel({
   const handleCloudPreview = useCallback(
     async (sel: MergeSelection) => {
       if (!collabDocId || !activeRun) {
-        return {
-          canMerge: false,
-          mainHeadSeq: "0",
-          closureIssues: [],
-          unresolvedConflicts: [],
-          estimatedOps: 0,
-        };
+        return NOTHING_TO_MERGE;
       }
       return previewBranchMerge(collabDocId, activeRun.branchId, sel);
     },
@@ -433,13 +458,15 @@ export default function AiPanel({
       ) {
         const conflict = err.body as Partial<MergeConflictBody>;
         if (conflict.diff) setCloudDiff(conflict.diff);
-        setCloudError(
-          typeof conflict.error === "string"
-            ? translateEngineText(conflict.error)
-            : t("Merge conflict detected; review updated diff."),
-        );
+        const { error } = conflict;
+        setCloudError({
+          say: () =>
+            typeof error === "string"
+              ? translateEngineText(error)
+              : t("Merge conflict detected; review updated diff."),
+        });
       } else {
-        setCloudError(failureText(err));
+        setCloudError(failureOf(err));
       }
     } finally {
       setCloudBusy(false);
@@ -476,7 +503,7 @@ export default function AiPanel({
       setReplayIdx(-1);
       onOpenReplayDraft(decodeBase64(loaded.baseSnapshotB64));
     } catch (err) {
-      setReplayMsg(failureText(err));
+      setReplayMsg(failureOf(err));
     }
   };
 
@@ -521,13 +548,7 @@ export default function AiPanel({
   const handleReplayPreview = useCallback(
     async (sel: MergeSelection) => {
       if (!bundle) {
-        return {
-          canMerge: false,
-          mainHeadSeq: "0",
-          closureIssues: [],
-          unresolvedConflicts: [],
-          estimatedOps: 0,
-        };
+        return NOTHING_TO_MERGE;
       }
       return previewLocalReplayMerge(
         bundle,
@@ -541,21 +562,23 @@ export default function AiPanel({
 
   const handleReplayApply = async (sel: MergeSelection) => {
     if (!bundle) return;
+    const { title } = bundle;
     onSetDiffHighlights(null);
     onSetAiPresence(null);
     if (collabDocId !== null || readOnly) {
       onExitDraft();
       setReplayReview(false);
-      setReplayMsg(
-        readOnly
-          ? t('Previewed "{title}". Nothing was merged: the workbook is read-only here.', {
-              title: bundle.title,
-            })
-          : t(
-              'Previewed "{title}" merge selection; returned to your cloud workbook without overwriting it.',
-              { title: bundle.title },
-            ),
-      );
+      setReplayMsg({
+        say: () =>
+          readOnly
+            ? t('Previewed "{title}". Nothing was merged: the workbook is read-only here.', {
+                title,
+              })
+            : t(
+                'Previewed "{title}" merge selection; returned to your cloud workbook without overwriting it.',
+                { title },
+              ),
+      });
       return;
     }
     const txns = buildLocalReplayMergeTxns(
@@ -566,12 +589,13 @@ export default function AiPanel({
     );
     onCommitLocalMerge(decodeBase64(bundle.baseSnapshotB64), txns);
     setReplayReview(false);
-    setReplayMsg(
-      t('Merged selected changes from "{title}" into your sheet.', { title: bundle.title }),
-    );
+    setReplayMsg({
+      say: () => t('Merged selected changes from "{title}" into your sheet.', { title }),
+    });
   };
 
   const handleReplayDiscard = async () => {
+    isLeavingRef.current = draftActive;
     setPlaying(false);
     setReplayReview(false);
     setBundle(null);
@@ -670,7 +694,7 @@ export default function AiPanel({
 
             {cloudError && !cloudDiff && (
               <div className="ai-card alert" role="alert">
-                {cloudError}
+                {cloudError.say()}
               </div>
             )}
 
@@ -707,7 +731,7 @@ export default function AiPanel({
                 activeSheetId={activeSheetId}
                 summaryText={runSummaryText(activeRun.summary)}
                 busy={cloudBusy}
-                errorText={cloudError}
+                errorText={cloudError?.say() ?? null}
                 onPreview={handleCloudPreview}
                 onApply={handleCloudApply}
                 onDiscard={handleCloudDiscard}
@@ -743,7 +767,7 @@ export default function AiPanel({
                 "Pure-client interactive replays running the real WASM FormulaEngine. No sign-in or API key required.",
               )}
             </div>
-            {replayMsg && <div className="ai-card">{replayMsg}</div>}
+            {replayMsg && <div className="ai-card">{replayMsg.say()}</div>}
 
             {!bundle ? (
               <div

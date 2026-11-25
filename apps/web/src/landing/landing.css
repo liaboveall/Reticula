@@ -207,9 +207,13 @@
   display: block;
   width: 100%;
   height: auto;
+  /* Safari gives one that could not be loaded the height of its text otherwise. */
+  aspect-ratio: var(--ratio);
   border-radius: 6px;
   box-shadow: 0 0 0 1px var(--shell-line);
   background: var(--shell-background);
+  color: var(--shell-muted);
+  font-size: 14px;
 }
 
 /* --- Things to try -------------------------------------------------------- */

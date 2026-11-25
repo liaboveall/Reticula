@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import type { GpuResult, GpuRun } from "../generated/benchmarks.ts";
-import { fmtInt, t } from "../i18n/index.ts";
+import { fmtInt, type Message, t } from "../i18n/index.ts";
 import { tx } from "../i18n/react.ts";
 import {
   comparisons,
@@ -196,7 +196,7 @@ function fmtPct(ratio: number): string {
 
 export default function BenchmarksPage({ onNavigate }: BenchmarksPageProps) {
   const [data, setData] = useState<BenchmarksHistory | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<Message | null>(null);
   const [filter, setFilter] = useState<TableFilter>("all");
 
   useEffect(() => {
@@ -207,12 +207,13 @@ export default function BenchmarksPage({ onNavigate }: BenchmarksPageProps) {
         if (active && json) {
           setData(json);
         } else if (active) {
-          setError(t("HTTP {status} loading benchmark archive", { status: res.status }));
+          const { status } = res;
+          setError({ say: () => t("HTTP {status} loading benchmark archive", { status }) });
         }
       })
       .catch((err: unknown) => {
         if (active) {
-          setError(errorText(err, t("Failed to load benchmark archive")));
+          setError({ say: () => errorText(err, t("Failed to load benchmark archive")) });
         }
       });
     return () => {
@@ -437,7 +438,9 @@ export default function BenchmarksPage({ onNavigate }: BenchmarksPageProps) {
           </div>
 
           {error && (
-            <p className="page-muted">{t("Error loading benchmark history: {error}", { error })}</p>
+            <p className="page-muted">
+              {t("Error loading benchmark history: {error}", { error: error.say() })}
+            </p>
           )}
           {!data && !error && (
             <p className="page-muted">{t("Loading archived benchmark results…")}</p>

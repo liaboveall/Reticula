@@ -35,6 +35,11 @@ export type Lookup = (source: string) => string | undefined;
 /** A catalogue as it is written, or as the build has made it. */
 export type LoadedCatalogue = Catalogue | Packed | PackedMessages;
 
+/** Something to say, kept as how to say it: the language may be switched while it is shown. */
+export interface Message {
+  readonly say: () => string;
+}
+
 /** What goes into the `{placeholders}` of a text. */
 export type Params = Readonly<Record<string, string | number>>;
 

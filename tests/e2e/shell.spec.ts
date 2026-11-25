@@ -434,6 +434,54 @@ test("a part of the editor that is gone leaves a message in place of a blank pag
   expect(server.documents()).toBe(2);
 });
 
+test("a key command whose code is gone is not ignored", async ({ page }) => {
+  server.missing = /\/later-/;
+  const openCommands = async () => {
+    await expect(page.getByTestId("engine-status")).toHaveText("ready");
+    await firstScreen(page);
+    await page.getByTestId("grid").focus();
+    await page.keyboard.press("ControlOrMeta+/");
+  };
+  await page.goto(`${server.origin}/app?hooks`);
+  const reloaded = page.waitForEvent("load");
+  await openCommands();
+  await reloaded;
+  expect(server.documents()).toBe(2);
+
+  await openCommands();
+  const problem = page.getByTestId("load-problem");
+  await expect(problem).toContainText("A newer version");
+  // What works without it stays.
+  await expect(page.getByTestId("grid")).toBeVisible();
+  expect(server.documents()).toBe(2);
+
+  server.missing = null;
+  await problem.getByRole("button", { name: "Reload" }).click();
+  await expect(problem).toHaveCount(0);
+  await openCommands();
+  await expect(page.getByTestId("palette-input")).toBeFocused();
+});
+
+test("a workbook that is open elsewhere is not shown without the lock over it", async ({
+  page,
+  context,
+}) => {
+  // From the start, so that the browser does not have it either.
+  server.missing = /\/later-/;
+  await page.goto(`${server.origin}/app?hooks`);
+  await expect(page.getByTestId("engine-status")).toHaveText("ready");
+  const other = await context.newPage();
+  await other.goto(`${server.origin}/app?hooks`, { waitUntil: "commit" });
+  const problem = other.getByTestId("load-problem");
+  await expect(problem).toContainText("A newer version", { timeout: 20_000 });
+  await expect(other.getByTestId("grid")).toHaveCount(0);
+  expect(server.documents()).toBe(3);
+
+  server.missing = null;
+  await problem.getByRole("button", { name: "Reload" }).click();
+  await expect(other.locator(".lock-overlay")).toBeVisible();
+});
+
 test("a message in place of a page stays when the address changes", async ({ page }) => {
   await page.goto(`${server.origin}/app?hooks`);
   await expect(page.getByTestId("engine-status")).toHaveText("ready");

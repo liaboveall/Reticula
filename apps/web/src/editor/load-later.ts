@@ -1,4 +1,5 @@
 import { type ComponentType, lazy } from "react";
+import type { Message } from "../i18n/index.ts";
 import { resolved } from "../ui/resolved.ts";
 
 type Later = typeof import("./later.ts");
@@ -38,8 +39,9 @@ export const withKeys = (text: string, command: string) => loaded?.withKeys(text
 /** What is said of a part of the editor to whoever points at it. */
 export const hint = (part: keyof Later["HINTS"]) => loaded?.HINTS[part]();
 
-/** What the engine has written, in the language shown. */
-export const engineText = (text: string) => loaded?.translateEngineText(text) ?? text;
+/** What the engine has written, or what there is to say, in the language shown. */
+export const engineText = (text: string | Message) =>
+  typeof text === "string" ? (loaded?.translateEngineText(text) ?? text) : text.say();
 
 /** Loads it when there is nothing more urgent to do. Never rejects. */
 export function loadLaterWhenIdle(then: () => void): void {

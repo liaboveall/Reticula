@@ -1,9 +1,8 @@
-import { ZOOM_STEPS } from "@reticula/grid";
+import { IS_MAC, ZOOM_STEPS } from "@reticula/grid";
 import type { RefObject } from "react";
 import { flushSync } from "react-dom";
 import type { EditorMenu } from "../editor/types.ts";
 import { fmtInt, t } from "../i18n/index.ts";
-import { IS_MAC } from "../keymap.ts";
 import Popup, { type PopupPlace } from "../ui/Popup.tsx";
 import type { EditorHandle } from "./handle.ts";
 import { keysOf, writtenKeysOf } from "./key-names.ts";

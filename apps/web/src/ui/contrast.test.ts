@@ -99,7 +99,7 @@ describe.each(["light", "dark"] as const)("the colors of the %s theme", (theme) 
 
 describe("custom properties", () => {
   // Set by scripts on the elements they are for.
-  const SET_ELSEWHERE = new Set(["--editor-padding"]);
+  const SET_ELSEWHERE = new Set(["--editor-padding", "--ratio"]);
   const EXPERIMENTS = /^(?:bench|ime|visual|ui\/harness)\//;
 
   it("are the same ones in both themes", () => {

@@ -1,3 +1,4 @@
+import type { CSSProperties } from "react";
 import { getLocale } from "../i18n/index.ts";
 import { SHOTS, type ShotName, shotUrl } from "./shots.ts";
 
@@ -22,6 +23,7 @@ export function Picture({ shot, alt, first = false }: PictureProps) {
       />
       <img
         className={`landing-shot landing-shot-${shot}`}
+        style={{ "--ratio": `${width} / ${height}` } as CSSProperties}
         src={shotUrl(shot, language, "light")}
         alt={alt}
         width={width}

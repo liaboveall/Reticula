@@ -442,6 +442,8 @@ test("rows and columns are inserted, moved, sized and deleted", async ({ page })
   await focusInGrid(page);
 
   // A sheet of as many columns as there can be has no room for another one; the sample has.
+  await command(page, "column left", "insertColLeft");
+  await expect(page.getByTestId("rejected-banner")).toContainText("16,384 columns");
   await page.goto("/app?hooks");
   await ready(page);
   await page.getByTestId("grid").focus();
@@ -474,9 +476,9 @@ test("cells are filled, as copies and as a series", async ({ page }) => {
   await expect.poll(() => textAt(page, 0, 2)).toBe("5");
 
   await goTo(page, "E1");
+  // How far the beginning of the series goes does not depend on what is shown of it by now.
+  await page.evaluate(() => window.__reticula?.spinWorker(500));
   await enter(page, ["1", "3"]);
-  // How far the beginning of the series goes is seen from what is shown.
-  await expect.poll(() => textAt(page, 1, 4)).toBe("3");
   await goTo(page, "E1:E5");
   await command(page, "series down", "fillSeriesDown");
   await expect.poll(() => column(page, 4, 5)).toEqual(["1", "3", "5", "7", "9"]);
@@ -920,6 +922,121 @@ test("what the engine refuses is said, whatever dialog is open", async ({ page }
   await activate(page, page.getByTestId("name-save-btn"));
   await expect.poll(() => alerted(page)).not.toBe("");
   await expect(page.locator("dialog:modal")).toHaveCount(1);
+});
+
+test("a cell is edited from what is in it, not from what is shown", async ({ page }) => {
+  await open(page, "formula");
+  await enter(page, ["5", "=A1+1"]);
+  await expect.poll(() => textAt(page, 1, 0)).toBe("6");
+  const formula = page.getByTestId("formula-input");
+  const editor = page.locator(".reticula-editor[data-editing]");
+  /** Selects the formula, with the engine busy for a while. */
+  const goThere = async () => {
+    await goTo(page, "C5");
+    await page.evaluate(() => {
+      window.__reticula?.spinWorker(700);
+      window.__reticula?.select(1, 0);
+    });
+  };
+
+  await goThere();
+  await page.keyboard.press("F2");
+  await expect(editor).toHaveText("");
+  await page.keyboard.press("Enter");
+  await selectionIs(page, "A3");
+  await goTo(page, "A2");
+  await expect(formula).toHaveText("=A1+1");
+
+  await goThere();
+  await page.keyboard.press("F2");
+  await page.keyboard.press("Escape");
+  await page.keyboard.press("F2");
+  await page.keyboard.type("+10");
+  await expect(editor).toHaveText("=A1+1+10");
+  await page.keyboard.press("Enter");
+  await selectionIs(page, "A3");
+  await expect.poll(() => textAt(page, 1, 0)).toBe("16");
+  await goTo(page, "A2");
+  await expect(formula).toHaveText("=A1+1+10");
+
+  // What is entered before that goes behind it all the same, and what is typed next elsewhere.
+  await goThere();
+  await page.keyboard.press("F2");
+  await page.keyboard.type("+100");
+  await page.keyboard.press("Enter");
+  await selectionIs(page, "A3");
+  await page.keyboard.type("7");
+  await page.keyboard.press("Enter");
+  await expect.poll(() => column(page, 0, 3)).toEqual(["5", "116", "7"]);
+  await goTo(page, "A2");
+  await expect(formula).toHaveText("=A1+1+10+100");
+
+  // What has been cleared a moment before is not there any more.
+  await page.evaluate(() => window.__reticula?.spinWorker(700));
+  await page.keyboard.press("Delete");
+  await page.keyboard.press("F2");
+  await page.keyboard.type("new");
+  await page.keyboard.press("Enter");
+  await expect.poll(() => column(page, 0, 3)).toEqual(["5", "new", "7"]);
+});
+
+test("what an input method composes is left alone when a cell's contents come", async ({
+  page,
+  browserName,
+}) => {
+  test.skip(browserName !== "chromium", "compositions are simulated through DevTools");
+  await open(page, "composed");
+  await enter(page, ["abc"]);
+  await expect.poll(() => textAt(page, 0, 0)).toBe("abc");
+  await goTo(page, "C5");
+  await page.evaluate(() => {
+    window.__reticula?.spinWorker(500);
+    window.__reticula?.select(0, 0);
+  });
+  const editor = page.locator(".reticula-editor[data-editing]");
+  await page.keyboard.press("F2");
+  const session = await page.context().newCDPSession(page);
+  const compose = (text: string) => {
+    const at = text.length;
+    return session.send("Input.imeSetComposition", { text, selectionStart: at, selectionEnd: at });
+  };
+  await compose("n");
+  await compose("ni");
+  await expect(page.getByTestId("formula-input")).toHaveText("ni");
+  await page.evaluate(() => window.__reticula?.stateDigest());
+  await compose("nih");
+  await expect(editor).toHaveText("nih");
+  await session.send("Input.insertText", { text: "你好" });
+  await expect(editor).toHaveText("abc你好");
+  await page.keyboard.press("Enter");
+  await expect.poll(() => textAt(page, 0, 0)).toBe("abc你好");
+});
+
+test("on macOS the grid's own keys go with Cmd, and Ctrl is for others", async ({ page }) => {
+  await page.addInitScript(() => {
+    Object.defineProperty(Navigator.prototype, "platform", { get: () => "MacIntel" });
+  });
+  await open(page, "mac");
+  await enter(page, ["1", "2", "3"]);
+  await expect.poll(() => column(page, 0, 3)).toEqual(["1", "2", "3"]);
+  await page.evaluate(() => window.__reticula?.select(0, 0));
+  for (const keys of ["z", "y", "a", "ArrowDown", "End", "Home", "Shift+ArrowDown"]) {
+    await page.keyboard.press(`Control+${keys}`);
+  }
+  await page.waitForTimeout(300);
+  await selectionIs(page, "A1");
+  expect(await column(page, 0, 3)).toEqual(["1", "2", "3"]);
+
+  await page.keyboard.press("Meta+ArrowDown");
+  await selectionIs(page, "A3");
+  await page.keyboard.press("Meta+Home");
+  await selectionIs(page, "A1");
+  await page.keyboard.press("Meta+a");
+  await selectionIs(page, /^A1:/);
+  await page.keyboard.press("Meta+z");
+  await expect.poll(() => column(page, 0, 3)).toEqual(["1", "2", ""]);
+  await page.keyboard.press("Meta+Shift+z");
+  await expect.poll(() => column(page, 0, 3)).toEqual(["1", "2", "3"]);
 });
 
 test("what is typed before its cell is known is not lost", async ({ page }) => {

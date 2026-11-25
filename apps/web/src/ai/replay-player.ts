@@ -4,7 +4,7 @@ import type {
   ConflictResolution,
   MergePreviewResponse,
 } from "@reticula/protocol/collab-api";
-import { t } from "../i18n/index.ts";
+import { type Message, t } from "../i18n/index.ts";
 
 export interface ReplayIndexEntry {
   readonly id: string;
@@ -67,20 +67,32 @@ export interface ReplayBundle {
   readonly acceptAllTxnsB64?: readonly string[];
 }
 
+/** A recording, or the list of them, that the server does not give out. */
+export class ReplayLoadError extends Error implements Message {
+  readonly say: () => string;
+
+  constructor(say: () => string) {
+    super(say());
+    this.say = say;
+  }
+}
+
 export async function fetchReplayIndex(): Promise<ReplayIndex> {
   const resp = await fetch("/data/ai-replays/index.json");
-  if (!resp.ok) {
-    const message = t("Could not load AI demos ({status})", { status: resp.status });
-    throw new Error(message);
+  const { ok, status } = resp;
+  if (!ok) {
+    const say = () => t("Could not load AI demos ({status})", { status });
+    throw new ReplayLoadError(say);
   }
   return resp.json();
 }
 
 export async function fetchReplayBundle(id: string): Promise<ReplayBundle> {
   const resp = await fetch(`/data/ai-replays/${encodeURIComponent(id)}.json`);
-  if (!resp.ok) {
-    const message = t('Could not load demo "{id}" ({status})', { id, status: resp.status });
-    throw new Error(message);
+  const { ok, status } = resp;
+  if (!ok) {
+    const say = () => t('Could not load demo "{id}" ({status})', { id, status });
+    throw new ReplayLoadError(say);
   }
   return resp.json();
 }

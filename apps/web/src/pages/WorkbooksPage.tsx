@@ -23,7 +23,7 @@ import {
   type WorkbookCatalogEntry,
 } from "../engine/storage.ts";
 import { fmtBytes } from "../i18n/formats.ts";
-import { t } from "../i18n/index.ts";
+import { type Message, t } from "../i18n/index.ts";
 import { ActionButton } from "../ui/ActionButton.tsx";
 import { announce } from "../ui/announcer.ts";
 import { isComposing, useKeptFocus } from "../ui/focus.ts";
@@ -40,10 +40,12 @@ export interface WorkbooksPageProps {
 
 type TabKind = "owned" | "shared" | "local" | "samples";
 
+function failureOf(err: unknown, fallback: () => string): Message {
+  return { say: () => apiErrorMessage(err, fallback()) };
+}
+
 function localBackend(): StorageBackendKind {
-  return typeof navigator !== "undefined" && typeof navigator.storage?.getDirectory === "function"
-    ? "opfs-writable"
-    : "memory";
+  return typeof navigator.storage?.getDirectory === "function" ? "opfs-writable" : "memory";
 }
 
 export default function WorkbooksPage({ onNavigate }: WorkbooksPageProps) {
@@ -55,15 +57,15 @@ export default function WorkbooksPage({ onNavigate }: WorkbooksPageProps) {
   const [renameId, setRenameId] = useState<string | null>(null);
   const [renameTitle, setRenameTitle] = useState("");
   const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [statusMsg, setStatusMsg] = useState<string | null>(null);
+  const [error, setError] = useState<Message | null>(null);
+  const [statusMsg, setStatusMsg] = useState<Message | null>(null);
   const loadSeqRef = useRef(0);
   const mainRef = useKeptFocus();
   const importRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     if (statusMsg !== null) {
-      announce(statusMsg);
+      announce(statusMsg.say());
     }
   }, [statusMsg]);
 
@@ -89,7 +91,7 @@ export default function WorkbooksPage({ onNavigate }: WorkbooksPageProps) {
         setUser(null);
         setCloudLists(null);
       } else {
-        setError(apiErrorMessage(err, t("Failed to load workbooks")));
+        setError(failureOf(err, () => t("Failed to load workbooks")));
       }
     }
   }, []);
@@ -106,7 +108,7 @@ export default function WorkbooksPage({ onNavigate }: WorkbooksPageProps) {
       await devLogin({ account });
       await loadData();
     } catch (err) {
-      setError(apiErrorMessage(err, t("Sign-in failed")));
+      setError(failureOf(err, () => t("Sign-in failed")));
     } finally {
       setBusy(false);
     }
@@ -119,7 +121,7 @@ export default function WorkbooksPage({ onNavigate }: WorkbooksPageProps) {
       const key = await createWorkbook({ title: newTitle.trim() || "Cloud Workbook" });
       onNavigate(`/app?collab=${encodeURIComponent(key.id)}`);
     } catch (err) {
-      setError(apiErrorMessage(err, t("Could not create cloud workbook")));
+      setError(failureOf(err, () => t("Could not create cloud workbook")));
     } finally {
       setBusy(false);
     }
@@ -143,7 +145,7 @@ export default function WorkbooksPage({ onNavigate }: WorkbooksPageProps) {
       endRename(id);
       await loadData();
     } catch (err) {
-      setError(apiErrorMessage(err, t("Could not rename workbook")));
+      setError(failureOf(err, () => t("Could not rename workbook")));
     } finally {
       setBusy(false);
     }
@@ -154,10 +156,10 @@ export default function WorkbooksPage({ onNavigate }: WorkbooksPageProps) {
     setError(null);
     try {
       await deleteWorkbook(item.id);
-      setStatusMsg(t('Deleted "{title}".', { title: item.title }));
+      setStatusMsg({ say: () => t('Deleted "{title}".', { title: item.title }) });
       await loadData();
     } catch (err) {
-      setError(apiErrorMessage(err, t("Could not delete workbook")));
+      setError(failureOf(err, () => t("Could not delete workbook")));
     } finally {
       setBusy(false);
     }
@@ -177,7 +179,7 @@ export default function WorkbooksPage({ onNavigate }: WorkbooksPageProps) {
       const key = await importWorkbook(encodeURIComponent(baseTitle), new Uint8Array(buf));
       onNavigate(`/app?collab=${encodeURIComponent(key.id)}`);
     } catch (err) {
-      setError(apiErrorMessage(err, t("Could not import snapshot")));
+      setError(failureOf(err, () => t("Could not import snapshot")));
     } finally {
       setBusy(false);
     }
@@ -186,13 +188,15 @@ export default function WorkbooksPage({ onNavigate }: WorkbooksPageProps) {
   const handleConvertLocal = async (entry: WorkbookCatalogEntry) => {
     setBusy(true);
     setError(null);
-    setStatusMsg(t('Packing "{title}" and uploading to cloud…', { title: entry.title }));
+    setStatusMsg({
+      say: () => t('Packing "{title}" and uploading to cloud…', { title: entry.title }),
+    });
     try {
       const key = await uploadLocalDocToCloud(entry.id, entry.title);
       onNavigate(`/app?collab=${encodeURIComponent(key.id)}`);
     } catch (err) {
       setStatusMsg(null);
-      setError(apiErrorMessage(err, t("Could not convert local workbook to cloud")));
+      setError(failureOf(err, () => t("Could not convert local workbook to cloud")));
     } finally {
       setBusy(false);
     }
@@ -204,7 +208,7 @@ export default function WorkbooksPage({ onNavigate }: WorkbooksPageProps) {
       const next = await removeDocStorage(entry.id, localBackend());
       setLocalDocs(next);
     } catch (err) {
-      setError(apiErrorMessage(err, t("Could not remove local workbook")));
+      setError(failureOf(err, () => t("Could not remove local workbook")));
     } finally {
       setBusy(false);
     }
@@ -330,10 +334,10 @@ export default function WorkbooksPage({ onNavigate }: WorkbooksPageProps) {
           >
             {error && (
               <div className="collab-error" data-testid="workbooks-error" role="alert">
-                {error}
+                {error.say()}
               </div>
             )}
-            {statusMsg && <p className="page-muted">{statusMsg}</p>}
+            {statusMsg && <p className="page-muted">{statusMsg.say()}</p>}
 
             {(tab === "owned" || tab === "shared") && !user && (
               <div className="collab-section" data-testid="workbooks-signin">

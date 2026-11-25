@@ -58,7 +58,7 @@ import {
   touchOverride,
 } from "./hooks.ts";
 import type { HookHost } from "./hooks-install.ts";
-import { t } from "./i18n/index.ts";
+import { type Message, t } from "./i18n/index.ts";
 import { commandFor, focusScope, swallowContextMenu } from "./keymap.ts";
 import type { LocalModalMode } from "./LocalModals.tsx";
 import type { M3aModalEvent, M3aToolMode } from "./M3aToolsModal.tsx";
@@ -117,24 +117,12 @@ const MARKS = {
 
 function computeLocalExcelSerialNow(): number {
   const now = new Date();
-  const localMs = Date.UTC(
-    now.getFullYear(),
-    now.getMonth(),
-    now.getDate(),
-    now.getHours(),
-    now.getMinutes(),
-    now.getSeconds(),
-    now.getMilliseconds(),
-  );
+  const localMs = now.getTime() - now.getTimezoneOffset() * 60_000;
   return 25569 + localMs / 86_400_000;
 }
 
 function nextEvalSeed(): string {
-  const words = new Uint32Array(2);
-  crypto.getRandomValues(words);
-  const hi = BigInt(words[0] ?? 0);
-  const lo = BigInt(words[1] ?? 0);
-  return ((hi << 32n) | lo).toString();
+  return String(crypto.getRandomValues(new BigUint64Array(1))[0]);
 }
 
 function sendEvalEnv(client: EngineClient): void {
@@ -153,15 +141,6 @@ function readInitialUrlDoc(): {
   joinToken: string | null;
   shareToken: string | null;
 } {
-  if (typeof window === "undefined") {
-    return {
-      docId: DEFAULT_DOC_ID,
-      safeRequested: false,
-      collabId: null,
-      joinToken: null,
-      shareToken: null,
-    };
-  }
   const params = new URLSearchParams(window.location.search);
   const rawDoc = params.get("doc")?.trim();
   const safeDoc = rawDoc && /^[a-zA-Z0-9._-]+$/.test(rawDoc) ? rawDoc : DEFAULT_DOC_ID;
@@ -181,9 +160,6 @@ function readInitialUrlDoc(): {
 }
 
 function syncUrlForDoc(docId: string): void {
-  if (typeof window === "undefined") {
-    return;
-  }
   const url = new URL(window.location.href);
   url.searchParams.delete("safe");
   url.searchParams.delete("collab");
@@ -303,7 +279,7 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
   const [modalMode, setModalMode] = useState<LocalModalMode | null>(null);
   const [m3aTool, setM3aTool] = useState<M3aToolMode | null>(null);
   const [m3aEvent, setM3aEvent] = useState<M3aModalEvent | null>(null);
-  const [quotaBanner, setQuotaBanner] = useState<string | null>(null);
+  const [quotaBanner, setQuotaBanner] = useState<string | Message | null>(null);
   const [swUpdateReady, setSwUpdateReady] = useState(false);
   const [csvProgress, setCsvProgress] = useState<{
     readonly rowsParsed: number;
@@ -321,7 +297,7 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
     readonly analysis: WireFormulaAnalysis;
   } | null>(null);
   const [activity, setActivity] = useState<Activity | null>(null);
-  const [rejectedReason, setRejectedReason] = useState<string | null>(null);
+  const [rejectedReason, setRejectedReason] = useState<string | Message | null>(null);
   const [menu, setMenu] = useState<EditorMenu | null>(null);
   const [dialog, setDialog] = useState<EditorDialog | null>(null);
   const [nameBoxEditing, setNameBoxEditing] = useState(false);
@@ -390,7 +366,7 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
   }, [sendPresenceNow]);
 
   const refreshStorageEstimate = useCallback(() => {
-    if (typeof navigator === "undefined" || !navigator.storage?.estimate) {
+    if (!navigator.storage?.estimate) {
       return;
     }
     void navigator.storage
@@ -409,7 +385,7 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
   const notePersistenceMutation = useCallback(() => {
     if (!persistRequestedRef.current) {
       persistRequestedRef.current = true;
-      if (typeof navigator !== "undefined" && navigator.storage?.persist) {
+      if (navigator.storage?.persist) {
         void navigator.storage.persist().catch(() => {});
       }
     }
@@ -432,6 +408,10 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
         return false;
       }
       notePersistenceMutation();
+      // What is held goes by positions, and these change them without a change of the sheet's size.
+      if (/^move[RC]|do$/.test(command.kind)) {
+        heldRef.current?.clear();
+      }
       if (action) {
         pendingActionRef.current = action;
       }
@@ -439,6 +419,13 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
         sendEvalEnv(client);
       }
       client.send(command);
+      // What is known of the selected cell may not be so any more.
+      const known = inspectedRef.current;
+      if (known) {
+        inspectedRef.current = null;
+        const { sheet, rowId, colId } = known;
+        client.send({ kind: "inspectCell", sheet, rowId, colId });
+      }
       return true;
     },
     [notePersistenceMutation],
@@ -464,7 +451,7 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
   }, []);
 
   /** Says why something was not done, whatever dialog is open. */
-  const reject = useCallback((reason: string) => {
+  const reject = useCallback((reason: string | Message) => {
     setRejectedReason(reason);
     announce(engineText(reason), { politeness: "assertive" });
   }, []);
@@ -710,30 +697,6 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
     const nameOfCell = ({ row, col }: { readonly row: number; readonly col: number }) =>
       `${columnName(col)}${grid.displayRowToPhysicalRow(row) + 1}`;
 
-    const idsOf = (row: number, col: number): CellIds | null => {
-      const rowId = grid.rowIdAt(row);
-      const colId = grid.colIdAt(col);
-      return rowId !== null && colId !== null ? { rowId, colId } : null;
-    };
-
-    const editCell = (sheet: number, { rowId, colId }: CellIds, raw: string) =>
-      mutate({ kind: "editCell", sheet, rowId, colId, raw }, { computes: true });
-
-    const held = new HeldCommits({
-      idsOf,
-      sheetId: () => activeSheetRef.current,
-      commit: ({ sheet, raw }, ids) => editCell(sheet, ids, raw),
-      fail: ({ row, col, raw: text }) =>
-        reject(
-          t("The text for {cell} could not be entered: {text}", {
-            cell: nameOfCell({ row, col }),
-            text,
-          }),
-        ),
-    });
-
-    heldRef.current = held;
-
     const grid = new Grid(element, {
       subscribe: (subscription) => {
         if (!workerTerminatedRef.current) {
@@ -824,6 +787,24 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
     });
     gridRef.current = grid;
 
+    const editCell = (sheet: number, { rowId, colId }: CellIds, raw: string) =>
+      mutate({ kind: "editCell", sheet, rowId, colId, raw }, { computes: true });
+
+    const held = new HeldCommits({
+      grid,
+      sheetId: () => activeSheetRef.current,
+      inspect: (sheet, ids) => send({ kind: "inspectCell", sheet, ...ids }),
+      commit: ({ sheet, raw }, ids) => editCell(sheet, ids, raw),
+      fail: (one) => {
+        const cell = nameOfCell(one);
+        const text = one.raw;
+        reject({
+          say: () => t("The text for {cell} could not be entered: {text}", { cell, text }),
+        });
+      },
+    });
+    heldRef.current = held;
+
     const views = new ViewMemory(grid);
     /** Whether the sheets are those of a past version or a draft. */
     let isPreview = false;
@@ -838,34 +819,32 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
       isTouchOnly: isTouchMode,
       textOf: (cell) => {
         const cur = grid.selectionDetails();
-        if (
-          cur &&
+        const known = inspectedRef.current;
+        // What is shown of a formula is its value.
+        return cur &&
           cur.row === cell.row &&
           cur.col === cell.col &&
-          inspectedRef.current &&
-          inspectedRef.current.sheet === activeSheetRef.current &&
-          inspectedRef.current.rowId === cur.rowId &&
-          inspectedRef.current.colId === cur.colId
-        ) {
-          return inspectedRef.current.raw;
-        }
-        return grid.textAt(cell.row, cell.col) ?? "";
+          known &&
+          known.sheet === activeSheetRef.current &&
+          known.rowId === cur.rowId &&
+          known.colId === cur.colId
+          ? known.raw
+          : null;
       },
-      onCommit: (cell, raw) => {
+      onCommit: (cell, raw, isRest) => {
         const session = editSessionRef.current;
         clearEditState(grid, editor);
         if (effectiveReadOnlyRef.current) {
           return;
         }
-        if (raw !== inspectedRef.current?.raw) {
+        if (!isRest && raw !== inspectedRef.current?.raw) {
           laterNow()?.announceCommit(nameOfCell(cell), raw);
         }
         const sheet = session?.hostSheet ?? activeSheetRef.current;
-        const ids = session ?? idsOf(cell.row, cell.col);
-        if (ids) {
-          editCell(sheet, ids, raw);
+        if (session && !isRest) {
+          editCell(sheet, session, raw);
         } else {
-          held.hold({ sheet, row: cell.row, col: cell.col, raw });
+          held.hold({ sheet, row: cell.row, col: cell.col, raw, isRest }, session);
         }
         if (session && activeSheetRef.current !== session.hostSheet) {
           send({ kind: "switchSheet", sheet: session.hostSheet });
@@ -1306,6 +1285,7 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
               break;
             }
             case "cellInspected": {
+              held.retry(message);
               const cur = grid.selectionDetails();
               if (
                 !cur ||
@@ -1316,22 +1296,13 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
                 break;
               }
               const info: InspectedState = {
-                sheet: message.sheet,
-                rowId: message.rowId,
-                colId: message.colId,
-                address: message.address,
-                raw: message.raw,
-                display: message.display,
-                isFormula: message.isFormula,
+                ...message,
                 error: message.error ?? null,
-                formatCode: message.formatCode,
-                style: message.style,
-                isSpillShadow: message.isSpillShadow,
                 spillAnchor: message.spillAnchor ?? null,
-                valueKind: message.valueKind,
               };
               inspectedRef.current = info;
               setInspected(info);
+              editor.supplyText();
               grid.setActiveSpillRange(message.spillRange ?? null);
               break;
             }
@@ -1407,17 +1378,7 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
               break;
             }
             case "clipboardCopied": {
-              const snap: CopiedSnapshot = {
-                sheet: message.sheet,
-                firstRow: message.firstRow,
-                rowCount: message.rowCount,
-                firstCol: message.firstCol,
-                colCount: message.firstCol === undefined ? 0 : message.colCount,
-                cut: message.cut,
-                tsv: message.tsv,
-                html: message.html,
-              };
-              lastCopiedRef.current = snap;
+              lastCopiedRef.current = message;
               if (message.sheet === activeSheetRef.current) {
                 grid.setClipboardRange(
                   {
@@ -1429,7 +1390,7 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
                   message.cut,
                 );
               }
-              if (typeof navigator !== "undefined" && navigator.clipboard) {
+              if (navigator.clipboard) {
                 if (typeof ClipboardItem !== "undefined" && navigator.clipboard.write) {
                   const item = new ClipboardItem({
                     "text/plain": new Blob([message.tsv], { type: "text/plain" }),

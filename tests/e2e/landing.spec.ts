@@ -113,6 +113,30 @@ test("the pictures load, say what they show and hold their place", async ({ page
   await expect(images.and(page.locator("svg"))).toHaveAccessibleName(/browser.*server/);
 });
 
+test("pictures that cannot be loaded leave their place, with what they show in words", async ({
+  page,
+}) => {
+  const sizes = () =>
+    page.evaluate(() =>
+      [...document.querySelectorAll("img")].map((image) => {
+        const { width, height } = image.getBoundingClientRect();
+        return [Math.round(width), Math.round(height)];
+      }),
+    );
+  await open(page);
+  await scrollThrough(page);
+  const loaded = await sizes();
+  await page.route("**/media/**", (route) => route.abort());
+  await open(page);
+  await scrollThrough(page);
+  for (const image of await page.locator("img").all()) {
+    await expect(image).toHaveJSProperty("complete", true);
+    await expect(image).toHaveJSProperty("naturalWidth", 0);
+    await expect(image).toHaveAccessibleName(/\S.{10}/);
+  }
+  expect(await sizes()).toEqual(loaded);
+});
+
 test("a dark theme has pictures of its own", async ({ page }) => {
   await page.emulateMedia({ colorScheme: "dark" });
   await open(page);

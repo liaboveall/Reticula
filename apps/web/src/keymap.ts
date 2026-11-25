@@ -1,3 +1,5 @@
+import { IS_MAC } from "@reticula/grid";
+
 /**
  * The keys of the editor's commands, and where each of them applies. One
  * listener looks them up, whatever has the focus: what has a use of its own for
@@ -65,8 +67,6 @@ export interface KeyPress {
   readonly defaultPrevented: boolean;
   getModifierState(key: string): boolean;
 }
-
-export const IS_MAC = typeof navigator !== "undefined" && /^Mac|^iP/.test(navigator.platform);
 
 /** What is pressed, written the way the table does, or `null` if it is typing. */
 function pressed(event: KeyPress, isMac: boolean): string | null {

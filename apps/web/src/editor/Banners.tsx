@@ -1,8 +1,8 @@
 import type { SheetInfo } from "@reticula/protocol";
 import { useEffect, useState } from "react";
-import { translateEngineText } from "../i18n/engine-text.ts";
-import { t } from "../i18n/index.ts";
+import { type Message, t } from "../i18n/index.ts";
 import { announce } from "../ui/announcer.ts";
+import { engineText } from "./load-later.ts";
 
 /** Has a banner read out that has just appeared: a live region that comes with its text is not. */
 function useAnnounced(text: string, politeness: "polite" | "assertive" = "polite"): void {
@@ -12,10 +12,10 @@ function useAnnounced(text: string, politeness: "polite" | "assertive" = "polite
 export interface BannersProps {
   readonly sheet: SheetInfo | null;
   /** Why the engine refused the last command. */
-  readonly rejected: string | null;
+  readonly rejected: string | Message | null;
   readonly onDismissRejected: () => void;
   /** That the browser is running out of storage, and what an import left behind. */
-  readonly storage: string | null;
+  readonly storage: string | Message | null;
   readonly onDismissStorage: () => void;
   readonly onExportRtcl: () => void;
   readonly onOpenWorkbooks: () => void;
@@ -53,7 +53,7 @@ export default function Banners(props: BannersProps) {
       )}
       {props.rejected && (
         <div className="rejected-banner" data-testid="rejected-banner">
-          <span>{translateEngineText(props.rejected)}</span>
+          <span>{engineText(props.rejected)}</span>
           <button
             type="button"
             className="tip-close"
@@ -74,12 +74,12 @@ function StorageBanner({
   onOpenWorkbooks,
   onDismiss,
 }: {
-  readonly message: string;
+  readonly message: string | Message;
   readonly onExportRtcl: () => void;
   readonly onOpenWorkbooks: () => void;
   readonly onDismiss: () => void;
 }) {
-  const text = translateEngineText(message);
+  const text = engineText(message);
   useAnnounced(text, "assertive");
   return (
     <div className="rejected-banner" data-testid="quota-banner">

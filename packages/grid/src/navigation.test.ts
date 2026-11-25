@@ -1,5 +1,5 @@
 import { describe, expect, test } from "vitest";
-import { type NavigationTarget, navigate } from "./navigation.ts";
+import { isCommand, type NavigationTarget, navigate } from "./navigation.ts";
 
 function fakeGrid(active = { row: 4, col: 2 }, focus = active) {
   const calls: unknown[] = [];
@@ -21,7 +21,7 @@ function fakeGrid(active = { row: 4, col: 2 }, focus = active) {
   return { grid, calls };
 }
 
-function press(keys: string, target = fakeGrid(), jumps = {}) {
+function press(keys: string, target = fakeGrid(), jumps = {}, isMac = false) {
   const parts = keys.split("+");
   const event = {
     key: parts.at(-1) ?? "",
@@ -30,7 +30,7 @@ function press(keys: string, target = fakeGrid(), jumps = {}) {
     metaKey: parts.includes("Meta"),
     altKey: parts.includes("Alt"),
   };
-  return { handled: navigate(target.grid, event, jumps), calls: target.calls };
+  return { handled: navigate(target.grid, event, jumps, isMac), calls: target.calls };
 }
 
 describe("a key", () => {
@@ -48,10 +48,28 @@ describe("a key", () => {
     ["Control+End", ["jump", 99, 19, false]],
     ["Control+ArrowDown", ["jump", 99, 2, false]],
     ["Control+ArrowRight", ["jump", 4, 19, false]],
-    ["Meta+ArrowUp", ["jump", 0, 2, false]],
+    ["Control+ArrowUp", ["jump", 0, 2, false]],
     ["Control+a", ["selectAll"]],
   ] as const)("%s moves the selection", (keys, call) => {
     expect(press(keys)).toEqual({ handled: true, calls: [call] });
+    // On macOS it is Cmd, and Ctrl is for the system and for text.
+    const onMac = keys.replace("Control", "Meta");
+    expect(press(onMac, undefined, {}, true)).toEqual({ handled: true, calls: [call] });
+    if (onMac !== keys) {
+      expect(press(keys, undefined, {}, true)).toEqual({ handled: false, calls: [] });
+      expect(press(onMac)).toEqual({ handled: false, calls: [] });
+      for (const isMac of [false, true]) {
+        const both = press(`Control+${onMac}`, undefined, {}, isMac);
+        expect(both).toEqual({ handled: false, calls: [] });
+      }
+    }
+  });
+
+  test("with the modifier of another system is for others, whatever it is", () => {
+    for (const key of ["ArrowUp", "PageDown", "Home", "End", "a", "f", "b"]) {
+      expect(press(`Control+${key}`, undefined, {}, true)).toEqual({ handled: false, calls: [] });
+      expect(press(`Meta+Shift+${key}`)).toEqual({ handled: false, calls: [] });
+    }
   });
 
   test.each([
@@ -89,8 +107,17 @@ test("without a selection a key moves nothing", () => {
   const { grid, calls } = fakeGrid();
   const empty = { ...grid, selection: null, selectionFocus: null };
   const key = (key: string, ctrlKey = false) =>
-    navigate(empty, { key, ctrlKey, shiftKey: false, metaKey: false, altKey: false });
+    navigate(empty, { key, ctrlKey, shiftKey: false, metaKey: false, altKey: false }, {}, false);
   expect(key("Home")).toBe(false);
   expect(key("ArrowDown", true)).toBe(true);
   expect(calls).toEqual([]);
+});
+
+test("commands go with Cmd on macOS, and with Ctrl elsewhere", () => {
+  const held = (ctrlKey: boolean, metaKey: boolean) =>
+    [false, true].map((isMac) => isCommand({ ctrlKey, metaKey }, isMac));
+  expect(held(false, false)).toEqual([false, false]);
+  expect(held(true, false)).toEqual([true, false]);
+  expect(held(false, true)).toEqual([false, true]);
+  expect(held(true, true)).toEqual([false, false]);
 });

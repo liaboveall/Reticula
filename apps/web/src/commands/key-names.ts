@@ -1,4 +1,5 @@
-import { IS_MAC, KEYS } from "../keymap.ts";
+import { IS_MAC } from "@reticula/grid";
+import { KEYS } from "../keymap.ts";
 
 const MAC_SIGNS: Readonly<Record<string, string>> = {
   Mod: "⌘",

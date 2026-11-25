@@ -72,7 +72,8 @@ const zhEngine: Readonly<Record<string, string>> = {
   "Operation contains duplicate target cells.": "操作中有重复的目标单元格。",
   "Axis limit or target error ({axis_err}).": "行或列的操作无效（{axis_err}）。",
   "invalid run of rows or columns": "行或列的范围无效",
-  "too many rows or columns": "行或列过多",
+  "This worksheet has no room for that: it can have 2,000,000 rows and 16,384 columns, including deleted ones.":
+    "此工作表已没有空间：最多 2,000,000 行、16,384 列，已删除的也计算在内。",
   "insertion point not found": "找不到插入位置",
   "row or column already exists": "行或列已存在",
   "row or column not found": "找不到行或列",
