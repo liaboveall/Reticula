@@ -255,9 +255,9 @@ pub fn bench(flags: &Flags) -> Result {
     check_flags(flags, suite)?;
     match suite {
         // B1-B8, B11 and B12.
-        "engine" => kernel_bench(flags, "engine", "native-bench", "m3b-engine", "engine"),
+        "engine" => kernel_bench(flags, "engine", "native-bench", "m6-engine", "engine"),
         // The collaborative slow path.
-        "b9" => kernel_bench(flags, "b9", "sync-bench", "m3a-sync", "sync"),
+        "b9" => kernel_bench(flags, "b9", "sync-bench", "m6-sync", "sync"),
         // B13: the renderers.
         "render" => script_bench(
             flags,

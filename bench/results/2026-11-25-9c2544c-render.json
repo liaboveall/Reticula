@@ -1,0 +1,195 @@
+{
+ "suite": "m6-render",
+ "date": "2026-11-25T01:16:21.055Z",
+ "commit": "9c2544c",
+ "uncommittedChanges": false,
+ "affinity": "FFFF",
+ "machine": {
+  "cpu": "13th Gen Intel(R) Core(TM) i9-13980HX",
+  "logicalProcessors": 32,
+  "memoryGB": 32,
+  "os": "Windows_NT 10.0.26300",
+  "system": {
+   "affinity": "FFFF",
+   "onMains": true,
+   "powerScheme": "f7092cd3-977f-4387-ace4-d2623560962f",
+   "displays": [
+    "GameViewer Virtual Display Adapter 3840x2160 144 Hz",
+    "NVIDIA GeForce RTX 4080 Laptop GPU 2560x1600 240 Hz"
+   ]
+  }
+ },
+ "browser": {
+  "name": "chrome",
+  "version": "158.0.8127.37",
+  "headless": true
+ },
+ "scrollWorkP99Ms": 0.935,
+ "chromeS1": {
+  "roundTripMs": {
+   "count": 2000,
+   "min": 0.215,
+   "mean": 0.271593,
+   "p50": 0.255,
+   "p95": 0.325,
+   "p99": 0.465,
+   "max": 3.26
+  },
+  "codecEncodeUs": {
+   "count": 30,
+   "min": 187.5,
+   "mean": 195.658,
+   "p50": 193.2,
+   "p95": 215.4,
+   "p99": 215.8,
+   "max": 215.8
+  },
+  "codecDecodeUs": {
+   "count": 30,
+   "min": 20.3,
+   "mean": 22.4117,
+   "p50": 21.675,
+   "p95": 25.4,
+   "p99": 37.525,
+   "max": 37.525
+  },
+  "scrollMargin05": {
+   "frames": 7199,
+   "placeholders": 0,
+   "work": {
+    "count": 7199,
+    "min": 0.51,
+    "mean": 0.645363,
+    "p50": 0.63,
+    "p95": 0.76,
+    "p99": 0.96,
+    "max": 1.9
+   }
+  },
+  "scrollMargin2": {
+   "frames": 7200,
+   "placeholders": 0,
+   "work": {
+    "count": 7200,
+    "min": 0.525,
+    "mean": 0.645932,
+    "p50": 0.63,
+    "p95": 0.765,
+    "p99": 0.935,
+    "max": 2.255
+   }
+  },
+  "jumpFilledMs": {
+   "count": 200,
+   "min": 7.235,
+   "mean": 9.6751,
+   "p50": 9.725,
+   "p95": 10,
+   "p99": 10.455,
+   "max": 10.815
+  },
+  "jumpCompleteFrameWorkMs": {
+   "count": 200,
+   "min": 1.475,
+   "mean": 1.6398,
+   "p50": 1.605,
+   "p95": 1.82,
+   "p99": 2.255,
+   "max": 2.755
+  }
+ },
+ "chromeS2": {
+  "drawAllCases": [
+   {
+    "label": "new text every frame",
+    "content": "unique",
+    "rowsPerFrame": 50,
+    "draw": {
+     "count": 600,
+     "min": 1.61,
+     "mean": 1.98381,
+     "p50": 1.955,
+     "p95": 2.33,
+     "p99": 2.76,
+     "max": 3.14
+    }
+   },
+   {
+    "label": "scrolling by 2 rows a frame",
+    "content": "unique",
+    "rowsPerFrame": 2,
+    "draw": {
+     "count": 600,
+     "min": 0.765,
+     "mean": 1.14694,
+     "p50": 1.12,
+     "p95": 1.51,
+     "p99": 1.95,
+     "max": 2.435
+    }
+   },
+   {
+    "label": "repeating values, new screen every frame",
+    "content": "repeating",
+    "rowsPerFrame": 50,
+    "draw": {
+     "count": 600,
+     "min": 0.88,
+     "mean": 1.21432,
+     "p50": 1.18,
+     "p95": 1.605,
+     "p99": 1.75,
+     "max": 1.985
+    }
+   }
+  ],
+  "pace10s": {
+   "frames": 2400,
+   "lateFrames": 0,
+   "framesOver60Hz": 0,
+   "interval": {
+    "count": 2400,
+    "min": 3.47,
+    "mean": 4.16683,
+    "p50": 4.165,
+    "p95": 4.245,
+    "p99": 4.31,
+    "max": 4.825
+   },
+   "draw": {
+    "count": 2400,
+    "min": 0.815,
+    "mean": 1.17978,
+    "p50": 1.15,
+    "p95": 1.54,
+    "p99": 1.78,
+    "max": 2.16
+   }
+  }
+ },
+ "firefoxHeadedJump": {
+  "browser": {
+   "name": "firefox",
+   "version": "159.0",
+   "headless": false
+  },
+  "jumpFilledMs": {
+   "count": 200,
+   "min": 9.58,
+   "mean": 10.0534,
+   "p50": 10,
+   "p95": 10.54,
+   "p99": 10.76,
+   "max": 11.54
+  },
+  "jumpCompleteFrameWorkMs": {
+   "count": 200,
+   "min": 1.6,
+   "mean": 1.9233,
+   "p50": 1.86,
+   "p95": 2.36,
+   "p99": 2.88,
+   "max": 3.48
+  }
+ }
+}
