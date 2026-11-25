@@ -26,7 +26,7 @@ use super::{ApiError, ApiState, auth};
 use crate::docs::{
     CLOSE_ACCESS_REVOKED, CLOSE_SERVER_BUSY, RoomConnection, RoomError, RoomOutbound,
 };
-use crate::ops::{AnonWsPermit, client_ip_parts};
+use crate::ops::AnonWsPermit;
 use crate::store::MAIN_BRANCH;
 
 const HEARTBEAT: Duration = Duration::from_secs(30);
@@ -87,7 +87,9 @@ pub(super) async fn upgrade(
         if branch_id != MAIN_BRANCH {
             return Err(ApiError::Forbidden);
         }
-        let ip = client_ip_parts(peer.map(|Extension(info)| info.0), &headers);
+        let ip = state
+            .limiter
+            .client_ip(peer.map(|Extension(info)| info.0), &headers);
         if authed.is_none() && crate::ops::has_session_cookie(&headers) {
             state
                 .limiter

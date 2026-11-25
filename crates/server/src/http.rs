@@ -2,7 +2,9 @@
 
 mod agent;
 mod auth;
+mod range;
 mod sync;
+mod tables;
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -68,9 +70,10 @@ impl ApiState {
         agent_cfg: AgentRuntimeConfig,
     ) -> Self {
         let metrics = Arc::new(Metrics::default());
+        let max_loaded_bytes = gov.max_loaded_bytes;
         let limiter = Arc::new(RateLimiter::new(gov, Arc::clone(&metrics)));
         let rooms =
-            DocRooms::with_governance(store.clone(), gov.max_loaded_bytes, Arc::clone(&metrics));
+            DocRooms::with_governance(store.clone(), max_loaded_bytes, Arc::clone(&metrics));
         let agent = AgentManager::new(
             store.clone(),
             rooms.clone(),
@@ -186,6 +189,18 @@ pub fn router(state: ApiState) -> Router {
             "/workbooks/{id}/agent/runs/{rid}/events",
             get(agent::agent_run_events),
         )
+        .route(
+            "/workbooks/{id}/tables",
+            get(tables::list_tables).post(tables::create_table),
+        )
+        .route(
+            "/workbooks/{id}/tables/{tid}",
+            patch(tables::update_table).delete(tables::delete_table),
+        )
+        .route(
+            "/workbooks/{id}/tables/{tid}/complete",
+            post(tables::complete_table),
+        )
         .route("/account", get(account).delete(delete_account))
         .route("/sync/{id}", get(sync::upgrade))
         .route("/client-errors", post(report))
@@ -210,9 +225,18 @@ pub fn router(state: ApiState) -> Router {
         .route("/workbooks/import", post(import_workbook))
         .layer(DefaultBodyLimit::max(import_limit));
 
+    // An upload counts its bytes itself, as it writes them.
+    let table_routes = Router::new()
+        .route(
+            "/workbooks/{id}/tables/{tid}/data",
+            get(tables::table_data).patch(tables::upload_table_data),
+        )
+        .layer(DefaultBodyLimit::disable());
+
     standard
         .merge(merge_routes)
         .merge(import_routes)
+        .merge(table_routes)
         .fallback(|| async { ApiError::NotFound })
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -322,7 +346,9 @@ enum ApiError {
     ConflictJson(serde_json::Value),
     Quota(String),
     DiskFull(String),
+    TooLarge(String),
     RateLimited(u64),
+    Throttled(String, u64),
     Busy,
     Unavailable(String),
     Provider,
@@ -338,6 +364,15 @@ impl From<StoreError> for ApiError {
             StoreError::Conflict(msg) => Self::Conflict(msg),
             StoreError::QuotaExceeded(msg) => Self::Quota(msg),
             StoreError::DiskFull(msg) => Self::DiskFull(msg),
+            StoreError::TooLarge(msg) => Self::TooLarge(msg),
+            StoreError::Busy {
+                reason,
+                retry_after,
+            } => Self::Throttled(reason, retry_after),
+            StoreError::UploadOffset(offset) => Self::ConflictJson(serde_json::json!({
+                "error": "the upload continues at another offset",
+                "uploadOffset": offset,
+            })),
             other => {
                 tracing::error!(error = %other, "collaboration storage failure");
                 Self::Internal
@@ -367,7 +402,7 @@ impl IntoResponse for ApiError {
             return (StatusCode::CONFLICT, Json(payload)).into_response();
         }
         let retry_after = match self {
-            Self::RateLimited(secs) => Some(secs),
+            Self::RateLimited(secs) | Self::Throttled(_, secs) => Some(secs),
             _ => None,
         };
         let (status, error) = match self {
@@ -380,6 +415,8 @@ impl IntoResponse for ApiError {
             Self::ConflictJson(_) => unreachable!(),
             Self::Quota(reason) => (StatusCode::FORBIDDEN, reason),
             Self::DiskFull(reason) => (StatusCode::INSUFFICIENT_STORAGE, reason),
+            Self::TooLarge(reason) => (StatusCode::PAYLOAD_TOO_LARGE, reason),
+            Self::Throttled(reason, _) => (StatusCode::TOO_MANY_REQUESTS, reason),
             Self::RateLimited(_) => (StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded".into()),
             Self::Busy => (
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -412,6 +449,14 @@ fn check_write_rate(state: &ApiState, user_id: Uuid) -> Result<(), ApiError> {
         .map_err(ApiError::RateLimited)
 }
 
+/// Runs to its end even if the client goes away, so that neither a file nor a
+/// lock is left halfway.
+async fn to_the_end<T: Send + 'static>(
+    work: impl Future<Output = Result<T, ApiError>> + Send + 'static,
+) -> Result<T, ApiError> {
+    tokio::spawn(work).await.map_err(|_| ApiError::Internal)?
+}
+
 async fn member(
     state: &ApiState,
     jar: &CookieJar,
@@ -427,8 +472,15 @@ async fn member(
 }
 
 enum ReadPrincipal {
-    Member(WorkbookAccess),
+    Member(User, WorkbookAccess),
     Anonymous(AnonymousShareAccess),
+}
+
+/// Which budget anonymous requests come out of.
+#[derive(Clone, Copy)]
+enum AnonBudget {
+    General,
+    Tables,
 }
 
 async fn read_access(
@@ -437,24 +489,27 @@ async fn read_access(
     headers: &HeaderMap,
     peer: Option<SocketAddr>,
     doc: Uuid,
+    budget: AnonBudget,
 ) -> Result<ReadPrincipal, ApiError> {
     let authed = auth::authenticate_optional(state, jar).await?;
-    if let Some((user, _)) = &authed
+    let signed_in = authed.is_some();
+    if let Some((user, _)) = authed
         && let Some(book) = state.store.workbook_access(doc, user.id).await?
     {
-        return Ok(ReadPrincipal::Member(book));
+        return Ok(ReadPrincipal::Member(user, book));
     }
     if let Some(token) = headers
         .get("x-reticula-share")
         .and_then(|value| value.to_str().ok())
         .filter(|value| !value.is_empty())
     {
-        if authed.is_none() && crate::ops::has_session_cookie(headers) {
-            let ip = crate::ops::client_ip_parts(peer, headers);
-            state
-                .limiter
-                .check_anon_ip(ip)
-                .map_err(ApiError::RateLimited)?;
+        if !signed_in && crate::ops::has_session_cookie(headers) {
+            let ip = state.limiter.client_ip(peer, headers);
+            match budget {
+                AnonBudget::General => state.limiter.check_anon_ip(ip),
+                AnonBudget::Tables => state.limiter.check_anon_table(ip),
+            }
+            .map_err(ApiError::RateLimited)?;
         }
         let hash = auth::token_hash(token).ok_or(ApiError::Forbidden)?;
         let anon = state
@@ -464,7 +519,7 @@ async fn read_access(
             .ok_or(ApiError::Forbidden)?;
         return Ok(ReadPrincipal::Anonymous(anon));
     }
-    if authed.is_some() {
+    if signed_in {
         Err(ApiError::Forbidden)
     } else {
         Err(ApiError::Unauthorized)
@@ -608,8 +663,17 @@ async fn workbook(
     peer: Option<Extension<ConnectInfo<SocketAddr>>>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<WorkbookSummary>, ApiError> {
-    match read_access(&state, &jar, &headers, peer.map(|Extension(c)| c.0), id).await? {
-        ReadPrincipal::Member(book) => {
+    match read_access(
+        &state,
+        &jar,
+        &headers,
+        peer.map(|Extension(c)| c.0),
+        id,
+        AnonBudget::General,
+    )
+    .await?
+    {
+        ReadPrincipal::Member(_, book) => {
             let members = state.store.workbook_members(id).await?;
             Ok(Json(WorkbookSummary {
                 id: book.id,
@@ -691,10 +755,13 @@ async fn delete_workbook(
         return Err(ApiError::Forbidden);
     }
     check_write_rate(&state, user.id)?;
-    state.agent.cancel_all_for_workbook(id).await;
-    state.rooms.shutdown_room(id).await;
-    state.store.delete_workbook(id).await?;
-    Ok(StatusCode::NO_CONTENT)
+    to_the_end(async move {
+        state.agent.cancel_all_for_workbook(id).await;
+        state.rooms.shutdown_room(id).await;
+        state.store.delete_workbook(id).await?;
+        Ok(StatusCode::NO_CONTENT)
+    })
+    .await
 }
 
 #[utoipa::path(get, path = "/api/workbooks/{id}/members", params(("id" = Uuid, Path)),
@@ -903,7 +970,15 @@ async fn snapshot(
     peer: Option<Extension<ConnectInfo<SocketAddr>>>,
     Path((id, seq)): Path<(Uuid, u64)>,
 ) -> Result<Response, ApiError> {
-    let _ = read_access(&state, &jar, &headers, peer.map(|Extension(c)| c.0), id).await?;
+    let _ = read_access(
+        &state,
+        &jar,
+        &headers,
+        peer.map(|Extension(c)| c.0),
+        id,
+        AnonBudget::General,
+    )
+    .await?;
     let snapshot = state
         .store
         .snapshot(id, seq)
@@ -948,7 +1023,15 @@ async fn history(
     Path(id): Path<Uuid>,
     Query(query): Query<HistoryQuery>,
 ) -> Result<Json<HistoryPage>, ApiError> {
-    let _ = read_access(&state, &jar, &headers, peer.map(|Extension(c)| c.0), id).await?;
+    let _ = read_access(
+        &state,
+        &jar,
+        &headers,
+        peer.map(|Extension(c)| c.0),
+        id,
+        AnonBudget::General,
+    )
+    .await?;
     Ok(Json(
         state
             .store
@@ -980,7 +1063,15 @@ async fn txns(
     Path(id): Path<Uuid>,
     Query(query): Query<TxnsQuery>,
 ) -> Result<Response, ApiError> {
-    let _ = read_access(&state, &jar, &headers, peer.map(|Extension(c)| c.0), id).await?;
+    let _ = read_access(
+        &state,
+        &jar,
+        &headers,
+        peer.map(|Extension(c)| c.0),
+        id,
+        AnonBudget::General,
+    )
+    .await?;
     let payload = state
         .store
         .fetch_txns_after(id, query.after_seq.unwrap_or(0), query.limit.unwrap_or(500))
@@ -1014,7 +1105,15 @@ async fn list_versions(
     peer: Option<Extension<ConnectInfo<SocketAddr>>>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Vec<VersionEntry>>, ApiError> {
-    let _ = read_access(&state, &jar, &headers, peer.map(|Extension(c)| c.0), id).await?;
+    let _ = read_access(
+        &state,
+        &jar,
+        &headers,
+        peer.map(|Extension(c)| c.0),
+        id,
+        AnonBudget::General,
+    )
+    .await?;
     Ok(Json(state.store.list_versions(id).await?))
 }
 
@@ -1098,29 +1197,40 @@ async fn delete_account(
             "account deletion requires confirm = \"DELETE\"".into(),
         ));
     }
-    state.agent.cancel_all_for_user(user.id).await;
-    let lists = state.store.list_workbooks(user.id).await?;
+    let config = Arc::clone(&state.auth);
+    let session = auth::session_hash(&config, &jar);
+    to_the_end(async move { erase_account(&state, user.id, session).await }).await?;
+    Ok((
+        auth::clear_session_cookie(&config, jar),
+        StatusCode::NO_CONTENT,
+    ))
+}
+
+async fn erase_account(
+    state: &ApiState,
+    user: Uuid,
+    session: Option<[u8; 32]>,
+) -> Result<(), ApiError> {
+    state.agent.cancel_all_for_user(user).await;
+    let lists = state.store.list_workbooks(user).await?;
     for wb in &lists.owned {
         state.agent.cancel_all_for_workbook(wb.id).await;
         state.rooms.shutdown_room(wb.id).await;
     }
     for wb in &lists.shared {
-        state.rooms.update_member_role(wb.id, user.id, None).await;
+        state.rooms.update_member_role(wb.id, user, None).await;
     }
-    if let Some(hash) = auth::session_hash(&state.auth, &jar) {
+    if let Some(hash) = session {
         let _ = state.revocations.send(hash);
     }
-    let outcome = state.store.delete_account(user.id).await?;
+    let outcome = state.store.delete_account(user).await?;
     for id in outcome.owned_workbooks {
         state.rooms.shutdown_room(id).await;
     }
     for id in outcome.shared_workbooks {
-        state.rooms.update_member_role(id, user.id, None).await;
+        state.rooms.update_member_role(id, user, None).await;
     }
-    Ok((
-        auth::clear_session_cookie(&state.auth, jar),
-        StatusCode::NO_CONTENT,
-    ))
+    Ok(())
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -1226,6 +1336,13 @@ fn percent_decode_utf8(input: &str) -> Option<String> {
         account,
         delete_account,
         sync::upgrade,
+        tables::list_tables,
+        tables::create_table,
+        tables::update_table,
+        tables::delete_table,
+        tables::complete_table,
+        tables::table_data,
+        tables::upload_table_data,
         report
     ),
     modifiers(&BrowserSession)

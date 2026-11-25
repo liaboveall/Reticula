@@ -30,6 +30,9 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 use uuid::Uuid;
 
+#[path = "../tests/support/table_fixture.rs"]
+mod table_fixture;
+
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type AppResult<T> = Result<T, String>;
 
@@ -51,6 +54,18 @@ struct DrillState {
     t0_digest_a: StateDigest,
     t0_seq_b: u64,
     t0_digest_b: StateDigest,
+    /// Tables of Workbook B: one that is backed up, one whose copy is lost, and
+    /// one that is still being uploaded.
+    kept_table: DrillTable,
+    lost_table: DrillTable,
+    unfinished_table: DrillTable,
+}
+
+#[derive(Serialize, Deserialize)]
+struct DrillTable {
+    id: Uuid,
+    bytes: usize,
+    sha256: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -277,6 +292,120 @@ async fn fetch_bytes(
         .await
         .map(|b| b.to_vec())
         .map_err(|e| format!("GET {path} bytes: {e}"))
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(64);
+    for byte in Sha256::digest(bytes) {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
+/// Uploads so many bytes of a table, and completes it when that is all of them.
+async fn upload_table(
+    ctx: ClientCtx<'_>,
+    name: &str,
+    bytes: &[u8],
+    arriving: usize,
+) -> AppResult<DrillTable> {
+    let table = DrillTable {
+        id: Uuid::new_v4(),
+        bytes: bytes.len(),
+        sha256: sha256_hex(bytes),
+    };
+    let path = format!("/api/workbooks/{}/tables", ctx.doc);
+    let declaration = json!({
+        "id": table.id, "name": name, "bytes": table.bytes, "sha256": &table.sha256,
+    });
+    let (status, body) = api_json(
+        ctx.http,
+        Method::POST,
+        ctx.base_url,
+        &path,
+        ctx.cookie,
+        Some(declaration),
+    )
+    .await?;
+    if status != StatusCode::CREATED {
+        return Err(format!("declare table {name}: {status} {body}"));
+    }
+    let mut offset = 0;
+    for chunk in bytes[..arriving].chunks(8 * 1024 * 1024) {
+        let response = ctx
+            .http
+            .patch(format!("{}{path}/{}/data", ctx.base_url, table.id))
+            .header(header::ORIGIN, ctx.base_url)
+            .header(header::COOKIE, ctx.cookie)
+            .header("upload-offset", offset)
+            .body(chunk.to_vec())
+            .send()
+            .await
+            .map_err(|e| format!("upload table {name}: {e}"))?;
+        if response.status() != StatusCode::OK {
+            return Err(format!("upload table {name}: {}", response.status()));
+        }
+        offset += chunk.len();
+    }
+    if arriving == bytes.len() {
+        let (status, body) = api_json(
+            ctx.http,
+            Method::POST,
+            ctx.base_url,
+            &format!("{path}/{}/complete", table.id),
+            ctx.cookie,
+            None,
+        )
+        .await?;
+        if status != StatusCode::OK || body["status"] != "ready" {
+            return Err(format!("complete table {name}: {status} {body}"));
+        }
+    }
+    Ok(table)
+}
+
+/// The tables of Workbook B as they are to be after the restore.
+async fn verify_tables(ctx: ClientCtx<'_>, state: &DrillState) -> AppResult<()> {
+    let path = format!("/api/workbooks/{}/tables", ctx.doc);
+    let (_, list) = api_json(ctx.http, Method::GET, ctx.base_url, &path, ctx.cookie, None).await?;
+    for (table, expected) in [
+        (&state.kept_table, "ready"),
+        (&state.lost_table, "missing"),
+        (&state.unfinished_table, "uploading"),
+    ] {
+        let id = table.id.to_string();
+        let found = list["tables"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|record| record["id"] == id.as_str());
+        if found.is_none_or(|record| record["status"] != expected) {
+            return Err(format!("expected table {id} to be {expected}, got {list}"));
+        }
+    }
+    let kept = fetch_bytes(
+        ctx.http,
+        ctx.base_url,
+        &format!("{path}/{}/data", state.kept_table.id),
+        ctx.cookie,
+    )
+    .await?;
+    if kept.len() != state.kept_table.bytes || sha256_hex(&kept) != state.kept_table.sha256 {
+        return Err(String::from("restored table does not have its bytes"));
+    }
+    let lost = api_json(
+        ctx.http,
+        Method::GET,
+        ctx.base_url,
+        &format!("{path}/{}/data", state.lost_table.id),
+        ctx.cookie,
+        None,
+    )
+    .await?;
+    if lost.0 != StatusCode::NOT_FOUND {
+        return Err(format!("expected no bytes of a lost table, got {}", lost.0));
+    }
+    Ok(())
 }
 
 async fn fetch_all_tail_txns(
@@ -746,6 +875,13 @@ async fn prepare_t0(args: &Args) -> AppResult<()> {
         return Err(format!("create B version failed: {ver_b_status}"));
     }
 
+    let kept = table_fixture::table_file(12 * 1024 * 1024, 1);
+    let kept_table = upload_table(ctx_b, "Kept", &kept, kept.len()).await?;
+    let lost = table_fixture::table_file(300_000, 2);
+    let lost_table = upload_table(ctx_b, "Lost", &lost, lost.len()).await?;
+    let unfinished = table_fixture::table_file(300_000, 3);
+    let unfinished_table = upload_table(ctx_b, "Unfinished", &unfinished, 100_000).await?;
+
     let state = DrillState {
         alice_id,
         alice_cookie,
@@ -758,6 +894,9 @@ async fn prepare_t0(args: &Args) -> AppResult<()> {
         t0_digest_a: alice_a.confirmed().state_digest(),
         t0_seq_b: alice_b.confirmed_seq(),
         t0_digest_b: alice_b.confirmed().state_digest(),
+        kept_table,
+        lost_table,
+        unfinished_table,
     };
     let serialized =
         serde_json::to_string_pretty(&state).map_err(|e| format!("serialize state: {e}"))?;
@@ -940,6 +1079,7 @@ async fn verify_restore(args: &Args) -> AppResult<()> {
     {
         return Err(String::from("restored Workbook B did not match T0 digest"));
     }
+    verify_tables(ctx_b, &state).await?;
 
     // 2. Reconnect Alice's T1-ahead ClientSyncMachine to the restored T0 server (epoch 0 -> 1).
     let ctx_alice = ClientCtx {

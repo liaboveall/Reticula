@@ -33,7 +33,7 @@ use crate::store::{
 /// - anonymous share-link header without member session -> `403`
 /// - signed-in non-member -> `403`
 /// - signed-in member -> `Ok((User, WorkbookAccess))`
-async fn member_only(
+pub(super) async fn member_only(
     state: &ApiState,
     jar: &CookieJar,
     headers: &HeaderMap,

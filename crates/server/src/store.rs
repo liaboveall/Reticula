@@ -4,6 +4,7 @@ mod agent;
 mod collaboration;
 mod history;
 mod snapshot;
+mod tables;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -34,6 +35,10 @@ pub use collaboration::{
 };
 pub use history::{HistoryEntry, HistoryPage, VersionEntry};
 pub use snapshot::SnapshotFile;
+pub use tables::{
+    MAX_TABLE_CHUNK_BYTES, NewTable, REMOVED_TABLES_KEPT, ReadyTable, TABLE_UPLOAD_IDLE, TableFile,
+    TableList, TableRecord, TableStatus,
+};
 
 pub const MAIN_BRANCH: Uuid = Uuid::nil();
 pub const DELETED_USER_ID: Uuid = Uuid::nil();
@@ -49,6 +54,14 @@ pub struct StorageLimits {
     pub user_quota_bytes: u64,
     pub disk_soft_bytes: u64,
     pub disk_hard_bytes: u64,
+    /// The largest table.
+    pub table_max_bytes: u64,
+    /// All tables of the workbooks of one owner.
+    pub table_user_quota_bytes: u64,
+    /// All tables. Counted in `disk_hard_bytes` as well.
+    pub table_total_bytes: u64,
+    /// What uploads leave free on the volume.
+    pub min_free_bytes: u64,
 }
 
 impl Default for StorageLimits {
@@ -60,6 +73,10 @@ impl Default for StorageLimits {
             user_quota_bytes: 268_435_456,
             disk_soft_bytes: 16 * 1024 * 1024 * 1024,
             disk_hard_bytes: 20 * 1024 * 1024 * 1024,
+            table_max_bytes: 512 * 1024 * 1024,
+            table_user_quota_bytes: 1024 * 1024 * 1024,
+            table_total_bytes: 8 * 1024 * 1024 * 1024,
+            min_free_bytes: 1024 * 1024 * 1024,
         }
     }
 }
@@ -90,6 +107,14 @@ pub enum StoreError {
     QuotaExceeded(String),
     #[error("{0}")]
     DiskFull(String),
+    #[error("{0}")]
+    TooLarge(String),
+    /// Not now, but in so many seconds.
+    #[error("{reason}")]
+    Busy { reason: String, retry_after: u64 },
+    /// An upload continues at another offset: that of the bytes there are.
+    #[error("{0}")]
+    UploadOffset(u64),
 }
 
 /// A validated change and the last server revision its author had observed.
@@ -104,6 +129,7 @@ pub struct Store {
     data_dir: PathBuf,
     limits: StorageLimits,
     disk_used_bytes: Arc<AtomicU64>,
+    tables: Arc<tables::TableWork>,
 }
 
 pub(crate) struct SnapshotCapture {
@@ -151,11 +177,14 @@ impl Store {
             data_dir,
             limits,
             disk_used_bytes: Arc::new(AtomicU64::new(0)),
+            tables: Arc::default(),
         };
         store.ready().await?;
         let dir = store.data_dir.clone();
         let _swept =
             tokio::task::spawn_blocking(move || snapshot::sweep_stale_tmp_files(&dir)).await??;
+        store.sweep_table_files().await?;
+        store.purge_removed_tables(REMOVED_TABLES_KEPT).await?;
         store.refresh_disk_used().await?;
         Ok(store)
     }
@@ -177,12 +206,7 @@ impl Store {
     }
 
     pub async fn refresh_disk_used(&self) -> Result<u64, StoreError> {
-        let total = sqlx::query_scalar!(
-            "SELECT COALESCE(SUM(storage_bytes), 0)::bigint AS \"total!\" FROM users"
-        )
-        .fetch_one(&self.pool)
-        .await?;
-        let bytes = u64::try_from(total.max(0)).unwrap_or(0);
+        let bytes = stored_bytes(&self.pool).await?;
         self.disk_used_bytes.store(bytes, Ordering::Relaxed);
         Ok(bytes)
     }
@@ -227,12 +251,7 @@ impl Store {
                 "user storage quota exceeded".to_owned(),
             ));
         }
-        let total = sqlx::query_scalar!(
-            "SELECT COALESCE(SUM(storage_bytes), 0)::bigint AS \"total!\" FROM users"
-        )
-        .fetch_one(&mut *db)
-        .await?;
-        if u64::try_from(total.max(0)).unwrap_or(0) >= self.limits.disk_hard_bytes {
+        if stored_bytes(&mut *db).await? >= self.limits.disk_hard_bytes {
             return Err(StoreError::DiskFull(
                 "server storage capacity reached".to_owned(),
             ));
@@ -329,15 +348,7 @@ impl Store {
                     "user storage quota exceeded".to_owned(),
                 ));
             }
-            let total = sqlx::query_scalar!(
-                "SELECT COALESCE(SUM(storage_bytes), 0)::bigint AS \"total!\" FROM users"
-            )
-            .fetch_one(&mut *db)
-            .await?;
-            if u64::try_from(total.max(0))
-                .unwrap_or(0)
-                .saturating_add(snap_size)
-                > self.limits.disk_hard_bytes
+            if stored_bytes(&mut *db).await?.saturating_add(snap_size) > self.limits.disk_hard_bytes
             {
                 return Err(StoreError::DiskFull(
                     "server storage capacity reached".to_owned(),
@@ -452,6 +463,7 @@ impl Store {
     }
 
     pub async fn delete_workbook(&self, doc: Uuid) -> Result<(), StoreError> {
+        let _closed = self.close_workbooks(vec![doc]).await;
         let mut db = self.pool.begin().await?;
         let wb = sqlx::query!(
             "SELECT owner_id, log_bytes FROM workbooks WHERE id = $1 FOR UPDATE",
@@ -468,6 +480,7 @@ impl Store {
         .fetch_one(&mut *db)
         .await?;
         let reclaimed = snap_bytes.saturating_add(wb.log_bytes);
+        let table_bytes = tables::workbook_table_bytes(&mut db, doc).await?;
         sqlx::query!("DELETE FROM workbooks WHERE id = $1", doc)
             .execute(&mut *db)
             .await?;
@@ -478,10 +491,12 @@ impl Store {
         )
         .execute(&mut *db)
         .await?;
+        tables::release_bytes(&mut db, wb.owner_id, table_bytes).await?;
         db.commit().await?;
 
         let dir = self.data_dir.join("snapshots").join(doc.to_string());
         let _ = tokio::fs::remove_dir_all(dir).await;
+        self.remove_workbook_tables(doc).await;
         self.refresh_disk_used().await?;
         Ok(())
     }
@@ -998,6 +1013,16 @@ fn decode_log(payload: &[u8], seq: u64) -> Result<WireWalRecordV3, StoreError> {
         return Err(invalid());
     }
     wal.records.pop().ok_or_else(invalid)
+}
+
+/// What everyone stores: snapshots, logs and tables.
+async fn stored_bytes(db: impl sqlx::PgExecutor<'_>) -> Result<u64, StoreError> {
+    let total: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(storage_bytes + table_bytes), 0)::bigint FROM users",
+    )
+    .fetch_one(db)
+    .await?;
+    Ok(u64::try_from(total.max(0)).unwrap_or(0))
 }
 
 fn integer<T, U: TryFrom<T>>(value: T, name: &'static str) -> Result<U, StoreError> {

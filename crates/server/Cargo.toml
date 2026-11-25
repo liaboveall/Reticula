@@ -26,6 +26,7 @@ reticula-agent.workspace = true
 reticula-core.workspace = true
 reticula-formula.workspace = true
 reticula-sync.workspace = true
+reticula-table.workspace = true
 reticula-wire.workspace = true
 serde.workspace = true
 serde_json = "1.0"
@@ -34,7 +35,7 @@ sqlx = { version = "0.9.1", default-features = false, features = ["json", "macro
 tempfile = "3.27.0"
 thiserror = "2.0.21"
 time = { version = "0.3", default-features = false }
-tokio = { version = "1.54.1", features = ["fs", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1.54.1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-stream = "0.1.19"
 tower = "0.5"
 tower-http = { version = "0.7.1", features = ["fs"] }

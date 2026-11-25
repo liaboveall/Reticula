@@ -368,7 +368,7 @@ fn storage_key_branch(doc: Uuid, branch_id: Uuid, seq: i64) -> String {
     }
 }
 
-fn hash_file(file: &mut File) -> io::Result<[u8; 32]> {
+pub(super) fn hash_file(file: &mut File) -> io::Result<[u8; 32]> {
     let mut sha = Sha256::new();
     let mut buffer = [0; 16 * 1024];
     loop {
@@ -381,7 +381,7 @@ fn hash_file(file: &mut File) -> io::Result<[u8; 32]> {
     Ok(sha.finalize().into())
 }
 
-fn sync_directory(path: &Path) -> io::Result<()> {
+pub(super) fn sync_directory(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
         for ancestor in path.ancestors().take(4) {

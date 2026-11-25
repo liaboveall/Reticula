@@ -12,6 +12,8 @@ export interface AccountSummary {
   quotaBytes: number;
   sharedWorkbooks: number;
   storageBytes: number;
+  tableBytes: number;
+  tableQuotaBytes: number;
   user: User;
 }
 
@@ -117,6 +119,13 @@ export interface CreateShareLink {
   role?: ShareRole | null;
   singleUse?: boolean | null;
   ttlSeconds?: number | null;
+}
+
+export interface CreateTable {
+  bytes: number;
+  id: string;
+  name: string;
+  sha256: string;
 }
 
 export interface CreateVersion {
@@ -266,8 +275,38 @@ export interface StatusResult {
   status: string;
 }
 
+export interface TableList {
+  changed: boolean;
+  tables?: TableRecord[] | null;
+  version: string;
+}
+
+export interface TableRecord {
+  bytes: number;
+  cols: number;
+  createdAt: string;
+  id: string;
+  name: string;
+  position: number;
+  rows: number;
+  sha256: string;
+  status: TableStatus;
+  uploadOffset?: number | null;
+}
+
+export type TableStatus = "uploading" | "ready" | "missing";
+
+export interface TableUpload {
+  uploadOffset: number;
+}
+
 export interface UpdateMemberRole {
   role: ShareRole;
+}
+
+export interface UpdateTable {
+  name?: string | null;
+  position?: number | null;
 }
 
 export interface UpdateWorkbook {
@@ -569,6 +608,47 @@ export async function snapshot(id: string, seq: string, signal?: AbortSignal, op
   if (options?.xReticulaShare != null) headers["X-Reticula-Share"] = String(options.xReticulaShare);
   const response = await request("GET", `/api/workbooks/${encodeURIComponent(id)}/snapshots/${encodeURIComponent(seq)}`, signal, undefined, headers);
   return response.arrayBuffer();
+}
+
+export async function listTables(id: string, signal?: AbortSignal, options?: { since?: string; xReticulaShare?: string }): Promise<TableList> {
+  const parameters = new URLSearchParams();
+  if (options?.since != null) parameters.set("since", String(options.since));
+  const query = parameters.toString();
+  const target = query ? `/api/workbooks/${encodeURIComponent(id)}/tables` + `?${query}` : `/api/workbooks/${encodeURIComponent(id)}/tables`;
+  const headers: Record<string, string> = {};
+  if (options?.xReticulaShare != null) headers["X-Reticula-Share"] = String(options.xReticulaShare);
+  const response = await request("GET", target, signal, undefined, headers);
+  return response.json();
+}
+
+export async function createTable(id: string, body: CreateTable, signal?: AbortSignal): Promise<TableRecord> {
+  const response = await request("POST", `/api/workbooks/${encodeURIComponent(id)}/tables`, signal, body);
+  return response.json();
+}
+
+export async function deleteTable(id: string, tid: string, signal?: AbortSignal): Promise<void> {
+  await request("DELETE", `/api/workbooks/${encodeURIComponent(id)}/tables/${encodeURIComponent(tid)}`, signal);
+}
+
+export async function updateTable(id: string, tid: string, body: UpdateTable, signal?: AbortSignal): Promise<TableRecord> {
+  const response = await request("PATCH", `/api/workbooks/${encodeURIComponent(id)}/tables/${encodeURIComponent(tid)}`, signal, body);
+  return response.json();
+}
+
+export async function completeTable(id: string, tid: string, signal?: AbortSignal): Promise<TableRecord> {
+  const response = await request("POST", `/api/workbooks/${encodeURIComponent(id)}/tables/${encodeURIComponent(tid)}/complete`, signal);
+  return response.json();
+}
+
+export function tableDataUrl(id: string, tid: string): string {
+  return `/api/workbooks/${encodeURIComponent(id)}/tables/${encodeURIComponent(tid)}/data`;
+}
+
+export async function uploadTableData(id: string, tid: string, uploadOffset: string, body: Uint8Array, signal?: AbortSignal): Promise<TableUpload> {
+  const headers: Record<string, string> = {};
+  headers["Upload-Offset"] = uploadOffset;
+  const response = await request("PATCH", `/api/workbooks/${encodeURIComponent(id)}/tables/${encodeURIComponent(tid)}/data`, signal, body, headers);
+  return response.json();
 }
 
 export async function txns(id: string, signal?: AbortSignal, options?: { afterSeq?: string; limit?: number; xReticulaShare?: string }): Promise<ArrayBuffer> {

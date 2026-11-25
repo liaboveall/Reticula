@@ -124,17 +124,16 @@ fn type_of(schema: &Value) -> Result<String> {
         Value::Null => Ok("unknown".to_owned()),
         Value::Array(types) => Ok(types
             .iter()
-            .map(ts_primitive)
+            .map(|kind| {
+                if kind == "array" {
+                    array_of(&schema["items"])
+                } else {
+                    ts_primitive(kind)
+                }
+            })
             .collect::<Result<Vec<_>>>()?
             .join(" | ")),
-        kind if kind == "array" => {
-            let item = type_of(&schema["items"])?;
-            if item.contains(" | ") {
-                Ok(format!("Array<{item}>"))
-            } else {
-                Ok(format!("{item}[]"))
-            }
-        }
+        kind if kind == "array" => array_of(&schema["items"]),
         kind if kind == "object" && schema.get("properties").is_some() => {
             let mut fields = Vec::new();
             for (key, prop) in map(&schema["properties"])? {
@@ -158,6 +157,15 @@ fn type_of(schema: &Value) -> Result<String> {
         }
         kind if kind == "object" => Ok("Record<string, unknown>".to_owned()),
         kind => ts_primitive(kind),
+    }
+}
+
+fn array_of(items: &Value) -> Result<String> {
+    let item = type_of(items)?;
+    if item.contains(" | ") {
+        Ok(format!("Array<{item}>"))
+    } else {
+        Ok(format!("{item}[]"))
     }
 }
 
@@ -210,7 +218,9 @@ fn operation_ts(out: &mut String, method: &str, path: &str, op: &Value) -> Resul
         }
     }
     let responses = &op["responses"];
+    // Parts of a file are for whoever asks for them, with headers of their own.
     let url_only = responses.get("101").is_some()
+        || responses.get("206").is_some()
         || responses.get("303").is_some()
         || responses
             .pointer("/200/content/text~1event-stream")

@@ -15,6 +15,12 @@ pub fn root() -> PathBuf {
         .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
 }
 
+/// Where cargo puts what it builds.
+pub fn target_dir() -> PathBuf {
+    // An absolute path replaces the root; cargo takes another one from here.
+    root().join(std::env::var_os("CARGO_TARGET_DIR").unwrap_or_else(|| OsString::from("target")))
+}
+
 /// Announces the next step of a task.
 pub fn step(title: &str) {
     println!("\n==> {title}");

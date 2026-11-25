@@ -30,12 +30,23 @@ if [[ ! -f "${BACKUP_DIR}/manifest.sha256" ]]; then
   exit 1
 fi
 
-echo "[backup-restic] uploading ${BACKUP_DIR} to ${RESTIC_REPOSITORY}..."
+BACKUP_DIR="$(cd "$BACKUP_DIR" && pwd)"
+# The tables the backup lists, which are not in it.
+TABLE_BACKUP_ROOT="${TABLE_BACKUP_ROOT:-$(dirname "${BACKUP_DIR%/}")-tables}"
+paths=("$BACKUP_DIR")
+if [[ -d "$TABLE_BACKUP_ROOT" ]]; then
+  paths+=("$TABLE_BACKUP_ROOT")
+elif [[ -s "${BACKUP_DIR}/tables.tsv" ]]; then
+  echo "error: ${BACKUP_DIR} lists tables and ${TABLE_BACKUP_ROOT} does not exist" >&2
+  exit 1
+fi
+
+echo "[backup-restic] uploading ${paths[*]} to ${RESTIC_REPOSITORY}..."
 if ! restic cat config >/dev/null 2>&1; then
   restic init
 fi
 
-restic backup --tag reticula "$BACKUP_DIR"
+restic backup --tag reticula "${paths[@]}"
 restic forget \
   --tag reticula \
   --keep-daily "${RESTIC_KEEP_DAILY:-7}" \

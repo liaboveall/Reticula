@@ -1,5 +1,6 @@
-# The whole service: the server image, PostgreSQL 18 and the volume that
-# holds workbook snapshots, with the memory and CPU limits of the target host.
+# The whole service: the server image, PostgreSQL 18 and the volume that holds
+# workbook snapshots and tables, with the memory and CPU limits of the target
+# host.
 #
 # Settings and secrets come from an env file that stays out of the repository
 # (`docker compose --env-file <file> up -d`):
@@ -15,6 +16,9 @@
 #   RETICULA_AGENT_*                optional AI analyst quotas & run guardrails (see .env.example)
 #   RETICULA_MAX_CONCURRENT_AGENT_RUNS
 #                                   optional global AI analyst concurrency limit (default 2)
+#   RETICULA_TABLE_*, RETICULA_MIN_FREE_BYTES
+#                                   optional limits of tables (see .env.example)
+#   RETICULA_TRUSTED_PROXIES        optional, see below
 #
 # `cargo xtask stack` runs this file against a locally built image.
 name: reticula
@@ -23,6 +27,10 @@ services:
   postgres:
     image: postgres:18.7-bookworm
     restart: unless-stopped
+    # Reaps what a health check leaves behind when it runs into its timeout.
+    # Without, that becomes a child of the server, which takes it for one of
+    # its own that crashed and starts over.
+    init: true
     environment:
       POSTGRES_USER: reticula
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in the env file}
@@ -64,6 +72,19 @@ services:
       RETICULA_AUTH_MODE: "github"
       RETICULA_GITHUB_CLIENT_ID: ${RETICULA_GITHUB_CLIENT_ID:?set RETICULA_GITHUB_CLIENT_ID in the env file}
       RETICULA_GITHUB_CLIENT_SECRET: ${RETICULA_GITHUB_CLIENT_SECRET:?set RETICULA_GITHUB_CLIENT_SECRET in the env file}
+      # Nginx on the host reaches the server through the published port, and then
+      # the peer is the gateway of this project's network, which Docker takes from
+      # its private pools. They can be trusted to name the visitor because the
+      # ports are published on the loopback interface of the host only, so the
+      # peer is the host or a container of this project.
+      RETICULA_TRUSTED_PROXIES: ${RETICULA_TRUSTED_PROXIES:-127.0.0.0/8,::1/128,172.16.0.0/12,192.168.0.0/16}
+      RETICULA_TABLE_MAX_BYTES: ${RETICULA_TABLE_MAX_BYTES:-}
+      RETICULA_TABLE_USER_QUOTA_BYTES: ${RETICULA_TABLE_USER_QUOTA_BYTES:-}
+      RETICULA_TABLE_TOTAL_BYTES: ${RETICULA_TABLE_TOTAL_BYTES:-}
+      RETICULA_MIN_FREE_BYTES: ${RETICULA_MIN_FREE_BYTES:-}
+      RETICULA_TABLE_UPLOAD_BYTES_PER_MINUTE: ${RETICULA_TABLE_UPLOAD_BYTES_PER_MINUTE:-}
+      RETICULA_TABLE_DOWNLOAD_BYTES_PER_MINUTE: ${RETICULA_TABLE_DOWNLOAD_BYTES_PER_MINUTE:-}
+      RETICULA_TABLE_ANON_RPM: ${RETICULA_TABLE_ANON_RPM:-}
       RETICULA_LLM_ENABLED: ${RETICULA_LLM_ENABLED:-false}
       RETICULA_LLM_MODE: ${RETICULA_LLM_MODE:-}
       RETICULA_LLM_PROVIDER: ${RETICULA_LLM_PROVIDER:-}

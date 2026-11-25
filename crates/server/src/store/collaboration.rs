@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
-use super::{DELETED_USER_ID, MAIN_BRANCH, Store, StoreError, integer};
+use super::{DELETED_USER_ID, MAIN_BRANCH, Store, StoreError, integer, tables};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
@@ -109,6 +109,8 @@ pub struct AccountSummary {
     pub shared_workbooks: u64,
     pub storage_bytes: u64,
     pub quota_bytes: u64,
+    pub table_bytes: u64,
+    pub table_quota_bytes: u64,
     pub disk_over_soft_limit: bool,
     pub disk_over_hard_limit: bool,
     pub ai_tokens_used_today: u64,
@@ -640,6 +642,12 @@ impl Store {
         .await?
         .ok_or(StoreError::NotFound)?;
 
+        let table_bytes: i64 = sqlx::query_scalar("SELECT table_bytes FROM users WHERE id = $1")
+            .bind(user_id)
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or(StoreError::NotFound)?;
+
         let quota = self.get_daily_quota(user_id).await.unwrap_or_default();
         Ok(AccountSummary {
             user: User {
@@ -651,6 +659,8 @@ impl Store {
             shared_workbooks: integer(row.shared, "shared workbooks")?,
             storage_bytes: integer(row.storage_bytes, "storage bytes")?,
             quota_bytes: self.limits.user_quota_bytes,
+            table_bytes: integer(table_bytes, "table bytes")?,
+            table_quota_bytes: self.limits.table_user_quota_bytes,
             disk_over_soft_limit: self.disk_over_soft_limit(),
             disk_over_hard_limit: self.disk_over_hard_limit(),
             ai_tokens_used_today: quota.llm_tokens,
@@ -665,6 +675,11 @@ impl Store {
         if user_id == DELETED_USER_ID {
             return Err(StoreError::Forbidden);
         }
+        let owned: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM workbooks WHERE owner_id = $1")
+            .bind(user_id)
+            .fetch_all(&self.pool)
+            .await?;
+        let _closed = self.close_workbooks(owned).await;
         let mut db = self.pool.begin().await?;
         sqlx::query!("SET CONSTRAINTS ALL DEFERRED")
             .execute(&mut *db)
@@ -741,6 +756,7 @@ impl Store {
         )
         .execute(&mut *db)
         .await?;
+        tables::disown_tables(&mut db, user_id).await?;
         sqlx::query("UPDATE agent_runs SET user_id = $2 WHERE user_id = $1")
             .bind(user_id)
             .bind(DELETED_USER_ID)
@@ -759,6 +775,7 @@ impl Store {
         for id in &owned_workbooks {
             let dir = self.data_dir.join("snapshots").join(id.to_string());
             let _ = tokio::fs::remove_dir_all(dir).await;
+            self.remove_workbook_tables(*id).await;
         }
         self.refresh_disk_used().await?;
 
@@ -769,7 +786,7 @@ impl Store {
     }
 }
 
-fn member_role(role: &str) -> Result<MemberRole, StoreError> {
+pub(super) fn member_role(role: &str) -> Result<MemberRole, StoreError> {
     match role {
         "owner" => Ok(MemberRole::Owner),
         "editor" => Ok(MemberRole::Editor),

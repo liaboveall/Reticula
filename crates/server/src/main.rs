@@ -12,6 +12,7 @@
 use std::env;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use axum::Router;
 use axum::extract::Request;
@@ -22,7 +23,8 @@ use axum::response::Response;
 use axum::routing::get;
 use reticula_server::http::{self, ApiState, AuthConfig};
 use reticula_server::ops::GovernanceConfig;
-use reticula_server::store::{StorageLimits, Store};
+use reticula_server::proxies::{TrustedProxies, TrustedProxiesError};
+use reticula_server::store::{REMOVED_TABLES_KEPT, StorageLimits, Store, TABLE_UPLOAD_IDLE};
 use tokio::net::TcpListener;
 use tower_http::services::{ServeDir, ServeFile};
 use tracing_subscriber::EnvFilter;
@@ -194,6 +196,22 @@ async fn shutdown_signal() {
     }
 }
 
+/// Drops table uploads that were abandoned, and files that were in no row for
+/// long, now and from time to time.
+async fn tidy_tables(store: Store) {
+    let mut ticks = tokio::time::interval(Duration::from_secs(300));
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        ticks.tick().await;
+        if let Err(error) = store.drop_idle_tables(TABLE_UPLOAD_IDLE).await {
+            tracing::error!(error = %error, "could not drop idle table uploads");
+        }
+        if let Err(error) = store.purge_removed_tables(REMOVED_TABLES_KEPT).await {
+            tracing::error!(error = %error, "could not remove files of tables that were put aside");
+        }
+    }
+}
+
 async fn wait_shutdown(mut rx: tokio::sync::watch::Receiver<bool>) {
     while !*rx.borrow() {
         if rx.changed().await.is_err() {
@@ -221,10 +239,24 @@ fn storage_limits_from_env() -> StorageLimits {
         user_quota_bytes: parse_env("RETICULA_USER_QUOTA_BYTES", defaults.user_quota_bytes),
         disk_soft_bytes: parse_env("RETICULA_DISK_SOFT_BYTES", defaults.disk_soft_bytes),
         disk_hard_bytes: parse_env("RETICULA_DISK_HARD_BYTES", defaults.disk_hard_bytes),
+        table_max_bytes: parse_env("RETICULA_TABLE_MAX_BYTES", defaults.table_max_bytes),
+        table_user_quota_bytes: parse_env(
+            "RETICULA_TABLE_USER_QUOTA_BYTES",
+            defaults.table_user_quota_bytes,
+        ),
+        table_total_bytes: parse_env("RETICULA_TABLE_TOTAL_BYTES", defaults.table_total_bytes),
+        min_free_bytes: parse_env("RETICULA_MIN_FREE_BYTES", defaults.min_free_bytes),
     }
 }
 
-fn governance_from_env() -> GovernanceConfig {
+fn trusted_proxies_from_env() -> Result<TrustedProxies, TrustedProxiesError> {
+    match env::var("RETICULA_TRUSTED_PROXIES") {
+        Ok(raw) if !raw.trim().is_empty() => raw.parse(),
+        _ => Ok(TrustedProxies::default()),
+    }
+}
+
+fn governance_from_env(trusted_proxies: TrustedProxies) -> GovernanceConfig {
     let defaults = GovernanceConfig::default();
     GovernanceConfig {
         max_loaded_bytes: parse_env("RETICULA_MAX_LOADED_BYTES", defaults.max_loaded_bytes),
@@ -235,6 +267,16 @@ fn governance_from_env() -> GovernanceConfig {
             defaults.max_anon_ws_per_doc,
         ),
         max_anon_ws_per_ip: parse_env("RETICULA_MAX_ANON_WS_PER_IP", defaults.max_anon_ws_per_ip),
+        table_upload_bpm: parse_env(
+            "RETICULA_TABLE_UPLOAD_BYTES_PER_MINUTE",
+            defaults.table_upload_bpm,
+        ),
+        table_download_bpm: parse_env(
+            "RETICULA_TABLE_DOWNLOAD_BYTES_PER_MINUTE",
+            defaults.table_download_bpm,
+        ),
+        table_anon_rpm: parse_env("RETICULA_TABLE_ANON_RPM", defaults.table_anon_rpm),
+        trusted_proxies,
     }
 }
 
@@ -255,6 +297,11 @@ async fn main() {
         env::var("RETICULA_STATIC_DIR").unwrap_or_else(|_| String::from("apps/web/dist")),
     );
 
+    let trusted_proxies = trusted_proxies_from_env().unwrap_or_else(|error| {
+        tracing::error!(error = %error, "invalid RETICULA_TRUSTED_PROXIES");
+        std::process::exit(1);
+    });
+
     let api = match env::var("RETICULA_DATABASE_URL") {
         Ok(database_url) => {
             let data_dir = env::var_os("RETICULA_DATA_DIR")
@@ -264,7 +311,7 @@ async fn main() {
                 std::process::exit(1);
             });
             let limits = storage_limits_from_env();
-            let gov = governance_from_env();
+            let gov = governance_from_env(trusted_proxies);
             match Store::connect_with_limits(&database_url, PathBuf::from(data_dir), limits).await {
                 Ok(store) => {
                     let api_state = ApiState::with_governance(store, auth, gov);
@@ -279,6 +326,7 @@ async fn main() {
                             "cleaned expired branch snapshots older than 7 days"
                         );
                     }
+                    tokio::spawn(tidy_tables(api_state.store().clone()));
                     Some(api_state)
                 }
                 Err(error) => {

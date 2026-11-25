@@ -20,12 +20,37 @@ if [[ -n "$ENV_FILE" && -f "$ENV_FILE" ]]; then
   set +a
 fi
 
+TABLE_BACKUP_ROOT="${TABLE_BACKUP_ROOT:-${BACKUP_ROOT%/}-tables}"
+TABLE_BACKUP_MAX_BYTES="${TABLE_BACKUP_MAX_BYTES:-12884901888}"
+TABLE_BACKUP_WARN_PCT="${TABLE_BACKUP_WARN_PCT:-80}"
+
 failures=()
 alert() {
   local msg="$1"
   echo "[monitor] ALERT: $msg" >&2
   failures+=("$msg")
 }
+
+# What has been found goes out however the script ends.
+finished=0
+report() {
+  local code=$?
+  trap - EXIT
+  if (( ! finished )); then
+    alert "the monitor stopped before its end (exit ${code})"
+  fi
+  if (( ${#failures[@]} > 0 )); then
+    if [[ -n "$ALERT_WEBHOOK_URL" ]]; then
+      local summary
+      summary="$(printf '%s; ' "${failures[@]}")"
+      curl -fsS -X POST -H "Content-Type: application/json" \
+        -d "{\"text\":\"Reticula monitor alert: ${summary}\"}" \
+        "$ALERT_WEBHOOK_URL" >/dev/null || true
+    fi
+    exit 1
+  fi
+}
+trap report EXIT
 
 check_http() {
   local url="$1"
@@ -46,8 +71,10 @@ else
   alert "could not scrape ${METRICS_URL}"
 fi
 
-disk_pct="$(df -P "$DATA_MOUNT" | awk 'NR==2 { gsub("%", "", $5); print $5 }')"
-if [[ -n "$disk_pct" ]] && (( disk_pct >= DISK_WARN_PCT )); then
+disk_pct="$(df -P "$DATA_MOUNT" | awk 'NR==2 { gsub("%", "", $5); print $5 }' || true)"
+if [[ -z "$disk_pct" ]]; then
+  alert "could not read the filesystem usage on ${DATA_MOUNT}"
+elif (( disk_pct >= DISK_WARN_PCT )); then
   alert "filesystem usage on ${DATA_MOUNT} is ${disk_pct}% (>= ${DISK_WARN_PCT}%)"
 fi
 
@@ -61,12 +88,25 @@ if [[ -d "$BACKUP_ROOT" ]]; then
       alert "latest backup ${latest_backup} is missing manifest.sha256"
     else
       now_epoch="$(date -u +%s)"
-      mtime_epoch="$(stat -c %Y "$manifest" 2>/dev/null || stat -f %m "$manifest")"
+      # A backup that is being pruned is as old as can be.
+      mtime_epoch="$(stat -c %Y "$manifest" 2>/dev/null || stat -f %m "$manifest" 2>/dev/null || echo 0)"
       age_hours="$(( (now_epoch - mtime_epoch) / 3600 ))"
       if (( age_hours > BACKUP_MAX_AGE_HOURS )); then
         alert "latest backup ${latest_backup} is ${age_hours}h old (> ${BACKUP_MAX_AGE_HOURS}h)"
       fi
     fi
+    missed="${latest_backup}/tables-missed.tsv"
+    if [[ -s "$missed" ]]; then
+      alert "latest backup ${latest_backup} is without $(wc -l < "$missed" | tr -d ' ') table(s)"
+    fi
+  fi
+fi
+
+if [[ -d "$TABLE_BACKUP_ROOT" ]]; then
+  # A file may go while it is looked at.
+  table_bytes="$({ find "$TABLE_BACKUP_ROOT" -type f -printf '%s\n' 2>/dev/null || true; } | awk '{ sum += $1 } END { printf "%.0f", sum }')"
+  if (( table_bytes * 100 >= TABLE_BACKUP_MAX_BYTES * TABLE_BACKUP_WARN_PCT )); then
+    alert "table backups in ${TABLE_BACKUP_ROOT} take ${table_bytes} of ${TABLE_BACKUP_MAX_BYTES} bytes (>= ${TABLE_BACKUP_WARN_PCT}%)"
   fi
 fi
 
@@ -86,14 +126,7 @@ if command -v docker >/dev/null 2>&1; then
   fi
 fi
 
-if (( ${#failures[@]} > 0 )); then
-  if [[ -n "$ALERT_WEBHOOK_URL" ]]; then
-    summary="$(printf '%s; ' "${failures[@]}")"
-    curl -fsS -X POST -H "Content-Type: application/json" \
-      -d "{\"text\":\"Reticula monitor alert: ${summary}\"}" \
-      "$ALERT_WEBHOOK_URL" >/dev/null || true
-  fi
-  exit 1
+finished=1
+if (( ${#failures[@]} == 0 )); then
+  echo "[monitor] ok (disk=${disk_pct:-?}%)"
 fi
-
-echo "[monitor] ok (disk=${disk_pct:-?}%)"

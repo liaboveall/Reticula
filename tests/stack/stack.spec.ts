@@ -2,6 +2,7 @@ import { execFileSync } from "node:child_process";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { expect, type Page, test } from "@playwright/test";
 import { createAndShareSheet, editCell, settled } from "../e2e/collab-helpers.ts";
+import { ask, connect, copies } from "../e2e/tables-remote-helpers.ts";
 
 // The stack `cargo xtask stack` started. The release image only signs people
 // in through GitHub, so the test writes two sessions straight into the
@@ -242,5 +243,97 @@ test("compose stack: sync, server SIGKILL, database restart and recreated contai
   } finally {
     await aliceCtx.close();
     await bobCtx.close();
+  }
+});
+
+// The container sees every request come from the gateway of its network: who
+// the visitor is, only the header of the proxy says.
+test("compose stack: anonymous visitors have budgets of their own", async () => {
+  await waitReady();
+  const statusFor = async (visitor: string) =>
+    (await fetch(`${baseUrl}/api/auth/me`, { headers: { "x-real-ip": visitor } })).status;
+
+  let status = await statusFor("203.0.113.1");
+  expect(status).toBe(401);
+  for (let request = 0; request < 1_000 && status === 401; request += 1) {
+    status = await statusFor("203.0.113.1");
+  }
+  expect(status).toBe(429);
+  expect(await statusFor("203.0.113.2")).toBe(401);
+  expect(await statusFor("2001:db8::2")).toBe(401);
+  expect(await statusFor("203.0.113.1")).toBe(429);
+});
+
+// A data table on its way to the server, and on the volume that it is kept on.
+test("compose stack: a data table survives the server, its database and both containers", async ({
+  browser,
+}) => {
+  await waitReady();
+  const token = seedSession("Dora");
+  const signedIn = async () => {
+    const context = await browser.newContext();
+    await context.addCookies([{ name: "reticula_session", value: token, url: baseUrl }]);
+    const page = await context.newPage();
+    await page.goto(`${baseUrl}/app?hooks&doc=${randomUUID()}`);
+    await expect(page.getByTestId("engine-status")).toHaveText("ready");
+    return { context, page };
+  };
+  const { context, page } = await signedIn();
+  try {
+    const created = await page.request.post(`${baseUrl}/api/workbooks`, {
+      headers: { origin: baseUrl },
+      data: { title: "Tables of the stack" },
+    });
+    expect(created.status()).toBe(201);
+    const { id: docId } = (await created.json()) as { id: string };
+    const me = (await (await page.request.get(`${baseUrl}/api/auth/me`)).json()) as { id: string };
+    const whose = { docId, userId: me.id, canWrite: true };
+    const listed = async () => {
+      const answer = await page.request.get(`${baseUrl}/api/workbooks/${docId}/tables`);
+      const { tables } = (await answer.json()) as {
+        tables: { status: string; sha256: string; uploadOffset?: number }[];
+      };
+      return tables;
+    };
+
+    // 1. The server is killed while the table is on its way: three pieces.
+    await connect(page, whose);
+    const { entry } = await ask(page, (client) => client.sample("orders", 900_000, 11));
+    await page.evaluate(async (userId) => {
+      const hooks = window.__reticula as NonNullable<Window["__reticula"]>;
+      const { resumeUploads } = await hooks.tables();
+      void resumeUploads(userId, () => {});
+    }, me.id);
+    await expect
+      .poll(async () => (await listed())[0]?.uploadOffset ?? 0, {
+        intervals: [20],
+        timeout: 30_000,
+      })
+      .toBeGreaterThan(0);
+    compose("kill", "--signal", "SIGKILL", "server");
+    compose("start", "server");
+    await waitReady();
+    await expect
+      .poll(async () => (await listed()).map(({ status }) => status), { timeout: 120_000 })
+      .toEqual(["ready"]);
+    const [record] = await listed();
+
+    // 2. It is there after the containers were replaced, and whole: the browser
+    //    has the checksum of every page of it.
+    compose("restart", "postgres");
+    compose("up", "--detach", "--wait", "--force-recreate");
+    await waitReady();
+    const other = await signedIn();
+    try {
+      await connect(other.page, whose);
+      await ask(other.page, (client, id) => client.open(id).then(() => null), entry.id);
+      const { columns } = await ask(other.page, (client) => client.summary([0, 1, 2, 3]), null);
+      expect(columns.map(({ rows }) => rows)).toEqual([900_000, 900_000, 900_000, 900_000]);
+      expect(await copies(other.page)).toEqual([record?.sha256]);
+    } finally {
+      await other.context.close();
+    }
+  } finally {
+    await context.close();
   }
 });
