@@ -2414,6 +2414,14 @@
       "networkLabel": "20 Mbps / 50 ms RTT",
       "shellP50Ms": 407.8,
       "suite": "m6-startup"
+    },
+    {
+      "commit": "7953455",
+      "date": "2026-11-25",
+      "firstScreenP50Ms": 1067.0,
+      "networkLabel": "20 Mbps / 50 ms RTT",
+      "shellP50Ms": 444.8,
+      "suite": "m6-startup"
     }
   ],
   "syncRuns": [
