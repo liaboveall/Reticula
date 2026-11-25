@@ -305,4 +305,23 @@ export const TABLES_PROVENANCE: Provenance | null = null;
 /** The latest run in Chrome. */
 export const TABLES: TableRun | null = null;
 
-export const TABLE_COMPARISON: TableComparison | null = null;
+export const TABLE_COMPARISON: TableComparison | null = {
+  provenance: {
+    report: "bench/results/2026-11-25-c3bad5d-tablediff.json",
+    commit: "c3bad5d",
+    date: "2026-11-25",
+    uncommittedChanges: false,
+    cpu: null,
+    logicalProcessors: null,
+    memoryGb: null,
+    os: null,
+    browser: null,
+    headless: null,
+    affinity: null,
+  },
+  reference: "DuckDB v1.4.3 (duckdb-wasm 1.32.0)",
+  tables: 74,
+  questions: 2611,
+  different: 0,
+  allowed: 1157,
+};

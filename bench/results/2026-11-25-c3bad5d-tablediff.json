@@ -1,0 +1,1031 @@
+{
+  "allowed": {
+    "NaN is text here": 1,
+    "a list of values counts the first 1,048,576 of them or 64 MiB, and says so": 2,
+    "a sum is compensated here: within two units of rounding of the exact one, which fsum need not be": 2,
+    "a time of day without a date is text here": 7,
+    "a time with a Z is one without a time zone here": 7,
+    "a time with an offset is text here": 9,
+    "dates and times may be in the same column here": 4,
+    "dates may be written in two ways in the same column here": 2,
+    "long texts outside of a dictionary that begin alike need not be sorted": 4,
+    "numbers that lose digits as a DOUBLE are text here": 16,
+    "numbers with a plus sign, zeros in front or a negative zero are text here": 9,
+    "numbers with a point are exact decimals here and DOUBLE there": 47,
+    "the dotted capital I and the sigma at the end of a word are folded as Unicode says here": 1047
+  },
+  "byKind": {
+    "cells": 620,
+    "parquetCounts": 236,
+    "summary": 584,
+    "types": 384,
+    "values": 464,
+    "view": 1563
+  },
+  "commit": "c3bad5d",
+  "comparisons": 2611,
+  "date": "2026-11-25",
+  "mismatches": 0,
+  "reference": "DuckDB v1.4.3 (duckdb-wasm 1.32.0)",
+  "seed": 2026,
+  "suite": "m5-tablediff",
+  "tables": [
+    {
+      "about": "three groups of rows",
+      "columns": 13,
+      "dictionaries": 3,
+      "dictionariesLeft": 0,
+      "from": "csv",
+      "groups": 3,
+      "name": "groups",
+      "passes": 1,
+      "questions": 137,
+      "rows": 150000
+    },
+    {
+      "about": "a dictionary that has too many entries",
+      "columns": 2,
+      "dictionaries": 1,
+      "dictionariesLeft": 1,
+      "from": "csv",
+      "groups": 66,
+      "name": "entries",
+      "passes": 1,
+      "questions": 18,
+      "rows": 4300000
+    },
+    {
+      "about": "dictionaries that take too much memory",
+      "columns": 3,
+      "dictionaries": 2,
+      "dictionariesLeft": 1,
+      "from": "csv",
+      "groups": 3,
+      "name": "bytes",
+      "passes": 1,
+      "questions": 18,
+      "rows": 145000
+    },
+    {
+      "about": "many rows to be sorted, and texts that begin alike outside of a dictionary",
+      "columns": 5,
+      "dictionaries": 1,
+      "dictionariesLeft": 0,
+      "from": "csv",
+      "groups": 11,
+      "name": "long",
+      "passes": 1,
+      "questions": 35,
+      "rows": 700000
+    },
+    {
+      "about": "longer texts that begin alike outside of a dictionary",
+      "columns": 3,
+      "dictionaries": 1,
+      "dictionariesLeft": 0,
+      "from": "csv",
+      "groups": 2,
+      "name": "alike",
+      "passes": 1,
+      "questions": 35,
+      "rows": 70000
+    },
+    {
+      "about": "texts that begin alike, some of them in a dictionary",
+      "columns": 3,
+      "dictionaries": 2,
+      "dictionariesLeft": 1,
+      "from": "csv",
+      "groups": 3,
+      "name": "alike mixed",
+      "passes": 1,
+      "questions": 18,
+      "rows": 145000
+    },
+    {
+      "about": "types that the first mebibyte does not tell",
+      "columns": 14,
+      "dictionaries": 6,
+      "dictionariesLeft": 0,
+      "from": "csv",
+      "groups": 1,
+      "name": "turns",
+      "passes": 2,
+      "questions": 52,
+      "rows": 36000
+    },
+    {
+      "about": "one column that the first mebibyte does not tell",
+      "columns": 3,
+      "dictionaries": 1,
+      "dictionariesLeft": 0,
+      "from": "csv",
+      "groups": 2,
+      "name": "turns late",
+      "passes": 2,
+      "questions": 35,
+      "rows": 100000
+    },
+    {
+      "about": "rows with too few fields",
+      "columns": 13,
+      "dictionaries": 4,
+      "dictionariesLeft": 0,
+      "from": "csv",
+      "groups": 1,
+      "name": "short rows",
+      "passes": 1,
+      "questions": 35,
+      "rows": 3000
+    },
+    {
+      "about": "many columns",
+      "columns": 120,
+      "dictionaries": 37,
+      "dictionariesLeft": 0,
+      "from": "csv",
+      "groups": 1,
+      "name": "wide",
+      "passes": 2,
+      "questions": 59,
+      "rows": 9000
+    },
+    {
+      "about": "at the edge of a group",
+      "columns": 5,
+      "dictionaries": 0,
+      "dictionariesLeft": 0,
+      "from": "csv",
+      "groups": 1,
+      "name": "edge 65535",
+      "passes": 1,
+      "questions": 35,
+      "rows": 65535
+    },
+    {
+      "about": "at the edge of a group",
+      "columns": 5,
+      "dictionaries": 0,
+      "dictionariesLeft": 0,
+      "from": "csv",
+      "groups": 1,
+      "name": "edge 65536",
+      "passes": 1,
+      "questions": 35,
+      "rows": 65536
+    },
+    {
+      "about": "at the edge of a group",
+      "columns": 5,
+      "dictionaries": 0,
+      "dictionariesLeft": 0,
+      "from": "csv",
+      "groups": 2,
+      "name": "edge 65537",
+      "passes": 1,
+      "questions": 35,
+      "rows": 65537
+    },
+    {
+      "about": "every kind of column",
+      "columns": 6,
+      "dictionaries": 0,
+      "dictionariesLeft": 0,
+      "from": "csv",
+      "groups": 1,
+      "name": "kinds 0",
+      "passes": 1,
+      "questions": 69,
+      "rows": 400
+    },
+    {
+      "about": "every kind of column",
+      "columns": 6,
+      "dictionaries": 1,
+      "dictionariesLeft": 0,
+      "from": "csv",
+      "groups": 1,
+      "name": "kinds 1",
+      "passes": 1,
+      "questions": 69,
+      "rows": 2500
+    },
+    {
+      "about": "every kind of column",
+      "columns": 6,
+      "dictionaries": 4,
+      "dictionariesLeft": 0,
+      "from": "csv",
+      "groups": 1,
+      "name": "kinds 2",
+      "passes": 1,
+      "questions": 69,
+      "rows": 9000
+    },
+    {
+      "about": "every kind of column",
+      "columns": 6,
+      "dictionaries": 2,
+      "dictionariesLeft": 0,
+      "from": "csv",
+      "groups": 1,
+      "name": "kinds 3",
+      "passes": 1,
+      "questions": 69,
+      "rows": 1100
+    },
+    {
+      "about": "every kind of column",
+      "columns": 6,
+      "dictionaries": 4,
+      "dictionariesLeft": 0,
+      "from": "csv",
+      "groups": 1,
+      "name": "kinds 4",
+      "passes": 1,
+      "questions": 69,
+      "rows": 20000
+    },
+    {
+      "about": "every kind of column",
+      "columns": 6,
+      "dictionaries": 3,
+      "dictionariesLeft": 0,
+      "from": "csv",
+      "groups": 1,
+      "name": "kinds 5",
+      "passes": 1,
+      "questions": 69,
+      "rows": 400
+    },
+    {
+      "about": "columns at random",
+      "columns": 3,
+      "dictionaries": 0,
+      "dictionariesLeft": 0,
+      "from": "csv",
+      "groups": 1,
+      "name": "random 0",
+      "passes": 1,
+      "questions": 35,
+      "rows": 256
+    },
+    {
+      "about": "columns at random",
+      "columns": 8,
+      "dictionaries": 3,
+      "dictionariesLeft": 0,
+      "from": "csv",
+      "groups": 1,
+      "name": "random 1",
+      "passes": 1,
+      "questions": 35,
+      "rows": 63
+    },
+    {
+      "about": "columns at random",
+      "columns": 8,
+      "dictionaries": 2,
+      "dictionariesLeft": 0,
+      "from": "csv",
+      "groups": 1,
+      "name": "random 2",
+      "passes": 1,
+      "questions": 35,
+      "rows": 2
+    },
+    {
+      "about": "columns at random",
+      "columns": 5,
+      "dictionaries": 0,
+      "dictionariesLeft": 0,
+      "from": "csv",
+      "groups": 0,
+      "name": "random 3",
+      "passes": 1,
+      "questions": 35,
+      "rows": 0
+    },
+    {
+      "about": "columns at random",
+      "columns": 8,
+      "dictionaries": 0,
+      "dictionariesLeft": 0,
+      "from": "csv",
+      "groups": 1,
+      "name": "random 4",
+      "passes": 1,
+      "questions": 35,
+      "rows": 1
+    },
+    {
+      "about": "columns at random",
+      "columns": 7,
+      "dictionaries": 3,
+      "dictionariesLeft": 0,
+      "from": "csv",
+      "groups": 1,
+      "name": "random 5",
+      "passes": 1,
+      "questions": 35,
+      "rows": 257
+    },
+    {
+      "about": "columns at random",
+      "columns": 2,
+      "dictionaries": 1,
+      "dictionariesLeft": 0,
+      "from": "csv",
+      "groups": 1,
+      "name": "random 6",
+      "passes": 1,
+      "questions": 35,
+      "rows": 2
+    },
+    {
+      "about": "columns at random",
+      "columns": 4,
+      "dictionaries": 1,
+      "dictionariesLeft": 0,
+      "from": "csv",
+      "groups": 1,
+      "name": "random 7",
+      "passes": 1,
+      "questions": 35,
+      "rows": 63
+    },
+    {
+      "about": "columns at random",
+      "columns": 7,
+      "dictionaries": 1,
+      "dictionariesLeft": 0,
+      "from": "csv",
+      "groups": 1,
+      "name": "random 8",
+      "passes": 1,
+      "questions": 35,
+      "rows": 1
+    },
+    {
+      "about": "columns at random",
+      "columns": 7,
+      "dictionaries": 3,
+      "dictionariesLeft": 0,
+      "from": "csv",
+      "groups": 1,
+      "name": "random 9",
+      "passes": 1,
+      "questions": 35,
+      "rows": 64
+    },
+    {
+      "about": "columns at random",
+      "columns": 8,
+      "dictionaries": 4,
+      "dictionariesLeft": 0,
+      "from": "csv",
+      "groups": 1,
+      "name": "random 10",
+      "passes": 1,
+      "questions": 35,
+      "rows": 1
+    },
+    {
+      "about": "columns at random",
+      "columns": 7,
+      "dictionaries": 2,
+      "dictionariesLeft": 0,
+      "from": "csv",
+      "groups": 1,
+      "name": "random 11",
+      "passes": 1,
+      "questions": 35,
+      "rows": 2
+    },
+    {
+      "about": "columns at random",
+      "columns": 8,
+      "dictionaries": 4,
+      "dictionariesLeft": 0,
+      "from": "csv",
+      "groups": 1,
+      "name": "random 12",
+      "passes": 1,
+      "questions": 35,
+      "rows": 256
+    },
+    {
+      "about": "columns at random",
+      "columns": 7,
+      "dictionaries": 5,
+      "dictionariesLeft": 0,
+      "from": "csv",
+      "groups": 1,
+      "name": "random 13",
+      "passes": 1,
+      "questions": 35,
+      "rows": 65
+    },
+    {
+      "about": "columns at random",
+      "columns": 6,
+      "dictionaries": 2,
+      "dictionariesLeft": 0,
+      "from": "csv",
+      "groups": 1,
+      "name": "random 14",
+      "passes": 1,
+      "questions": 35,
+      "rows": 12000
+    },
+    {
+      "about": "columns at random",
+      "columns": 4,
+      "dictionaries": 1,
+      "dictionariesLeft": 0,
+      "from": "csv",
+      "groups": 1,
+      "name": "random 15",
+      "passes": 1,
+      "questions": 35,
+      "rows": 1500
+    },
+    {
+      "about": "columns at random",
+      "columns": 3,
+      "dictionaries": 2,
+      "dictionariesLeft": 0,
+      "from": "csv",
+      "groups": 1,
+      "name": "random 16",
+      "passes": 1,
+      "questions": 35,
+      "rows": 63
+    },
+    {
+      "about": "columns at random",
+      "columns": 6,
+      "dictionaries": 2,
+      "dictionariesLeft": 0,
+      "from": "csv",
+      "groups": 1,
+      "name": "random 17",
+      "passes": 1,
+      "questions": 35,
+      "rows": 2
+    },
+    {
+      "about": "columns at random",
+      "columns": 5,
+      "dictionaries": 1,
+      "dictionariesLeft": 0,
+      "from": "csv",
+      "groups": 1,
+      "name": "random 18",
+      "passes": 1,
+      "questions": 35,
+      "rows": 2
+    },
+    {
+      "about": "columns at random",
+      "columns": 4,
+      "dictionaries": 0,
+      "dictionariesLeft": 0,
+      "from": "csv",
+      "groups": 0,
+      "name": "random 19",
+      "passes": 1,
+      "questions": 35,
+      "rows": 0
+    },
+    {
+      "about": "columns at random",
+      "columns": 5,
+      "dictionaries": 1,
+      "dictionariesLeft": 0,
+      "from": "csv",
+      "groups": 1,
+      "name": "random 20",
+      "passes": 1,
+      "questions": 35,
+      "rows": 65
+    },
+    {
+      "about": "columns at random",
+      "columns": 3,
+      "dictionaries": 1,
+      "dictionariesLeft": 0,
+      "from": "csv",
+      "groups": 1,
+      "name": "random 21",
+      "passes": 1,
+      "questions": 35,
+      "rows": 255
+    },
+    {
+      "about": "columns at random",
+      "columns": 5,
+      "dictionaries": 1,
+      "dictionariesLeft": 0,
+      "from": "csv",
+      "groups": 1,
+      "name": "random 22",
+      "passes": 1,
+      "questions": 35,
+      "rows": 63
+    },
+    {
+      "about": "columns at random",
+      "columns": 8,
+      "dictionaries": 2,
+      "dictionariesLeft": 0,
+      "from": "csv",
+      "groups": 1,
+      "name": "random 23",
+      "passes": 1,
+      "questions": 35,
+      "rows": 255
+    },
+    {
+      "about": "columns at random",
+      "columns": 3,
+      "dictionaries": 1,
+      "dictionariesLeft": 0,
+      "from": "csv",
+      "groups": 1,
+      "name": "random 24",
+      "passes": 1,
+      "questions": 35,
+      "rows": 12000
+    },
+    {
+      "about": "columns at random",
+      "columns": 2,
+      "dictionaries": 1,
+      "dictionariesLeft": 0,
+      "from": "csv",
+      "groups": 1,
+      "name": "random 25",
+      "passes": 1,
+      "questions": 35,
+      "rows": 256
+    },
+    {
+      "about": "columns at random",
+      "columns": 7,
+      "dictionaries": 4,
+      "dictionariesLeft": 0,
+      "from": "csv",
+      "groups": 1,
+      "name": "random 26",
+      "passes": 1,
+      "questions": 35,
+      "rows": 64
+    },
+    {
+      "about": "columns at random",
+      "columns": 4,
+      "dictionaries": 2,
+      "dictionariesLeft": 0,
+      "from": "csv",
+      "groups": 1,
+      "name": "random 27",
+      "passes": 1,
+      "questions": 35,
+      "rows": 700
+    },
+    {
+      "about": "three groups of rows",
+      "columns": 13,
+      "dictionaries": 2,
+      "dictionariesLeft": 0,
+      "from": "parquet",
+      "groups": 3,
+      "name": "groups",
+      "parquet": {
+        "compression": "zstd",
+        "rowGroup": 50000,
+        "version": "V2"
+      },
+      "questions": 64,
+      "rows": 150000
+    },
+    {
+      "about": "one column that the first mebibyte does not tell",
+      "columns": 3,
+      "dictionaries": 0,
+      "dictionariesLeft": 0,
+      "from": "parquet",
+      "groups": 2,
+      "name": "turns late",
+      "parquet": {
+        "compression": "snappy",
+        "rowGroup": 20000,
+        "version": "V1"
+      },
+      "questions": 17,
+      "rows": 100000
+    },
+    {
+      "about": "every kind of column",
+      "columns": 6,
+      "dictionaries": 0,
+      "dictionariesLeft": 0,
+      "from": "parquet",
+      "groups": 1,
+      "name": "kinds 0",
+      "parquet": {
+        "compression": "gzip",
+        "rowGroup": 2048,
+        "version": "V1"
+      },
+      "questions": 33,
+      "rows": 400
+    },
+    {
+      "about": "every kind of column",
+      "columns": 6,
+      "dictionaries": 0,
+      "dictionariesLeft": 0,
+      "from": "parquet",
+      "groups": 1,
+      "name": "kinds 1",
+      "parquet": {
+        "compression": "uncompressed",
+        "rowGroup": 2048,
+        "version": "V2"
+      },
+      "questions": 33,
+      "rows": 2500
+    },
+    {
+      "about": "every kind of column",
+      "columns": 6,
+      "dictionaries": 2,
+      "dictionariesLeft": 0,
+      "from": "parquet",
+      "groups": 1,
+      "name": "kinds 2",
+      "parquet": {
+        "compression": "lz4_raw",
+        "rowGroup": 2048,
+        "version": "V1"
+      },
+      "questions": 33,
+      "rows": 9000
+    },
+    {
+      "about": "every kind of column",
+      "columns": 6,
+      "dictionaries": 2,
+      "dictionariesLeft": 0,
+      "from": "parquet",
+      "groups": 1,
+      "name": "kinds 3",
+      "parquet": {
+        "compression": "zstd",
+        "rowGroup": 2048,
+        "version": "V2"
+      },
+      "questions": 33,
+      "rows": 1100
+    },
+    {
+      "about": "every kind of column",
+      "columns": 6,
+      "dictionaries": 3,
+      "dictionariesLeft": 0,
+      "from": "parquet",
+      "groups": 1,
+      "name": "kinds 4",
+      "parquet": {
+        "compression": "snappy",
+        "rowGroup": 2048,
+        "version": "V1"
+      },
+      "questions": 33,
+      "rows": 20000
+    },
+    {
+      "about": "every kind of column",
+      "columns": 6,
+      "dictionaries": 3,
+      "dictionariesLeft": 0,
+      "from": "parquet",
+      "groups": 1,
+      "name": "kinds 5",
+      "parquet": {
+        "compression": "gzip",
+        "rowGroup": 2048,
+        "version": "V2"
+      },
+      "questions": 33,
+      "rows": 400
+    },
+    {
+      "about": "columns at random",
+      "columns": 5,
+      "dictionaries": 0,
+      "dictionariesLeft": 0,
+      "from": "parquet",
+      "groups": 0,
+      "name": "random 3",
+      "parquet": {
+        "compression": "lz4_raw",
+        "rowGroup": 4096,
+        "version": "V2"
+      },
+      "questions": 17,
+      "rows": 0
+    },
+    {
+      "about": "columns at random",
+      "columns": 8,
+      "dictionaries": 0,
+      "dictionariesLeft": 0,
+      "from": "parquet",
+      "groups": 1,
+      "name": "random 4",
+      "parquet": {
+        "compression": "uncompressed",
+        "rowGroup": 4096,
+        "version": "V2"
+      },
+      "questions": 17,
+      "rows": 1
+    },
+    {
+      "about": "columns at random",
+      "columns": 4,
+      "dictionaries": 1,
+      "dictionariesLeft": 0,
+      "from": "parquet",
+      "groups": 1,
+      "name": "random 7",
+      "parquet": {
+        "compression": "lz4_raw",
+        "rowGroup": 4096,
+        "version": "V2"
+      },
+      "questions": 17,
+      "rows": 63
+    },
+    {
+      "about": "columns at random",
+      "columns": 7,
+      "dictionaries": 3,
+      "dictionariesLeft": 0,
+      "from": "parquet",
+      "groups": 1,
+      "name": "random 9",
+      "parquet": {
+        "compression": "lz4_raw",
+        "rowGroup": 122880,
+        "version": "V1"
+      },
+      "questions": 17,
+      "rows": 64
+    },
+    {
+      "about": "columns at random",
+      "columns": 7,
+      "dictionaries": 3,
+      "dictionariesLeft": 0,
+      "from": "parquet",
+      "groups": 1,
+      "name": "random 13",
+      "parquet": {
+        "compression": "zstd",
+        "rowGroup": 122880,
+        "version": "V1"
+      },
+      "questions": 17,
+      "rows": 65
+    },
+    {
+      "about": "columns at random",
+      "columns": 4,
+      "dictionaries": 1,
+      "dictionariesLeft": 0,
+      "from": "parquet",
+      "groups": 1,
+      "name": "random 15",
+      "parquet": {
+        "compression": "lz4_raw",
+        "rowGroup": 2048,
+        "version": "V2"
+      },
+      "questions": 17,
+      "rows": 1500
+    },
+    {
+      "about": "columns at random",
+      "columns": 3,
+      "dictionaries": 1,
+      "dictionariesLeft": 0,
+      "from": "parquet",
+      "groups": 1,
+      "name": "random 16",
+      "parquet": {
+        "compression": "uncompressed",
+        "rowGroup": 4096,
+        "version": "V1"
+      },
+      "questions": 17,
+      "rows": 63
+    },
+    {
+      "about": "columns at random",
+      "columns": 5,
+      "dictionaries": 0,
+      "dictionariesLeft": 0,
+      "from": "parquet",
+      "groups": 1,
+      "name": "random 18",
+      "parquet": {
+        "compression": "zstd",
+        "rowGroup": 122880,
+        "version": "V2"
+      },
+      "questions": 17,
+      "rows": 2
+    },
+    {
+      "about": "columns at random",
+      "columns": 5,
+      "dictionaries": 0,
+      "dictionariesLeft": 0,
+      "from": "parquet",
+      "groups": 1,
+      "name": "random 20",
+      "parquet": {
+        "compression": "gzip",
+        "rowGroup": 122880,
+        "version": "V2"
+      },
+      "questions": 17,
+      "rows": 65
+    },
+    {
+      "about": "columns at random",
+      "columns": 3,
+      "dictionaries": 0,
+      "dictionariesLeft": 0,
+      "from": "parquet",
+      "groups": 1,
+      "name": "random 21",
+      "parquet": {
+        "compression": "lz4_raw",
+        "rowGroup": 4096,
+        "version": "V2"
+      },
+      "questions": 17,
+      "rows": 255
+    },
+    {
+      "about": "columns at random",
+      "columns": 5,
+      "dictionaries": 0,
+      "dictionariesLeft": 0,
+      "from": "parquet",
+      "groups": 1,
+      "name": "random 22",
+      "parquet": {
+        "compression": "zstd",
+        "rowGroup": 2048,
+        "version": "V2"
+      },
+      "questions": 17,
+      "rows": 63
+    },
+    {
+      "about": "columns at random",
+      "columns": 3,
+      "dictionaries": 1,
+      "dictionariesLeft": 0,
+      "from": "parquet",
+      "groups": 1,
+      "name": "random 24",
+      "parquet": {
+        "compression": "snappy",
+        "rowGroup": 4096,
+        "version": "V1"
+      },
+      "questions": 17,
+      "rows": 12000
+    },
+    {
+      "about": "columns at random",
+      "columns": 2,
+      "dictionaries": 1,
+      "dictionariesLeft": 0,
+      "from": "parquet",
+      "groups": 1,
+      "name": "random 25",
+      "parquet": {
+        "compression": "zstd",
+        "rowGroup": 2048,
+        "version": "V2"
+      },
+      "questions": 17,
+      "rows": 256
+    },
+    {
+      "about": "columns at random",
+      "columns": 7,
+      "dictionaries": 4,
+      "dictionariesLeft": 0,
+      "from": "parquet",
+      "groups": 1,
+      "name": "random 26",
+      "parquet": {
+        "compression": "lz4_raw",
+        "rowGroup": 2048,
+        "version": "V2"
+      },
+      "questions": 17,
+      "rows": 64
+    },
+    {
+      "about": "columns at random",
+      "columns": 4,
+      "dictionaries": 2,
+      "dictionariesLeft": 0,
+      "from": "parquet",
+      "groups": 1,
+      "name": "random 27",
+      "parquet": {
+        "compression": "zstd",
+        "rowGroup": 4096,
+        "version": "V1"
+      },
+      "questions": 17,
+      "rows": 700
+    },
+    {
+      "about": "types that only Parquet has",
+      "columns": 28,
+      "dictionaries": 0,
+      "dictionariesLeft": 0,
+      "from": "parquet",
+      "groups": 0,
+      "name": "parquet types 0",
+      "parquet": {
+        "compression": "zstd",
+        "rowGroup": 2048,
+        "version": "V1"
+      },
+      "questions": 34,
+      "rows": 0
+    },
+    {
+      "about": "types that only Parquet has",
+      "columns": 28,
+      "dictionaries": 0,
+      "dictionariesLeft": 0,
+      "from": "parquet",
+      "groups": 1,
+      "name": "parquet types 1",
+      "parquet": {
+        "compression": "snappy",
+        "rowGroup": 2048,
+        "version": "V2"
+      },
+      "questions": 34,
+      "rows": 1
+    },
+    {
+      "about": "types that only Parquet has",
+      "columns": 28,
+      "dictionaries": 2,
+      "dictionariesLeft": 0,
+      "from": "parquet",
+      "groups": 1,
+      "name": "parquet types 3000",
+      "parquet": {
+        "compression": "gzip",
+        "rowGroup": 2048,
+        "version": "V2"
+      },
+      "questions": 34,
+      "rows": 3000
+    },
+    {
+      "about": "types that only Parquet has",
+      "columns": 28,
+      "dictionaries": 3,
+      "dictionariesLeft": 0,
+      "from": "parquet",
+      "groups": 2,
+      "name": "parquet types 70000",
+      "parquet": {
+        "compression": "lz4_raw",
+        "rowGroup": 30000,
+        "version": "V1"
+      },
+      "questions": 34,
+      "rows": 70000
+    }
+  ],
+  "uncommittedChanges": false
+}

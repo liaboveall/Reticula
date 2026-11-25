@@ -2266,6 +2266,39 @@
     "unclassifiedCount": 0,
     "uniqueFunctionsCovered": 188
   },
+  "latestTableDiff": {
+    "allowed": {
+      "NaN is text here": 1,
+      "a list of values counts the first 1,048,576 of them or 64 MiB, and says so": 2,
+      "a sum is compensated here: within two units of rounding of the exact one, which fsum need not be": 2,
+      "a time of day without a date is text here": 7,
+      "a time with a Z is one without a time zone here": 7,
+      "a time with an offset is text here": 9,
+      "dates and times may be in the same column here": 4,
+      "dates may be written in two ways in the same column here": 2,
+      "long texts outside of a dictionary that begin alike need not be sorted": 4,
+      "numbers that lose digits as a DOUBLE are text here": 16,
+      "numbers with a plus sign, zeros in front or a negative zero are text here": 9,
+      "numbers with a point are exact decimals here and DOUBLE there": 47,
+      "the dotted capital I and the sigma at the end of a word are folded as Unicode says here": 1047
+    },
+    "byKind": {
+      "cells": 620,
+      "parquetCounts": 236,
+      "summary": 584,
+      "types": 384,
+      "values": 464,
+      "view": 1563
+    },
+    "commit": "c3bad5d",
+    "date": "2026-11-25",
+    "different": 0,
+    "questions": 2611,
+    "reference": "DuckDB v1.4.3 (duckdb-wasm 1.32.0)",
+    "report": "bench/results/2026-11-25-c3bad5d-tablediff.json",
+    "seed": 2026,
+    "tables": 74
+  },
   "loadRuns": [
     {
       "achievedTxnsPerSec": 100.0,
