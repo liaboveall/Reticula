@@ -28,8 +28,8 @@ export interface TouchTarget {
   /** Zooms with the next frame to so many times the zoom of the beginning. */
   readonly pinch: (scale: number, point: Point) => void;
   readonly endPinch: () => void;
-  /** Opens what a filter button at a point is for. Returns whether there is one. */
-  readonly pressFilterButton: (point: Point) => boolean;
+  /** Opens what a button at a point is for. Returns whether there is one. */
+  readonly pressButton: (point: Point) => boolean;
 }
 
 /** Where a double tap goes at 100% while there is no other zoom to go back to. */
@@ -175,15 +175,22 @@ export class TouchInput {
   };
 
   #tap({ x, y }: Point): void {
-    const { grid, host, metrics, cellAt, pressFilterButton } = this.#target;
+    const { grid, host, metrics, cellAt, pressButton } = this.#target;
     const { headerWidth, headerHeight } = metrics();
     const isRow = x < headerWidth;
     const isCol = y < headerHeight;
     const cell = cellAt(Math.max(x, headerWidth), Math.max(y, headerHeight));
-    if (!cell || !host.dispatchEvent(new Event(TAP_EVENT, { cancelable: true }))) {
+    if (!cell) {
+      // Columns have headers, and buttons in them, even if there are no rows.
+      if (isCol) {
+        pressButton({ x, y });
+      }
       return;
     }
-    if (pressFilterButton({ x, y })) {
+    if (!host.dispatchEvent(new Event(TAP_EVENT, { cancelable: true }))) {
+      return;
+    }
+    if (pressButton({ x, y })) {
       return;
     }
     grid.focus();

@@ -53,33 +53,3 @@ export function withSizes(
   }
   return result;
 }
-
-/** The size that all of some rows or columns have, or `null` if they have none in common. */
-export function commonSize(
-  sizes: CustomSizes,
-  intervals: readonly Interval[],
-  standard: number,
-): number | null {
-  let common: number | null = null;
-  let count = 0;
-  let custom = 0;
-  for (const { first, end } of mergeIntervals(intervals)) {
-    count += end - first;
-    for (const [index, size] of sizes) {
-      if (index >= first && index < end) {
-        if (common !== null && size !== common) {
-          return null;
-        }
-        common = size;
-        custom++;
-      }
-    }
-  }
-  if (count === 0) {
-    return null;
-  }
-  if (custom === 0) {
-    return standard;
-  }
-  return custom === count || common === standard ? common : null;
-}

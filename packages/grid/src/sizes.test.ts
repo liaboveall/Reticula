@@ -1,5 +1,5 @@
 import { describe, expect, test } from "vitest";
-import { commonSize, mergeIntervals, sizeIn, withSizes } from "./sizes.ts";
+import { mergeIntervals, sizeIn, withSizes } from "./sizes.ts";
 
 const run = (first: number, end: number) => ({ first, end });
 
@@ -35,17 +35,5 @@ describe("sizes", () => {
   test("that are the standard one are none of their own", () => {
     expect(withSizes(SIZES, [run(0, 6)], 24, 24)).toEqual([[9, 30]]);
     expect(withSizes(SIZES, [], 24, 24)).toEqual(SIZES);
-  });
-
-  test("are told if they are the same", () => {
-    expect(commonSize(SIZES, [run(2, 3)], 24)).toBe(40);
-    expect(commonSize(SIZES, [run(5, 6), run(9, 10)], 24)).toBe(30);
-    expect(commonSize(SIZES, [run(6, 9)], 24)).toBe(24);
-    // A million rows are not looked at one by one.
-    expect(commonSize(SIZES, [run(10, 1_000_000)], 24)).toBe(24);
-    expect(commonSize(SIZES, [run(5, 7)], 24)).toBeNull();
-    expect(commonSize(SIZES, [run(2, 3), run(5, 6)], 24)).toBeNull();
-    expect(commonSize([[3, 24]], [run(3, 5)], 24)).toBe(24);
-    expect(commonSize(SIZES, [], 24)).toBeNull();
   });
 });

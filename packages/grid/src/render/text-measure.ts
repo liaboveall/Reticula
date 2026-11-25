@@ -1,5 +1,4 @@
 import type { PageCache } from "../cache.ts";
-import { columnName } from "../layout.ts";
 import type { Theme } from "../theme.ts";
 import { type GridCellStyle, PADDING } from "./frame.ts";
 
@@ -219,17 +218,23 @@ export class TextMeasurer implements TextMeasure {
     };
   }
 
-  /** The width in CSS pixels that a column needs for its name and the texts of some rows. */
+  /**
+   * The width in CSS pixels that a column needs for its name, with some room
+   * besides it, and the texts of some rows.
+   */
   columnFitWidth(
     theme: Theme,
     cache: PageCache,
     styles: readonly GridCellStyle[] | undefined,
+    name: string,
+    room: number,
     col: number,
     firstRow: number,
     endRow: number,
   ): number {
     const header = `600 ${theme.fontSize}px ${theme.fontFamily}`;
-    let fit = Math.max(48, Math.ceil(this.width(header, columnName(col)) + 2 * PADDING + 12));
+    const named = Math.ceil(this.width(header, name) + 2 * PADDING + 12 + room);
+    let fit = Math.max(48, Math.min(600, named));
     for (let row = firstRow; row < endRow; row++) {
       const page = cache.pageOf(row, col);
       if (!page || row >= page.firstRow + page.rowCount || col >= page.firstCol + page.colCount) {

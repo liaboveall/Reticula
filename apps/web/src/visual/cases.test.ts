@@ -49,6 +49,8 @@ describe("the cases", () => {
       "filterState",
       "filterRowMap",
       "activeSpillRange",
+      "columns",
+      "clipText",
     ];
     const frames = CASE_NAMES.map((name) => buildCase(name, THEME, 1).frame);
     for (const overlay of overlays) {

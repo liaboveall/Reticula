@@ -19,6 +19,15 @@ export type SpriteSpec =
       readonly color: PackedColor;
     }
   | {
+      /** A shape of its own: its corners, from the middle. */
+      readonly kind: "shape";
+      readonly width: number;
+      readonly height: number;
+      readonly scale: number;
+      readonly color: PackedColor;
+      readonly corners: readonly (readonly [number, number])[];
+    }
+  | {
       /** A collaborator's name. */
       readonly kind: "plate";
       readonly width: number;
@@ -80,20 +89,22 @@ export function rasterize(spec: SpriteSpec): HTMLCanvasElement {
     const x = spec.width / 2;
     const y = spec.height / 2;
     const points: readonly (readonly [number, number])[] =
-      spec.kind === "funnel"
-        ? [
-            [-4, -3],
-            [4, -3],
-            [1.2, 0.5],
-            [1.2, 3.5],
-            [-1.2, 3.5],
-            [-1.2, 0.5],
-          ]
-        : [
-            [-3.5, -2],
-            [3.5, -2],
-            [0, 2.5],
-          ];
+      spec.kind === "shape"
+        ? spec.corners
+        : spec.kind === "funnel"
+          ? [
+              [-4, -3],
+              [4, -3],
+              [1.2, 0.5],
+              [1.2, 3.5],
+              [-1.2, 3.5],
+              [-1.2, 0.5],
+            ]
+          : [
+              [-3.5, -2],
+              [3.5, -2],
+              [0, 2.5],
+            ];
     path(
       context,
       points.map(([dx, dy]) => [x + dx * scale, y + dy * scale] as const),

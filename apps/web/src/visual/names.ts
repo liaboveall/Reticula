@@ -47,6 +47,12 @@ export const CASES = {
   "zoom-half-frozen": { scale: 1, dark: true },
   "zoom-one-and-a-half": { scale: 1.25, dark: true },
   "zoom-double": { scale: 1, dark: false },
+  "column-names": { scale: 1, dark: false },
+  "column-sort": { scale: 1.25, dark: true },
+  "column-filters": { scale: 1.5, dark: false },
+  "column-names-frozen": { scale: 1, dark: true },
+  "column-names-zoom-half": { scale: 2, dark: false },
+  "clipped-text": { scale: 1.25, dark: false },
 } as const satisfies Record<string, CaseInfo>;
 
 export type CaseName = keyof typeof CASES;

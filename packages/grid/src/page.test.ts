@@ -1,4 +1,15 @@
-import { HEADER_LEN, TEXT_LEN_AT, VERSION_AT } from "@reticula/protocol/viewport";
+import {
+  CELL_LEN,
+  CELL_TEXT_LEN_AT,
+  CELL_TEXT_START_AT,
+  COL_COUNT_AT,
+  HEADER_LEN,
+  ID_LEN,
+  ROW_COUNT_AT,
+  TEXT_LEN_AT,
+  VERSION,
+  VERSION_AT,
+} from "@reticula/protocol/viewport";
 import { fixture } from "@reticula/protocol/viewport-fixture";
 import { describe, expect, test } from "vitest";
 import { decodePage, isBool, isError, isFormula, isNumber, isTruncated } from "./page.ts";
@@ -57,6 +68,34 @@ describe("a v2 page encoded by the engine", () => {
     expect(fixture.cells[0][0].text).toBe("品名 😀");
     expect(page.texts[0]).toBe("品名 😀");
     expect(page.texts[1]).toBe(fixture.cells[0][1].text);
+  });
+});
+
+describe("the text of a page", () => {
+  /** A page of one row. */
+  function rowOf(texts: readonly string[]): ArrayBuffer {
+    const pool = new TextEncoder().encode(texts.join(""));
+    const cellsAt = HEADER_LEN + (1 + texts.length) * ID_LEN;
+    const textAt = cellsAt + texts.length * CELL_LEN;
+    const buffer = new ArrayBuffer(textAt + pool.length);
+    const view = new DataView(buffer);
+    view.setUint32(VERSION_AT, VERSION, true);
+    view.setUint16(ROW_COUNT_AT, 1, true);
+    view.setUint16(COL_COUNT_AT, texts.length, true);
+    view.setUint32(TEXT_LEN_AT, pool.length, true);
+    let start = 0;
+    texts.forEach((text, cell) => {
+      view.setUint32(cellsAt + cell * CELL_LEN + CELL_TEXT_START_AT, start, true);
+      view.setUint16(cellsAt + cell * CELL_LEN + CELL_TEXT_LEN_AT, text.length, true);
+      start += text.length;
+    });
+    new Uint8Array(buffer).set(pool, textAt);
+    return buffer;
+  }
+
+  test("may start with the character that marks the byte order of a file", () => {
+    const texts = ["\u{feff}name", "b", "\u{feff}"];
+    expect(decodePage(rowOf(texts)).texts).toEqual(texts);
   });
 });
 

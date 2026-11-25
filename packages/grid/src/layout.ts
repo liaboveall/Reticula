@@ -379,7 +379,7 @@ export function visibleCells(
   layout?: SheetLayout,
 ): Span {
   const area = cellArea(metrics, size);
-  if (area.width <= 0 || area.height <= 0 || sheet.rows <= 0 || sheet.cols <= 0) {
+  if (area.width <= 0 || area.height <= 0 || sheet.cols <= 0) {
     return EMPTY_SPAN;
   }
   if (!layout) {

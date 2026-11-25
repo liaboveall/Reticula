@@ -1,8 +1,13 @@
 import type { RemotePresence, WireCellStyle } from "@reticula/protocol";
 import type { PageCache } from "../cache.ts";
-import type { CellRect, FilterDisplayState, FilterRowMap } from "../filter.ts";
+import type { CellRect, FilterButtonRect, FilterDisplayState, FilterRowMap } from "../filter.ts";
 import type { Metrics, Scroll, SheetLayout, SheetSize, Size, Span } from "../layout.ts";
 import type { Theme } from "../theme.ts";
+import type { PackedColor } from "./color.ts";
+import type { Look } from "./look.ts";
+import type { PixelBox } from "./rects.ts";
+import type { SpriteSpec } from "./sprites.ts";
+import type { TextMeasure } from "./text-measure.ts";
 
 export type GridCellStyle = WireCellStyle;
 
@@ -29,6 +34,40 @@ export type ReorderGuide =
   | { readonly axis: "row"; readonly beforeRow: number }
   | { readonly axis: "col"; readonly beforeCol: number };
 
+/** The header of a column that is to be drawn, in device pixels. */
+export interface HeaderCell {
+  readonly col: number;
+  readonly left: number;
+  /** The line after it is not a part of it. */
+  readonly right: number;
+  readonly bottom: number;
+  /** Device pixels to a pixel of a header at a zoom of 1. */
+  readonly scale: number;
+  readonly look: Look;
+  /** What texts are drawn in. */
+  readonly font: string;
+  readonly measure: TextMeasure;
+  readonly fill: (box: PixelBox, color: PackedColor) => void;
+  /** Draws a text over everything else, from a place to another one at most. */
+  readonly text: (text: string, left: number, right: number) => void;
+  readonly sprite: (spec: SpriteSpec, left: number, top: number) => void;
+}
+
+/**
+ * The headers of columns that have names, which a sheet's do not: whoever needs
+ * them loads `@reticula/grid/columns` for them.
+ */
+export interface ColumnHeaders {
+  nameOf(col: number): string;
+  /** The way the rows are sorted by a column. */
+  sortOf(col: number): "ascending" | "descending" | null;
+  /** The room a header takes besides its name, in pixels at a zoom of 1. */
+  roomOf(col: number): number;
+  /** The button in a header, if there is room for one, of so many units to a pixel at a zoom of 1. */
+  buttonIn(left: number, width: number, height: number, scale: number): FilterButtonRect | null;
+  draw(cell: HeaderCell): void;
+}
+
 /** Everything one frame is drawn from. */
 export interface Frame {
   /** Size of the grid's area in CSS pixels. */
@@ -53,6 +92,10 @@ export interface Frame {
   readonly sheet?: SheetSize;
   /** Sparse row/col sizes and freeze counts. */
   readonly layout?: SheetLayout;
+  /** What the columns are called, if not by letters. */
+  readonly columns?: ColumnHeaders | null;
+  /** Whether no text runs on over the empty cells next to its own. */
+  readonly clipText?: boolean;
   /** Sheet style table indexed by `styleId`. */
   readonly styles?: readonly GridCellStyle[];
   /** Colored formula reference rectangles on the active sheet. */

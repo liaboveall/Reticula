@@ -30,6 +30,8 @@ export interface TextSetting {
   readonly styles: StyleTable;
   /** Frozen columns of the sheet: their text ends where they do. */
   readonly frozenCols: number;
+  /** Whether all text ends where its cell does. Numbers there is no room for are not shown then. */
+  readonly clipText?: boolean;
 }
 
 const NO_RECTS = new RectList(1);
@@ -213,7 +215,7 @@ export function layoutText(
   runs: TextRuns,
 ): void {
   const { xs, ys, overflowXs } = geometry;
-  const { measure, look, styles } = setting;
+  const { measure, look, styles, clipText } = setting;
   const { colCount, texts } = page;
   const { padding } = look;
   const frozen = setting.frozenCols - page.firstCol;
@@ -284,7 +286,7 @@ export function layoutText(
     const room = cellRight - left - 2 * padding;
     for (let row = firstRow; row < endRow; row++) {
       const cell = row * colCount + col;
-      const text = texts[cell];
+      let text = texts[cell];
       if (!text) {
         continue;
       }
@@ -304,11 +306,17 @@ export function layoutText(
             : error || isBool(flags)
               ? ALIGN_CENTER
               : ALIGN_LEFT;
-      if (align !== ALIGN_LEFT && room <= 0) {
+      if ((align !== ALIGN_LEFT || clipText) && room <= 0) {
         continue;
       }
       const color = error ? look.errorText : inkOf(style, look);
-      const width = measure.width(look.fonts[style.font] ?? "", text);
+      const font = look.fonts[style.font] ?? "";
+      let width = measure.width(font, text);
+      if (clipText && width > room && isNumber(flags)) {
+        // A part of a number, or of a date, would be taken for another one.
+        text = "#".repeat(Math.max(1, Math.floor(room / measure.width(font, "#"))));
+        width = measure.width(font, text);
+      }
       let x = left + padding;
       let right = cellRight - padding;
       let fits = width <= room;
@@ -316,7 +324,7 @@ export function layoutText(
         x = right - width;
       } else if (align === ALIGN_CENTER) {
         x = (left + cellRight - width) / 2;
-      } else if (!fits) {
+      } else if (!fits && !clipText) {
         // Left-aligned text runs on over the empty cells to its right.
         const limit = limitOf(col < frozen);
         const stop = stopOf(row, col + 1, limit, x + width);

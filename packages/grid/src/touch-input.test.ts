@@ -77,7 +77,7 @@ function open({ zooms = true, capture = () => {}, filter = false } = {}) {
     beginPinch: () => void log.push("begin"),
     pinch: (scale, { x, y }) => void log.push(`pinch ${scale.toFixed(2)} at ${x},${y}`),
     endPinch: () => void log.push("end"),
-    pressFilterButton: () => {
+    pressButton: () => {
       if (filter) {
         log.push("filter");
       }
@@ -286,6 +286,21 @@ describe("a tap", () => {
     editor.host.addEventListener("reticula-tap", (event) => event.preventDefault());
     editor.tap(100, 100);
     expect(editor.log).toEqual([]);
+  });
+
+  test("opens what the button in a header is for, even if there are no rows below it", () => {
+    const button = open({ filter: true });
+    button.tap(1_200, 10);
+    expect(button.log).toEqual(["filter"]);
+    button.tap(1_200, 100);
+    expect(button.log).toEqual(["filter"]);
+
+    const none = open();
+    const tapped = vi.fn();
+    none.host.addEventListener("reticula-tap", tapped);
+    none.tap(1_200, 10);
+    expect(none.log).toEqual([]);
+    expect(tapped).not.toHaveBeenCalled();
   });
 
   test("is none of a finger that comes to one whose release was never heard of, but by itself", () => {

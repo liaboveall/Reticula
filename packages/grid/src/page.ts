@@ -106,7 +106,8 @@ export function isSpill(flags: number): boolean {
   return (flags & FLAG_SPILL) !== 0;
 }
 
-const utf8 = new TextDecoder("utf-8");
+// A text may start with the mark of the byte order; the records count it like any other character.
+const utf8 = new TextDecoder("utf-8", { ignoreBOM: true });
 
 /**
  * Reads a v2 viewport page from the binary packet sent by the engine worker.

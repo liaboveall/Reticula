@@ -1,5 +1,11 @@
 import { PageCache } from "./cache.ts";
-import { type CellRect, type FilterDisplayState, FilterRowMap, filterButtonBox } from "./filter.ts";
+import {
+  type CellRect,
+  type FilterButtonRect,
+  type FilterDisplayState,
+  FilterRowMap,
+  filterButtonBox,
+} from "./filter.ts";
 import {
   type Box,
   boxOfSpan,
@@ -19,6 +25,7 @@ import {
   frozenPixels,
   type HeaderHit,
   headerHitAt,
+  headerZoom,
   isEmpty,
   isOverFillHandle,
   type Metrics,
@@ -46,6 +53,7 @@ import { navigate } from "./navigation.ts";
 import { decodePage } from "./page.ts";
 import { Canvas2dRenderer } from "./render/canvas2d.ts";
 import type {
+  ColumnHeaders,
   DiffHighlightMap,
   FormulaReferenceOverlay,
   Frame,
@@ -57,14 +65,7 @@ import { TextMeasurer } from "./render/text-measure.ts";
 import type { GridRenderer, RendererCounters, RendererKind } from "./render/types.ts";
 import { type RendererPreference, type RendererReason, startUpgrade } from "./render/upgrade.ts";
 import { Scrollbar } from "./scrollbar.ts";
-import {
-  type CustomSizes,
-  commonSize,
-  type Interval,
-  mergeIntervals,
-  sizeIn,
-  withSizes,
-} from "./sizes.ts";
+import { type CustomSizes, type Interval, mergeIntervals, sizeIn, withSizes } from "./sizes.ts";
 import { type GridStrings, NO_STRINGS } from "./strings.ts";
 import { readTheme, type Theme } from "./theme.ts";
 import type { TouchInput } from "./touch-input.ts";
@@ -78,7 +79,10 @@ export interface IdRun {
 
 /** Sheet dimensions + optional M1b sparse metrics, freeze counts, filter state, and style table. */
 export interface SheetConfig extends SheetSize {
+  /** How many rows there are with those that are not shown. The row headers have room for their numbers. */
   readonly totalRows?: number;
+  /** What the columns are called, if not by letters. */
+  readonly columns?: ColumnHeaders | null;
   readonly filter?: FilterDisplayState | null | undefined;
   readonly frozenRows?: number;
   readonly frozenCols?: number;
@@ -113,6 +117,13 @@ export interface GridOptions {
   readonly margin?: { readonly rows: number; readonly cols: number };
   /** Sizes at a zoom of 1. */
   readonly metrics?: Metrics;
+  /**
+   * Whether nothing of the sheet is to be changed. Its columns can still be made
+   * wider and narrower if there is `onLocalColumnResize`.
+   */
+  readonly readOnly?: boolean;
+  /** Whether no text runs on over the empty cells next to its own. */
+  readonly clipText?: boolean;
   /** Whether Ctrl with the wheel and pinches zoom the sheet, and not the page. */
   readonly zoom?: boolean;
   readonly onZoomChange?: (zoom: number) => void;
@@ -121,6 +132,10 @@ export interface GridOptions {
   readonly onActivateEdit?: (cell: { readonly row: number; readonly col: number }) => void;
   readonly onResizeRows?: (sizes: readonly { run: IdRun; sizePx: number | null }[]) => void;
   readonly onResizeCols?: (sizes: readonly { run: IdRun; sizePx: number | null }[]) => void;
+  /** Told of the widths of columns instead of `onResizeCols`, by where the columns are. */
+  readonly onLocalColumnResize?: (
+    sizes: readonly { readonly col: number; readonly sizePx: number | null }[],
+  ) => void;
   readonly onMoveRows?: (rows: readonly IdRun[], afterRowId: string | null) => void;
   readonly onMoveCols?: (cols: readonly IdRun[], afterColId: string | null) => void;
   readonly onFillRange?: (src: Span, dst: Span) => void;
@@ -132,6 +147,8 @@ export interface GridOptions {
    */
   readonly onPointAndClickRange?: (range: Span) => boolean;
   readonly onFilterButtonClick?: (col: number, anchorRect: DOMRect) => void;
+  /** The button in the header of a column with a name was pressed. */
+  readonly onColumnButton?: (col: number, anchorRect: DOMRect) => void;
   readonly onContextMenu?: (target: GridContextTarget) => void;
 }
 
@@ -222,8 +239,13 @@ const MAX_COL_PX = 1200;
 const ZOOM_GESTURE_MS = 200;
 /** The smallest font that cells are edited in, in CSS pixels. */
 const LEAST_EDITED_FONT = 11;
-/** How long the engine has to send rows or columns that have moved, after which it is taken not to have moved them. */
-const MOVE_SETTLE_MS = 2_000;
+/** As many digits as the row headers have room for at their least width. */
+const ROW_DIGITS = 8;
+/** Rows or columns. */
+type Axis = "row" | "col";
+
+/** What else of a header is taken for the button at its end: a finger needs as much. */
+const BUTTON_SLACK = 8;
 
 const NOTHING = (): void => {};
 
@@ -269,11 +291,6 @@ function spanOf(one: Cell, other: Cell): Span {
   };
 }
 
-const rowsOf = (spans: readonly Span[]): Interval[] =>
-  spans.map(({ firstRow, endRow }) => ({ first: firstRow, end: endRow }));
-const colsOf = (spans: readonly Span[]): Interval[] =>
-  spans.map(({ firstCol, endCol }) => ({ first: firstCol, end: endCol }));
-
 /**
  * The size an edge has been dragged to, as it is kept: at a zoom of 1. An edge
  * that has not moved has not changed it.
@@ -312,20 +329,20 @@ type DragInteraction =
   | { readonly kind: "fill"; readonly src: Span }
   | {
       readonly kind: "resize";
-      readonly axis: "row" | "col";
+      readonly axis: Axis;
       readonly index: number;
       readonly startClient: number;
       readonly startBase: number;
     }
   | {
       readonly kind: "reorder";
-      readonly axis: "row" | "col";
+      readonly axis: Axis;
       readonly start: number;
       moved: boolean;
     };
 
 /** The row or column that a part of a header is of. */
-function lineOf(hit: Exclude<HeaderHit, { readonly kind: "corner" }>): ["row" | "col", number] {
+function lineOf(hit: Exclude<HeaderHit, { readonly kind: "corner" }>): [Axis, number] {
   return "row" in hit ? ["row", hit.row] : ["col", hit.col];
 }
 
@@ -377,7 +394,7 @@ export class Grid {
   #customCols: CustomSizes = [];
   /** The size shown while a row's or column's edge is dragged, which nobody else knows of. */
   #sizePreview: {
-    readonly axis: "row" | "col";
+    readonly axis: Axis;
     readonly index: number;
     readonly px: number;
   } | null = null;
@@ -385,6 +402,7 @@ export class Grid {
   #frozenCols = 0;
   #layout: SheetLayout;
   #styles: readonly GridCellStyle[] = [];
+  #columns: ColumnHeaders | null = null;
   #formulaRefs: readonly FormulaReferenceOverlay[] = [];
   #remotePresences: readonly RemotePresenceOverlay[] = [];
   #diffHighlights: DiffHighlightMap | null = null;
@@ -406,15 +424,18 @@ export class Grid {
   #focus: { row: number; col: number } | null = null;
   #extraRanges: Span[] = [];
   #scope: SelectionScope = "cells";
-  /** Where rows or columns were last moved to, until when they may still be held where they were before. */
-  #moved: {
-    readonly axis: "row" | "col";
+  /** For `arrange.ts`: where it has moved rows or columns to, until when they may still be held where they were before. */
+  moved: {
+    readonly axis: Axis;
     readonly first: number;
-    readonly ids: readonly bigint[];
+    readonly ids: readonly string[];
     readonly until: number;
   } | null = null;
   #cache = new PageCache();
   #epoch = 0;
+  /** The subscription that everything held was asked for with, or with a later one. */
+  #leastEpoch = 0;
+  #paused = false;
   #lastFreezeKey = "0:0";
   /** Whether more pages than are wanted may be held. */
   #holdsTooMuch = false;
@@ -564,7 +585,6 @@ export class Grid {
     const zoom = clampZoom(view.zoom ?? this.#zoom, this.#zoom);
     const isZoomed = zoom !== this.#zoom;
     this.#zoom = zoom;
-    this.#metrics = viewMetrics(this.#base, zoom, this.#scale);
     this.#sheet = { rows: sheet.rows, cols: sheet.cols };
     this.#applySheetConfig(sheet);
     this.#placeScroll({ top: 0, left: 0 });
@@ -584,7 +604,7 @@ export class Grid {
     this.#fillPreview = null;
     this.#reorderGuide = null;
     this.#activeSpillRange = null;
-    this.#moved = null;
+    this.moved = null;
     if (sheet.filter === undefined) {
       this.#filterState = null;
       this.#filterRowMap = null;
@@ -594,6 +614,38 @@ export class Grid {
       this.#options.onZoomChange?.(zoom);
     }
     this.#notifySelection();
+    this.#invalidate();
+  }
+
+  /**
+   * Opens the sheet once more as its rows are others now. Unlike with `setSheet`,
+   * pages of it that are there already are drawn with the next frame, and nothing
+   * that was asked for before is drawn any more.
+   */
+  refresh(
+    sheet: SheetConfig,
+    view: Partial<GridView> = {},
+    pages: readonly ArrayBuffer[] = [],
+  ): void {
+    this.setSheet(sheet, view);
+    if (!this.#paused) {
+      this.#see();
+      const margin = this.#effectiveMargin(performance.now());
+      this.#hold(pagesToHold(this.#visible, this.#sheet, margin), true);
+    }
+    for (const page of pages) {
+      this.#take(page, null);
+    }
+  }
+
+  /** Stops asking for pages and drawing, and forgets the pages held, until it is resumed. */
+  pause(): void {
+    this.#paused = true;
+    this.#hold(EMPTY_SPAN);
+  }
+
+  resume(): void {
+    this.#paused = false;
     this.#invalidate();
   }
 
@@ -714,6 +766,16 @@ export class Grid {
   }
 
   #applySheetConfig(sheet: SheetConfig): void {
+    const { headerWidth } = this.#options.metrics ?? DEFAULT_METRICS;
+    const digits = String(sheet.totalRows ?? sheet.rows).length;
+    this.#base = {
+      ...this.#base,
+      headerWidth: headerWidth * Math.max(1, digits / ROW_DIGITS),
+    };
+    this.#metrics = viewMetrics(this.#base, this.#zoom, this.#scale);
+    if (sheet.columns !== undefined) {
+      this.#columns = sheet.columns;
+    }
     if ("filter" in sheet) {
       this.#applyFilterState(sheet.filter ?? null, sheet.totalRows ?? sheet.rows);
     }
@@ -738,7 +800,7 @@ export class Grid {
   #makeLayout(): SheetLayout {
     const { rowHeight, colWidth } = this.#base;
     const preview = this.#sizePreview;
-    const axisOf = (axis: "row" | "col", sizes: CustomSizes, standard: number) => {
+    const axisOf = (axis: Axis, sizes: CustomSizes, standard: number) => {
       const shown =
         preview?.axis === axis
           ? withSizes(
@@ -785,11 +847,17 @@ export class Grid {
 
   /** Takes a viewport page the engine sent. */
   acceptPage(buffer: ArrayBuffer): void {
+    this.#take(buffer, this.#leastEpoch);
+  }
+
+  #take(buffer: ArrayBuffer, leastEpoch: number | null): void {
     const started = performance.now();
     const page = decodePage(buffer);
     this.#pagesReceived++;
     this.#bytesReceived += page.byteLength;
-    if (this.#cache.accept(page)) {
+    // Epochs start over when there is no room for the next one.
+    const isLate = leastEpoch !== null && ((page.epoch - leastEpoch) | 0) < 0;
+    if (!isLate && this.#cache.accept(page)) {
       if (this.#anchor) {
         const range = this.selectionRange;
         if (
@@ -1006,7 +1074,7 @@ export class Grid {
       const row = isInside ? (active?.row ?? 0) : 0;
       this.selectRange({ row, col: from }, { row: this.#sheet.rows - 1, col: to }, "cols");
     }
-    this.#revealAnchor();
+    this.revealAnchor();
   }
 
   /** Selects some cells as well, the first of which becomes the active one. */
@@ -1027,13 +1095,13 @@ export class Grid {
       wholeRows && wholeCols ? "all" : wholeRows ? "rows" : wholeCols ? "cols" : "cells";
     this.#anchor = { row: firstRow, col: firstCol };
     this.#focus = { row: endRow - 1, col: endCol - 1 };
-    this.#revealAnchor();
+    this.revealAnchor();
     this.#notifySelection();
     this.#invalidate();
   }
 
   /** Scrolls to the active cell; along whole rows or columns there is nothing to scroll to. */
-  #revealAnchor(): void {
+  revealAnchor(): void {
     if (this.#anchor) {
       this.#revealWithin(this.#anchor, this.#scope);
     }
@@ -1129,200 +1197,126 @@ export class Grid {
     return id === undefined ? null : String(id);
   }
 
+  /** The rows or columns that are selected, each of them once and in order. */
+  selectedLines(axis: Axis): Interval[] {
+    return mergeIntervals(
+      this.selectionRanges.map(({ firstRow, endRow, firstCol, endCol }) =>
+        axis === "row" ? { first: firstRow, end: endRow } : { first: firstCol, end: endCol },
+      ),
+    );
+  }
+
   /** Resolves contiguous `IdRun`s for all unique rows across all selected ranges. */
   selectedRowRuns(): IdRun[] | null {
-    const ranges = this.selectionRanges;
-    return ranges.length === 0
-      ? null
-      : idRunsOf(rowsOf(ranges), (position) => this.#cache.rowIdAt(position));
+    return this.#selectedRuns("row");
   }
 
   /** Resolves contiguous `IdRun`s for all unique columns across all selected ranges. */
   selectedColRuns(): IdRun[] | null {
-    const ranges = this.selectionRanges;
-    return ranges.length === 0
-      ? null
-      : idRunsOf(colsOf(ranges), (position) => this.#cache.colIdAt(position));
+    return this.#selectedRuns("col");
   }
 
-  /**
-   * Moves the selected rows past the row before or after them, and the selection
-   * with them. Returns whether it did: there has to be such a row, and the grid
-   * has to know the rows, which it does of the ones around what is in view.
-   */
-  moveSelectedRows(direction: -1 | 1): boolean {
-    return this.#moveSelected("row", direction);
+  #selectedRuns(axis: Axis): IdRun[] | null {
+    return this.#anchor && idRunsOf(this.selectedLines(axis), this.#idOf(axis));
   }
 
-  moveSelectedCols(direction: -1 | 1): boolean {
-    return this.#moveSelected("col", direction);
-  }
-
-  #moveSelected(axis: "row" | "col", direction: -1 | 1): boolean {
-    const span = this.selectionRange;
-    const { onMoveRows, onMoveCols } = this.#options;
+  /** Has rows or columns moved behind another one. Returns whether that may be. */
+  moveLines(axis: Axis, runs: readonly IdRun[], after: string | null): boolean {
+    const { readOnly, onMoveRows, onMoveCols } = this.#options;
     const onMove = axis === "row" ? onMoveRows : onMoveCols;
-    const anchor = this.#anchor;
-    const focus = this.#focus;
-    if (!span || !anchor || !focus || !onMove || this.#extraRanges.length > 0 || this.#isMoving()) {
+    if (readOnly || !onMove) {
       return false;
     }
+    onMove(runs, after);
+    return true;
+  }
+
+  #reportCols(sizes: readonly { readonly run: IdRun; readonly sizePx: number | null }[]): void {
+    const { onResizeCols, onLocalColumnResize } = this.#options;
+    if (onLocalColumnResize) {
+      onLocalColumnResize(
+        sizes.flatMap(({ run, sizePx }) =>
+          Array.from({ length: run.len }, (_, index) => ({
+            col: Number(run.firstId) + index,
+            sizePx,
+          })),
+        ),
+      );
+    } else {
+      onResizeCols?.(sizes);
+    }
+  }
+
+  /** How rows or columns are told apart. Where only this grid knows of a column's width, that is by its place. */
+  #idOf(axis: Axis): (position: number) => bigint | undefined {
+    return (position) =>
+      axis === "row"
+        ? this.#cache.rowIdAt(position)
+        : this.#options.onLocalColumnResize
+          ? BigInt(position)
+          : this.#cache.colIdAt(position);
+  }
+
+  /** The sizes that rows or columns have of their own, and the standard one, at a zoom of 1. */
+  sizesOf(axis: Axis): { readonly custom: CustomSizes; readonly standard: number } {
+    return axis === "row"
+      ? { custom: this.#customRows, standard: this.#base.rowHeight }
+      : { custom: this.#customCols, standard: this.#base.colWidth };
+  }
+
+  /**
+   * Resizes rows or columns here, without waiting for the engine to say so, and
+   * there, each to a size at a zoom of 1 or to the standard one. Returns whether
+   * it did: the grid has to know them.
+   */
+  resizeLines(
+    axis: Axis,
+    sizes: readonly (readonly [lines: Interval, px: number | null])[],
+  ): boolean {
     const isRow = axis === "row";
-    const count = isRow ? this.#sheet.rows : this.#sheet.cols;
-    const [first, end] = isRow ? [span.firstRow, span.endRow] : [span.firstCol, span.endCol];
-    const before = direction < 0 ? first - 1 : end + 1;
-    if (before < 0 || before > count) {
-      return false;
-    }
-    const after = before === 0 ? null : isRow ? this.rowIdAt(before - 1) : this.colIdAt(before - 1);
-    const ids = this.#idsOf(axis, first, end);
-    const passed = this.#idsOf(
-      axis,
-      direction < 0 ? first - 1 : end,
-      direction < 0 ? first : end + 1,
-    );
-    if (!ids || !passed || (before > 0 && after === null)) {
-      return false;
-    }
-    this.#moved = {
-      axis,
-      first: direction < 0 ? first - 1 : first,
-      ids: direction < 0 ? [...ids, ...passed] : [...passed, ...ids],
-      until: performance.now() + MOVE_SETTLE_MS,
-    };
-    onMove(coalesceIdRuns(ids), after);
-    const moved = ({ row, col }: Cell): Cell =>
-      isRow ? { row: row + direction, col } : { row, col: col + direction };
-    this.#anchor = moved(anchor);
-    this.#focus = moved(focus);
-    this.#revealAnchor();
-    this.#notifySelection();
-    this.#invalidate();
-    return true;
-  }
-
-  /**
-   * Whether the rows or columns that were moved last are still held where they
-   * were before. Their pages arrive one by one, some of which are not of them.
-   */
-  #isMoving(): boolean {
-    if (this.#moved) {
-      const { axis, first, ids, until } = this.#moved;
-      const held = this.#idsOf(axis, first, first + ids.length);
-      if (performance.now() >= until || ids.every((id, index) => id === held?.[index])) {
-        this.#moved = null;
+    const { standard, custom } = this.sizesOf(axis);
+    const reported: { readonly run: IdRun; readonly sizePx: number | null }[] = [];
+    let resized = custom;
+    for (const [lines, wanted] of sizes) {
+      const runs = idRunsOf([lines], this.#idOf(axis));
+      if (!runs || (isRow && this.#options.readOnly)) {
+        return false;
       }
+      const px =
+        wanted === null
+          ? standard
+          : boundedSize(wanted, isRow ? MIN_ROW_PX : MIN_COL_PX, isRow ? MAX_ROW_PX : MAX_COL_PX);
+      resized = withSizes(resized, [lines], px, standard);
+      reported.push(...runs.map((run) => ({ run, sizePx: px === standard ? null : px })));
     }
-    return this.#moved !== null;
-  }
-
-  /** The identifiers of some rows or columns, or `null` if not all of them are known. */
-  #idsOf(axis: "row" | "col", first: number, end: number): bigint[] | null {
-    const ids: bigint[] = [];
-    for (let position = first; position < end; position++) {
-      const id = axis === "row" ? this.#cache.rowIdAt(position) : this.#cache.colIdAt(position);
-      if (id === undefined) {
-        return null;
-      }
-      ids.push(id);
+    if (isRow) {
+      this.#customRows = resized;
+    } else {
+      this.#customCols = resized;
     }
-    return ids;
-  }
-
-  /**
-   * Gives the selected rows a height in pixels at a zoom of 1, or the standard
-   * one. Returns whether it did; the grid has to know the rows.
-   */
-  resizeSelectedRows(sizePx: number | null): boolean {
-    const runs = this.selectedRowRuns();
-    if (!runs || !this.#options.onResizeRows) {
-      return false;
-    }
-    const { rowHeight } = this.#base;
-    const px = sizePx === null ? rowHeight : boundedSize(sizePx, MIN_ROW_PX, MAX_ROW_PX);
-    const intervals = rowsOf(this.selectionRanges);
-    this.#customRows = withSizes(this.#customRows, intervals, px, rowHeight);
     this.#rebuildLayout();
     this.#invalidate();
-    const size = px === rowHeight ? null : px;
-    this.#options.onResizeRows(runs.map((run) => ({ run, sizePx: size })));
+    if (isRow) {
+      this.#options.onResizeRows?.(reported);
+    } else {
+      this.#reportCols(reported);
+    }
     return true;
-  }
-
-  /** The same for the width of the selected columns. */
-  resizeSelectedCols(sizePx: number | null): boolean {
-    const runs = this.selectedColRuns();
-    if (!runs || !this.#options.onResizeCols) {
-      return false;
-    }
-    const { colWidth } = this.#base;
-    const px = sizePx === null ? colWidth : boundedSize(sizePx, MIN_COL_PX, MAX_COL_PX);
-    const intervals = colsOf(this.selectionRanges);
-    this.#customCols = withSizes(this.#customCols, intervals, px, colWidth);
-    this.#rebuildLayout();
-    this.#invalidate();
-    const size = px === colWidth ? null : px;
-    this.#options.onResizeCols(runs.map((run) => ({ run, sizePx: size })));
-    return true;
-  }
-
-  /**
-   * Makes the selected columns as wide as their texts in view need. Returns
-   * whether there was any of them whose texts the grid has.
-   */
-  autofitSelectedCols(): boolean {
-    const { colWidth } = this.#base;
-    const sizes: { run: IdRun; sizePx: number | null }[] = [];
-    let found = false;
-    for (const { first, end } of mergeIntervals(colsOf(this.selectionRanges))) {
-      for (let col = first; col < end; col++) {
-        const id = this.#cache.colIdAt(col);
-        if (id === undefined || !this.#cache.pageOf(this.#visible.firstRow, col)) {
-          continue;
-        }
-        found = true;
-        const px = this.#fitWidth(col);
-        if (px !== sizeIn(this.#customCols, col, colWidth)) {
-          this.#customCols = withSizes(
-            this.#customCols,
-            [{ first: col, end: col + 1 }],
-            px,
-            colWidth,
-          );
-          const run = { firstId: String(id), len: 1 };
-          sizes.push({ run, sizePx: px === colWidth ? null : px });
-        }
-      }
-    }
-    if (sizes.length > 0) {
-      this.#rebuildLayout();
-      this.#invalidate();
-      this.#options.onResizeCols?.(sizes);
-    }
-    return found;
   }
 
   /** How wide a column has to be for its name and those of its texts that are in view. */
-  #fitWidth(col: number): number {
+  fitWidth(col: number): number {
     const { frozenRows } = frozenPixels(this.#metrics, this.#sheet, this.#size, this.#layout);
     return this.#measurer.columnFitWidth(
       this.#theme,
       this.#cache,
       this.#styles,
+      this.#nameOfCol(col),
+      this.#columns?.roomOf(col) ?? 0,
       col,
       frozenRows > 0 ? 0 : this.#visible.firstRow,
       Math.max(frozenRows, this.#visible.endRow),
     );
-  }
-
-  /** The sizes that all selected rows and columns have, in pixels at a zoom of 1. */
-  sizeOfSelection(): { readonly rowPx: number | null; readonly colPx: number | null } {
-    const ranges = this.selectionRanges;
-    const { rowHeight, colWidth } = this.#base;
-    return {
-      rowPx: commonSize(this.#customRows, rowsOf(ranges), rowHeight),
-      colPx: commonSize(this.#customCols, colsOf(ranges), colWidth),
-    };
   }
 
   /**
@@ -1668,6 +1662,8 @@ export class Grid {
       cell && {
         row: this.displayRowToPhysicalRow(cell.row),
         col: cell.col,
+        name: this.#nameOfCol(cell.col),
+        sort: this.#columns?.sortOf(cell.col) ?? null,
         text: this.textAt(cell.row, cell.col) ?? "",
       },
     );
@@ -1682,15 +1678,17 @@ export class Grid {
     const ranges = this.selectionRanges;
     const rowId = this.#cache.rowIdAt(anchor.row);
     const colId = this.#cache.colIdAt(anchor.col);
-    const rowName = (row: number) => this.displayRowToPhysicalRow(row) + 1;
-    const startName = `${columnName(range.firstCol)}${rowName(range.firstRow)}`;
+    // A name of a column's own may end with a digit.
+    const space = this.#columns ? " " : "";
+    const nameOf = (row: number, col: number) =>
+      `${this.#nameOfCol(col)}${space}${this.displayRowToPhysicalRow(row) + 1}`;
     const single =
       ranges.length === 1 &&
       range.endRow - range.firstRow === 1 &&
       range.endCol - range.firstCol === 1;
     const baseName = single
-      ? `${columnName(anchor.col)}${rowName(anchor.row)}`
-      : `${startName}:${columnName(range.endCol - 1)}${rowName(range.endRow - 1)}`;
+      ? nameOf(anchor.row, anchor.col)
+      : `${nameOf(range.firstRow, range.firstCol)}:${nameOf(range.endRow - 1, range.endCol - 1)}`;
     const name = ranges.length > 1 ? `${baseName} (+${ranges.length - 1})` : baseName;
     return {
       row: anchor.row,
@@ -1703,6 +1701,10 @@ export class Grid {
       colId: colId === undefined ? null : String(colId),
       text: this.textAt(anchor.row, anchor.col),
     };
+  }
+
+  #nameOfCol(col: number): string {
+    return this.#columns?.nameOf(col) ?? columnName(col);
   }
 
   #effectiveMargin(now: number): { readonly rows: number; readonly cols: number } {
@@ -1720,6 +1722,9 @@ export class Grid {
 
   #frame = (): void => {
     this.#frameRequest = 0;
+    if (this.#paused) {
+      return;
+    }
     const started = performance.now();
     if (this.#resized) {
       this.#resize();
@@ -1737,9 +1742,8 @@ export class Grid {
     }
 
     const metrics = this.#metrics;
-    const scroll = this.#drawnScroll();
-    const visible = visibleCells(metrics, this.#sheet, scroll, this.#size, this.#layout);
-    this.#visible = visible;
+    const scroll = this.#see();
+    const visible = this.#visible;
     const wantedPages = pagesToHold(visible, this.#sheet, this.#effectiveMargin(started));
     const freezeKey = `${this.#frozenRows}:${this.#frozenCols}`;
     const freezeChanged = freezeKey !== this.#lastFreezeKey;
@@ -1770,6 +1774,8 @@ export class Grid {
       selectionRanges: this.selectionRanges,
       sheet: this.#sheet,
       layout: this.#layout,
+      columns: this.#columns,
+      clipText: this.#options.clipText === true,
       styles: this.#styles,
       formulaReferences: this.#formulaRefs,
       remotePresences: this.#remotePresences,
@@ -1777,7 +1783,7 @@ export class Grid {
       fillPreview: this.#fillPreview,
       clipboardRange: this.#clipboardRange,
       reorderGuide: this.#reorderGuide,
-      showFillHandle: this.#extraRanges.length === 0,
+      showFillHandle: !this.#options.readOnly && this.#extraRanges.length === 0,
       filterState: this.#filterState,
       filterRowMap: this.#filterRowMap,
       activeSpillRange: this.#activeSpillRange,
@@ -1817,6 +1823,13 @@ export class Grid {
     }
   };
 
+  /** Finds out what is in view, from where it is scrolled to. */
+  #see(): Scroll {
+    const scroll = this.#drawnScroll();
+    this.#visible = visibleCells(this.#metrics, this.#sheet, scroll, this.#size, this.#layout);
+    return scroll;
+  }
+
   #drawnScroll(): Scroll {
     const scale = this.#scale;
     return {
@@ -1831,11 +1844,16 @@ export class Grid {
       return;
     }
     this.#lastFreezeKey = freezeKey;
+    const heldNone = isEmpty(this.#cache.span);
     // Pages of newly pinned strips may have come before there was room for them.
-    const resend = force || isEmpty(this.#cache.span);
+    const resend = force || heldNone;
     this.#cache.retain(pages, this.#frozenRows, this.#frozenCols);
     const cells = cellsOfPages(pages, this.#sheet);
     this.#epoch = (this.#epoch + 1) >>> 0;
+    if (heldNone) {
+      // What was asked for before may be of another sheet, or of the same one as it was.
+      this.#leastEpoch = this.#epoch;
+    }
     this.#options.subscribe({
       epoch: this.#epoch,
       firstRow: cells.firstRow,
@@ -2030,13 +2048,19 @@ export class Grid {
 
   #headerAt(x: number, y: number): HeaderHit | null {
     const scroll = this.#drawnScroll();
-    return headerHitAt(this.#metrics, this.#sheet, scroll, this.#size, x, y, this.#layout);
+    const hit = headerHitAt(this.#metrics, this.#sheet, scroll, this.#size, x, y, this.#layout);
+    if (hit?.kind === "rowResize" && this.#options.readOnly) {
+      const cell = this.#cellAtClamped(x, y);
+      return cell && { kind: "row", row: cell.row };
+    }
+    return hit;
   }
 
   #isOverFillHandle(localX: number, localY: number): boolean {
     const range = this.selectionRange;
     return (
       range !== null &&
+      !this.#options.readOnly &&
       this.#extraRanges.length === 0 &&
       isOverFillHandle(this.#viewNow(), range, { x: localX, y: localY })
     );
@@ -2089,7 +2113,7 @@ export class Grid {
           beginPinch: this.#beginPinch,
           pinch: this.#pinch,
           endPinch: this.#endZoomGesture,
-          pressFilterButton: (point) => this.#pressFilterButton(point),
+          pressButton: (point) => this.#pressButton(point),
         }),
     );
     this.#touch.then(act, () => {
@@ -2155,6 +2179,11 @@ export class Grid {
       return;
     }
 
+    if (this.#pressButton({ x, y })) {
+      event.preventDefault();
+      return;
+    }
+
     // 2. Check header strips (corner, resize handles, whole-row/col select or drag reorder).
     const hit = this.#headerAt(x, y);
     if (hit) {
@@ -2175,7 +2204,7 @@ export class Grid {
                 ? sizeIn(this.#customRows, index, rowHeight)
                 : sizeIn(this.#customCols, index, colWidth),
           };
-        } else if (!event.shiftKey && !multiMod && this.#isLineSelected(axis, index)) {
+        } else if (!event.shiftKey && !multiMod && this.#canReorder(axis, index)) {
           // If clicking an already-selected whole line without Shift/Ctrl, allow dragging to reorder!
           this.#drag = { kind: "reorder", axis, start: index, moved: false };
         } else {
@@ -2192,13 +2221,9 @@ export class Grid {
       return;
     }
 
-    // 3. Cell body click / drag (after AutoFilter header chevron hit-test).
+    // 3. Cell body click / drag.
     const cell = this.#cellAt(x, y);
     if (cell) {
-      if (this.#pressFilterButton({ x, y })) {
-        event.preventDefault();
-        return;
-      }
       // Formula point-and-click reference insertion check (`14-m1b.md` 6.1):
       const initialSpan = spanOf(cell, cell);
       if (this.#options.onPointAndClickRange?.(initialSpan)) {
@@ -2229,7 +2254,41 @@ export class Grid {
     }
   }
 
-  /** Opens the filter whose button is at a point. Returns whether there is one. */
+  /** Opens what the button at a point is for. Returns whether there is one. */
+  #pressButton(point: Point): boolean {
+    return this.#pressColumnButton(point) || this.#pressFilterButton(point);
+  }
+
+  #pressColumnButton({ x, y }: Point): boolean {
+    const { onColumnButton } = this.#options;
+    const hit = onColumnButton && this.#headerAt(x, y);
+    const button = hit?.kind === "col" ? this.#columnButton(hit.col) : null;
+    if (hit?.kind !== "col" || !button || x < button.x - BUTTON_SLACK * headerZoom(this.#zoom)) {
+      return false;
+    }
+    onColumnButton?.(hit.col, this.columnButtonRect(hit.col));
+    return true;
+  }
+
+  #columnButton(col: number): FilterButtonRect | null {
+    const { left, width } = this.boxOf(0, col);
+    const { headerHeight } = this.#metrics;
+    return this.#columns?.buttonIn(left, width, headerHeight, headerZoom(this.#zoom)) ?? null;
+  }
+
+  /**
+   * Where on the page the button in a column's header is, or the header if it
+   * has none. The column need not be in view; `reveal` has it there.
+   */
+  columnButtonRect(col: number): DOMRect {
+    const { left, top } = this.#input.getBoundingClientRect();
+    const button = this.#columnButton(col);
+    const header = this.boxOf(0, col);
+    return button
+      ? new DOMRect(left + button.x, top + button.y, button.size, button.size)
+      : new DOMRect(left + header.left, top, header.width, this.#metrics.headerHeight);
+  }
+
   #pressFilterButton({ x, y }: Point): boolean {
     const filter = this.#filterState;
     const cell = this.#cellAt(x, y);
@@ -2350,7 +2409,8 @@ export class Grid {
     if (finishedDrag.kind === "resize") {
       const px = this.#takeSizePreview();
       if (px !== null && px !== finishedDrag.startBase) {
-        this.#resizeLine(finishedDrag.axis, finishedDrag.index, px);
+        const { axis, index } = finishedDrag;
+        this.resizeLines(axis, [[{ first: index, end: index + 1 }, px]]);
       }
     } else if (finishedDrag.kind === "fill") {
       const preview = this.#fillPreview;
@@ -2377,15 +2437,18 @@ export class Grid {
         const after =
           before === 0 ? null : isRow ? this.rowIdAt(before - 1) : this.colIdAt(before - 1);
         if (runs && (before < first || before > end) && (before === 0 || after !== null)) {
-          const { onMoveRows, onMoveCols } = this.#options;
-          (isRow ? onMoveRows : onMoveCols)?.(runs, after);
+          this.moveLines(guide.axis, runs, after);
         }
       }
     }
   }
 
+  #canReorder(axis: Axis, index: number): boolean {
+    return !this.#options.readOnly && this.#isLineSelected(axis, index);
+  }
+
   /** Whether a whole row or column is selected, by itself or with others around it. */
-  #isLineSelected(axis: "row" | "col", index: number): boolean {
+  #isLineSelected(axis: Axis, index: number): boolean {
     const range = this.selectionRange;
     return (
       range !== null &&
@@ -2396,8 +2459,11 @@ export class Grid {
   }
 
   /** Selects a whole row or column, or extends the selection to it. */
-  #pickLine(axis: "row" | "col", index: number, extend = false): void {
+  #pickLine(axis: Axis, index: number, extend = false): void {
     const { rows, cols } = this.#sheet;
+    if (rows <= 0) {
+      return;
+    }
     const isRow = axis === "row";
     this.#scope = isRow ? "rows" : "cols";
     if (!extend || !this.#anchor) {
@@ -2424,9 +2490,9 @@ export class Grid {
     // 2. Double-click column resize border -> auto-fit column width to visible text!
     const hit = this.#headerAt(x, y);
     if (hit && hit.kind === "colResize") {
-      const fitPx = this.#fitWidth(hit.col);
+      const fitPx = this.fitWidth(hit.col);
       if (fitPx !== sizeIn(this.#customCols, hit.col, this.#base.colWidth)) {
-        this.#resizeLine("col", hit.col, fitPx);
+        this.resizeLines("col", [[{ first: hit.col, end: hit.col + 1 }, fitPx]]);
       }
       return;
     }
@@ -2496,7 +2562,7 @@ export class Grid {
           cursor = "col-resize";
         } else if (hit.kind === "rowResize") {
           cursor = "row-resize";
-        } else if (hit.kind !== "corner" && this.#isLineSelected(...lineOf(hit))) {
+        } else if (hit.kind !== "corner" && this.#canReorder(...lineOf(hit))) {
           cursor = "grab";
         } else {
           cursor = "pointer";
@@ -2508,7 +2574,7 @@ export class Grid {
     }
   }
 
-  #previewSize(axis: "row" | "col", index: number, px: number): void {
+  #previewSize(axis: Axis, index: number, px: number): void {
     this.#sizePreview = { axis, index, px };
     this.#rebuildLayout();
     this.#invalidate();
@@ -2521,28 +2587,6 @@ export class Grid {
     this.#rebuildLayout();
     this.#invalidate();
     return px;
-  }
-
-  /** Resizes a row or a column here, without waiting for the engine to say so, and there. */
-  #resizeLine(axis: "row" | "col", index: number, px: number): void {
-    const isRow = axis === "row";
-    const id = isRow ? this.#cache.rowIdAt(index) : this.#cache.colIdAt(index);
-    if (id === undefined) {
-      return;
-    }
-    const { rowHeight, colWidth } = this.#base;
-    const standard = isRow ? rowHeight : colWidth;
-    const line = [{ first: index, end: index + 1 }];
-    if (isRow) {
-      this.#customRows = withSizes(this.#customRows, line, px, standard);
-    } else {
-      this.#customCols = withSizes(this.#customCols, line, px, standard);
-    }
-    this.#rebuildLayout();
-    this.#invalidate();
-    const { onResizeRows, onResizeCols } = this.#options;
-    const run = { firstId: String(id), len: 1 };
-    (isRow ? onResizeRows : onResizeCols)?.([{ run, sizePx: px === standard ? null : px }]);
   }
 
   #updateDragTarget(): void {

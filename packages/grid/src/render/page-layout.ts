@@ -28,6 +28,7 @@ export interface PageSetting {
   readonly look: Look;
   readonly styles: StyleTable;
   readonly frozenCols: number;
+  readonly clipText?: boolean;
 }
 
 /** The edges of a page's rows and columns relative to its first ones. */
@@ -273,11 +274,12 @@ export class PageLayout {
 
   /** Whether the layout still holds; sizes are compared, as every edit makes new axes. */
   isValidFor(layout: SheetLayout, setting: PageSetting): boolean {
-    const { look, styles, frozenCols } = this.#setting;
+    const { look, styles, frozenCols, clipText } = this.#setting;
     if (
       look !== setting.look ||
       styles !== setting.styles ||
       frozenCols !== setting.frozenCols ||
+      clipText !== setting.clipText ||
       styles.version !== this.#stylesVersion
     ) {
       return false;

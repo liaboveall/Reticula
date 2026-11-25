@@ -17,14 +17,19 @@ import {
 import type { GridCellStyle } from "./frame.ts";
 import { makeLook, StyleTable } from "./look.ts";
 import { BAND_ROWS, PageLayout, type PageSetting } from "./page-layout.ts";
-import { bandsOf, type Scene } from "./scene.ts";
+import { bandsOf, type Scene, SceneBuilder } from "./scene.ts";
 import { TextRuns } from "./text-layout.ts";
 
-function settingOf(scale = 1, styles: readonly GridCellStyle[] = [], frozenCols = 0): PageSetting {
+function settingOf(
+  scale = 1,
+  styles: readonly GridCellStyle[] = [],
+  frozenCols = 0,
+  clipText = false,
+): PageSetting {
   const look = makeLook(theme, scale, measure, colors);
   const table = new StyleTable(colors);
   table.use(styles, theme);
-  return { measure, look, styles: table, frozenCols };
+  return { measure, look, styles: table, frozenCols, clipText };
 }
 
 interface Run {
@@ -47,15 +52,17 @@ function runsOf(
     frozenCols = 0,
     layout = axes(),
     pageCol = 0,
+    clipText = false,
   }: {
     scale?: number;
     styles?: readonly GridCellStyle[];
     frozenCols?: number;
     layout?: ReturnType<typeof axes>;
     pageCol?: number;
+    clipText?: boolean;
   } = {},
 ): Run[] {
-  const setting = settingOf(scale, styles, frozenCols);
+  const setting = settingOf(scale, styles, frozenCols, clipText);
   const page = new PageLayout(pageOf(cells, 0, pageCol), layout, setting);
   const runs: Run[] = [];
   for (let band = 0; band * BAND_ROWS < page.page.rowCount; band++) {
@@ -506,4 +513,83 @@ test("sizes that are not whole pixels leave every edge on one", () => {
     expect(xs[col]).toBe(Math.round((16 + col) * 111 * scale) - Math.round(16 * 111 * scale));
   }
   expect(ys[64]).toBe(Math.round(64 * 24 * scale));
+});
+
+describe("text that ends where its cell does", () => {
+  const cells: TestCells = {
+    "0:0": LONG,
+    "1:1": "short",
+    "2:2": { text: LONG, style: 1 },
+    "3:3": { text: "1234567890123456789", flags: FLAG_NUMBER },
+    "4:15": LONG,
+  };
+  const styles = [PLAIN, { ...PLAIN, strikethrough: true }];
+
+  test("is cut off at the same distance from the edge as it has at its start", () => {
+    const runs = runsOf(cells, { styles, clipText: true });
+    expect(runs.map(({ text }) => text)).toEqual([
+      LONG,
+      "short",
+      LONG,
+      expect.stringMatching(/^#+$/),
+      LONG,
+    ]);
+    expect(runs[0]).toMatchObject({ x: 6, clip: [0, 0, 69, 20] });
+    expect(runs[1]).toMatchObject({ x: 81, clip: null });
+    expect(runs[2]?.clip).toEqual([150, 40, 219, 60]);
+    expect(runs[4]?.clip).toEqual([15 * 75, 80, 16 * 75 - 6, 100]);
+    expect(runsOf(cells, { styles })[0]?.clip).toBeNull();
+  });
+
+  test("that is a part of a number is never shown", () => {
+    const number = (text: string) => ({ "0:0": { text, flags: FLAG_NUMBER } });
+    const [run] = runsOf(number("-1234567890123456789"), { clipText: true });
+    expect(run?.text).toMatch(/^#+$/);
+    expect(run?.clip).toBeNull();
+    // As many as there is room for, and at the right, where a number is.
+    const room = 75 - 2 * 6;
+    const one = measure.width(makeLook(theme, 1, measure, colors).fonts[0] ?? "", "#");
+    expect(run?.width).toBeLessThanOrEqual(room);
+    expect(run?.width).toBeGreaterThan(room - one);
+    expect((run?.x ?? 0) + (run?.width ?? 0)).toBeCloseTo(75 - 6);
+    const narrow = { ...axes(), colAxis: new SparseAxis(75, [[0, 14]]) };
+    expect(runsOf(number("12"), { clipText: true, layout: narrow })[0]).toMatchObject({
+      text: "#",
+      clip: [6, 0, 8, 20],
+    });
+    // One that fits is shown, whatever the sign.
+    expect(runsOf(number("-12"), { clipText: true })[0]?.text).toBe("-12");
+    // Elsewhere, numbers are as they are.
+    expect(runsOf(number("-1234567890123456789"))[0]?.text).toBe("-1234567890123456789");
+  });
+
+  test("is not drawn at all where there is no room but the distances", () => {
+    const layout = { ...axes(), colAxis: new SparseAxis(75, [[0, 12]]) };
+    const texts = (clipText: boolean) =>
+      runsOf({ "0:0": LONG, "1:0": "x" }, { layout, clipText }).map(({ text }) => text);
+    expect(texts(true)).toEqual([]);
+    expect(texts(false)).toEqual([LONG, "x"]);
+  });
+
+  test("is laid out anew when that changes", () => {
+    const page = pageOf({ "0:0": LONG }, 0, 0);
+    const setting = settingOf();
+    const held = new PageLayout(page, axes(), setting);
+    expect(held.isValidFor(axes(), setting)).toBe(true);
+    expect(held.isValidFor(axes(), { ...setting, clipText: true })).toBe(false);
+    const frame = frameOf({ cache: cacheOf({ "0:0": LONG }, 1, 1) });
+    const clipsOf = (scene: Scene) =>
+      scene.steps.flatMap((step) => {
+        if (step.kind !== "texts") {
+          return [];
+        }
+        const { texts } = step.layout;
+        step.layout.band(0);
+        return [texts.clipped[0] === 1 ? texts.clip[2] : null];
+      });
+    const builder = new SceneBuilder(measure, colors);
+    expect(clipsOf(builder.build(frame))).toEqual([null]);
+    expect(clipsOf(builder.build({ ...frame, clipText: true }))).toEqual([69]);
+    expect(clipsOf(builder.build(frame))).toEqual([null]);
+  });
 });

@@ -1,9 +1,12 @@
-import { columnName, type SheetSize } from "./layout.ts";
+import type { SheetSize } from "./layout.ts";
 
 /** The selected cell, at its place in the sheet itself: rows a filter hides count. */
 export interface MirroredCell {
   readonly row: number;
   readonly col: number;
+  /** What its column is called, and which way the rows are sorted by it. */
+  readonly name: string;
+  readonly sort: "ascending" | "descending" | null;
   readonly text: string;
 }
 
@@ -73,11 +76,12 @@ export class Mirror {
     if (!selected) {
       return;
     }
-    const { row, col, text } = selected;
+    const { row, col, name, sort, text } = selected;
     setIndex(this.#row, "row", row + 2);
     setIndex(this.#colHeader, "col", col + 2);
     setIndex(this.#cell, "col", col + 2);
-    this.#colHeader.textContent = columnName(col);
+    this.#colHeader.textContent = name;
+    this.#colHeader.ariaSort = sort;
     this.#rowHeader.textContent = String(row + 1);
     this.#cell.textContent = text;
   }

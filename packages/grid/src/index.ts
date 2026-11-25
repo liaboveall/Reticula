@@ -49,6 +49,7 @@ export {
 } from "./layout.ts";
 export { IS_MAC, type JumpDirection } from "./navigation.ts";
 export type {
+  ColumnHeaders,
   DiffHighlightKind,
   DiffHighlightMap,
   FormulaReferenceOverlay,

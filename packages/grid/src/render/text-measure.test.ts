@@ -1,5 +1,6 @@
 import { describe, expect, test } from "vitest";
 import { advanceOf, cacheOf, measure, PLAIN, theme } from "./fixtures.ts";
+import type { GridCellStyle } from "./frame.ts";
 import { fontOf, TextMeasurer } from "./text-measure.ts";
 
 /** A context that counts what it is asked to measure. Fonts named "joined" join letters. */
@@ -208,8 +209,19 @@ describe("fitting a column", () => {
     const wanted = Math.ceil(
       [..."a longer text"].reduce((sum, c) => sum + advanceOf(font, c), 0) + 18,
     );
-    expect(measurer.columnFitWidth(theme, cache, [PLAIN, bold], 1, 0, 64)).toBe(wanted);
-    expect(measurer.columnFitWidth(theme, cache, [PLAIN, bold], 2, 0, 64)).toBe(600);
-    expect(measurer.columnFitWidth(theme, cache, undefined, 3, 0, 64)).toBe(48);
+    const fit = (styles: GridCellStyle[] | undefined, col: number, name = "B", room = 0) =>
+      measurer.columnFitWidth(theme, cache, styles, name, room, col, 0, 64);
+    expect(fit([PLAIN, bold], 1)).toBe(wanted);
+    expect(fit([PLAIN, bold], 2)).toBe(600);
+    expect(fit(undefined, 3)).toBe(48);
+
+    // A name may be longer than the texts, and has a button next to it.
+    const header = [..."a name of some length"].reduce(
+      (sum, c) => sum + advanceOf("600 13px sans-serif", c),
+      0,
+    );
+    expect(fit([PLAIN, bold], 1, "a name of some length")).toBe(Math.ceil(header + 24));
+    expect(fit([PLAIN, bold], 1, "a name of some length", 33)).toBe(Math.ceil(header + 24 + 33));
+    expect(fit(undefined, 3, "x".repeat(400), 33)).toBe(600);
   });
 });

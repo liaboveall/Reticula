@@ -199,7 +199,7 @@ export class SceneBuilder {
     };
     const frozen = frozenPixels(metrics, sheet, size, layout);
     this.#styles.use(frame.styles ?? NO_STYLES, frame.theme);
-    const setting = this.#settingOf(look, frozen.frozenCols);
+    const setting = this.#settingOf(look, frozen.frozenCols, frame.clipText === true);
     this.#layouts.begin(frame.cache);
 
     const rects = this.#rects;
@@ -307,9 +307,13 @@ export class SceneBuilder {
     return this.#look;
   }
 
-  #settingOf(look: Look, frozenCols: number): PageSetting {
-    if (this.#setting?.look !== look || this.#setting.frozenCols !== frozenCols) {
-      this.#setting = { measure: this.measure, look, styles: this.#styles, frozenCols };
+  #settingOf(look: Look, frozenCols: number, clipText: boolean): PageSetting {
+    if (
+      this.#setting?.look !== look ||
+      this.#setting.frozenCols !== frozenCols ||
+      this.#setting.clipText !== clipText
+    ) {
+      this.#setting = { measure: this.measure, look, styles: this.#styles, frozenCols, clipText };
     }
     return this.#setting;
   }
@@ -829,7 +833,7 @@ export class SceneBuilder {
     const rects = this.#rects;
     const { left, top, right, bottom } = box;
     const { hairline, scale } = look;
-    const { metrics, selection, selectionRange } = frame;
+    const { metrics, selection, selectionRange, columns } = frame;
     const font = look.fonts[HEADER_FONT] ?? "";
     const ranges = rangesOf(frame);
     if (ranges.length === 0 && selection) {
@@ -846,7 +850,8 @@ export class SceneBuilder {
     const nameWidth = (col: number) =>
       this.measure.width(font, "W".repeat(columnName(col).length)) + 4 * scale;
     const lastCol = Math.max(0, ...strips.map((strip) => strip.endCol - 1));
-    const colStep = labelStep(metrics.colWidth * scale, nameWidth(lastCol));
+    const colStep = columns ? 1 : labelStep(metrics.colWidth * scale, nameWidth(lastCol));
+    const headerScale = scale * headerZoom(look.zoom);
 
     for (const strip of strips) {
       const clip = { left: strip.left, top: 0, right: strip.right, bottom: top };
@@ -863,7 +868,24 @@ export class SceneBuilder {
       const cols = { first: strip.firstCol, end: strip.endCol };
       const all = { first: strip.all.firstCol, end: strip.all.endCol };
       for (const { index, from, to } of labelled(cols, all, colStep, 0, strip.x, nameWidth)) {
-        this.#label(look, columnName(index), look.headerText, clip, from, 0, to, top);
+        if (columns) {
+          columns.draw({
+            col: index,
+            left: from,
+            right: to - hairline,
+            bottom: top - hairline,
+            scale: headerScale,
+            look,
+            font,
+            measure: this.measure,
+            fill: (box, color) => rects.add(clip, box.left, box.top, box.right, box.bottom, color),
+            text: (text, left, right) =>
+              this.#label(look, text, look.headerText, clip, from, 0, right + hairline, top, left),
+            sprite: (spec, x, y) => this.#step({ kind: "sprite", spec, x, y, clip }),
+          });
+        } else {
+          this.#label(look, columnName(index), look.headerText, clip, from, 0, to, top);
+        }
       }
       for (let col = strip.firstCol + 1; col <= strip.endCol; col++) {
         const at = strip.x(col);
@@ -938,9 +960,8 @@ export class SceneBuilder {
       selectionRange.firstCol === 0 &&
       selectionRange.endCol === sheet.cols;
     rects.push(0, 0, left, top, allSelected ? look.headerSelected : look.headerBackground);
-    const cornerScale = scale * headerZoom(look.zoom);
-    const size = lineWidth(8, cornerScale);
-    const inset = Math.round(5 * cornerScale);
+    const size = lineWidth(8, headerScale);
+    const inset = Math.round(5 * headerScale);
     this.#step({
       kind: "sprite",
       spec: { kind: "corner", width: size, height: size, color: look.headerLine },
@@ -952,7 +973,7 @@ export class SceneBuilder {
     rects.push(0, top - hairline, right, hairline, look.headerLine);
   }
 
-  /** A text in the middle of a header's cell, and nowhere else. */
+  /** A text in the middle of a header's cell, or from a place in it on, and nowhere else. */
   #label(
     look: Look,
     text: string,
@@ -962,6 +983,7 @@ export class SceneBuilder {
     top: number,
     right: number,
     bottom: number,
+    start?: number,
   ): void {
     // The last pixels of a header's cell are the line after it.
     const boxLeft = Math.max(clip.left, left);
@@ -972,7 +994,7 @@ export class SceneBuilder {
       return;
     }
     const width = this.measure.width(look.fonts[HEADER_FONT] ?? "", text);
-    const x = (left + right - width) / 2;
+    const x = start ?? (left + right - width) / 2;
     const line = look.lineOf(HEADER_FONT);
     const middle = (top + bottom) / 2;
     const baseline = Math.round(middle + line.lift);

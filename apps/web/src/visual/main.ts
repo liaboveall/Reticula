@@ -196,6 +196,11 @@ const hooks: VisualHooks = {
       ...page.overflows.map((overflow) => overflow.text),
     ]);
     const names = frame.remotePresences?.map((presence) => presence.displayName) ?? [];
+    const { columns } = frame;
+    if (columns) {
+      const count = frame.sheet?.cols ?? 0;
+      names.push(...Array.from({ length: count }, (_, col) => columns.nameOf(col)), "\u{2026}");
+    }
     return [...new Set([...texts, ...names].join(""))].join("");
   },
   adapter,

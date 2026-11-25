@@ -1,4 +1,5 @@
 import { FilterRowMap } from "@reticula/grid";
+import { type NamedColumn, NamedColumns } from "@reticula/grid/columns";
 import {
   type Frame,
   type Metrics,
@@ -48,6 +49,9 @@ type Overlays = Partial<
     | "filterState"
     | "filterRowMap"
     | "activeSpillRange"
+    | "columns"
+    | "clipText"
+    | "showFillHandle"
   >
 >;
 
@@ -60,6 +64,8 @@ interface Setting {
   readonly frozenCols?: number;
   readonly rowHeights?: readonly (readonly [number, number])[];
   readonly colWidths?: readonly (readonly [number, number])[];
+  /** Width of the row headers at a zoom of 1, if not the usual one. */
+  readonly headerWidth?: number;
   /** Pages that have not arrived. */
   readonly missing?: (pageRow: number, pageCol: number) => boolean;
   readonly overlays?: Overlays;
@@ -192,6 +198,11 @@ function styled(): SyntheticSheet {
   sheet.put(8, 2, amount(3), { strikethrough: true, align: "left" });
   sheet.put(8, 3, han(5, 4), { strikethrough: true, align: "center", italic: true });
   return sheet;
+}
+
+/** A table to read: the texts stay in their cells, and the columns have names. */
+function table(columns: readonly NamedColumn[]): Overlays {
+  return { columns: new NamedColumns(columns), clipText: true, showFillHandle: false };
 }
 
 const FILTER_HIDDEN = [
@@ -579,6 +590,120 @@ const SETTINGS: Record<CaseName, () => Setting> = {
     scroll: { top: 9, left: 31 },
     overlays: ZOOMED,
   }),
+  "column-names": () => ({
+    sheet: new SyntheticSheet(1000, 9).fill(mixed),
+    scroll: { top: 24 * 3 + 5, left: 21 },
+    colWidths: [
+      [0, 104],
+      [1, 141],
+      [3, 33],
+      [4, 61],
+      [5, 18],
+    ],
+    overlays: {
+      ...table([
+        { name: "jellyfish of the fjord" },
+        { name: han(3, 24) },
+        { name: `${word(0)} ${han(7, 9)}` },
+        { name: word(5) },
+        { name: `${han(11, 2)}${EMOJI}${EMOJI}${EMOJI}` },
+        { name: word(8) },
+        { name: "id" },
+        { name: `${HEBREW} ${HEBREW}` },
+      ]),
+      selection: { row: 6, col: 1 },
+      selectionRange: span(5, 8, 1, 3),
+    },
+  }),
+  "column-sort": () => ({
+    sheet: new SyntheticSheet(1000, 12).fill(mixed),
+    scroll: { top: 0, left: 13 },
+    colWidths: [
+      [1, 120],
+      [3, 47],
+      [4, 31],
+    ],
+    overlays: table([
+      { name: word(0), sort: "ascending" },
+      { name: word(1), sort: "descending", sortOrder: 1 },
+      { name: han(5, 2), sort: "ascending", sortOrder: 2 },
+      { name: word(2), sort: "descending", sortOrder: 3 },
+      { name: word(3), sort: "ascending", sortOrder: 14 },
+      { name: `${word(4)} ${word(5)}`, sort: "descending" },
+    ]),
+  }),
+  "column-filters": () => ({
+    sheet: new SyntheticSheet(1000, 12).fill(mixed),
+    scroll: { top: 11, left: 0 },
+    colWidths: [
+      [2, 46],
+      [3, 44],
+    ],
+    overlays: {
+      ...table([
+        { name: word(0), filtered: true },
+        { name: word(1) },
+        { name: word(2), filtered: true },
+        { name: word(3), filtered: true },
+        { name: han(9, 6), filtered: true, sort: "descending", sortOrder: 2 },
+      ]),
+      selection: { row: 0, col: 1 },
+      selectionRange: span(0, 1000, 1, 2),
+      selectionRanges: [span(0, 1000, 4, 5), span(0, 1000, 1, 2)],
+    },
+  }),
+  "column-names-frozen": () => ({
+    sheet: new SyntheticSheet(1000, 24).fill(mixed),
+    zoom: 1.5,
+    frozenCols: 2,
+    scroll: { top: 36 * 70 + 7, left: 120 * 15 + 44 },
+    colWidths: [
+      [0, 64],
+      [1, 49],
+    ],
+    overlays: table(
+      Array.from({ length: 24 }, (_, col) => ({
+        name: `${han(col * 3, 1 + (col % 3))} ${word(col)}`,
+        sort: col % 4 === 1 ? "ascending" : null,
+        sortOrder: col > 4 ? 2 : 1,
+        filtered: col % 3 === 0,
+      })),
+    ),
+  }),
+  // The last rows there can be, and headers as wide as their numbers.
+  "column-names-zoom-half": () => ({
+    sheet: new SyntheticSheet(100_000_000, 30).fill(mixed),
+    zoom: 0.5,
+    frozenCols: 1,
+    headerWidth: 63,
+    scroll: { top: 12 * 99_999_978 + 5, left: 40 * 3 + 9 },
+    overlays: table(
+      Array.from({ length: 30 }, (_, col) => ({
+        name: `${word(col)} ${han(col, 4)}`,
+        sort: col % 5 === 0 ? "descending" : null,
+        filtered: col % 2 === 0,
+      })),
+    ),
+  }),
+  "clipped-text": () => ({
+    sheet: (() => {
+      const sheet = new SyntheticSheet(1000, 8);
+      const long = `${word(2)} ${word(3)} ${han(4, 8)} ${word(6)}`;
+      for (let row = 0; row < 14; row++) {
+        sheet.put(row, row % 4, long, row % 5 === 2 ? { italic: true, strikethrough: true } : {});
+      }
+      sheet.put(2, 4, "1234567890123456789.25").put(3, 4, "#VALUE! not supported here");
+      sheet.put(4, 5, long, { align: "right" }).put(5, 5, long, { align: "center" });
+      return sheet;
+    })(),
+    scroll: { top: 5, left: 27 },
+    colWidths: [
+      [1, 33],
+      [2, 13],
+      [3, 12],
+    ],
+    overlays: { clipText: true },
+  }),
 };
 
 /** Rows and columns from a hair's breadth to most of the picture. */
@@ -652,7 +777,8 @@ export function cacheOf(
 export function buildCase(name: CaseName, theme: Theme, scale: number): BuiltCase {
   const setting = SETTINGS[name]();
   const { sheet, zoom, frozenRows = 0, frozenCols = 0, overlays = {} } = setting;
-  const metrics = zoom === undefined ? METRICS : viewMetrics(METRICS, zoom, scale);
+  const base = { ...METRICS, headerWidth: setting.headerWidth ?? METRICS.headerWidth };
+  const metrics = zoom === undefined ? base : viewMetrics(base, zoom, scale);
   const enlarged = Math.min(MOST_ENLARGED, Math.max(1, 1 / scale));
   const size = { width: SIZE.width * enlarged, height: SIZE.height * enlarged };
   const snap = (position: number) => Math.round(position * scale) / scale;

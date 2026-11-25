@@ -4,6 +4,8 @@
   "type": "module",
   "exports": {
     ".": "./src/index.ts",
+    "./arrange": "./src/arrange.ts",
+    "./columns": "./src/columns.ts",
     "./editor": "./src/editor.ts",
     "./internals": "./src/internals.ts",
     "./grid.css": "./src/grid.css"

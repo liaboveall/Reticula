@@ -23,6 +23,7 @@ const BLOCKS = [
   [0xa0, 0xff, "half"],
   [0x300, 0x314, "mark"],
   [0x5d0, 0x5ea, "half"],
+  [0x2026, 0x2026, "half"],
   [0x4e00, 0x4ec7, "full"],
   [0x1f600, 0x1f603, "full"],
 ];
@@ -294,8 +295,8 @@ function buildFont() {
       ...[650, 600, 0, 75, 650, 600, 0, 350, 50, 260].flatMap(u16),
       ...u16(0),
       ...Array.from({ length: 10 }, () => 0),
-      // Basic Latin, Latin-1, combining marks and Hebrew; CJK ideographs.
-      ...u32(0x00000843),
+      // Basic Latin, Latin-1, combining marks, Hebrew and punctuation; CJK ideographs.
+      ...u32(0x80000843),
       ...u32(0x08000000),
       ...u32(0),
       ...u32(0),
