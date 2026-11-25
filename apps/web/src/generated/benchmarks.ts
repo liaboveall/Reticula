@@ -217,8 +217,8 @@ export const QUALITY = {
   simNightlySeeds: 100000,
   fuzzTargets: 9,
   determinismDigest: "823dbb337c5ef1e6",
-  compatFiles: 11,
-  compatGenerations: 3,
+  compatFiles: 16,
+  compatGenerations: 4,
   visualCases: 41,
 } as const;
 

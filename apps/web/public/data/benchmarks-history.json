@@ -2290,6 +2290,7 @@
     "builtInFunctions": 193,
     "catalogEntries": 200,
     "compatGenerations": [
+      "table-v1",
       "v1",
       "v2",
       "v3"

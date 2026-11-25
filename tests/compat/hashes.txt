@@ -15,3 +15,13 @@ aa469f0a2842e62c11eba5ac6c40c67305cd5d27f021bed1bc2b30b8a6ddd3bc  crates/wire/sr
 4b191cb85dfd1df989828e8451edc8066ba9dd627c144d485543f0f286282901  tests/compat/v3/expected_digest.txt
 8cfa8789b68f468a2c92576d46bb52f4a2ce8d09c7567c0a9665a004f0ea2604  tests/compat/v3/replay.rtclwal
 7272cc347e851dd85d549068f882b9683c97987178ceb96aacb8d523d8f2ff01  tests/compat/v3/sync_frames.bin
+# Frozen SHA-256 manifest for table files, version 1 (RTBL v1).
+06309562b27c85c1a8a356af9982d37898f09fbe3de5114712e81681ed8e732c  crates/table/src/bits.rs
+af11ce70e396a97257f0d6cd00e8bdd69671ff634dc343464468560ab0e58018  crates/table/src/checksum.rs
+96d7b51a513404712abfda7161a807e83812206e80301d5b4b0f9ebcf945a5fb  crates/table/src/layout.rs
+6e9d35b932fd1a68ad72cac03dc3d66b8cc1ca887883c14efb0c3dd6c434b588  crates/table/src/types.rs
+29c82e6ed067063c61b0019190c25d843af9b9118edc08e42fcb5b8d9e0d0e3a  tests/compat/table-v1/empty.rtbl
+c917fb91545e23353ca72593a49a239b01a9fbdc7fcecb7a5d11f33e9852f222  tests/compat/table-v1/expected_digests.txt
+32194bcb2f8f443379ea1d81b2cd2dcdf3503c3e2adb7e7eebcb2bb4ad7caeae  tests/compat/table-v1/kinds.rtbl
+7f3170e094cae44091154147047105eb3ff28ff153a41a2a97756ba9350641f6  tests/compat/table-v1/mixed.rtbl
+0fd3481d6c81f4a72725140d28bf0e1554a5b957dfc40d3ddde9006408b11507  tests/compat/table-v1/orders.rtbl
