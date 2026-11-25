@@ -51,6 +51,8 @@ async function start(page: Page, doc: string): Promise<void> {
 
 /** Starts another client in place of the one there is. */
 async function connect(page: Page, doc: string): Promise<void> {
+  // The hooks are loaded after everything else.
+  await page.waitForFunction(() => window.__reticula !== undefined);
   await page.evaluate(async (docId) => {
     const { TableClient } = await (window.__reticula as NonNullable<Window["__reticula"]>).tables();
     const harness: Harness = {

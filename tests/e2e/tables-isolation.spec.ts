@@ -5,6 +5,7 @@ import {
   content,
   DOC,
   expectSaid,
+  filledCell,
   goTo,
   importTable,
   listenToPage,
@@ -160,7 +161,7 @@ test.describe("a crash", () => {
     await fillSheet(page);
     await importTable(page, "orders", ordersCsv(100));
     await goTo(page, "amount 50");
-    const before = await selectedCell(page);
+    const before = await filledCell(page);
     await page.evaluate(() => window.__reticula?.crashDataWorker());
     const problem = page.getByTestId("table-problem");
     await expect(problem).toHaveAttribute("data-code", "crashed");

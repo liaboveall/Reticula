@@ -10,6 +10,8 @@ export async function openWorkbook(page: Page, query = ""): Promise<void> {
   await expect(page.getByTestId("engine-status")).toHaveAttribute("data-status", "ready", {
     timeout: 20_000,
   });
+  // The hooks are loaded after everything else.
+  await page.waitForFunction(() => window.__reticula !== undefined);
 }
 
 /** Whether the browser has what data tables are kept with. */
@@ -53,6 +55,12 @@ export function selectedCell(
       text: text(".reticula-mirror tbody td"),
     };
   });
+}
+
+/** The selected cell once it has a text: what has not come yet looks like a blank. */
+export async function filledCell(page: Page): ReturnType<typeof selectedCell> {
+  await expect.poll(async () => (await selectedCell(page)).text).not.toBe("");
+  return selectedCell(page);
 }
 
 /** Goes to a cell with the name box, and waits until it is known what is in it. */

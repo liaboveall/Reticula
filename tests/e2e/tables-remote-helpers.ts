@@ -236,6 +236,11 @@ export async function startRemoteServer(): Promise<RemoteServer> {
   return handle;
 }
 
+/** Waits for the hooks, which are loaded after everything else. */
+export async function hooked(page: Page): Promise<void> {
+  await page.waitForFunction(() => window.__reticula !== undefined);
+}
+
 /** Signs in without the dialogs, and waits until the page is there. Gives who it is. */
 export async function enter(
   page: Page,
@@ -254,6 +259,7 @@ export async function enter(
   // A workbook of its own, which no other tab has open.
   await page.goto(`${baseUrl}/app?hooks&doc=source-${randomUUID()}`);
   await expect(page.getByTestId("engine-status")).toHaveText("ready");
+  await hooked(page);
   return userId;
 }
 
@@ -298,6 +304,7 @@ export interface Whose {
 
 /** Starts a client of the tables of a workbook, in place of the one there is. */
 export async function connect(page: Page, target: Whose): Promise<TableRecord[]> {
+  await hooked(page);
   return page.evaluate(async (whose) => {
     const { TableClient } = await (window.__reticula as NonNullable<Window["__reticula"]>).tables();
     await window.__remote?.client.close();

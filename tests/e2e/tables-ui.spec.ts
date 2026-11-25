@@ -4,6 +4,7 @@ import {
   canKeepTables,
   columnMenu,
   expectSaid,
+  filledCell,
   goTo,
   importTable,
   listenToPage,
@@ -440,7 +441,7 @@ test.describe("rows", () => {
     await page.getByTestId("table-filter-apply").click();
     await expect(page.getByTestId("table-count")).toHaveText("250 of 1,000 rows");
     await goTo(page, "amount 200");
-    const before = await selectedCell(page);
+    const before = await filledCell(page);
     await page.reload();
     await expect(page.getByTestId("table-count")).toHaveText("250 of 1,000 rows");
     await expect.poll(() => selectedCell(page)).toEqual(before);

@@ -535,6 +535,7 @@ test("what is to be uploaded is no workbook, whatever the address says", async (
   for (const name of ["upload-queue", "tables-queue"]) {
     await page.goto(`${server.baseUrl}/app?hooks&doc=${name}`);
     await expect(page.getByTestId("engine-status")).toHaveText("ready");
+    await page.waitForFunction(() => window.__reticula !== undefined);
     await page.waitForTimeout(1_000);
     await expect(page.getByRole("tab")).toHaveText(["Sheet1"]);
     await page.evaluate(async (id) => {

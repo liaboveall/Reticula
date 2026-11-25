@@ -3,7 +3,15 @@ import { createServer, type Server } from "node:http";
 import { extname, join, resolve } from "node:path";
 import { expect, type Page, test } from "@playwright/test";
 import { listen } from "./listen.ts";
-import { canKeepTables, importTable, ordersCsv, selectedCell, view } from "./tables-helpers.ts";
+import {
+  canKeepTables,
+  filledCell,
+  goTo,
+  importTable,
+  ordersCsv,
+  selectedCell,
+  view,
+} from "./tables-helpers.ts";
 
 // Data tables without a connection, and updates of the app while one is imported.
 
@@ -104,8 +112,8 @@ test.afterEach(async () => {
 
 test("a table that was open before is there without a connection", async ({ page }) => {
   await importTable(page, "orders", ordersCsv(1_000));
-  await page.keyboard.press("ControlOrMeta+End");
-  const before = await selectedCell(page);
+  await goTo(page, "amount 1000");
+  const before = await filledCell(page);
   // What a table needs was kept when it was first used, by a worker that was there by then.
   await page.reload();
   await expect(view(page)).toHaveAttribute("data-status", "open");
@@ -135,6 +143,20 @@ test("a table is there without a connection after the first visit", async ({ pag
   await page.reload();
   await expect(view(page)).toHaveAttribute("data-status", "open", { timeout: 15_000 });
   await expect(page.getByTestId("table-count")).toHaveText("1,000 rows");
+});
+
+test("what tables are shown with is kept as a whole, whichever part of it is seen", async ({
+  page,
+}) => {
+  // A page that has its worker from the start does not tell it what was loaded before.
+  await page.reload();
+  await expect(page.getByTestId("engine-status")).toHaveText("ready", { timeout: 20_000 });
+  await controlled(page);
+  expect((await kept(page)).files).toBe(0);
+  const names = (await readdir(join(DIST_DIR, "assets"))).filter(isOfTables);
+  const name = names.find((one) => one.startsWith("table-worker-") && one.endsWith(".js"));
+  await page.evaluate((path) => fetch(path).then((answer) => answer.text()), `/assets/${name}`);
+  await expect.poll(async () => (await kept(page)).files).toBeGreaterThanOrEqual(3);
 });
 
 test("a table is there without a connection after an update", async ({ page }) => {

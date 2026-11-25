@@ -10,10 +10,10 @@
 ///   tabs and posts `{ kind: "SKIP_WAITING" }`.
 /// - Hashed `/assets/*` are served cache-first; only a response of the kind the
 ///   name asks for is kept.
-/// - What not everybody needs is kept when it is first used, in a cache that
-///   outlives an update: a new version adds what it has of it before it takes
-///   over, and deletes what it has no use for. Pages that were loaded before
-///   there was a worker say what they have in use.
+/// - What not everybody needs is kept when some of it is first used, all of it,
+///   in a cache that outlives an update: a new version adds what it has of it
+///   before it takes over, and deletes what it has no use for. Pages that were
+///   loaded before there was a worker say what they have in use.
 /// - Navigation / HTML requests are served network-first with instant fallback
 ///   to the precached `/index.html` shell when offline.
 
@@ -216,7 +216,14 @@ sw.addEventListener("fetch", (event) => {
   }
 
   if (url.pathname.startsWith("/assets/")) {
-    event.respondWith(cacheFirstAsset(request));
+    const answer = cacheFirstAsset(request);
+    event.respondWith(answer);
+    if (ON_USE_URLS.includes(url.pathname)) {
+      // What a page was loading when it got a worker came past it, and is on no list.
+      event.waitUntil(
+        answer.then(() => precache(ON_USE_CACHE, ON_USE_URLS, "default")).catch(() => {}),
+      );
+    }
     return;
   }
 
