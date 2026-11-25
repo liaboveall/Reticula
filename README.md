@@ -45,7 +45,7 @@ Measured on an Intel Core i9-13980HX (pinned to P-cores `0xFFFF`, 32 GB RAM, GeF
 | **Bundles** (brotli-11) — core / sim / XLSX `.wasm` | `965.9 KB` / `704.8 KB` / `762.5 KB` | — | `≤ 1.2 MB` / `≤ 800 KB` / `≤ 900 KB` |
 | **JS** (brotli-11) — editor / landing first screen / WebGPU / Chinese / total | `177.8` / `70.9` / `11.8` / `26.9` / `297.5 KB` | — | `≤ 180` / `80` / `16` / `40` / `300 KB` |
 
-¹ Noisy on this machine: 11 to 37 ms over eight alternating runs of this and the previous release's engine.
+¹ Over the target in this run. The three earlier archived runs measured 9.9 to 13.6 ms.
 
 ### Renderers
 
@@ -57,9 +57,10 @@ Benchmark B13 draws the same sheets with both renderers in one browser, in turns
 | Chrome 158, **WebGPU** | **`0.46`** / **`1.02 ms`** | **`4.17 ms`** | **0 of 1,919** |
 | Firefox 159, Canvas 2D | `41.74` / `51.04 ms` | `41.7 ms` | 185 of 185 |
 | Firefox 159, **WebGPU** | **`0.64`** / **`1.44 ms`** | **`4.16 ms`** | **0 of 1,920** |
+| Chrome, main thread slowed 4×, Canvas 2D | `188.69` / `301.12 ms` | `279.2 ms` | 34 of 34 |
 | Chrome, main thread slowed 4×, **WebGPU** | `2.08` / `5.43 ms` | `4.17 ms` | 0 of 1,892 |
 
-With a thousand cells, Canvas 2D takes the main thread 0.69 to 1.01 times as long as before the renderers shared a scene (`*-ab.json`, alternating runs against `5b46fff`). While a zoom gesture is running at 10,000 cells, WebGPU shows stretched stand-ins for texts that are not ready and replaces them within a few frames. Chrome's and Firefox's adapters were a discrete GPU; integrated and mobile GPUs were not measured.
+With a thousand cells, Canvas 2D takes the main thread 0.69 to 1.01 times as long as before the renderers shared a scene (`*-ab.json`, alternating runs against `5b46fff`). During a zoom gesture, WebGPU shows stretched stand-ins for texts that are not ready yet: in 69 of 72 frames when all texts differ, with up to 11,725 cells in view. Chrome reported a discrete GPU (`nvidia lovelace`); Firefox does not name its adapter. Integrated and mobile GPUs were not measured.
 
 ## Measured Collaboration, Formula & End-to-End Verification
 
@@ -77,7 +78,7 @@ Benchmark B9 delivers remote commits to a client that still has local edits pend
 
 ## Accessibility and languages
 
-- Every function of the editor can be reached with the keyboard alone; `F6` cycles through the parts of the window, `Ctrl+/` (`Cmd+/`) lists and searches all commands with their keys. End-to-end tests walk the flows in three browsers with the mouse forbidden.
+- Every function of the editor can be reached with the keyboard alone; `F6` cycles through the parts of the window, `Ctrl+/` (`Cmd+/`) lists and searches all commands with their keys. End-to-end tests walk the flows in three browsers with the mouse forbidden; the tests of the sort dialog set one native menu by script, and on macOS two.
 - The canvas is hidden from assistive technology. A hidden table mirrors the active cell, and a live region reads the address, contents, formula, errors, spills and ranges as the selection moves; dialogs are native `<dialog>` elements with their own announcements. Focus rings, contrast, reduced motion and forced colours are covered by tests.
 - The interface is in English and Simplified Chinese, including function help and engine messages. Function names, error values and formula syntax stay `en-US`.
 - **Not verified:** real screen readers (NVDA, VoiceOver, TalkBack), Safari with a keyboard on macOS beyond automation, real phones and tablets, and WebGPU in Safari (which stays on Canvas 2D). Browsing many cells with a screen reader's table commands is not supported: only the active cell is mirrored.
@@ -96,6 +97,7 @@ cargo xtask diff --engine all           # 51k stratified differential check (Lib
 cargo xtask fuzz --cpu-seconds 3600     # 6-target fuzzing campaign (parser, snapshot, wal, ops, eval, sync); --target picks one
 cargo xtask bench --affinity FFFF       # engine benchmarks (B1-B8, B11, B12); --suite b9|render|grid|startup|ab for sync, B13, S1/S2, B10 and regressions
 cargo xtask visual                      # compare the two renderers on generated cases (golden images in CI)
+cargo xtask e2e --webgpu                # end-to-end tests of the WebGPU renderer
 cargo xtask sim --seeds 100000          # deterministic multi-client sync simulation with fault injection
 cargo xtask ci                          # full pre-push verification (check, test, server + sim, deny, release build + budget, 3-browser E2E)
 cargo xtask db up                       # development PostgreSQL 18 in Docker on 127.0.0.1:5434
