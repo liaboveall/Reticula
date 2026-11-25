@@ -1172,6 +1172,9 @@ test.describe("every control", () => {
       ["find & replace", "replace"],
     ] as const) {
       await command(page, search, id);
+      // Not the palette's, nor the moment before this one's code has loaded.
+      await expect(page.getByTestId("palette-input")).toHaveCount(0);
+      await expect(page.getByRole("dialog")).toBeVisible();
       await expectNamed(page.getByRole("dialog"));
       await page.keyboard.press("Escape");
       await expect(page.getByRole("dialog")).toHaveCount(0);
