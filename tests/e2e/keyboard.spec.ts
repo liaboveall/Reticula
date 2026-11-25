@@ -219,7 +219,8 @@ test("cells are gone to, written to and calculated", async ({ page }) => {
   // What is written is found by it in the formula bar as well.
   await page.keyboard.press("Shift+F6");
   await expect(page.getByTestId("formula-input")).toBeFocused();
-  await page.keyboard.press("End");
+  // On macOS, End scrolls and leaves the caret where it is.
+  await page.keyboard.press(process.platform === "darwin" ? "Meta+ArrowRight" : "End");
   await page.keyboard.type("5");
   await page.keyboard.press("Enter");
   await expect.poll(() => textAt(page, 1, 0)).toBe("205");

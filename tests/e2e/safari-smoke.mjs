@@ -451,9 +451,12 @@ try {
   const tab2 = await openTab(docUrl);
   assert(tab2 !== tab1, "expected distinct WebDriver tab handles for tab1 and tab2");
   await waitStatus(tab2, "blocked");
-  const overlayText = await execSync(
-    tab2,
-    `return document.querySelector('[data-testid="lock-overlay"]')?.textContent ?? "";`,
+  // Its code is loaded only when it is needed.
+  const overlayText = await waitUntil("the lock overlay", () =>
+    execSync(
+      tab2,
+      `return document.querySelector('[data-testid="lock-overlay"]')?.textContent ?? "";`,
+    ),
   );
   assert(
     overlayText.includes("open in another tab"),

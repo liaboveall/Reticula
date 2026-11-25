@@ -442,8 +442,8 @@ test.describe("a grid without an editor", () => {
       ["ArrowDown", 1, 0],
       ["ArrowRight", 1, 1],
       ["End", 1, await last("col")],
-      ["Control+Home", 0, 0],
-      ["Control+ArrowDown", lastRow, 0],
+      ["ControlOrMeta+Home", 0, 0],
+      ["ControlOrMeta+ArrowDown", lastRow, 0],
       ["ArrowUp", lastRow - 1, 0],
       ["PageDown", lastRow, 0],
     ] as const) {
@@ -473,7 +473,7 @@ test.describe("a grid without an editor", () => {
         );
     const before = await scrolled();
     await grid.focus();
-    await page.keyboard.press("Control+End");
+    await page.keyboard.press("ControlOrMeta+End");
     await expect.poll(scrolled).not.toEqual(before);
     const ids = await page.evaluate(() =>
       [...document.querySelectorAll("[id]")].map(({ id }) => id),

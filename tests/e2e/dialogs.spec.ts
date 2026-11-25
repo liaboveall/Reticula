@@ -467,9 +467,15 @@ test.describe("the editor's dialogs and drawers", () => {
 
     await page.getByTestId("sort-header-mode").focus();
     await page.getByTestId("sort-header-mode").selectOption("no");
-    await tabTo(page, page.getByTestId("sort-key-dir-0"));
-    await page.keyboard.press("ArrowDown");
-    await expect(page.getByTestId("sort-key-dir-0")).toHaveValue("desc");
+    const order = page.getByTestId("sort-key-dir-0");
+    await tabTo(page, order);
+    if (process.platform === "darwin") {
+      // There the key opens a menu of the system's, out of reach of the test.
+      await order.selectOption("desc");
+    } else {
+      await page.keyboard.press("ArrowDown");
+    }
+    await expect(order).toHaveValue("desc");
     await activate(page, page.getByTestId("sort-apply-btn"));
     await expect(dialog).toHaveCount(0);
     await expect.poll(() => textAt(page, 0, 0)).toBe("3");

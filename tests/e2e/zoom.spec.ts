@@ -519,7 +519,7 @@ test.describe("in detail", () => {
     await zoomIs(page, 0.75);
     expect((await stats(page)).selection).not.toBeNull();
     await editor.focus();
-    await page.keyboard.press("Control+Home");
+    await page.keyboard.press("ControlOrMeta+Home");
     await page.keyboard.press("ArrowDown");
     expect((await stats(page)).selection).toMatchObject({ name: "A2" });
     await chooseZoom(page, 50);
