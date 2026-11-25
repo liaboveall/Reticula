@@ -3,6 +3,12 @@
 version = 4
 
 [[package]]
+name = "adler2"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
+
+[[package]]
 name = "ahash"
 version = "0.8.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2027,6 +2033,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "miniz_oxide"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b63fbc4a50860e98e7b2aa7804ded1db5cbc3aff9193adaff57a6931bf7c4b4c"
+dependencies = [
+ "adler2",
+]
+
+[[package]]
 name = "mio"
 version = "1.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2691,11 +2706,13 @@ dependencies = [
  "reticula-core",
  "reticula-formula",
  "reticula-sync",
+ "reticula-table",
  "reticula-wasm",
  "reticula-wire",
  "reticula-xlsx",
  "serde",
  "serde_json",
+ "sha2 0.11.1",
  "zip",
 ]
 
@@ -2717,6 +2734,7 @@ dependencies = [
  "reticula-core",
  "reticula-formula",
  "reticula-sync",
+ "reticula-table",
  "reticula-wire",
  "serde",
  "serde_json",
@@ -2773,6 +2791,33 @@ dependencies = [
  "reticula-formula",
  "reticula-wire",
  "serde",
+ "wasm-bindgen-test",
+]
+
+[[package]]
+name = "reticula-table"
+version = "0.0.0"
+dependencies = [
+ "hashbrown 0.17.1",
+ "lz4_flex",
+ "miniz_oxide",
+ "reticula-core",
+ "rustc-hash 2.1.3",
+ "ruzstd",
+ "sha2 0.11.1",
+ "wasm-bindgen-test",
+]
+
+[[package]]
+name = "reticula-table-wasm"
+version = "0.0.0"
+dependencies = [
+ "reticula-core",
+ "reticula-table",
+ "serde",
+ "sha2 0.11.1",
+ "tsify",
+ "wasm-bindgen",
  "wasm-bindgen-test",
 ]
 
@@ -2902,6 +2947,12 @@ dependencies = [
  "tempfile",
  "wait-timeout",
 ]
+
+[[package]]
+name = "ruzstd"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "69e4ce4a039f42bf25920b95667e4d789e98749ab11bbb8d2c2936f788421bb5"
 
 [[package]]
 name = "ryu"
@@ -4335,6 +4386,7 @@ dependencies = [
  "reticula-core",
  "reticula-formula",
  "reticula-server",
+ "reticula-table",
  "reticula-wire",
  "serde_json",
  "tokio",

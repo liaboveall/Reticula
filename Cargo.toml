@@ -9,6 +9,8 @@ members = [
     "crates/sim",
     "crates/sim-wasm",
     "crates/sync",
+    "crates/table",
+    "crates/table-wasm",
     "crates/wasm",
     "crates/wire",
     "crates/xlsx",
@@ -31,6 +33,7 @@ reticula-core = { path = "crates/core" }
 reticula-formula = { path = "crates/formula" }
 reticula-sim = { path = "crates/sim" }
 reticula-sync = { path = "crates/sync" }
+reticula-table = { path = "crates/table" }
 reticula-wire = { path = "crates/wire" }
 reticula-xlsx = { path = "crates/xlsx" }
 
