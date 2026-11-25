@@ -43,6 +43,7 @@ pub mod formula_store;
 pub mod id;
 pub mod input;
 pub mod memory;
+pub mod nearest;
 pub mod num;
 pub mod ops;
 pub mod rng;

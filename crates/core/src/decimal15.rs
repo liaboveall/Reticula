@@ -12,6 +12,7 @@
 use alloc::string::String;
 use core::fmt::Write as _;
 
+use crate::nearest;
 use crate::num;
 use crate::value::CalcError;
 
@@ -329,10 +330,7 @@ fn decimal_to_f64(negative: bool, significand: u128, scale: i32) -> f64 {
     if significand == 0 {
         return 0.0;
     }
-    let mut buf = String::with_capacity(48);
-    let neg_scale = scale.saturating_neg();
-    let _ = write!(buf, "{significand}e{neg_scale}");
-    let mag = buf.parse::<f64>().unwrap_or(f64::INFINITY);
+    let mag = nearest::from_parts(significand, scale.saturating_neg());
     if mag == 0.0 {
         0.0
     } else if negative {

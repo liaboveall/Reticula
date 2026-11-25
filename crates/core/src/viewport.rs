@@ -749,68 +749,44 @@ where
     }
     let end_col = first_col.saturating_add(cols);
 
-    let cells = (rows as usize).saturating_mul(cols as usize);
-    let fixed = HEADER_LEN
-        .saturating_add(
-            (rows as usize)
-                .saturating_add(cols as usize)
-                .saturating_mul(ID_LEN),
-        )
-        .saturating_add(cells.saturating_mul(CELL_LEN));
-    let mut out = Vec::with_capacity(fixed.saturating_add(cells.saturating_mul(8)));
-
-    out.extend_from_slice(&VERSION.to_le_bytes());
-    out.extend_from_slice(&sheet.id().0.to_le_bytes());
-    out.extend_from_slice(&first_row.to_le_bytes());
-    out.extend_from_slice(&first_col.to_le_bytes());
-    out.extend_from_slice(&u16::try_from(rows).unwrap_or(0).to_le_bytes());
-    out.extend_from_slice(&u16::try_from(cols).unwrap_or(0).to_le_bytes());
-    out.extend_from_slice(&0_u32.to_le_bytes()); // text_len, patched below
-    out.extend_from_slice(&epoch.to_le_bytes());
-    out.extend_from_slice(&0_u16.to_le_bytes()); // overflow_count, patched below
-    out.resize(HEADER_LEN, 0);
-
-    for &row_id in &row_ids {
-        out.extend_from_slice(&row_id.0.to_le_bytes());
-    }
     let mut col_ids: SmallVec<[ColId; 16]> = SmallVec::new();
     for col in first_col..end_col {
-        let id = sheet.col_id(col);
-        col_ids.push(ColId(id));
-        out.extend_from_slice(&id.to_le_bytes());
+        col_ids.push(ColId(sheet.col_id(col)));
     }
+    let mut writer = PageWriter::new(
+        PageFrame {
+            sheet: sheet.id().0,
+            first_row,
+            first_col,
+            epoch,
+        },
+        row_ids.iter().map(|id| id.0),
+        col_ids.iter().map(|id| id.0),
+        text,
+    );
 
-    text.clear();
-    let mut position: u32 = 0;
     // A cell may hold a value that shows nothing, such as an empty string. Text
     // runs on over it like over any other cell with nothing to draw.
     let mut first_cell_blank: SmallVec<[bool; 64]> = SmallVec::new();
     for &row_id in &row_ids {
         for (index, &col_id) in col_ids.iter().enumerate() {
-            let start = text.len();
             let cell_overlay = overlay(row_id, col_id);
-            let (mut flags, _) =
-                format_overlay_or_sheet_value(sheet, row_id, col_id, cell_overlay.value, text);
-            let (units, truncated) = clip_to_record(text, start);
+            let (flags, _) = format_overlay_or_sheet_value(
+                sheet,
+                row_id,
+                col_id,
+                cell_overlay.value,
+                writer.text(),
+            );
+            let style_id = sheet.effective_style_id(row_id, col_id).0;
+            let units = writer.cell(style_id, flags | cell_overlay.extra_flags);
             if index == 0 {
                 first_cell_blank.push(units == 0);
             }
-            flags |= cell_overlay.extra_flags;
-            if truncated {
-                flags |= FLAG_TRUNCATED;
-            }
-            let style_id = sheet.effective_style_id(row_id, col_id).0;
-            out.extend_from_slice(&position.to_le_bytes());
-            out.extend_from_slice(&units.to_le_bytes());
-            out.extend_from_slice(&style_id.to_le_bytes());
-            out.extend_from_slice(&flags.to_le_bytes());
-            out.extend_from_slice(&0_u16.to_le_bytes());
-            position = position.saturating_add(u32::from(units));
         }
     }
 
     // Left-overflow candidate scan (`first_col > 0`).
-    let mut overflow_count: u16 = 0;
     if first_col > 0 {
         let min_scan_col = first_col.saturating_sub(MAX_LEFT_OVERFLOW_LOOKBACK);
         let mut lookback_col_ids: SmallVec<[(u32, ColId); 64]> = SmallVec::new();
@@ -840,10 +816,14 @@ where
                 if is_empty {
                     continue;
                 }
-                let start = text.len();
-                let (_, is_text) =
-                    format_overlay_or_sheet_value(sheet, row_id, origin_col_id, ov_val, text);
-                if text.len() == start {
+                let (_, is_text) = format_overlay_or_sheet_value(
+                    sheet,
+                    row_id,
+                    origin_col_id,
+                    ov_val,
+                    writer.text(),
+                );
+                if writer.is_text_empty() {
                     continue;
                 }
                 let eff_style = sheet.effective_style_by_id(row_id, origin_col_id);
@@ -859,32 +839,159 @@ where
                     && let (Ok(r_off), Ok(orig_c)) =
                         (u16::try_from(r_idx), u16::try_from(origin_col_pos))
                 {
-                    let (units, _) = clip_to_record(text, start);
                     let style_id = sheet.effective_style_id(row_id, origin_col_id).0;
-                    out.extend_from_slice(&position.to_le_bytes());
-                    out.extend_from_slice(&units.to_le_bytes());
-                    out.extend_from_slice(&r_off.to_le_bytes());
-                    out.extend_from_slice(&orig_c.to_le_bytes());
-                    out.extend_from_slice(&style_id.to_le_bytes());
-                    position = position.saturating_add(u32::from(units));
-                    overflow_count = overflow_count.saturating_add(1);
+                    writer.overflow(r_off, orig_c, style_id);
                 } else {
-                    text.truncate(start);
+                    writer.drop_text();
                 }
                 break;
             }
         }
     }
 
-    let text_len = u32::try_from(text.len()).unwrap_or(u32::MAX);
-    if let Some(field) = out.get_mut(TEXT_LEN_AT..TEXT_LEN_AT.saturating_add(4)) {
-        field.copy_from_slice(&text_len.to_le_bytes());
+    writer.finish()
+}
+
+/// Where a page lies and which subscription it answers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PageFrame {
+    /// Identifier of the sheet, or of whatever else the cells belong to.
+    pub sheet: u32,
+    /// Position of the first row.
+    pub first_row: u32,
+    /// Position of the first column.
+    pub first_col: u32,
+    /// Subscription epoch.
+    pub epoch: u32,
+}
+
+/// Writes one v2 page, whatever its cells come from: the header and the
+/// identifiers first, then each cell in row-major order, then the overflow
+/// records, then the text.
+///
+/// What a cell shows is appended to [`PageWriter::text`]; the call that
+/// follows closes it.
+#[derive(Debug)]
+pub struct PageWriter<'t> {
+    out: Vec<u8>,
+    text: &'t mut String,
+    /// Where the text of the next record starts in `text`.
+    start: usize,
+    /// The same in UTF-16 code units.
+    position: u32,
+    overflow_count: u16,
+}
+
+impl<'t> PageWriter<'t> {
+    /// Starts a page of at most [`PAGE_ROWS`] by [`PAGE_COLS`] cells.
+    ///
+    /// `text` is scratch space: it is emptied, and left holding the page's text.
+    pub fn new<R, C>(frame: PageFrame, row_ids: R, col_ids: C, text: &'t mut String) -> Self
+    where
+        R: ExactSizeIterator<Item = u64>,
+        C: ExactSizeIterator<Item = u64>,
+    {
+        let (rows, cols) = (row_ids.len(), col_ids.len());
+        let cells = rows.saturating_mul(cols);
+        let fixed = HEADER_LEN
+            .saturating_add(rows.saturating_add(cols).saturating_mul(ID_LEN))
+            .saturating_add(cells.saturating_mul(CELL_LEN));
+        let mut out = Vec::with_capacity(fixed.saturating_add(cells.saturating_mul(8)));
+
+        out.extend_from_slice(&VERSION.to_le_bytes());
+        out.extend_from_slice(&frame.sheet.to_le_bytes());
+        out.extend_from_slice(&frame.first_row.to_le_bytes());
+        out.extend_from_slice(&frame.first_col.to_le_bytes());
+        out.extend_from_slice(&u16::try_from(rows).unwrap_or(0).to_le_bytes());
+        out.extend_from_slice(&u16::try_from(cols).unwrap_or(0).to_le_bytes());
+        out.extend_from_slice(&0_u32.to_le_bytes()); // text_len, patched by `finish`
+        out.extend_from_slice(&frame.epoch.to_le_bytes());
+        out.extend_from_slice(&0_u16.to_le_bytes()); // overflow_count, patched by `finish`
+        out.resize(HEADER_LEN, 0);
+        for id in row_ids {
+            out.extend_from_slice(&id.to_le_bytes());
+        }
+        for id in col_ids {
+            out.extend_from_slice(&id.to_le_bytes());
+        }
+
+        text.clear();
+        Self {
+            out,
+            text,
+            start: 0,
+            position: 0,
+            overflow_count: 0,
+        }
     }
-    if let Some(field) = out.get_mut(OVERFLOW_COUNT_AT..OVERFLOW_COUNT_AT.saturating_add(2)) {
-        field.copy_from_slice(&overflow_count.to_le_bytes());
+
+    /// Where the text of the next record is appended.
+    pub const fn text(&mut self) -> &mut String {
+        self.text
     }
-    out.extend_from_slice(text.as_bytes());
-    out
+
+    /// Whether nothing was written for the next record.
+    #[must_use]
+    pub fn is_text_empty(&self) -> bool {
+        self.text.len() == self.start
+    }
+
+    /// Takes back what was written for the next record.
+    pub fn drop_text(&mut self) {
+        self.text.truncate(self.start);
+    }
+
+    /// Closes the next cell. Returns the length of its text in UTF-16 code units.
+    pub fn cell(&mut self, style: u16, flags: u16) -> u16 {
+        let (units, truncated) = clip_to_record(self.text, self.start);
+        let flags = if truncated {
+            flags | FLAG_TRUNCATED
+        } else {
+            flags
+        };
+        self.out.extend_from_slice(&self.position.to_le_bytes());
+        self.out.extend_from_slice(&units.to_le_bytes());
+        self.out.extend_from_slice(&style.to_le_bytes());
+        self.out.extend_from_slice(&flags.to_le_bytes());
+        self.out.extend_from_slice(&0_u16.to_le_bytes());
+        self.advance(units);
+        units
+    }
+
+    /// Closes an overflow record, after all the cells.
+    pub fn overflow(&mut self, row_offset: u16, origin_col: u16, style: u16) {
+        let (units, _) = clip_to_record(self.text, self.start);
+        self.out.extend_from_slice(&self.position.to_le_bytes());
+        self.out.extend_from_slice(&units.to_le_bytes());
+        self.out.extend_from_slice(&row_offset.to_le_bytes());
+        self.out.extend_from_slice(&origin_col.to_le_bytes());
+        self.out.extend_from_slice(&style.to_le_bytes());
+        self.advance(units);
+        self.overflow_count = self.overflow_count.saturating_add(1);
+    }
+
+    fn advance(&mut self, units: u16) {
+        self.position = self.position.saturating_add(u32::from(units));
+        self.start = self.text.len();
+    }
+
+    /// The finished page.
+    #[must_use]
+    pub fn finish(mut self) -> Vec<u8> {
+        self.drop_text();
+        let text_len = u32::try_from(self.text.len()).unwrap_or(u32::MAX);
+        if let Some(field) = self.out.get_mut(TEXT_LEN_AT..TEXT_LEN_AT.saturating_add(4)) {
+            field.copy_from_slice(&text_len.to_le_bytes());
+        }
+        if let Some(field) = self
+            .out
+            .get_mut(OVERFLOW_COUNT_AT..OVERFLOW_COUNT_AT.saturating_add(2))
+        {
+            field.copy_from_slice(&self.overflow_count.to_le_bytes());
+        }
+        self.out.extend_from_slice(self.text.as_bytes());
+        self.out
+    }
 }
 
 fn column_has_storage(sheet: &Sheet, col: ColId) -> bool {
