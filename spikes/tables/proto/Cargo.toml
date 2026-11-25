@@ -1,0 +1,17 @@
+# A throwaway prototype of a column store, to compare with DuckDB-WASM.
+[package]
+name = "table-proto"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
+[workspace]

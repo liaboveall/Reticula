@@ -1,0 +1,70 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>DuckDB-WASM</title>
+<input type="file" id="file">
+<script type="importmap">
+{ "imports": {
+  "@duckdb/duckdb-wasm": "/nm/@duckdb/duckdb-wasm/dist/duckdb-browser.mjs",
+  "apache-arrow": "/nm/apache-arrow/Arrow.dom.mjs",
+  "flatbuffers": "/nm/flatbuffers/mjs/flatbuffers.js",
+  "tslib": "/nm/tslib/tslib.es6.mjs"
+} }
+</script>
+<script type="module">
+import * as duckdb from "@duckdb/duckdb-wasm";
+let db, conn;
+const now = () => performance.now();
+async function memory() {
+  const m = await performance.measureUserAgentSpecificMemory();
+  return { bytes: m.bytes, breakdown: m.breakdown.filter((b) => b.bytes > 1e6).map((b) => ({ bytes: b.bytes, types: b.types.join("+"), where: b.attribution.map((a) => a.scope).join("+") })) };
+}
+async function boot(options) {
+  const t0 = now();
+  const worker = new Worker("/nm/@duckdb/duckdb-wasm/dist/duckdb-browser-eh.worker.js");
+  db = new duckdb.AsyncDuckDB(new duckdb.VoidLogger(), worker);
+  await db.instantiate("/nm/@duckdb/duckdb-wasm/dist/duckdb-eh.wasm");
+  const t1 = now();
+  await db.open({ path: options?.path, accessMode: options?.path ? duckdb.DuckDBAccessMode.READ_WRITE : undefined, opfs: { fileHandling: "manual" }, query: { castBigIntToDouble: true, castDecimalToDouble: true } });
+  conn = await db.connect();
+  await conn.query("SET custom_extension_repository='" + location.origin + "/ext'");
+  for (const s of options?.settings ?? []) await conn.query(s);
+  const t2 = now();
+  const v = (await conn.query("SELECT version() v")).toArray()[0].v;
+  return { instantiate: t1 - t0, open: t2 - t1, version: v };
+}
+async function sql(text) {
+  const t = now();
+  const r = await conn.query(text);
+  return { ms: now() - t, rows: r.numRows, first: r.numRows ? JSON.parse(JSON.stringify(r.get(0), (k, v) => typeof v === "bigint" ? Number(v) : v)) : null };
+}
+async function drop(name) {
+  const root = await navigator.storage.getDirectory();
+  try { await root.removeEntry(name); } catch {}
+}
+async function registerFile(name) {
+  const f = document.getElementById("file").files[0];
+  await db.registerFileHandle(name, f, duckdb.DuckDBDataProtocol.BROWSER_FILEREADER, true);
+  return f.size;
+}
+async function registerOpfs(name) {
+  await db.registerOPFSFileName("opfs://" + name);
+}
+async function dropFiles() { await db.dropFiles(); }
+async function sizeOf(name) {
+  const root = await navigator.storage.getDirectory();
+  return (await (await root.getFileHandle(name)).getFile()).size;
+}
+async function many(texts) {
+  const out = [];
+  for (const t of texts) { const a = now(); const r = await conn.query(t); r.toArray; out.push(now() - a); }
+  return out;
+}
+async function column(text) {
+  const t = now();
+  const r = await conn.query(text);
+  const c = r.getChildAt(0).toArray();
+  return { ms: now() - t, length: c.length, kind: c.constructor.name };
+}
+async function close() { await conn.close(); await db.terminate(); }
+Object.assign(window, { s8: { boot, sql, many, column, drop, registerFile, registerOpfs, dropFiles, sizeOf, memory, close } });
+</script>
