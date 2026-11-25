@@ -3,6 +3,19 @@ import { defineConfig, devices } from "@playwright/test";
 const port = 5278;
 const onCi = Boolean(process.env.CI);
 
+// On a machine without a GPU the GPU process does not survive a WebGPU canvas
+// unless everything else is drawn in software too.
+const args = ["--enable-unsafe-webgpu", "--use-webgpu-adapter=swiftshader"];
+if (onCi) {
+  args.push(
+    "--use-angle=swiftshader",
+    "--enable-unsafe-swiftshader",
+    "--enable-features=Vulkan",
+    "--use-vulkan=swiftshader",
+    "--disable-vulkan-surface",
+  );
+}
+
 // The app drawn with WebGPU, by a software adapter that is there on every
 // machine with this browser. It is slow, hence the small window. Nothing here
 // needs the server or its database.
@@ -29,9 +42,7 @@ export default defineConfig({
         viewport: { width: 800, height: 500 },
         // The headless shell, which is the default, has no WebGPU.
         channel: "chromium",
-        launchOptions: {
-          args: ["--enable-unsafe-webgpu", "--use-webgpu-adapter=swiftshader"],
-        },
+        launchOptions: { args },
       },
     },
   ],

@@ -1,3 +1,6 @@
 * text=auto eol=lf
 *.rtclsnap binary
 *.rtclwal binary
+*.png binary
+*.webp binary
+*.ttf binary

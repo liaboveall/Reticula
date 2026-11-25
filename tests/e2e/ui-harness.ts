@@ -20,7 +20,12 @@ export async function startDevServer(): Promise<DevServer> {
     cacheDir,
     // It would complain of every request to the server of the app, which nobody has started.
     logLevel: "silent",
-    optimizeDeps: { entries: ["ui.html", "index.html"] },
+    optimizeDeps: {
+      entries: ["ui.html", "index.html"],
+      // Found only later, they would be built anew and ask for a reload that
+      // nothing here can tell the page of.
+      include: ["react", "react-dom", "react-dom/client", "react/jsx-dev-runtime"],
+    },
     server: { host: "127.0.0.1", port: 0, strictPort: false, hmr: false, watch: null },
   });
   await server.listen();
