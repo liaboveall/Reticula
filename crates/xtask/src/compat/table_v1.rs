@@ -25,7 +25,7 @@ const DIRECTORY: &str = "tests/compat/table-v1";
 /// What is frozen: the modules that say what the bytes of a file mean, and files.
 pub(super) const FROZEN_TABLE_V1_FILES: [&str; 9] = [
     "crates/table/src/bits.rs",
-    "crates/table/src/hash.rs",
+    "crates/table/src/checksum.rs",
     "crates/table/src/layout.rs",
     "crates/table/src/types.rs",
     "tests/compat/table-v1/empty.rtbl",

@@ -1839,6 +1839,7 @@
     "crates/server/src/http/sync.rs": [
       "Viewer"
     ],
+    "crates/server/src/http/tables.rs": [],
     "crates/server/src/store.rs": [
       "workbook title",
       "server storage capacity reached",
@@ -1870,6 +1871,28 @@
       "a named version with this title already exists",
       "{field} must be between 1 and 120 characters",
       "{field} must not contain control characters"
+    ],
+    "crates/server/src/store/tables.rs": [
+      "table uploads are busy; try again shortly",
+      "table name",
+      "this is not a table file",
+      "the table file is larger than this server accepts",
+      "another table has this ID",
+      "the workbook has as many tables as it can",
+      "server storage capacity reached",
+      "another table is being uploaded for the owner of this workbook",
+      "owner table storage quota exceeded",
+      "the request has too many bytes of the table",
+      "the table is not being uploaded"
+    ],
+    "crates/server/src/store/tables/files.rs": [
+      "the table file does not have the declared checksum"
+    ],
+    "crates/server/src/table_file.rs": [
+      "this is not a table file",
+      "the table file is not as long as it says it is",
+      "the table has too many columns or groups of rows for this server",
+      "the table file could not be read"
     ],
     "crates/sim-wasm/src/lib.rs": [
       "unsupported link mode `{raw}`",

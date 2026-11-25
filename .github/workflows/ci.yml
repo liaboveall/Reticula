@@ -119,6 +119,7 @@ jobs:
             packages/protocol/pkg
             packages/protocol/sim-pkg
             packages/protocol/xlsx-pkg
+            packages/protocol/table-pkg
           if-no-files-found: error
 
   web:

@@ -16,7 +16,7 @@ const RESULTS: &str = "bench/results";
 
 /// The milestones in the order they were finished. A suite is named after the
 /// one it was measured for: `m6-startup`.
-const MILESTONES: [&str; 8] = ["m1a", "m1b", "m2a", "m2b", "m3a", "m3b", "m4", "m6"];
+const MILESTONES: [&str; 9] = ["m1a", "m1b", "m2a", "m2b", "m3a", "m3b", "m4", "m6", "m5"];
 
 /// The functions of the catalog that are not another name of one that is there
 /// as well (`crates/formula/src/functions/catalog.rs`).
@@ -296,6 +296,62 @@ export interface GpuRun {
 }
 ";
 
+/// What there is of tables.
+const TABLE_TYPES: &str = "\
+/** One run of the benchmark of tables in one browser, as `public/data/benchmarks-history.json` has it. */
+export interface TableRun {
+  readonly report: string;
+  readonly date: string;
+  readonly commit: string;
+  readonly suite: string;
+  readonly cpu: string | null;
+  readonly browser: string | null;
+  readonly headless: boolean | null;
+  readonly affinity: string | null;
+  readonly rows: number | null;
+  readonly columns: number | null;
+  /** Bytes of the delimited text, and of the table made of it. */
+  readonly textBytes: number | null;
+  readonly fileBytes: number | null;
+  readonly importMs: number | null;
+  /** Of text whose start does not tell the types, so that it is read again from the start. */
+  readonly importTwiceMs: number | null;
+  /** Of text where only the last row says so. */
+  readonly importLastMs: number | null;
+  /** Of as many rows that do not compress. */
+  readonly importHardMs: number | null;
+  /** The longest time between two frames while importing. */
+  readonly importFrameGapMs: number | null;
+  readonly sortNumberMs: number | null;
+  readonly sortTextMs: number | null;
+  readonly sortTwoMs: number | null;
+  readonly filterNumberMs: number | null;
+  readonly filterValuesMs: number | null;
+  readonly filterTextMs: number | null;
+  readonly listValuesMs: number | null;
+  readonly summaryMs: number | null;
+  /** The worst of both renderers and of all views. */
+  readonly scrollWorkP99Ms: number | null;
+  readonly scrollPlaceholderFrames: number | null;
+  readonly jumpP95Ms: number | null;
+  /** How long the rows jumped to take to come while the table is being sorted. */
+  readonly pageWhileSortingP95Ms: number | null;
+  readonly peakMemoryMiB: number | null;
+  readonly longestStepMs: number | null;
+}
+
+/** The latest comparison of tables with another engine. */
+export interface TableComparison {
+  readonly provenance: Provenance;
+  readonly reference: string;
+  readonly tables: number;
+  readonly questions: number;
+  readonly different: number;
+  /** Known differences that the comparison allows for. */
+  readonly allowed: number;
+}
+";
+
 /// The constants of the landing page and of the page for small screens.
 pub fn constants() -> Result<String> {
     let engine = latest_result("engine")?;
@@ -466,7 +522,146 @@ pub fn constants() -> Result<String> {
         "\n/** The latest comparison of the renderers, once there is one. */\n\
          export const RENDERER_COMPARISON: RendererComparison | null = {comparison};\n",
     );
+    out.push_str(&table_constants(
+        &load_all_results("tables")?,
+        latest_result("tablediff")?.as_ref(),
+    ));
     Ok(out)
+}
+
+/// The same of tables. Null while there are no reports about them.
+fn table_constants(tables: &[Archived], diff: Option<&Archived>) -> String {
+    let latest = tables.last();
+    let mut out = format!("\n{TABLE_TYPES}\n");
+    let runs = table_runs(tables.get(tables.len().saturating_sub(1)..).unwrap_or(&[]));
+    let run = runs.iter().find(|run| {
+        run["browser"]
+            .as_str()
+            .is_some_and(|browser| browser.starts_with("Chrome"))
+    });
+    let _ = writeln!(
+        out,
+        "export const TABLES_PROVENANCE: Provenance | null = {};\n",
+        run.map_or_else(|| String::from("null"), |_| provenance(latest)),
+    );
+    let run = run.map_or_else(
+        || String::from("null"),
+        |run| serde_json::to_string_pretty(run).unwrap_or_default(),
+    );
+    let _ = writeln!(
+        out,
+        "/** The latest run in Chrome. */\nexport const TABLES: TableRun | null = {run};\n"
+    );
+    let comparison = diff.map_or_else(
+        || String::from("null"),
+        |archived| {
+            let report = &archived.report;
+            let allowed = report["allowed"].as_object();
+            let allowed: u64 = allowed
+                .into_iter()
+                .flat_map(serde_json::Map::values)
+                .filter_map(Value::as_u64)
+                .sum();
+            format!(
+                "{{\n  provenance: {},\n  reference: {},\n  tables: {},\n  questions: {},\n  different: {},\n  allowed: {allowed},\n}}",
+                provenance(Some(archived)),
+                quoted(report["reference"].as_str().unwrap_or("unknown")),
+                report["tables"].as_array().map_or(0, Vec::len),
+                report["comparisons"].as_u64().unwrap_or(0),
+                report["mismatches"].as_u64().unwrap_or(0),
+            )
+        },
+    );
+    let _ = writeln!(
+        out,
+        "export const TABLE_COMPARISON: TableComparison | null = {comparison};"
+    );
+    out
+}
+
+/// Every run of the benchmark of tables. A report has one for each browser.
+fn table_runs(archives: &[Archived]) -> Vec<Value> {
+    archives
+        .iter()
+        .flat_map(|archived| {
+            runs(&archived.report)
+                .iter()
+                .map(|run| table_run(archived, run))
+        })
+        .collect()
+}
+
+fn table_run(archived: &Archived, run: &Value) -> Value {
+    let report = &archived.report;
+    let milliseconds = |value: &Value| opt_round2(value["p50"].as_f64().or_else(|| value.as_f64()));
+    // The worst of some runs is what counts.
+    let worst = |of: &str, key: &str| {
+        let all = run[of].as_array().into_iter().flatten();
+        all.filter_map(|one| one[key].as_f64()).reduce(f64::max)
+    };
+    let placeholders = run["scroll"].as_array().map(|all| {
+        let frames = all
+            .iter()
+            .filter_map(|one| one["placeholderFrames"].as_u64());
+        frames.sum::<u64>()
+    });
+    let machine = [&run["machine"], &report["machine"]]
+        .into_iter()
+        .find(|machine| machine.is_object())
+        .unwrap_or(&Value::Null);
+    let peak = run["peakWasmBytes"]
+        .as_f64()
+        .map(|bytes| bytes / (1024.0 * 1024.0));
+    serde_json::json!({
+        "report": format!("{RESULTS}/{}", archived.name),
+        "date": short_date(report),
+        "commit": report["commit"].as_str().unwrap_or("unknown"),
+        "suite": report["suite"].as_str().unwrap_or("tables"),
+        "cpu": machine["cpu"].as_str().or_else(|| machine["cpus"].as_str()).map(cpu_name),
+        "browser": browser_name(&run["browser"]),
+        "headless": run["browser"]["headless"],
+        "affinity": report["affinity"],
+        "rows": report["data"]["rows"],
+        "columns": report["data"]["columns"],
+        "textBytes": report["data"]["textBytes"],
+        "fileBytes": run["fileBytes"],
+        "importMs": milliseconds(&run["import"]["onceMs"]),
+        "importTwiceMs": milliseconds(&run["import"]["twiceMs"]),
+        "importLastMs": milliseconds(&run["import"]["lastMs"]),
+        "importHardMs": milliseconds(&run["hard"]["import"]["ms"]),
+        "importFrameGapMs": opt_round2(run["import"]["longestFrameGapMs"].as_f64()),
+        "sortNumberMs": milliseconds(&run["sort"]["numberMs"]),
+        "sortTextMs": milliseconds(&run["sort"]["textMs"]),
+        "sortTwoMs": milliseconds(&run["sort"]["twoMs"]),
+        "filterNumberMs": milliseconds(&run["filter"]["numberMs"]),
+        "filterValuesMs": milliseconds(&run["filter"]["valuesMs"]),
+        "filterTextMs": milliseconds(&run["filter"]["textMs"]),
+        "listValuesMs": milliseconds(&run["filter"]["listMs"]),
+        "summaryMs": milliseconds(&run["summaryMs"]),
+        "scrollWorkP99Ms": opt_round2(worst("scroll", "workP99Ms")),
+        "scrollPlaceholderFrames": placeholders,
+        "jumpP95Ms": opt_round2(worst("jump", "filledP95Ms")),
+        "pageWhileSortingP95Ms": opt_round2(run["tripMs"]["p95"].as_f64()),
+        "peakMemoryMiB": opt_round2(peak),
+        "longestStepMs": opt_round2(run["longestStepMs"].as_f64()),
+    })
+}
+
+/// The latest comparison of tables with another engine, for the dashboard.
+fn table_diff_summary(archived: &Archived) -> Value {
+    let report = &archived.report;
+    serde_json::json!({
+        "report": format!("{RESULTS}/{}", archived.name),
+        "date": short_date(report),
+        "commit": report["commit"].as_str().unwrap_or("unknown"),
+        "reference": report["reference"],
+        "seed": report["seed"],
+        "tables": report["tables"].as_array().map_or(0, Vec::len),
+        "questions": report["comparisons"],
+        "byKind": report["byKind"],
+        "different": report["mismatches"],
+        "allowed": report["allowed"],
+    })
 }
 
 /// The runs a report of the renderers is made of, the one it is about first. The
@@ -768,6 +963,7 @@ fn sync_stage_label(commit: &str, suite: &str) -> &'static str {
         "9eb1390" => "M2b worker incremental",
         _ if suite.starts_with("m3a") => "M3a wire v3 + permute",
         _ if suite.starts_with("m6") => "M6",
+        _ if suite.starts_with("m5") => "M5",
         _ => "Sync replay",
     }
 }
@@ -987,7 +1183,7 @@ pub fn history() -> Result<String> {
     let latest_diff = latest_result("diff")?.map(|found| build_diff_summary(&found.report));
     let quality = Quality::read()?;
 
-    let history = serde_json::json!({
+    let mut history = serde_json::json!({
         "engineRuns": engine_runs,
         "startupRuns": startup_runs,
         "renderRuns": render_runs,
@@ -1004,6 +1200,14 @@ pub fn history() -> Result<String> {
             "compatGenerations": quality.compat_generations,
         },
     });
+    // The dashboard of before there were tables has no such fields.
+    let tables = load_all_results("tables")?;
+    if !tables.is_empty() {
+        history["tableRuns"] = table_runs(&tables).into();
+    }
+    if let Some(diff) = latest_result("tablediff")? {
+        history["latestTableDiff"] = table_diff_summary(&diff);
+    }
     let mut out = serde_json::to_string_pretty(&history)
         .map_err(|e| format!("cannot serialize benchmark history: {e}"))?;
     out.push('\n');
@@ -1015,9 +1219,10 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        Archived, MILESTONES, RESULTS, SIM_INVARIANTS, TYPES, Value, browser_name, cpu_name,
-        gpu_runs, kind_of, kinds_of_differences, number_in, opt_number, provenance, read,
-        renderer_comparison, some, sort_by_age, suite_rank, util,
+        Archived, MILESTONES, RESULTS, SIM_INVARIANTS, TABLE_TYPES, TYPES, Value, browser_name,
+        cpu_name, gpu_runs, kind_of, kinds_of_differences, number_in, opt_number, provenance, read,
+        renderer_comparison, some, sort_by_age, suite_rank, table_constants, table_diff_summary,
+        table_runs, util,
     };
 
     fn sorted(reports: Vec<(&str, Value)>) -> Vec<String> {
@@ -1034,12 +1239,22 @@ mod tests {
 
     #[test]
     fn every_suite_of_a_milestone_ranks_with_it() {
-        for kind in ["engine", "startup", "render", "sync", "load", "diff", "gpu"] {
+        for kind in [
+            "engine",
+            "startup",
+            "render",
+            "sync",
+            "load",
+            "diff",
+            "gpu",
+            "tables",
+            "tablediff",
+        ] {
             let ranks: Vec<usize> = MILESTONES
                 .iter()
                 .map(|milestone| suite_rank(&json!({ "suite": format!("{milestone}-{kind}") })))
                 .collect();
-            assert_eq!(ranks, [1, 2, 3, 4, 5, 6, 7, 8], "{kind}");
+            assert_eq!(ranks, [1, 2, 3, 4, 5, 6, 7, 8, 9], "{kind}");
         }
         for unknown in [
             json!({}),
@@ -1123,6 +1338,12 @@ mod tests {
         assert_eq!(kind_of("2026-11-26-abc1234-ab.json"), Some("ab"));
         assert_eq!(kind_of("2026-11-26-abc1234-gpu.json.bak"), None);
         assert_eq!(kind_of("gpu.json"), None);
+        // Which is why the one of tables is not called `table-diff`.
+        assert_eq!(kind_of("2026-11-26-abc1234-table-diff.json"), Some("diff"));
+        assert_eq!(
+            kind_of("2026-11-26-abc1234-tablediff.json"),
+            Some("tablediff")
+        );
         // What nothing reads would be there for nothing, but for comparisons
         // of two commits, which are no measurement of one.
         for entry in std::fs::read_dir(util::root().join(RESULTS)).expect("the results") {
@@ -1131,7 +1352,18 @@ mod tests {
             assert!(
                 matches!(
                     kind,
-                    Some("engine" | "startup" | "render" | "gpu" | "sync" | "load" | "diff" | "ab")
+                    Some(
+                        "engine"
+                            | "startup"
+                            | "render"
+                            | "gpu"
+                            | "sync"
+                            | "load"
+                            | "diff"
+                            | "ab"
+                            | "tables"
+                            | "tablediff"
+                    )
                 ),
                 "{name:?}"
             );
@@ -1253,11 +1485,113 @@ mod tests {
         assert_eq!(gpu_runs(&[]), Vec::<Value>::new());
     }
 
+    /// A report of two browsers.
+    fn tables_report() -> Archived {
+        let run = |browser: &str| {
+            json!({
+                "browser": { "name": browser, "version": "158.0", "headless": true },
+                "fileBytes": 209_000_000_u64,
+                "import": {
+                    "onceMs": { "p50": 8_123.456 }, "twiceMs": { "p50": 14_000.0 },
+                    "lastMs": { "p50": 15_000.0 },
+                    "longestFrameGapMs": 21.0,
+                },
+                "scroll": [
+                    { "renderer": "canvas2d", "view": "file", "workP99Ms": 2.5, "placeholderFrames": 0 },
+                    { "renderer": "webgpu", "view": "sorted", "workP99Ms": 3.456, "placeholderFrames": 2 },
+                ],
+                "jump": [{ "view": "file", "filledP95Ms": 20.0 }, { "view": "sorted", "filledP95Ms": 61.0 }],
+                "sort": { "numberMs": { "p50": 250.0 }, "textMs": { "p50": 900.0 }, "twoMs": { "p50": 500.0 } },
+                "filter": {
+                    "numberMs": { "p50": 40.0 }, "valuesMs": { "p50": 41.0 },
+                    "textMs": { "p50": 200.0 }, "listMs": { "p50": 250.0 },
+                },
+                "summaryMs": { "p50": 300.0 },
+                "tripMs": { "p50": 5.0, "p95": 19.006 },
+                "hard": { "import": { "ms": { "p50": 40_000.0 } } },
+                "peakWasmBytes": 314_572_800,
+                "longestStepMs": 18.25,
+            })
+        };
+        Archived {
+            name: String::from("2026-12-01-abc1234-tables.json"),
+            report: json!({
+                "suite": "m5-tables", "date": "2026-12-01T10:00:00Z", "commit": "abc1234",
+                "uncommittedChanges": false, "affinity": "FFFF",
+                "machine": { "cpu": "13th Gen Intel(R) Core(TM) i9-13980HX" },
+                "data": { "rows": 10_000_000, "columns": 13, "textBytes": 988_455_324 },
+                "runs": [run("firefox"), run("chrome")],
+            }),
+        }
+    }
+
+    fn table_diff_report() -> Archived {
+        Archived {
+            name: String::from("2026-12-01-abc1234-tablediff.json"),
+            report: json!({
+                "suite": "m5-tablediff", "date": "2026-12-01", "commit": "abc1234",
+                "uncommittedChanges": false, "reference": "DuckDB v1", "seed": 7,
+                "comparisons": 3_000, "byKind": { "view": 2_000 }, "mismatches": 0,
+                "allowed": { "one": 3, "other": 4 },
+                "tables": [{ "name": "a" }, { "name": "b" }],
+            }),
+        }
+    }
+
+    #[test]
+    fn nothing_is_said_of_tables_before_there_are_reports() {
+        let text = table_constants(&[], None);
+        for line in [
+            "TABLES_PROVENANCE: Provenance | null = null;",
+            "TABLES: TableRun | null = null;",
+            "TABLE_COMPARISON: TableComparison | null = null;",
+        ] {
+            assert!(text.contains(line), "{line} in {text}");
+        }
+        assert_eq!(table_runs(&[]), Vec::<Value>::new());
+    }
+
+    #[test]
+    fn what_is_said_of_tables_is_in_the_reports() {
+        let run = &table_runs(&[tables_report()])[1];
+        for (key, value) in [
+            (
+                "report",
+                json!("bench/results/2026-12-01-abc1234-tables.json"),
+            ),
+            ("cpu", json!("Intel Core i9-13980HX")),
+            ("browser", json!("Chrome 158.0")),
+            ("rows", json!(10_000_000)),
+            ("importMs", json!(8_123.46)),
+            ("importLastMs", json!(15_000.0)),
+            ("importHardMs", json!(40_000.0)),
+            ("pageWhileSortingP95Ms", json!(19.01)),
+            ("scrollWorkP99Ms", json!(3.46)),
+            ("scrollPlaceholderFrames", json!(2)),
+            ("jumpP95Ms", json!(61.0)),
+            ("peakMemoryMiB", json!(300.0)),
+        ] {
+            assert_eq!(run[key], value, "{key}");
+        }
+        let text = table_constants(&[tables_report()], Some(&table_diff_report()));
+        for line in [
+            r#""browser": "Chrome 158.0","#,
+            r#"report: "bench/results/2026-12-01-abc1234-tablediff.json","#,
+            "tables: 2,\n  questions: 3000,\n  different: 0,\n  allowed: 7,",
+        ] {
+            assert!(text.contains(line), "{line} in {text}");
+        }
+        let one = table_constants(&[], Some(&table_diff_report()));
+        assert!(one.contains("TABLES: TableRun | null = null;"), "{one}");
+        assert_eq!(table_diff_summary(&table_diff_report())["questions"], 3_000);
+    }
+
     #[test]
     fn what_the_dashboard_has_of_a_run_is_what_its_types_say() {
         let fields = |name: &str| -> Vec<&str> {
-            let (_, rest) = TYPES
-                .split_once(&format!("interface {name} {{"))
+            let (_, rest) = [TYPES, TABLE_TYPES]
+                .into_iter()
+                .find_map(|types| types.split_once(&format!("interface {name} {{")))
                 .expect(name);
             let (body, _) = rest.split_once("\n}").expect(name);
             body.lines()
@@ -1280,6 +1614,8 @@ mod tests {
         let runs = gpu_runs(&[gpu_report()]);
         assert_eq!(keys(&runs[0]), sorted(fields("GpuRun")));
         assert_eq!(keys(&runs[0]["results"][0]), sorted(fields("GpuResult")));
+        let runs = table_runs(&[tables_report()]);
+        assert_eq!(keys(&runs[0]), sorted(fields("TableRun")));
     }
 
     #[test]

@@ -41,6 +41,7 @@ extern crate std;
 
 pub mod bits;
 pub mod calendar;
+pub mod checksum;
 pub mod csv;
 pub mod determinism;
 pub mod hash;

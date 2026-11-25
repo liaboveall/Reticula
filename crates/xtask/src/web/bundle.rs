@@ -51,17 +51,32 @@ const LOCALE_MARKER: &str = "__LOCALE__";
 /// Brotli-compressed sizes the build must not exceed, in bytes.
 const MAX_EDITOR_JS: u64 = 180_000;
 const MAX_LANDING_JS: u64 = 80_000;
-const MAX_TOTAL_JS: u64 = 300_000;
+const MAX_TOTAL_JS: u64 = 400_000;
 const MAX_WEBGPU_JS: u64 = 16_000;
+const MAX_TABLES_JS: u64 = 40_000;
 const MAX_ZH_JS: u64 = 40_000;
 const MAX_CORE_WASM: u64 = 1_200_000;
 const MAX_SIM_WASM: u64 = 800_000;
 const MAX_XLSX_WASM: u64 = 900_000;
+const MAX_TABLE_WASM: u64 = 185_000;
 
 /// Chunks that are only ever loaded on demand, by the start of their names.
-/// `vite.config.ts` names the first; the second are named after their modules.
+/// `vite.config.ts` names the first and the tables'; the others are named after
+/// their modules.
 const WEBGPU_PREFIX: &str = "webgpu-";
 const ZH_PREFIX: &str = "zh-";
+const TABLES_PREFIX: &str = "tables-";
+const TABLE_WORKER_PREFIX: &str = "table-worker-";
+const LATER: [&str; 4] = [WEBGPU_PREFIX, ZH_PREFIX, TABLES_PREFIX, TABLE_WORKER_PREFIX];
+/// What only those who open a table download, by the start of its name: the
+/// service worker keeps it once it was used.
+const ON_USE: [&str; 3] = [TABLES_PREFIX, TABLE_WORKER_PREFIX, "reticula_table_wasm"];
+
+/// Whether a file under `assets/` is kept by the service worker once it was used,
+/// and not before.
+pub fn is_kept_on_use(name: &str) -> bool {
+    ON_USE.iter().any(|prefix| name.starts_with(prefix))
+}
 
 /// One chunk of the main build, as Vite's manifest describes it.
 struct Chunk {
@@ -502,7 +517,7 @@ fn budgets(
         let scripts = closures.first_screen(page);
         if let Some(script) = scripts
             .iter()
-            .find(|name| name.starts_with(WEBGPU_PREFIX) || name.starts_with(ZH_PREFIX))
+            .find(|name| LATER.iter().any(|prefix| name.starts_with(prefix)))
         {
             return Err(format!(
                 "`{script}` is to be loaded on demand, but the {page} page needs it to start"
@@ -551,6 +566,11 @@ fn budgets(
             MAX_WEBGPU_JS,
         ),
         optional("Chinese text JS", total(ZH_PREFIX, "js"), MAX_ZH_JS),
+        optional(
+            "tables JS",
+            total(TABLES_PREFIX, "js").saturating_add(total(TABLE_WORKER_PREFIX, "js")),
+            MAX_TABLES_JS,
+        ),
         required(
             "total JS",
             total("", "js").saturating_add(service_worker),
@@ -562,6 +582,11 @@ fn budgets(
             "xlsx WASM",
             total("reticula_xlsx_wasm", "wasm"),
             MAX_XLSX_WASM,
+        ),
+        required(
+            "table WASM",
+            total("reticula_table_wasm", "wasm"),
+            MAX_TABLE_WASM,
         ),
     ])
 }
@@ -668,7 +693,12 @@ mod tests {
                 sizes.insert(script.to_owned(), 1_000);
             }
         }
-        for module in ["reticula_wasm", "reticula_sim_wasm", "reticula_xlsx_wasm"] {
+        for module in [
+            "reticula_wasm",
+            "reticula_sim_wasm",
+            "reticula_xlsx_wasm",
+            "reticula_table_wasm",
+        ] {
             sizes.insert(format!("{module}_bg-K.wasm"), 1_000);
         }
         sizes
@@ -895,14 +925,18 @@ mod tests {
         sizes.insert(String::from("zh-core-Z.js"), 3);
         sizes.insert(String::from("zh-pages-Z.js"), 4);
         sizes.insert(String::from("webgpu-G.js"), 5);
+        sizes.insert(String::from("tables-T.js"), 6);
+        sizes.insert(String::from("table-worker-D.js"), 8);
         sizes.insert(String::from("index-C.css"), 1_000);
         let budgets = budgets(&sizes, 100, &closures).unwrap();
         assert_eq!(used(&budgets, "editor first-screen JS"), 7_000);
         assert_eq!(used(&budgets, "landing first-screen JS"), 4_000);
         assert_eq!(used(&budgets, "WebGPU renderer JS"), 5);
         assert_eq!(used(&budgets, "Chinese text JS"), 7);
-        assert_eq!(used(&budgets, "total JS"), 13_000 + 10 + 7 + 5 + 100);
+        assert_eq!(used(&budgets, "tables JS"), 14);
+        assert_eq!(used(&budgets, "total JS"), 13_000 + 10 + 7 + 5 + 14 + 100);
         assert_eq!(used(&budgets, "core WASM"), 1_000);
+        assert_eq!(used(&budgets, "table WASM"), 1_000);
         assert!(budgets.iter().try_for_each(Budget::check).is_ok());
     }
 
@@ -923,10 +957,13 @@ mod tests {
             ("LandingPage-L.js", MAX_LANDING_JS, "landing"),
             ("webgpu-G.js", MAX_WEBGPU_JS + 1, "WebGPU"),
             ("zh-core-Z.js", MAX_ZH_JS + 1, "Chinese"),
+            ("tables-T.js", MAX_TABLES_JS + 1, "tables"),
+            ("table-worker-D.js", MAX_TABLES_JS + 1, "tables"),
             ("SimLabPage-X.js", MAX_TOTAL_JS, "total"),
             ("reticula_wasm_bg-K.wasm", MAX_CORE_WASM + 1, "core"),
             ("reticula_sim_wasm_bg-K.wasm", MAX_SIM_WASM + 1, "sim"),
             ("reticula_xlsx_wasm_bg-K.wasm", MAX_XLSX_WASM + 1, "xlsx"),
+            ("reticula_table_wasm_bg-K.wasm", MAX_TABLE_WASM + 1, "table"),
         ] {
             let error = outcome(&|sizes| {
                 sizes.insert(file.to_owned(), size);
@@ -943,7 +980,7 @@ mod tests {
 
     #[test]
     fn chunks_for_later_may_not_be_part_of_a_first_screen() {
-        for name in ["webgpu-G", "zh-core-Z"] {
+        for name in ["webgpu-G", "zh-core-Z", "tables-T", "table-worker-D"] {
             let eager = MANIFEST.replace("deep-D", name);
             let closures = built(&eager).unwrap();
             let error = budgets(&sizes(&closures), 100, &closures);
@@ -953,8 +990,14 @@ mod tests {
 
     #[test]
     fn worker_and_engine_must_be_unambiguous() {
-        let names =
-            ["worker-A.js", "worker-B.js", "worker-C.js.br", "other.wasm"].map(String::from);
+        let names = [
+            "worker-A.js",
+            "worker-B.js",
+            "worker-C.js.br",
+            "table-worker-D.js",
+            "other.wasm",
+        ]
+        .map(String::from);
         assert!(only(&names, "worker-", "js").is_err());
         assert_eq!(only(&names[1..], "worker-", "js"), Ok("worker-B.js"));
         assert!(only(&names, "reticula_wasm_bg", "wasm").is_err());

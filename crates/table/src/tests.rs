@@ -602,7 +602,7 @@ pub(crate) fn reseal(file: &mut [u8], data_len: usize) {
     let end = file.len() - 64;
     let pages = data_len / PAGE_BYTES as usize;
     for page in 0..pages {
-        let sum = crate::hash::checksum(&file[page * 4_096..(page + 1) * 4_096]);
+        let sum = crate::checksum::checksum(&file[page * 4_096..(page + 1) * 4_096]);
         let at = end - (pages - page) * 4;
         file[at..at + 4].copy_from_slice(&sum.to_le_bytes());
     }

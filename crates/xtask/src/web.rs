@@ -99,6 +99,7 @@ fn inject_sw_manifest(dist_dir: &Path) -> Result {
     let mut urls = vec![String::from("/index.html")];
     let assets_dir = dist_dir.join("assets");
     let mut asset_names = Vec::new();
+    let mut on_use = Vec::new();
     for entry in fs::read_dir(&assets_dir)
         .map_err(|e| format!("cannot read {}: {e}", assets_dir.display()))?
     {
@@ -114,9 +115,14 @@ fn inject_sw_manifest(dist_dir: &Path) -> Result {
         {
             continue;
         }
-        asset_names.push(name.to_owned());
+        if bundle::is_kept_on_use(name) {
+            on_use.push(format!("/assets/{name}"));
+        } else {
+            asset_names.push(name.to_owned());
+        }
     }
     asset_names.sort();
+    on_use.sort();
     for name in asset_names {
         urls.push(format!("/assets/{name}"));
     }
@@ -139,8 +145,6 @@ fn inject_sw_manifest(dist_dir: &Path) -> Result {
     }
     let full_hex = sha256_hex(&hash_input);
     let build_id = &full_hex[..16];
-    let manifest_json =
-        serde_json::to_string(&urls).map_err(|e| format!("serialize SW precache manifest: {e}"))?;
 
     let sw_path = dist_dir.join("sw.js");
     let sw_src = fs::read_to_string(&sw_path)
@@ -153,28 +157,33 @@ fn inject_sw_manifest(dist_dir: &Path) -> Result {
             sw_path.display()
         ));
     }
-    let list_placeholder = [
-        "[\"__RETICULA_PRECACHE__\"]",
-        "['__RETICULA_PRECACHE__']",
-        "[`__RETICULA_PRECACHE__`]",
-    ]
-    .into_iter()
-    .find(|pat| sw_src.contains(pat))
-    .ok_or_else(|| {
-        format!(
-            "placeholder [\"__RETICULA_PRECACHE__\"] not found in {}",
-            sw_path.display()
-        )
-    })?;
-    let updated = sw_src
-        .replace(id_token, build_id)
-        .replacen(list_placeholder, &manifest_json, 1);
+    let mut updated = sw_src.replace(id_token, build_id);
+    for (token, list) in [
+        ("__RETICULA_PRECACHE__", &urls),
+        ("__RETICULA_ON_USE__", &on_use),
+    ] {
+        updated =
+            fill_list(&updated, token, list).map_err(|e| format!("{}: {e}", sw_path.display()))?;
+    }
     fs::write(&sw_path, updated).map_err(|e| format!("cannot write {}: {e}", sw_path.display()))?;
     println!(
-        "  injected SW manifest: build_id={build_id}, {} precached file(s)",
-        urls.len()
+        "  injected SW manifest: build_id={build_id}, {} precached file(s), {} kept on use",
+        urls.len(),
+        on_use.len()
     );
     Ok(())
+}
+
+/// Puts a list in the place of a list of one token, whatever quotes the
+/// minifier chose for it.
+fn fill_list(source: &str, token: &str, list: &[String]) -> Result<String> {
+    let json = serde_json::to_string(list).map_err(|e| format!("serialize a list: {e}"))?;
+    let placeholder = ['"', '\'', '`']
+        .map(|quote| format!("[{quote}{token}{quote}]"))
+        .into_iter()
+        .find(|placeholder| source.contains(placeholder))
+        .ok_or_else(|| format!("no list of {token}"))?;
+    Ok(source.replacen(&placeholder, &json, 1))
 }
 
 /// Builds the pages that experiments are run on, with the app's build

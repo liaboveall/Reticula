@@ -41,26 +41,35 @@ Commands:
                           nightly atomics + rayon worker threads on `reticula-wasm`).
   codegen [--check]       Write the TypeScript files generated from the Rust sources;
                           --check only reports whether they are up to date.
-  digest [--update]       Print the determinism digest; --update records it as expected.
-  compat [--freeze v1|v2|v3]
+  digest [--update]       Print the determinism digests of the engine and of tables;
+                          --update records them as expected.
+  compat [--freeze v1|v2|v3|table-v1] [--samples table-v1]
                           Verify frozen wire v1, v2, and v3 SHA-256 hashes (or generate/freeze fixtures).
+                          --samples writes those of a version that is not frozen to target/compat/.
   diff [--engine rust|libreoffice|all] [--count <n>] [--quota-per-fn <n>] [--seed <n>] [--image <tag>] [--skip-image] [--dump-xlsx <dir>] [--archive] [--out <file>]
                           Differential evaluation against ironcalc_base, formualizer-eval, and/or headless LibreOffice Calc.
+  diff --tables [--count <n>] [--seed <n>] [--archive] [--out <file>]
+                          Tables made up at random, imported and asked questions, compared
+                          with what DuckDB says. Installs DuckDB in .tools/ the first time.
   fuzz [--cpu-seconds <s>] [--threads <n>] [--affinity <mask>] [--target <name>]
-                          Multi-threaded mutation & structured fuzzing campaign over the six
-                          targets, or with --target (parser, snapshot, wal, ops, eval, sync)
-                          over one of them.
+                          Multi-threaded mutation & structured fuzzing campaign over the nine
+                          targets, or with --target (parser, snapshot, wal, ops, eval, sync,
+                          table, parquet, csv) over one of them.
   sim [--seeds <n>] [--start-seed <n>] [--seed <s>] [--threads <n>] [--fail-fast] [--out <file>]
                           Deterministic multi-client sync simulation.
   bench [--affinity <mask>] [--browser <name>] [--quick] [--out <file>] [--suite engine|b9]
                           Run native and Chrome WASM engine benchmarks (B1-B8, B11, B12),
                           or with --suite b9 the collaborative slow path (B9).
-  bench --suite render|grid|startup|ab [--affinity <mask>] [--quick] [--skip-build] [--no-archive] [options]
+  bench --suite render|table|grid|startup|ab [--affinity <mask>] [--quick] [--skip-build] [--no-archive] [options]
                           What is measured on the app in a browser, archived only of a
                           clean working tree. `render` (B13): the renderers, for about
                           two minutes in a window that must stay in view; [--browser
                           <name>] [--slowdown <n>] add runs to the same archive, see
-                          bench/run-render-bench.mjs. `grid` (S1, S2): viewport pages and
+                          bench/run-render-bench.mjs. `table` (B14): data tables of ten
+                          million rows, in a window like that;
+                          [--browser <name>] adds a run, [--stress] fifty million rows,
+                          [--duckdb] another engine with the same file, see
+                          bench/run-table-bench.mjs. `grid` (S1, S2): viewport pages and
                           a thousand cells, with Firefox in a window at the end unless
                           --skip-firefox. `startup` (B10): a first visit. `ab
                           [--baseline <commit>]`: against an earlier commit, which it
@@ -151,10 +160,10 @@ fn run(args: &[String]) -> Result {
         }
         "codegen" => codegen::run(Flags::parse(rest, &["check"], &[])?.has("check")),
         "digest" => digest(&Flags::parse(rest, &["update"], &[])?),
-        "compat" => compat::run(&Flags::parse(rest, &[], &["freeze"])?),
+        "compat" => compat::run(&Flags::parse(rest, &[], &["freeze", "samples"])?),
         "diff" => qa::diff(&Flags::parse(
             rest,
-            &["skip-image", "archive"],
+            &["skip-image", "archive", "tables"],
             &[
                 "engine",
                 "count",
@@ -253,25 +262,41 @@ fn test(flags: &Flags) -> Result {
 
 fn digest(flags: &Flags) -> Result {
     use reticula_formula::determinism;
+    use reticula_table::determinism as tables;
 
-    let hex = determinism::to_hex(determinism::digest());
-    let hex = String::from_utf8_lossy(&hex);
-    let path = util::root().join("tests/determinism/expected.txt");
-    if flags.has("update") {
-        std::fs::write(&path, format!("{hex}\n"))
-            .map_err(|error| format!("cannot write {}: {error}", path.display()))?;
-        println!("{hex} (recorded)");
-        return Ok(());
+    let directory = util::root().join("tests/determinism");
+    let read = |name: &str| {
+        let path = directory.join(name);
+        std::fs::read_to_string(&path)
+            .map_err(|error| format!("cannot read {}: {error}", path.display()))
+    };
+    let hex = |digest| String::from_utf8_lossy(&determinism::to_hex(digest)).into_owned();
+    let mut different = Vec::new();
+    for (name, found) in [
+        ("expected.txt", hex(determinism::digest())),
+        ("table.txt", hex(tables::digest())),
+        ("table-app.txt", tables::app(&read("table.csv")?)),
+    ] {
+        let found = found.trim();
+        if flags.has("update") {
+            let path = directory.join(name);
+            std::fs::write(&path, format!("{found}\n"))
+                .map_err(|error| format!("cannot write {}: {error}", path.display()))?;
+            println!("{found}  {name} (recorded)");
+            continue;
+        }
+        println!("{found}  {name}");
+        let expected = read(name)?;
+        if expected.trim() != found {
+            different.push(format!("{name} has {}", expected.trim()));
+        }
     }
-    let expected = std::fs::read_to_string(&path)
-        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
-    println!("{hex}");
-    if expected.trim() == hex {
+    if different.is_empty() {
         Ok(())
     } else {
         Err(format!(
-            "expected {}; run with --update if the workload changed",
-            expected.trim()
+            "{}; run with --update if the workload changed",
+            different.join(", ")
         ))
     }
 }

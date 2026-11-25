@@ -11,6 +11,7 @@ use hashbrown::HashTable;
 use sha2::{Digest, Sha256};
 
 use crate::bits;
+use crate::checksum::checksum;
 use crate::hash;
 use crate::layout::{
     self, Block, Column, DictionaryPlace, Directory, Encoding, MAX_DICTIONARY_ENTRIES,
@@ -541,7 +542,7 @@ impl Appender {
         let (pages, rest) = self.pending.as_chunks::<PAGE>();
         let rest = rest.len();
         for page in pages {
-            self.sums.push(hash::checksum(page));
+            self.sums.push(checksum(page));
         }
         let whole = self.pending.len().saturating_sub(rest);
         sink.append(self.pending.get(..whole).unwrap_or(&[]))

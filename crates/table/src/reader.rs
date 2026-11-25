@@ -16,7 +16,7 @@ use rustc_hash::FxHasher;
 use sha2::{Digest, Sha256};
 
 use crate::bits;
-use crate::hash;
+use crate::checksum::checksum;
 use crate::layout::{
     self, Block, Column, DictionaryPlace, Directory, Encoding, HEADER_LEN, Malformed, PAGE,
     PAGE_BYTES, TRAILER_LEN, Trailer,
@@ -469,7 +469,7 @@ impl Reader {
             if *word & bit != 0 {
                 continue;
             }
-            if self.directory.sums.get(page) != Some(&hash::checksum(content)) {
+            if self.directory.sums.get(page) != Some(&checksum(content)) {
                 return Err(ReadError::Corrupt("a page does not match its checksum"));
             }
             *word |= bit;

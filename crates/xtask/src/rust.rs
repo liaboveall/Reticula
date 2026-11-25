@@ -10,30 +10,34 @@ const WASM_TARGET: &str = "wasm32-unknown-unknown";
 const NO_STD_TARGET: &str = "wasm32v1-none";
 
 /// Crates that make up the engine kernel, by directory name under `crates/`.
-const KERNEL_CRATES: [&str; 4] = ["core", "formula", "wire", "sync"];
+const KERNEL_CRATES: [&str; 5] = ["core", "formula", "wire", "sync", "table"];
 
 /// All workspace packages compiled & linted against `wasm32-unknown-unknown`.
-const WASM_CLIPPY_PACKAGES: [&str; 8] = [
+const WASM_CLIPPY_PACKAGES: [&str; 10] = [
     "reticula-core",
     "reticula-formula",
     "reticula-wire",
     "reticula-sync",
+    "reticula-table",
     "reticula-wasm",
     "reticula-sim-wasm",
     "reticula-xlsx",
     "reticula-xlsx-wasm",
+    "reticula-table-wasm",
 ];
 
 /// Packages whose unit/integration tests run under `wasm-bindgen-test-runner`.
 /// (`reticula-xlsx` / `reticula-xlsx-wasm` are verified in Node below because
 /// `wasm-bindgen-test-runner` unescapes `\x` inside Windows `\crates\xlsx\` paths.)
-const WASM_TEST_PACKAGES: [&str; 6] = [
+const WASM_TEST_PACKAGES: [&str; 8] = [
     "reticula-core",
     "reticula-formula",
     "reticula-wire",
     "reticula-sync",
+    "reticula-table",
     "reticula-wasm",
     "reticula-sim-wasm",
+    "reticula-table-wasm",
 ];
 
 pub fn check() -> Result {

@@ -178,7 +178,7 @@ pub fn reseal(file: &mut [u8], data_len: usize) {
     let end = file.len() - 64;
     let pages = data_len / page_len;
     for page in 0..pages {
-        let sum = reticula_table::hash::checksum(&file[page * page_len..(page + 1) * page_len]);
+        let sum = reticula_table::checksum::checksum(&file[page * page_len..(page + 1) * page_len]);
         let at = end - (pages - page) * 4;
         file[at..at + 4].copy_from_slice(&sum.to_le_bytes());
     }

@@ -119,6 +119,8 @@ const SOURCES: &[(&str, &[&str])] = &[
         &[
             "collaboration storage unavailable\n",
             "client error fields are missing or too long",
+            // Answered with a status of its own.
+            "the upload continues at another offset",
         ],
     ),
     (
@@ -129,6 +131,14 @@ const SOURCES: &[(&str, &[&str])] = &[
     (
         "crates/server/src/http/sync.rs",
         &["expected a WebSocket upgrade"],
+    ),
+    (
+        "crates/server/src/http/tables.rs",
+        &[
+            // Told to a client that asks in the wrong way.
+            "sha256 must have 64 hexadecimal digits",
+            "Upload-Offset must say where the bytes go",
+        ],
     ),
     (
         "crates/server/src/store.rs",
@@ -145,6 +155,9 @@ const SOURCES: &[(&str, &[&str])] = &[
     ("crates/server/src/store/agent.rs", &[]),
     ("crates/server/src/store/collaboration.rs", &[]),
     ("crates/server/src/store/history.rs", &[]),
+    ("crates/server/src/store/tables.rs", &[]),
+    ("crates/server/src/store/tables/files.rs", &[]),
+    ("crates/server/src/table_file.rs", &[]),
     (
         "crates/sim-wasm/src/lib.rs",
         // The names of the replicas.
@@ -194,8 +207,11 @@ const SILENT: &[&str] = &[
     "crates/formula/src/functions/catalog.rs",
     // For whoever operates the server, or answers to a navigation.
     "crates/server/src/http/auth.rs",
+    // A header of a response.
+    "crates/server/src/http/range.rs",
     "crates/server/src/main.rs",
     "crates/server/src/ops.rs",
+    "crates/server/src/proxies.rs",
     // The benchmarks.
     "crates/wasm/src/bench.rs",
     "crates/wasm/src/bench_sync.rs",

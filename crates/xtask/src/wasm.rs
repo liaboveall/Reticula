@@ -15,6 +15,8 @@ const SIM_OUT_DIR: &str = "packages/protocol/sim-pkg";
 const SIM_MODULE: &str = "packages/protocol/sim-pkg/reticula_sim_wasm_bg.wasm";
 const XLSX_OUT_DIR: &str = "packages/protocol/xlsx-pkg";
 const XLSX_MODULE: &str = "packages/protocol/xlsx-pkg/reticula_xlsx_wasm_bg.wasm";
+const TABLE_OUT_DIR: &str = "packages/protocol/table-pkg";
+const TABLE_MODULE: &str = "packages/protocol/table-pkg/reticula_table_wasm_bg.wasm";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Profile {
@@ -58,12 +60,21 @@ pub fn build_with_options(profile: Profile, parallel: bool) -> Result {
         profile,
         false,
     )?;
+    build_package(
+        "reticula-table-wasm",
+        "reticula_table_wasm.wasm",
+        TABLE_OUT_DIR,
+        TABLE_MODULE,
+        profile,
+        false,
+    )?;
 
     if profile == Profile::Release {
         report_sizes(&[
             Path::new(CORE_MODULE),
             Path::new(SIM_MODULE),
             Path::new(XLSX_MODULE),
+            Path::new(TABLE_MODULE),
         ])?;
     }
     Ok(())
@@ -121,9 +132,12 @@ fn build_package(
     };
     build.run()?;
     bindgen
-        .arg(format!(
-            "target/wasm32-unknown-unknown/{directory}/{wasm_name}"
-        ))
+        .arg(
+            util::target_dir()
+                .join("wasm32-unknown-unknown")
+                .join(directory)
+                .join(wasm_name),
+        )
         .run()?;
 
     if profile == Profile::Release {
