@@ -140,7 +140,10 @@ function isWithin(area: Area, { totalRows, cols }: SheetInfo): boolean {
 
 /** Selects what a text refers to. Returns what is wrong with it, if anything is. */
 export async function goTo(handle: EditorHandle, text: string): Promise<string | null> {
-  const { sheet } = handle.state();
+  const { sheet, table } = handle.state();
+  if (table) {
+    return table.view?.goTo(text) ?? null;
+  }
   if (!sheet) {
     return t("There is no worksheet to go to.");
   }

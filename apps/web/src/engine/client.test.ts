@@ -67,6 +67,38 @@ test("a failed WAL write prevents queued sends", async () => {
   client.stop();
 });
 
+test("what is sent says which of the workbooks that were opened it is meant for", () => {
+  const sent: unknown[] = [];
+  let receive: ((message: { data: WorkerOutput }) => void) | undefined;
+  vi.stubGlobal(
+    "Worker",
+    class {
+      set onmessage(listener: typeof receive) {
+        receive = listener;
+      }
+      postMessage = (message: unknown) => sent.push(message);
+      terminate = () => {};
+    },
+  );
+  const client = startEngine({ onMessage: vi.fn(), onPage: vi.fn() });
+  sent.length = 0;
+  client.send({ kind: "openEmpty" });
+  receive?.({
+    data: {
+      kind: "docOpened",
+      docId: "a",
+      title: "A",
+      storageBackend: "memory",
+      walRecords: 0,
+      activeSlot: "a",
+      opening: 2,
+    },
+  });
+  client.send({ kind: "openEmpty" });
+  expect(sent).toMatchObject([{ opening: 0 }, { opening: 2 }]);
+  client.stop();
+});
+
 test("an ordered WAL rewrite can await a fresh checkpoint without blocking its reply", async () => {
   const receive = fakeWorker();
   const entered = Promise.withResolvers<void>();

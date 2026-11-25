@@ -1,12 +1,14 @@
 import { useEffect, useState } from "react";
-import type { GpuResult, GpuRun } from "../generated/benchmarks.ts";
+import type { GpuResult, GpuRun, TableRun } from "../generated/benchmarks.ts";
 import { fmtInt, type Message, t } from "../i18n/index.ts";
 import { tx } from "../i18n/react.ts";
 import {
   comparisons,
   latestComparison,
+  latestTables,
   logPosition,
   rendererName,
+  tableQuestions,
   workloadName,
 } from "./benchmarks.ts";
 import { errorText } from "./errors.ts";
@@ -150,12 +152,24 @@ interface DiffSummary {
   };
 }
 
+interface TableDiffSummary {
+  readonly date: string;
+  readonly commit: string;
+  readonly reference: string;
+  readonly questions: number;
+  readonly different: number;
+  /** How many of the questions had differences that are known, by what they are. */
+  readonly allowed: Readonly<Record<string, number>>;
+}
+
 interface BenchmarksHistory {
   readonly engineRuns: readonly EngineRun[];
   readonly startupRuns: readonly StartupRun[];
   readonly renderRuns: readonly RenderRun[];
   /** Missing in what a browser has kept from before there were any. */
   readonly gpuRuns?: readonly GpuRun[];
+  readonly tableRuns?: readonly TableRun[];
+  readonly latestTableDiff?: TableDiffSummary;
   readonly syncRuns: readonly SyncRun[];
   readonly loadRuns: readonly LoadRun[];
   readonly latestDiff: DiffSummary | null;
@@ -228,6 +242,8 @@ export default function BenchmarksPage({ onNavigate }: BenchmarksPageProps) {
   const firefox = data?.renderRuns.findLast((run) => run.firefoxJumpP99Ms !== null);
   const gpuRuns = data?.gpuRuns ?? [];
   const comparison = latestComparison(gpuRuns);
+  const tableRuns = data?.tableRuns ?? [];
+  const tables = latestTables(tableRuns);
   const diff = data?.latestDiff ?? null;
 
   const tableRows: BenchTableRow[] = [];
@@ -396,6 +412,57 @@ export default function BenchmarksPage({ onNavigate }: BenchmarksPageProps) {
         });
       }
     }
+    for (const run of tableRuns) {
+      const rows = fmtInt(run.rows ?? 0);
+      const items: readonly [string, string][] = [
+        [
+          t(
+            "B14 {rows} rows: import (types guessed right / wrong early on / wrong in the last row)",
+            { rows },
+          ),
+          [run.importMs, run.importTwiceMs, run.importLastMs].map((ms) => fmtMs(ms, 0)).join(" / "),
+        ],
+        [
+          t("B14 {rows} rows: sort by a number / a text / two columns", { rows }),
+          [run.sortNumberMs, run.sortTextMs, run.sortTwoMs].map((ms) => fmtMs(ms, 1)).join(" / "),
+        ],
+        [
+          t("B14 {rows} rows: filter by a number / a value / a part of a text", { rows }),
+          [run.filterNumberMs, run.filterValuesMs, run.filterTextMs]
+            .map((ms) => fmtMs(ms, 1))
+            .join(" / "),
+        ],
+        [
+          t("B14 {rows} rows: values of a column / summary of all columns", { rows }),
+          [run.listValuesMs, run.summaryMs].map((ms) => fmtMs(ms, 1)).join(" / "),
+        ],
+        [
+          t("B14 {rows} rows: frame work p99 / jump p95 / page while sorting p95", { rows }),
+          [run.scrollWorkP99Ms, run.jumpP95Ms, run.pageWhileSortingP95Ms]
+            .map((ms) => fmtMs(ms))
+            .join(" / "),
+        ],
+        [
+          t("B14 {rows} rows: peak memory / longest step of the worker", { rows }),
+          `${run.peakMemoryMiB === null ? "—" : `${run.peakMemoryMiB.toFixed(0)} MiB`} / ${fmtMs(run.longestStepMs, 1)}`,
+        ],
+      ];
+      for (const [index, [metric, value]] of items.entries()) {
+        tableRows.push({
+          id: `${run.report}-${run.browser}-${index}`,
+          category: "wasm",
+          env: run.browser ?? "—",
+          suite: run.suite,
+          commit: run.commit,
+          metric,
+          value,
+          detail:
+            index === 4 && run.scrollPlaceholderFrames !== null
+              ? `${run.date} · ${t("{n} frames with placeholders", { n: run.scrollPlaceholderFrames })}`
+              : run.date,
+        });
+      }
+    }
   }
 
   const visibleRows = filter === "all" ? tableRows : tableRows.filter((r) => r.category === filter);
@@ -543,6 +610,7 @@ export default function BenchmarksPage({ onNavigate }: BenchmarksPageProps) {
             <h2>{t("Cross-Milestone SVG Trends")}</h2>
             <div className="bench-charts-grid">
               {comparison && <RendererChart run={comparison} />}
+              {tables && <TableChart run={tables} diff={data.latestTableDiff ?? null} />}
               <div className="bench-chart-card">
                 <h3>{t("Engine & Startup Latency (ms, Chrome WASM p50)")}</h3>
                 <EngineTrendSvg engineRuns={data.engineRuns} startupRuns={data.startupRuns} />
@@ -851,6 +919,76 @@ function RendererChart({ run }: { readonly run: GpuRun }) {
           ))}
         </svg>
       </div>
+    </figure>
+  );
+}
+
+/** How long questions to a data table take, each a bar from zero. */
+function TableChart({
+  run,
+  diff,
+}: {
+  readonly run: TableRun;
+  readonly diff: TableDiffSummary | null;
+}) {
+  const questions = tableQuestions(run);
+  const longest = Math.max(1, ...questions.map(({ ms }) => ms));
+  const title = t("Questions to a Data Table of {rows} Rows (ms)", { rows: fmtInt(run.rows ?? 0) });
+  const known = Object.values(diff?.allowed ?? {}).reduce((sum, count) => sum + count, 0);
+  return (
+    <figure className="bench-chart-card bench-tables" data-testid="bench-tables">
+      <h3>{title}</h3>
+      <p className="page-muted">
+        {t("{date} · {commit} · {browser} · {cpu}. All numbers are in the table below.", {
+          date: run.date,
+          commit: run.commit,
+          browser: run.browser ?? "—",
+          cpu: run.cpu ?? "—",
+        })}
+      </p>
+      <svg
+        viewBox={`0 0 360 ${questions.length * 22 + 4}`}
+        className="bench-svg"
+        role="img"
+        data-testid="bench-svg-tables"
+      >
+        <title>{title}</title>
+        {questions.map(({ name, ms }, row) => {
+          const width = Math.max(1, (ms / longest) * 150);
+          const y = 4 + row * 22;
+          return (
+            <g key={name}>
+              <title>{`${name}: ${fmtMs(ms, 1)}`}</title>
+              {/* What the pointer finds is the whole row, not just the bar. */}
+              <rect y={y - 4} width={360} height={22} fill="transparent" />
+              <text x={138} y={y + 11} textAnchor="end">
+                {name}
+              </text>
+              <path
+                d={`M146 ${y}h${Math.max(0, width - 4)}a4 4 0 0 1 4 4v6a4 4 0 0 1-4 4h-${Math.max(0, width - 4)}z`}
+              />
+              <text x={154 + Math.max(4, width)} y={y + 11}>
+                {fmtMs(ms, ms < 100 ? 1 : 0)}
+              </text>
+            </g>
+          );
+        })}
+      </svg>
+      {diff && (
+        <p className="page-muted">
+          {t(
+            "Compared with {reference}: {questions} questions, {different} answered differently, {known} differences that are known ({date} · {commit}).",
+            {
+              reference: diff.reference,
+              questions: fmtInt(diff.questions),
+              different: fmtInt(diff.different),
+              known: fmtInt(known),
+              date: diff.date,
+              commit: diff.commit,
+            },
+          )}
+        </p>
+      )}
     </figure>
   );
 }

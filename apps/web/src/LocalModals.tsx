@@ -1,18 +1,20 @@
 import { type RefObject, useEffect, useRef, useState } from "react";
 import { flushSync } from "react-dom";
 import type { EditorHandle } from "./commands/handle.ts";
+import { runCommand } from "./commands/run.ts";
 import { download } from "./download.ts";
 import type { SafeModeInfo } from "./engine/client.ts";
 import { readRawDocFilesFromOpfs, type WorkbookCatalogEntry } from "./engine/storage.ts";
 import { translateEngineText } from "./i18n/engine-text.ts";
-import { fmtDateTime } from "./i18n/formats.ts";
-import { fmtInt, type Message, t } from "./i18n/index.ts";
+import { fmtBytes, fmtDateTime } from "./i18n/formats.ts";
+import { type Message, t, tn } from "./i18n/index.ts";
 import { tx } from "./i18n/react.ts";
+import { fileKind, hasManyRows, importWorkbook } from "./import-workbook.ts";
+import { keepsUploads, type TableSize, tableSizes, uploadsReason } from "./local-tables.ts";
+import { closeTables } from "./tables/shell.ts";
 import { announce } from "./ui/announcer.ts";
 import { Dialog } from "./ui/Dialog.tsx";
 import { isComposing } from "./ui/focus.ts";
-
-const MAX_CSV_RAW_BYTES = 256 * 1024 * 1024;
 
 export type LocalModalMode =
   | {
@@ -30,7 +32,6 @@ interface WorkbookDialogsProps {
   readonly activeDocId: string;
   readonly docs: readonly WorkbookCatalogEntry[];
   readonly storageUsedMb: string;
-  readonly csvProgress: { readonly rowsParsed: number; readonly percent: number } | null;
   readonly onClose: () => void;
   readonly onOpenDoc: (docId: string, title?: string) => void;
   readonly onCreateDoc: (title: string, template: "empty" | "sample") => void;
@@ -39,10 +40,10 @@ interface WorkbookDialogsProps {
   readonly onExportRtcl: () => void;
   readonly onExportCsv: () => void;
   readonly onExportXlsx: () => void;
-  readonly onImportRtcl: (title: string, bytes: ArrayBuffer) => void;
-  readonly onImportCsv: (title: string, sheetName: string, bytes: ArrayBuffer) => void;
-  readonly onImportNotice?: (message: Message) => void;
-  readonly onImportRejected: (reason: string | Message) => void;
+  readonly onImport: (file: File) => void;
+  /** Adds a data table to the workbook that is open, or `null` if it can have none. */
+  readonly onImportTable: (() => void) | null;
+  readonly onOpenSampleTable: () => void;
   readonly onSafeModeOpenFrozen: (docId: string) => void;
   readonly onSafeModeSkipTail: (docId: string, skipCount: number, salvageMid: boolean) => void;
 }
@@ -53,14 +54,10 @@ function rawFilesText(count: number): string {
     : t("Downloaded {n} raw file(s) as .zip.", { n: count });
 }
 
-function formatBytes(bytes: number): string {
-  if (bytes < 1024) {
-    return `${bytes} B`;
-  }
-  if (bytes < 1024 * 1024) {
-    return `${(bytes / 1024).toFixed(1)} KB`;
-  }
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+function tablesText({ count, bytes }: TableSize = { count: 0, bytes: 0 }): string {
+  return tn(count, "{n} data table, {size}", "{n} data tables, {size}", {
+    size: fmtBytes(bytes),
+  });
 }
 
 const CRC32_TABLE = (() => {
@@ -162,9 +159,6 @@ export function packStoreZip(
   return out;
 }
 
-/** At which parts of an import its progress is read out. */
-const ANNOUNCED_PERCENT = 25;
-
 function WorkbookDialogs({
   mode,
   opener,
@@ -172,7 +166,6 @@ function WorkbookDialogs({
   activeDocId,
   docs,
   storageUsedMb,
-  csvProgress,
   onClose,
   onOpenDoc,
   onCreateDoc,
@@ -181,10 +174,9 @@ function WorkbookDialogs({
   onExportRtcl,
   onExportCsv,
   onExportXlsx,
-  onImportRtcl,
-  onImportCsv,
-  onImportNotice,
-  onImportRejected,
+  onImport,
+  onImportTable,
+  onOpenSampleTable,
   onSafeModeOpenFrozen,
   onSafeModeSkipTail,
 }: WorkbookDialogsProps) {
@@ -197,6 +189,7 @@ function WorkbookDialogs({
   const [skipCountOverride, setSkipCountOverride] = useState<number | null>(null);
   /** How many raw files were downloaded, or `null` while nobody has asked for them. */
   const [rawFileCount, setRawFileCount] = useState<number | null>(null);
+  const [tableBytes, setTableBytes] = useState<ReadonlyMap<string, TableSize>>(new Map());
 
   // Where a browser takes this for nobody's wish, the button has the focus.
   useEffect(() => {
@@ -205,12 +198,13 @@ function WorkbookDialogs({
     }
   }, [isImporting]);
 
-  const csvPart = csvProgress === null ? null : Math.floor(csvProgress.percent / ANNOUNCED_PERCENT);
   useEffect(() => {
-    if (csvPart !== null) {
-      announce(t("Importing CSV: {percent}%", { percent: csvPart * ANNOUNCED_PERCENT }));
-    }
-  }, [csvPart]);
+    let isOver = false;
+    void tableSizes(docs).then((found) => isOver || setTableBytes(found));
+    return () => {
+      isOver = true;
+    };
+  }, [docs]);
 
   useEffect(() => {
     const deleted = deletingRef.current;
@@ -371,53 +365,6 @@ function WorkbookDialogs({
     );
   }
 
-  const handleFilePicked = async (file: File) => {
-    const lower = file.name.toLowerCase();
-    const baseTitle = file.name.replace(/\.(rtcl|rtclsnap|csv|tsv|txt|xlsx)$/i, "") || "Imported";
-    if (lower.endsWith(".rtcl") || lower.endsWith(".rtclsnap")) {
-      const buf = await file.arrayBuffer();
-      onImportRtcl(baseTitle, buf);
-      return;
-    }
-    if (lower.endsWith(".xlsx")) {
-      try {
-        const { importXlsxBytes } = await import("./xlsx/xlsxBridge.ts");
-        const buf = await file.arrayBuffer();
-        const result = await importXlsxBytes(new Uint8Array(buf));
-        if (result.report.unsupported.length > 0 || result.report.preservedFormulaCount > 0) {
-          const { unsupported, preservedFormulaCount: n } = result.report;
-          const items = () => [
-            ...unsupported.map((u) => translateEngineText(u.detail)),
-            ...(n > 0
-              ? [t("{n} external/unknown formula(s) preserved with cached values", { n })]
-              : []),
-          ];
-          onImportNotice?.({
-            say: () =>
-              t("Imported with Excel compatibility notes: {notes}", {
-                notes: items().join(t("; |separator")),
-              }),
-          });
-        }
-        onImportRtcl(baseTitle, result.snapshot);
-      } catch (err) {
-        onImportRejected(err instanceof Error ? err.message : String(err));
-      }
-      return;
-    }
-    if (file.size > MAX_CSV_RAW_BYTES) {
-      onImportRejected({
-        say: () =>
-          t("CSV file ({size}) exceeds the 256 MiB local workbook limit.", {
-            size: formatBytes(file.size),
-          }),
-      });
-      return;
-    }
-    const buf = await file.arrayBuffer();
-    onImportCsv(baseTitle, baseTitle.slice(0, 31) || "Sheet1", buf);
-  };
-
   const beginRename = (doc: WorkbookCatalogEntry) => {
     setEditingDoc({ id: doc.id, draft: doc.title });
   };
@@ -492,17 +439,35 @@ function WorkbookDialogs({
         <input
           ref={fileInputRef}
           type="file"
-          accept=".rtcl,.rtclsnap,.csv,.tsv,.txt,.xlsx"
+          accept=".rtcl,.rtclsnap,.csv,.tsv,.txt,.xlsx,.parquet,.rtbl"
           data-testid="import-file-input"
           style={{ display: "none" }}
           onChange={(e) => {
             const file = e.target.files?.[0];
             e.target.value = "";
             if (file) {
-              void handleFilePicked(file);
+              onImport(file);
             }
           }}
         />
+        {onImportTable && (
+          <button
+            type="button"
+            className="toolbar-btn"
+            data-testid="import-table-btn"
+            onClick={onImportTable}
+          >
+            {t("Import as Data Table…")}
+          </button>
+        )}
+        <button
+          type="button"
+          className="toolbar-btn"
+          data-testid="sample-table-btn"
+          onClick={onOpenSampleTable}
+        >
+          {t("Open 10 Million Rows")}
+        </button>
         <span className="titlebar-spacer" />
         <button
           type="button"
@@ -530,16 +495,12 @@ function WorkbookDialogs({
         </button>
       </div>
 
-      {csvProgress && (
-        <div className="csv-progress-box" data-testid="csv-import-progress">
-          <span>
-            {t("Importing CSV: {rows} rows ({percent}%)", {
-              rows: fmtInt(csvProgress.rowsParsed),
-              percent: csvProgress.percent,
-            })}
-          </span>
-          <progress aria-label={t("CSV import")} max={100} value={csvProgress.percent} />
-        </div>
+      {(tableBytes.get(activeDocId)?.count ?? 0) > 0 && (
+        <p className="drawer-storage-note" data-testid="tables-not-exported">
+          {t(
+            "Exported workbooks have no data tables in them. Export each of them as .rtbl, from the menu of its tab.",
+          )}
+        </p>
       )}
 
       <div className="drawer-list" data-testid="workbooks-list">
@@ -592,7 +553,9 @@ function WorkbookDialogs({
                       {isCurrent && <span className="drawer-current-pill">{t("Open|state")}</span>}
                     </span>
                     <span className="drawer-doc-meta">
-                      {formatBytes(doc.sizeBytes)} ·{" "}
+                      {fmtBytes(doc.sizeBytes)} ·{" "}
+                      {(tableBytes.get(doc.id)?.bytes ?? 0) > 0 &&
+                        `${tablesText(tableBytes.get(doc.id))} · `}
                       {fmtDateTime(doc.updatedAt, {
                         hour: "2-digit",
                         minute: "2-digit",
@@ -635,14 +598,7 @@ function WorkbookDialogs({
 
 export type LocalModalsProps = Pick<
   WorkbookDialogsProps,
-  | "mode"
-  | "opener"
-  | "onFocusGrid"
-  | "activeDocId"
-  | "docs"
-  | "storageUsedMb"
-  | "csvProgress"
-  | "onClose"
+  "mode" | "opener" | "onFocusGrid" | "activeDocId" | "docs" | "storageUsedMb" | "onClose"
 > & {
   readonly handle: EditorHandle;
   readonly onNotice: (message: Message) => void;
@@ -664,29 +620,50 @@ export default function LocalModals({ handle, onNotice, onRejected, ...props }: 
         handle.noteChange();
         handle.sendHost({ kind: "renameDoc", docId, title });
       }}
-      onDeleteDoc={(docId) => {
+      onDeleteDoc={async (docId) => {
+        if (await keepsUploads(docId)) {
+          onClose();
+          onRejected({ say: uploadsReason });
+          return;
+        }
         handle.noteChange();
+        // What holds the tables of the workbook would keep it from being deleted.
+        if (docId === handle.docId()) {
+          handle.showTable(null);
+          await closeTables();
+        }
         handle.sendHost({ kind: "deleteDoc", docId });
       }}
       onExportRtcl={() => handle.sendHost({ kind: "exportRtcl" })}
       onExportCsv={() => handle.sendHost({ kind: "exportCsv", sheet: handle.sheetId() })}
       onExportXlsx={() => handle.sendHost({ kind: "exportXlsxSnapshot" })}
-      onImportNotice={onNotice}
-      onImportRtcl={(title, bytes) => {
-        handle.noteChange();
-        onClose();
-        handle.sendHost({ kind: "importRtcl", docId: handle.freshDocId(), title, bytes }, [bytes]);
+      onImport={async (file) => {
+        const isLarge = fileKind(file.name) === "text" && (await hasManyRows(file));
+        if (isLarge || fileKind(file.name) === "table") {
+          onClose();
+          handle.askTables({ kind: "import", file });
+          return;
+        }
+        await importWorkbook(handle, file, {
+          onNotice,
+          onRejected: (reason) => {
+            onClose();
+            onRejected(reason);
+          },
+          onOpening: onClose,
+        });
       }}
-      onImportCsv={(title, sheetName, bytes) => {
-        handle.noteChange();
-        handle.sendHost(
-          { kind: "importCsv", docId: handle.freshDocId(), title, sheetName, bytes },
-          [bytes],
-        );
-      }}
-      onImportRejected={(reason) => {
+      onImportTable={
+        handle.state().readOnly
+          ? null
+          : () => {
+              onClose();
+              handle.askTables({ kind: "import" });
+            }
+      }
+      onOpenSampleTable={() => {
         onClose();
-        onRejected(reason);
+        runCommand(handle, "sampleTable");
       }}
       onSafeModeOpenFrozen={(docId) => {
         onClose();

@@ -42,6 +42,9 @@ const zhEngine: Readonly<Record<string, string>> = {
   "Merge: {title}": "合并：{title}",
 
   // Why the engine turns an edit down
+  "Nothing was changed: another workbook has been opened meanwhile.":
+    "没有任何改动：期间已打开另一个工作簿。",
+  "The workbook is open in another tab.": "此工作簿正在另一个标签页中打开。",
   "Target sheet does not exist.": "目标工作表不存在。",
   "Target sheet not found.": "找不到目标工作表。",
   "Target worksheet does not exist.": "目标工作表不存在。",
@@ -279,6 +282,8 @@ const zhEngine: Readonly<Record<string, string>> = {
     "工作簿“{docId}”已在浏览器的另一个标签页中打开。",
   'Workbook "{docId}" requires Safe Mode recovery before uploading to cloud.':
     "工作簿“{docId}”需要先在安全模式中恢复，才能上传到云端。",
+  'Workbook "{docId}" has to be opened once to repair its data tables.':
+    "需要先打开一次工作簿“{docId}”，以修复其中的数据表。",
   "CSV exceeds the 256 MiB local workbook import limit.": "CSV 超过 256 MiB 的本地工作簿导入上限。",
   "Snapshot file is missing; use Export Raw Files instead.": "快照文件缺失，请改用“导出原始文件”。",
   "Snapshot slot '{activeSlot}' is missing or empty.": "快照槽“{activeSlot}”缺失或为空。",
@@ -498,6 +503,21 @@ const zhEngine: Readonly<Record<string, string>> = {
   "server storage capacity reached": "服务器存储空间已满",
   "user storage quota exceeded": "账号的存储空间已用完",
   "owner storage quota exceeded": "所有者的存储空间已用完",
+  "owner table storage quota exceeded": "所有者的数据表空间已用完",
+  "table uploads are busy; try again shortly": "正在上传的数据表太多，请稍后重试",
+  "another table is being uploaded for the owner of this workbook":
+    "此工作簿的所有者有另一个数据表正在上传",
+  "another table has this ID": "另一个数据表已使用此标识符",
+  "the workbook has as many tables as it can": "工作簿的数据表已达上限",
+  "the request has too many bytes of the table": "请求中的数据超出了数据表的大小",
+  "the table is not being uploaded": "此数据表不在上传中",
+  "this is not a table file": "这不是数据表文件",
+  "the table file is larger than this server accepts": "数据表文件超过服务器接受的大小",
+  "the table file does not have the declared checksum": "数据表文件与声明的校验和不符",
+  "the table file is not as long as it says it is": "数据表文件的长度与其记录不符",
+  "the table has too many columns or groups of rows for this server":
+    "数据表的列或行组超过服务器的上限",
+  "the table file could not be read": "无法读取数据表文件",
   "replica ID space exhausted": "副本标识符已用尽",
   "snapshot payload exceeds import byte limit": "快照超过导入的大小上限",
   "invalid or oversized snapshot": "快照无效或过大",
@@ -505,6 +525,7 @@ const zhEngine: Readonly<Record<string, string>> = {
   "{field} must be between 1 and 120 characters": "{field}须为 1 到 120 个字符",
   "{field} must not contain control characters": "{field}不能包含控制字符",
   "workbook title": "工作簿标题",
+  "table name": "数据表名称",
   "version name": "版本名称",
   "X-Workbook-Title header is required": "缺少 X-Workbook-Title 请求头",
   "X-Workbook-Title is not valid UTF-8": "X-Workbook-Title 不是有效的 UTF-8",

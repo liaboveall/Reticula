@@ -215,11 +215,11 @@ export const QUALITY = {
   simInvariants: 11,
   simCiSeeds: 5000,
   simNightlySeeds: 100000,
-  fuzzTargets: 6,
+  fuzzTargets: 9,
   determinismDigest: "823dbb337c5ef1e6",
   compatFiles: 11,
   compatGenerations: 3,
-  visualCases: 35,
+  visualCases: 41,
 } as const;
 
 /** The latest comparison of the renderers, once there is one. */
@@ -246,3 +246,63 @@ export const RENDERER_COMPARISON: RendererComparison | null = {
     { renderer: "webgpu", workP50Ms: 0.47, workP99Ms: 1.02, lateFrames: 0.0000 },
   ],
 };
+
+/** One run of the benchmark of tables in one browser, as `public/data/benchmarks-history.json` has it. */
+export interface TableRun {
+  readonly report: string;
+  readonly date: string;
+  readonly commit: string;
+  readonly suite: string;
+  readonly cpu: string | null;
+  readonly browser: string | null;
+  readonly headless: boolean | null;
+  readonly affinity: string | null;
+  readonly rows: number | null;
+  readonly columns: number | null;
+  /** Bytes of the delimited text, and of the table made of it. */
+  readonly textBytes: number | null;
+  readonly fileBytes: number | null;
+  readonly importMs: number | null;
+  /** Of text whose start does not tell the types, so that it is read again from the start. */
+  readonly importTwiceMs: number | null;
+  /** Of text where only the last row says so. */
+  readonly importLastMs: number | null;
+  /** Of as many rows that do not compress. */
+  readonly importHardMs: number | null;
+  /** The longest time between two frames while importing. */
+  readonly importFrameGapMs: number | null;
+  readonly sortNumberMs: number | null;
+  readonly sortTextMs: number | null;
+  readonly sortTwoMs: number | null;
+  readonly filterNumberMs: number | null;
+  readonly filterValuesMs: number | null;
+  readonly filterTextMs: number | null;
+  readonly listValuesMs: number | null;
+  readonly summaryMs: number | null;
+  /** The worst of both renderers and of all views. */
+  readonly scrollWorkP99Ms: number | null;
+  readonly scrollPlaceholderFrames: number | null;
+  readonly jumpP95Ms: number | null;
+  /** How long the rows jumped to take to come while the table is being sorted. */
+  readonly pageWhileSortingP95Ms: number | null;
+  readonly peakMemoryMiB: number | null;
+  readonly longestStepMs: number | null;
+}
+
+/** The latest comparison of tables with another engine. */
+export interface TableComparison {
+  readonly provenance: Provenance;
+  readonly reference: string;
+  readonly tables: number;
+  readonly questions: number;
+  readonly different: number;
+  /** Known differences that the comparison allows for. */
+  readonly allowed: number;
+}
+
+export const TABLES_PROVENANCE: Provenance | null = null;
+
+/** The latest run in Chrome. */
+export const TABLES: TableRun | null = null;
+
+export const TABLE_COMPARISON: TableComparison | null = null;

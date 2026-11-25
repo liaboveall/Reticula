@@ -6,11 +6,11 @@
  * 1. When any tab sees a `waiting` Service Worker (while already controlled), it
  *    notifies sibling tabs via `{ kind: "updateReady" }` so every tab shows the
  *    non-intrusive update banner without calling `skipWaiting()` automatically.
- * 2. When the user confirms the update in any tab, that initiator discovers live
- *    sibling tabs (`discoverPeers` / `peerPresent`), broadcasts `drainForUpdate`,
- *    drains its own OPFS handles & Web Locks, waits for every peer to reply
- *    `drainedForUpdate`, and then posts `{ kind: "SKIP_WAITING" }` to the waiting
- *    Service Worker.
+ * 2. When the user confirms the update in any tab while one of them imports a data
+ *    table, the user is asked. The initiator then discovers live sibling tabs
+ *    (`discoverPeers` / `peerPresent`), broadcasts `drainForUpdate`, drains its own OPFS handles & Web Locks, waits for
+ *    every peer to reply `drainedForUpdate`, and then posts
+ *    `{ kind: "SKIP_WAITING" }` to the waiting Service Worker.
  * 3. When the new Service Worker activates and `controllerchange` fires, every
  *    previously controlled tab reloads cleanly onto the new build.
  */
@@ -23,10 +23,13 @@ export interface SwClientOptions {
   readonly tabId: string;
   readonly onUpdateReady: (ready: boolean) => void;
   readonly onDrainForUpdate: () => Promise<void>;
+  /** Something is being imported, here or in another tab. `update`: to be called if it may be given up. */
+  readonly onBusy: (update: () => void) => void;
 }
 
 export interface SwClientHandle {
-  applyUpdate(): Promise<void>;
+  /** Whether the update is being made, and the page is about to be loaded again. */
+  applyUpdate(): Promise<boolean>;
   checkForUpdate(): Promise<void>;
   status(): Promise<SwStatus>;
   dispose(): void;
@@ -61,12 +64,26 @@ function queryWorkerBuildId(worker: ServiceWorker): Promise<string | null> {
   });
 }
 
+/** A worker that is being installed, once it is. */
+async function installed(worker: ServiceWorker | null): Promise<ServiceWorker | null> {
+  while (worker?.state === "installing") {
+    await new Promise((change) => worker.addEventListener("statechange", change, { once: true }));
+  }
+  return worker?.state === "installed" ? worker : null;
+}
+
+/** Whether a data table is being imported in some tab: whoever does holds this lock. */
+async function isImporting(): Promise<boolean> {
+  const { held } = (await navigator.locks?.query?.()) ?? {};
+  return held?.some(({ name }) => name === "reticula:importing") === true;
+}
+
 export function createSwClient(options: SwClientOptions): SwClientHandle {
   const swContainer = "serviceWorker" in navigator ? navigator.serviceWorker : null;
 
   if (!swContainer || !import.meta.env.PROD) {
     return {
-      applyUpdate: async () => {},
+      applyUpdate: async () => false,
       checkForUpdate: async () => {},
       status: async () => ({
         supported: Boolean(swContainer),
@@ -125,6 +142,14 @@ export function createSwClient(options: SwClientOptions): SwClientHandle {
     });
   };
 
+  /** What the page has loaded by now, the worker has not seen. */
+  const keepWhatIsInUse = () => {
+    const paths = performance
+      .getEntriesByType("resource")
+      .map(({ name }) => new URL(name, window.location.href).pathname);
+    swContainer.controller?.postMessage({ kind: "IN_USE", paths });
+  };
+
   const onControllerChange = () => {
     if (disposed || reloaded) {
       return;
@@ -132,6 +157,7 @@ export function createSwClient(options: SwClientOptions): SwClientHandle {
     if (!hadController) {
       // First-ever activation claiming this uncontrolled page — do not reload.
       hadController = true;
+      keepWhatIsInUse();
       return;
     }
     reloaded = true;
@@ -221,13 +247,13 @@ export function createSwClient(options: SwClientOptions): SwClientHandle {
     }
   };
 
-  const applyUpdate = async (): Promise<void> => {
+  const applyUpdate = async (isAgreed = false): Promise<boolean> => {
     if (updating || disposed) {
-      return;
+      return updating;
     }
     const reg = registration ?? (await readyPromise);
     if (!reg) {
-      return;
+      return false;
     }
     let waiting = reg.waiting;
     if (!waiting) {
@@ -236,13 +262,19 @@ export function createSwClient(options: SwClientOptions): SwClientHandle {
       } catch {
         // Ignore offline update check error.
       }
-      waiting = reg.waiting;
+      // Another tab may have told of it before it is so here.
+      waiting = reg.waiting ?? (await installed(reg.installing));
     }
     if (!waiting) {
-      return;
+      return false;
     }
 
     updating = true;
+    if (!isAgreed && (await isImporting())) {
+      updating = false;
+      options.onBusy(() => void applyUpdate(true));
+      return false;
+    }
     hadController = true;
     const updateId = `${options.tabId}-${Date.now().toString(36)}`;
     activeUpdateId = updateId;
@@ -289,6 +321,7 @@ export function createSwClient(options: SwClientOptions): SwClientHandle {
 
     activeUpdateId = null;
     waiting.postMessage({ kind: "SKIP_WAITING" });
+    return true;
   };
 
   const status = async (): Promise<SwStatus> => {
@@ -305,7 +338,7 @@ export function createSwClient(options: SwClientOptions): SwClientHandle {
   };
 
   return {
-    applyUpdate,
+    applyUpdate: () => applyUpdate(),
     checkForUpdate,
     status,
     dispose: () => {

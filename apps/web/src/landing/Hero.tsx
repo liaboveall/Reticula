@@ -23,6 +23,14 @@ export function Hero({ onNavigate }: { readonly onNavigate: (path: string) => vo
           <Link to="/app" className="landing-cta" testId="open-demo" onNavigate={onNavigate}>
             {t("Open the demo")}
           </Link>
+          <Link
+            to="/app?doc=orders-10m&sample=10000000"
+            className="landing-secondary"
+            testId="open-sample-table"
+            onNavigate={onNavigate}
+          >
+            {t("Open 10 million rows")}
+          </Link>
           <Link to="/sim" className="landing-secondary" onNavigate={onNavigate}>
             {t("Open the simulator")}
           </Link>

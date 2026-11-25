@@ -76,6 +76,13 @@ async function open(
   return opened;
 }
 
+/** A catalogue without any texts, as it is written and as it is built. */
+const NO_TEXTS = {
+  *[Symbol.iterator]() {
+    yield* ["", "", 3];
+  },
+};
+
 const ENGLISH = "http://localhost/app";
 const CHINESE = "http://localhost/app?lang=zh";
 
@@ -87,6 +94,7 @@ beforeEach(() => {
   vi.doMock("./zh-core.ts", async () => ({ default: await core() }));
   vi.doMock("./zh-engine.ts", () => ({ default: {} }));
   vi.doMock("./zh-functions.ts", async () => ({ default: await functions() }));
+  vi.doMock("./zh-tables.ts", () => ({ default: NO_TEXTS }));
 });
 
 afterEach(() => {

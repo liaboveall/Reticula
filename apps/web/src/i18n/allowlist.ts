@@ -60,6 +60,7 @@ export const ALLOWED: readonly AllowedText[] = [
   { file: "apps/web/src/landing/names.ts", text: "Canvas 2D", reason: BRAND },
   { file: "apps/web/src/pages/WorkbooksPage.tsx", text: "Cloud Workbook", reason: TITLE },
   { file: "apps/web/src/pages/WorkbooksPage.tsx", text: "Untitled Cloud Workbook", reason: TITLE },
+  { file: "apps/web/src/tables/store.ts", text: "Table {}", reason: TITLE },
   {
     file: "apps/web/src/sw.ts",
     text: "Reticula is offline and the cached shell is not available yet.",

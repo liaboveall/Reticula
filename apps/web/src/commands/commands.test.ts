@@ -3,15 +3,17 @@ import type { EngineCommand, SheetInfo } from "@reticula/protocol";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { EngineMessage } from "../engine/client.ts";
 import { KEYS } from "../keymap.ts";
-import type { EditorHandle, EditorState, MutateOptions } from "./handle.ts";
+import type { EditorHandle, EditorState, MutateOptions, TableView } from "./handle.ts";
 import { COMMANDS, commandOf, isEnabled, run } from "./registry.ts";
 import { findCommands } from "./search.ts";
+import { type TableUse, tableUseOf } from "./table-use.ts";
 
 const announced = vi.hoisted(() => [] as string[]);
 vi.mock("../ui/announcer.ts", () => ({ announce: (text: string) => announced.push(text) }));
 // What is loaded later may arrive when the test is over.
 vi.mock("../i18n/zh-engine.ts", () => ({ default: {} }));
 vi.mock("../i18n/zh-functions.ts", () => ({ default: {} }));
+vi.mock("../i18n/zh-tables.ts", () => ({ default: {} }));
 
 const SHEET = {
   sheet: 1,
@@ -41,9 +43,10 @@ interface Fake {
   readonly range?: Span;
   /** The texts of cells, by "row:col". Others are empty. */
   readonly texts?: Readonly<Record<string, string | null>>;
+  readonly tables?: readonly { readonly id: string; readonly name: string }[];
 }
 
-function editor({ state = {}, range = span(2, 3, 1, 2), texts = {} }: Fake = {}) {
+function editor({ state = {}, range = span(2, 3, 1, 2), texts = {}, tables = [] }: Fake = {}) {
   const log: unknown[] = [];
   const listeners = new Set<(message: EngineMessage) => boolean>();
   const selection = {
@@ -61,6 +64,7 @@ function editor({ state = {}, range = span(2, 3, 1, 2), texts = {} }: Fake = {})
     style: undefined,
     formatCode: "General",
     isCloud: false,
+    table: null,
     ...state,
   };
   const grid = {
@@ -77,8 +81,13 @@ function editor({ state = {}, range = span(2, 3, 1, 2), texts = {} }: Fake = {})
     selectedFormatTarget: () => ({ scope: "cols", cols: [] }),
     selectRows: (first: number, last: number) => log.push(["rows", first, last]),
     selectCols: (first: number, last: number) => log.push(["cols", first, last]),
-    moveSelectedRows: (direction: number) => {
-      log.push(["move", direction]);
+    selectionFocus: { row: range.firstRow, col: range.firstCol },
+    selectionRanges: [range],
+    selectedLines: () => [{ first: range.firstRow, end: range.endRow }],
+    selectedRowRuns: () => [{ firstId: `r${range.firstRow}`, len: 1 }],
+    moved: null,
+    moveLines: (axis: string, _runs: unknown, after: string | null) => {
+      log.push(["move", axis, after]);
       return false;
     },
   } as unknown as Grid;
@@ -107,6 +116,14 @@ function editor({ state = {}, range = span(2, 3, 1, 2), texts = {} }: Fake = {})
     },
     switchSheet: (sheet: number) => log.push(["switch", sheet]),
     openDialog: (dialog: unknown) => log.push(dialog),
+    docId: () => "doc",
+    collab: () => null,
+    tables: () => tables,
+    showTable: (id: string | null) => id !== null && log.push(["table", id]),
+    askTables: (ask: unknown) => log.push(ask),
+    notify: () => log.push("notice"),
+    openWith: (docId: string, command: unknown) => log.push([docId, command]),
+    sendHost: (command: unknown) => log.push(command),
   } as unknown as EditorHandle;
   const say = (message: EngineMessage) => [...listeners].some((listener) => listener(message));
   return { handle, log, say, state: full };
@@ -203,6 +220,20 @@ describe("the commands", () => {
       "deleteSheet",
       "nextSheet",
       "previousSheet",
+      "tableSortAscending",
+      "tableSortDescending",
+      "tableSortAdd",
+      "tableSortClear",
+      "tableFilterValues",
+      "tableFilterCondition",
+      "tableFilterClear",
+      "tablePanel",
+      "tableRename",
+      "tableMoveLeft",
+      "tableMoveRight",
+      "tableExport",
+      "tableDelete",
+      "tableCancel",
       "zoomIn",
       "zoomOut",
       "zoom",
@@ -216,6 +247,8 @@ describe("the commands", () => {
       "workbooks",
       "newWorkbook",
       "import",
+      "importTable",
+      "sampleTable",
       "exportRtcl",
       "exportCsv",
       "exportXlsx",
@@ -280,10 +313,154 @@ describe("the commands", () => {
   });
 
   it("say so when they come to nothing", () => {
-    expect(outcome("moveRowsUp")).toEqual([["move", -1]]);
+    expect(outcome("moveRowsUp")).toEqual([["move", "row", "r0"]]);
     expect(announced).toEqual(["Not possible here: Move Rows Up"]);
     outcome("redo");
     expect(announced).toContain("Not possible here: Redo");
+  });
+});
+
+describe("while a data table is in view, the commands", () => {
+  const did: string[] = [];
+  const view = {
+    grid: () => null,
+    focus: () => {},
+    can: () => true,
+    run: (id: string) => {
+      did.push(id);
+    },
+    goTo: () => null,
+  } as TableView;
+  const table = { id: "t", view };
+
+  beforeEach(() => {
+    did.length = 0;
+  });
+
+  it("are each for the worksheet, the table, or the same as ever", () => {
+    // Families of commands by what is before the colon.
+    const uses: Readonly<Record<TableUse, string>> = {
+      off:
+        "undo redo cut paste clearContents fillDown fillRight fillSeriesDown fillSeriesUp " +
+        "fillSeriesRight fillSeriesLeft autoFillDown find replace bold italic strikethrough " +
+        "alignLeft alignCenter alignRight numberFormat textColor fillColor borderThin " +
+        "borderMedium borderNone insertRowAbove insertRowBelow deleteRows insertColLeft " +
+        "insertColRight deleteCols moveRowsUp moveRowsDown moveColsLeft moveColsRight rowHeight " +
+        "freeze:row1 freeze:row1col1 sort filter names renameSheet moveSheetLeft moveSheetRight " +
+        "deleteSheet exportCsv",
+      table:
+        "copy selectRows selectCols selectAll colWidth autofitCols freeze:none freeze:col1 " +
+        "freeze:active filterColumn clearFilters zoomIn zoomOut zoom contextMenu " +
+        "tableSortAscending tableSortDescending tableSortAdd tableSortClear tableFilterValues " +
+        "tableFilterCondition tableFilterClear tablePanel tableRename tableMoveLeft " +
+        "tableMoveRight tableExport tableDelete tableCancel",
+      same:
+        "goTo resumeRecalc addSheet nextSheet previousSheet rendererAuto rendererCanvas language " +
+        "nextRegion previousRegion workbooks newWorkbook import importTable sampleTable " +
+        "exportRtcl exportXlsx cloud history ai palette keyboardHelp",
+    };
+    const wanted = new Map(
+      (Object.keys(uses) as TableUse[]).flatMap((use) =>
+        uses[use].split(" ").map((id) => [id, use] as const),
+      ),
+    );
+    const family = (id: string) => (wanted.has(id) ? id : id.replace(/:.*/, ""));
+    // Whoever adds a command has to say what becomes of it.
+    for (const { id } of COMMANDS) {
+      expect(wanted.get(family(id)), id).toBe(tableUseOf(id));
+    }
+    const known = new Set(COMMANDS.map(({ id }) => family(id)));
+    expect([...wanted.keys()].filter((id) => !known.has(id))).toEqual([]);
+  });
+
+  it("do nothing that is for the worksheet", () => {
+    const off = COMMANDS.filter(({ id }) => tableUseOf(id) === "off");
+    expect(off.length).toBeGreaterThan(40);
+    for (const { id } of off) {
+      expect(outcome(id, { state: { table }, range: span(1, 4, 1, 4) }), id).toEqual([]);
+    }
+    expect(did).toEqual([]);
+    expect(announced).toHaveLength(off.length);
+  });
+
+  it("have the table do what is for that", () => {
+    const own = COMMANDS.filter(({ id }) => tableUseOf(id) === "table");
+    for (const { id } of own) {
+      expect(outcome(id, { state: { table } }), id).toEqual([]);
+    }
+    expect(did).toEqual(own.map(({ id }) => id));
+    // Not while it is being loaded, nor what it cannot do now.
+    did.length = 0;
+    for (const { id } of own) {
+      outcome(id, { state: { table: { id: "t", view: null } } });
+      outcome(id, { state: { table: { id: "t", view: { ...view, can: () => false } } } });
+    }
+    expect(did).toEqual([]);
+  });
+
+  it("never change the worksheet", () => {
+    // What is the same as ever is about the workbook, or the window.
+    const same = COMMANDS.filter(({ id }) => tableUseOf(id) === "same").map(({ id }) => id);
+    expect(same).toEqual([
+      "goTo",
+      "resumeRecalc",
+      "addSheet",
+      "nextSheet",
+      "previousSheet",
+      "rendererAuto",
+      "rendererCanvas",
+      "language:en",
+      "language:zh-CN",
+      "nextRegion",
+      "previousRegion",
+      "workbooks",
+      "newWorkbook",
+      "import",
+      "importTable",
+      "sampleTable",
+      "exportRtcl",
+      "exportXlsx",
+      "cloud",
+      "history",
+      "ai",
+      "palette",
+      "keyboardHelp",
+    ]);
+  });
+
+  it("go on to the tabs of the worksheets, and back", () => {
+    const tables = [
+      { id: "t1", name: "Orders" },
+      { id: "t2", name: "Returns" },
+    ];
+    const last = { ...SHEET, sheet: 2 };
+    expect(outcome("nextSheet", { state: { sheet: last }, tables })).toEqual([["table", "t1"]]);
+    const at = (id: string) => ({ state: { table: { id, view } }, tables });
+    expect(outcome("nextSheet", at("t1"))).toEqual([["table", "t2"]]);
+    expect(outcome("nextSheet", at("t2"))).toEqual([]);
+    expect(outcome("previousSheet", at("t2"))).toEqual([["table", "t1"]]);
+    expect(outcome("previousSheet", at("t1"))).toEqual([["switch", 2]]);
+  });
+});
+
+describe("data tables", () => {
+  it("are imported into a workbook that may be changed", () => {
+    expect(outcome("importTable")).toEqual([{ kind: "import" }]);
+    expect(outcome("importTable", { state: { isCloud: true } })).toEqual([{ kind: "import" }]);
+    expect(outcome("importTable", { state: { readOnly: true } })).toEqual([]);
+  });
+
+  it("come with a workbook of their own when they are built in", () => {
+    expect(outcome("sampleTable")).toEqual([
+      ["orders-10m", { kind: "openDoc", docId: "orders-10m", title: "10 million orders" }],
+      { kind: "sample", docId: "orders-10m" },
+    ]);
+  });
+
+  it("are not in exported workbooks, which is said", () => {
+    expect(outcome("exportRtcl")).toEqual([{ kind: "exportRtcl" }]);
+    const tables = [{ id: "t", name: "Orders" }];
+    expect(outcome("exportXlsx", { tables })).toEqual([{ kind: "exportXlsxSnapshot" }, "notice"]);
   });
 });
 

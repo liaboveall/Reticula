@@ -564,6 +564,28 @@ input.name-box {
   font-weight: 600;
 }
 
+.table-tab::before {
+  content: "\25a6" / "";
+  margin-inline-end: 5px;
+}
+
+/* A data table has no use for what worksheets have. */
+.app[data-table] > :is(.formulabar-wrap, .formatbar, .touchbar, .demo-tip),
+.app[data-table] > .banners > .demo-tip,
+.app[data-table] .statusbar > span:not([data-status]) {
+  display: none;
+}
+
+.app[data-drop] > .sheet::after {
+  content: "";
+  position: absolute;
+  inset: 4px;
+  z-index: 30;
+  border: 2px dashed var(--shell-accent);
+  border-radius: 6px;
+  pointer-events: none;
+}
+
 .sheet-rename-input {
   position: absolute;
   top: 2px;

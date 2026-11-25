@@ -22,19 +22,27 @@ const FILE_NAMES = {
 // code the renderer alone uses does not hide it from its budget.
 const WEBGPU_MODULE = /\/grid\/src\/render\/webgpu\//;
 
+// What a table needs is loaded when one is opened, and has a size budget that
+// finds it by this name too. Every page may load the modules that tell which
+// tables there are and delete them.
+const TABLES_MODULE = /\/src\/tables\/(?!(?:catalog|delete|shell)\.ts)/;
+
 // Small modules that no first screen needs and that most of what is loaded later
 // shares. Left alone they are a dozen files of some hundred bytes each. The entry
 // must not import any of them: they import the entry.
 const SHARED_MODULE =
-  /[\\/]src[\\/](?:ui[\\/](?:Dialog|drawer|focus|Popup|roving|Tabs)|(?:collab|pages)[\\/]labels|pages[\\/]helpers|i18n[\\/](?:engine-text|formats)|generated[\\/]collab-api|download)\.tsx?$/;
+  /[\\/]src[\\/](?:ui[\\/](?:Dialog|drawer|focus|Popup|roving|Tabs)|(?:collab|pages)[\\/]labels|pages[\\/]helpers|i18n[\\/](?:engine-text|formats)|generated[\\/]collab-api|tables[\\/](?:catalog|delete|shell)|engine[\\/]storage|download|import-workbook|local-tables|editor[\\/](?:activity|cell-announcer))\.tsx?$/;
 /** What every page but the landing page and the editor starts with. */
 const PAGE_MODULE = /[\\/]src[\\/]pages[\\/](?:errors|PageNav)\.tsx?$/;
 /** What the editor and the pages with workbooks start with. */
-const CLIENT_MODULE = /[\\/]src[\\/](?:engine[\\/]client|ui[\\/]ActionButton)\.tsx?$/;
+const CLIENT_MODULE =
+  /[\\/]src[\\/](?:engine[\\/]client|ui[\\/](?:ActionButton|resolved)|editor[\\/]load-later)\.tsx?$/;
 const LANGUAGE_MODULE = /[\\/]src[\\/](?:i18n[\\/]languages|pages[\\/]LanguageSwitch)\.tsx?$/;
 // What is opened in the editor is loaded when it is opened. These belong together.
 const DIALOG_MODULE = /[\\/]src[\\/](?:LocalModals|M3aToolsModal)\.tsx$/;
 const CLOUD_MODULE = /[\\/]src[\\/]collab[\\/](?:CollabHost|CollabShell|HistoryDrawer)\.tsx$/;
+// Chinese texts have a size budget, which finds them by this name.
+const LATER_TEXTS = /\/i18n\/later-texts\.ts$/;
 
 // The style sheet of the document, which no chunk has to load.
 const DOCUMENT_STYLES = /^assets\/index-[^/]*\.css$/;
@@ -105,10 +113,17 @@ export default defineConfig(({ mode }) => ({
                     { name: "cloud", test: CLOUD_MODULE },
                   ],
                 },
-                chunkFileNames: ({ moduleIds }) =>
-                  moduleIds.some((id) => WEBGPU_MODULE.test(id))
-                    ? "assets/webgpu-[hash:6].js"
-                    : FILE_NAMES.chunkFileNames,
+                chunkFileNames: ({ moduleIds }) => {
+                  if (moduleIds.some((id) => WEBGPU_MODULE.test(id))) {
+                    return "assets/webgpu-[hash:6].js";
+                  }
+                  if (moduleIds.some((id) => LATER_TEXTS.test(id))) {
+                    return "assets/zh-later-[hash:6].js";
+                  }
+                  return moduleIds.some((id) => TABLES_MODULE.test(id))
+                    ? "assets/tables-[hash:6].js"
+                    : FILE_NAMES.chunkFileNames;
+                },
               },
             },
           },

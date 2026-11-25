@@ -30,6 +30,8 @@ export type HostEvent =
       readonly storageBackend: StorageBackendKind;
       readonly walRecords: number;
       readonly activeSlot: "a" | "b";
+      /** How many workbooks the worker has opened by now. */
+      readonly opening: number;
     }
   | { readonly kind: "docBlocked"; readonly docId: string; readonly title: string }
   | {
@@ -154,7 +156,12 @@ export type HostCommand =
   | { readonly kind: "debugSpinWorker"; readonly ms: number };
 
 export type WorkerEnvelope =
-  | { readonly channel: "engine"; readonly command: EngineCommand }
+  | {
+      readonly channel: "engine";
+      readonly command: EngineCommand;
+      /** Which of the workbooks that were opened it is meant for. */
+      readonly opening?: number;
+    }
   | { readonly channel: "host"; readonly command: HostCommand }
   | { readonly channel: "collab"; readonly command: SyncCommand };
 
@@ -207,6 +214,7 @@ export function startEngine(handlers: EngineHandlers): EngineClient {
     name: tabId,
   });
   let stopped = false;
+  let opening = 0;
   let syncFailed = false;
   let syncEffects = Promise.resolve();
   let checkpointRequest: PromiseWithResolvers<SyncCheckpoint> | undefined;
@@ -240,7 +248,9 @@ export function startEngine(handlers: EngineHandlers): EngineClient {
           }
         });
     } else {
-      if (event.data.kind === "failed") {
+      if (event.data.kind === "docOpened") {
+        opening = event.data.opening;
+      } else if (event.data.kind === "failed") {
         checkpointRequest?.reject(new Error(event.data.message));
         checkpointRequest = undefined;
       }
@@ -272,7 +282,8 @@ export function startEngine(handlers: EngineHandlers): EngineClient {
   worker.postMessage(initial);
 
   return {
-    send: (command) => worker.postMessage({ channel: "engine", command } satisfies WorkerEnvelope),
+    send: (command) =>
+      worker.postMessage({ channel: "engine", command, opening } satisfies WorkerEnvelope),
     sendHost: (command, transfer) => {
       const env: WorkerEnvelope = { channel: "host", command };
       if (transfer && transfer.length > 0) {

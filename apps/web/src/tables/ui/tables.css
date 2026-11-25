@@ -1,0 +1,326 @@
+/* Data tables, whose screen is over the worksheet's, and their dialogs. */
+
+.table-view {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--shell-background);
+}
+
+.table-bar {
+  align-items: flex-start;
+}
+
+.table-bar > .name-box {
+  flex: none;
+  max-width: 40%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* All of what is in a cell, which can be selected and copied. */
+.table-text {
+  flex: 1;
+  min-width: 0;
+  min-height: 20px;
+  max-height: 64px;
+  padding: 2px 6px;
+  overflow-y: auto;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+  font-family: ui-monospace, "Cascadia Mono", Consolas, system-ui, monospace;
+  font-size: 13px;
+  line-height: 20px;
+  user-select: text;
+}
+
+.table-bar > .toolbar-btn {
+  flex: none;
+}
+
+.table-body {
+  position: relative;
+  flex: 1;
+  display: flex;
+  min-height: 0;
+}
+
+.table-space {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+}
+
+.table-grid:focus-visible {
+  outline-offset: -2px;
+}
+
+.table-opening {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-content: center;
+  margin: 0;
+  color: var(--shell-muted);
+}
+
+.table-problem {
+  justify-items: center;
+  background: var(--shell-background);
+}
+
+.table-problem p {
+  max-width: 560px;
+}
+
+.table-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.table-panel {
+  box-sizing: border-box;
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: min(440px, 45%);
+  padding: 10px 12px;
+  overflow-y: auto;
+  border-left: 1px solid var(--shell-line);
+  background: var(--shell-surface);
+  font-size: 12px;
+}
+
+.table-panel :is(h2, h3, p, ul, ol) {
+  margin: 0;
+}
+
+.table-panel h2 {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font-size: 14px;
+}
+
+.table-panel h3 {
+  font-size: 12px;
+  color: var(--shell-muted);
+}
+
+.table-asked {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding-inline-start: 20px;
+}
+
+.table-status > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.table-asked > li > span {
+  overflow-wrap: anywhere;
+}
+
+.table-figures {
+  overflow-x: auto;
+}
+
+.table-figures table,
+.table-preview table {
+  border-spacing: 0;
+  font-variant-numeric: tabular-nums;
+}
+
+.table-figures :is(th, td),
+.table-preview :is(th, td) {
+  padding: 3px 8px;
+  border-bottom: 1px solid var(--shell-line);
+  text-align: start;
+  white-space: nowrap;
+}
+
+.table-figures td[data-figure] {
+  text-align: end;
+}
+
+.table-figures th[scope="row"] {
+  position: sticky;
+  left: 0;
+  background: var(--shell-surface);
+}
+
+.table-figures th > button {
+  max-width: 140px;
+  padding: 0;
+  overflow: hidden;
+  border: 0;
+  background: none;
+  color: var(--shell-accent);
+  font: inherit;
+  text-overflow: ellipsis;
+  cursor: pointer;
+}
+
+.table-size {
+  color: var(--shell-muted);
+}
+
+.table-status {
+  order: 1;
+  flex: 1;
+  display: flex;
+  justify-content: flex-end;
+  gap: 16px;
+  min-width: 0;
+}
+
+.app[data-table] .table-status {
+  justify-content: flex-start;
+}
+
+.statusbar > .zoom-control {
+  order: 2;
+}
+
+.table-job {
+  flex: none;
+  color: var(--shell-accent);
+  font-weight: 600;
+}
+
+.dialog.table-dialog {
+  width: min(760px, calc(100vw - 40px));
+}
+
+.table-form {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-height: 0;
+}
+
+.table-form p,
+.dialog.table-dialog > p {
+  margin: 0;
+}
+
+.table-search,
+.table-condition :is(select, input) {
+  padding: 5px 8px;
+  border: 1px solid var(--shell-control);
+  border-radius: 4px;
+  background: var(--shell-background);
+  color: var(--shell-text);
+  font: inherit;
+}
+
+.table-values {
+  margin: 0;
+  /* A fieldset is as wide as what is in it otherwise. */
+  min-width: 0;
+  min-height: 120px;
+  max-height: min(320px, 40vh);
+}
+
+.table-values > .m3a-field > span:nth-child(2) {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: pre;
+}
+
+.table-count {
+  margin-inline-start: auto;
+  color: var(--shell-muted);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.table-preview {
+  max-height: min(300px, 36vh);
+  overflow: auto;
+  border: 1px solid var(--shell-line);
+  border-radius: 6px;
+  font-size: 12px;
+}
+
+.table-preview th {
+  position: sticky;
+  top: 0;
+  background: var(--shell-background);
+}
+
+.table-preview select {
+  max-width: 160px;
+  font: inherit;
+  font-size: 11px;
+}
+
+.table-preview td {
+  max-width: 260px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.table-notes {
+  margin: 0;
+  max-height: 160px;
+  padding-inline-start: 20px;
+  overflow-y: auto;
+  font-size: 12px;
+}
+
+.table-failure {
+  padding: 6px 10px;
+  border-radius: 4px;
+  background: var(--shell-danger-soft);
+  color: var(--shell-danger);
+  font-size: 12.5px;
+}
+
+@media (max-width: 767px) {
+  .table-panel {
+    position: absolute;
+    inset: 0;
+    width: auto;
+    border-left: 0;
+  }
+}
+
+.app[data-touch] .table-text {
+  max-height: min(20vh, 96px);
+  font-size: 15px;
+}
+
+.app[data-touch] .table-panel {
+  position: absolute;
+  inset: 0 0 0 auto;
+  width: min(440px, 100vw);
+}
+
+.app[data-touch] :is(.table-bar .toolbar-btn, .table-bar .name-box, .table-panel .tip-close) {
+  min-width: 44px;
+  min-height: 44px;
+}
+
+.app[data-touch] .table-figures th > button {
+  min-height: 40px;
+}
+
+@media (forced-colors: active) {
+  .table-preview th,
+  .table-figures th[scope="row"] {
+    background: Canvas;
+  }
+
+  .table-failure {
+    border: 1px solid CanvasText;
+  }
+}

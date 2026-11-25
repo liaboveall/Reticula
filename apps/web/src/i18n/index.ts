@@ -43,6 +43,8 @@ export interface Message {
 /** What goes into the `{placeholders}` of a text. */
 export type Params = Readonly<Record<string, string | number>>;
 
+const later = () => import("./later-texts.ts");
+
 const LOADERS: Readonly<
   Record<CatalogueName, () => Promise<{ readonly default: LoadedCatalogue }>>
 > = {
@@ -50,8 +52,9 @@ const LOADERS: Readonly<
   "zh-pages": () => import("./zh-pages.ts"),
   "zh-landing": () => import("./zh-landing.ts"),
   "zh-labs": () => import("./zh-labs.ts"),
-  "zh-engine": () => import("./zh-engine.ts"),
-  "zh-functions": () => import("./zh-functions.ts"),
+  "zh-engine": () => later().then(({ engine }) => ({ default: engine })),
+  "zh-functions": () => later().then(({ functions }) => ({ default: functions })),
+  "zh-tables": () => later().then(({ tables }) => ({ default: tables })),
 };
 
 const INTL_TAG: Readonly<Record<Locale, string>> = { en: "en-US", "zh-CN": "zh-CN" };

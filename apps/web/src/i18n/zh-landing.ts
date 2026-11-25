@@ -11,6 +11,7 @@ const zhLanding: Readonly<Record<string, string>> = {
   Limits: "限制",
   "Open the demo": "打开演示",
   "Open the simulator": "打开仿真器",
+  "Open 10 million rows": "打开 1,000 万行",
   "View on GitHub": "在 GitHub 上查看",
 
   // Overview
@@ -81,6 +82,14 @@ const zhLanding: Readonly<Record<string, string>> = {
   "Edit reaching everyone else, p95": "编辑到达其他所有人，p95",
   "{clients} clients, {rate} edits a second, {rtt} ms round trip added":
     "{clients} 个客户端，每秒 {rate} 处编辑，另加往返 {rtt} 毫秒",
+  "Import {rows} rows of CSV": "导入 {rows} 行 CSV",
+  "{text} in {columns} columns, into a table of {file}":
+    "{text}，{columns} 列，得到 {file} 的数据表",
+  "Sort {rows} rows by a number": "{rows} 行按数字排序",
+  "by a text {text}; filter by a number {filter}": "按文本 {text}；按数字筛选 {filter}",
+  "Main thread per frame, {rows} rows": "主线程每帧用时，{rows} 行",
+  "p99 of scrolling, the worst of both renderers; {n} frames with placeholders":
+    "滚动的 p99，取两个渲染器中较差的；{n} 帧有占位符",
 
   // Renderers
   "Canvas 2D and WebGPU": "Canvas 2D 与 WebGPU",

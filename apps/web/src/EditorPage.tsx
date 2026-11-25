@@ -17,22 +17,32 @@ import type {
   WireFormulaAnalysis,
   WireSearchMatch,
 } from "@reticula/protocol";
-import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
+import { type DragEvent, lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
 import type { CollabWorkbookTarget } from "./collab/CollabShell.tsx";
 import type {
   CopiedSnapshot,
   EditorHandle,
   EditorState,
   MutateOptions,
+  ShownTable,
+  TableAsk,
+  TableView,
 } from "./commands/handle.ts";
 import { runCommand } from "./commands/run.ts";
 import type { Activity, SheetAction } from "./editor/activity.ts";
+import type { ImportProgress } from "./editor/Banners.tsx";
 import type { CellInspection } from "./editor/cell-announcer.ts";
 import { DemoTip } from "./editor/DemoTip.tsx";
 import { FormatToolbar } from "./editor/FormatToolbar.tsx";
 import { useGridStrings } from "./editor/grid-strings.ts";
 import { type CellIds, HeldCommits } from "./editor/held-commits.ts";
-import { engineText, laterNow, lazyPart, loadLaterWhenIdle } from "./editor/load-later.ts";
+import {
+  engineText,
+  laterNow,
+  lazyPart,
+  loadLater,
+  loadLaterWhenIdle,
+} from "./editor/load-later.ts";
 import { NameBox } from "./editor/NameBox.tsx";
 import { SheetTabs } from "./editor/SheetTabs.tsx";
 import { StatusBar } from "./editor/StatusBar.tsx";
@@ -64,13 +74,13 @@ import type { LocalModalMode } from "./LocalModals.tsx";
 import type { M3aModalEvent, M3aToolMode } from "./M3aToolsModal.tsx";
 import { rendererPreference } from "./renderer.ts";
 import type { SwClientHandle } from "./sw-client.ts";
+import type { TableEntry } from "./tables/catalog.ts";
 import { announce } from "./ui/announcer.ts";
 import { useMedia } from "./ui/media.ts";
 import { useOpener } from "./ui/opener.ts";
 import { loadPopup } from "./ui/Popover.tsx";
 
 const LazyMobileFallback = lazy(() => import("./editor/MobileFallback.tsx"));
-const LazyTouchBar = lazy(() => import("./editor/TouchBar.tsx"));
 const LazyLocalModals = lazy(() => import("./LocalModals.tsx"));
 const LazyCollabHost = lazy(() => import("./collab/CollabHost.tsx"));
 const LazyM3aToolsModal = lazy(() => import("./M3aToolsModal.tsx"));
@@ -80,6 +90,8 @@ const LazyLockOverlay = lazyPart(({ LockOverlay }) => LockOverlay);
 const LazyMenus = lazyPart(({ EditorMenus }) => EditorMenus);
 const LazyDialogs = lazyPart(({ EditorDialogs }) => EditorDialogs);
 const LazyAnnouncements = lazyPart(({ CellAnnouncements }) => CellAnnouncements);
+const LazyTableDock = lazyPart(({ TableDock }) => TableDock);
+const LazyTouchBar = lazyPart(({ TouchBar }) => TouchBar);
 
 interface InspectedState extends CellInspection {
   readonly sheet: number;
@@ -273,6 +285,8 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
 
   const [engine, setEngine] = useState<EngineState>({ status: "starting" });
   const [docId, setDocId] = useState<string>(initialRoute.current.docId);
+  /** Tells a workbook from the one before it that had its name. */
+  const [opening, setOpening] = useState(0);
   const [docTitle, setDocTitle] = useState<string>(activeDocTitleRef.current);
   const [catalogDocs, setCatalogDocs] = useState<readonly WorkbookCatalogEntry[]>([]);
   const [lockOverlay, setLockOverlay] = useState<LockOverlayState | null>(null);
@@ -281,10 +295,7 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
   const [m3aEvent, setM3aEvent] = useState<M3aModalEvent | null>(null);
   const [quotaBanner, setQuotaBanner] = useState<string | Message | null>(null);
   const [swUpdateReady, setSwUpdateReady] = useState(false);
-  const [csvProgress, setCsvProgress] = useState<{
-    readonly rowsParsed: number;
-    readonly percent: number;
-  } | null>(null);
+  const [csvProgress, setCsvProgress] = useState<ImportProgress | null>(null);
   const [storageUsedMb, setStorageUsedMb] = useState<string>("0.0");
 
   const [stats, setStats] = useState<GridStats | null>(null);
@@ -315,6 +326,12 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
   const [historySeekMs, setHistorySeekMs] = useState<number | null>(null);
   const [aiOpen, setAiOpen] = useState(false);
   const [draftPreview, setDraftPreview] = useState(false);
+  /** The data tables there are, and the one in view in place of the worksheet. */
+  const [tables, setTables] = useState<readonly TableEntry[]>([]);
+  const [table, setTable] = useState<ShownTable | null>(null);
+  const tableRef = useRef<string | null>(null);
+  const [tableView, setTableView] = useState<TableView | null>(null);
+  const [tableAsk, setTableAsk] = useState<TableAsk | null>(null);
   const touchMode = useTouchMode(() => {
     actionsRef.current.commitPending();
     editorRef.current?.refreshAttributes();
@@ -324,7 +341,8 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
     collabTarget?.role === "viewer" ||
     historyPreviewSeq !== null ||
     draftPreview ||
-    lockOverlay !== null;
+    lockOverlay !== null ||
+    csvProgress !== null;
   const effectiveReadOnlyRef = useRef(effectiveReadOnly);
   effectiveReadOnlyRef.current = effectiveReadOnly;
   const [unsyncedRescue, setUnsyncedRescue] = useState<{
@@ -334,7 +352,12 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
 
   const sendPresenceNow = useCallback((sheetOverride?: number) => {
     const client = clientRef.current;
-    if (!client || workerTerminatedRef.current || !collabTargetRef.current) {
+    if (
+      !client ||
+      workerTerminatedRef.current ||
+      !collabTargetRef.current ||
+      tableRef.current !== null
+    ) {
       return;
     }
     const sel = lastSelectionRef.current;
@@ -440,6 +463,11 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
     }
   }, []);
 
+  const askTables = useCallback((ask: TableAsk) => {
+    setIsLaterReady(true);
+    setTableAsk(ask);
+  }, []);
+
   const openCollab = useCallback((target: CollabWorkbookTarget) => {
     const { userId, docId, branchId, title, role } = target;
     const online = !collabManualOfflineRef.current && navigator.onLine !== false;
@@ -465,8 +493,31 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
   /** Where the focus goes that has no other place: the grid, or what is in front of it. */
   const focusGrid = useCallback(
     () =>
-      (document.querySelector<HTMLElement>(".lock-overlay button") ?? editorRef.current)?.focus(),
+      (
+        document.querySelector<HTMLElement>(".lock-overlay button, .table-grid") ??
+        editorRef.current
+      )?.focus(),
     [],
+  );
+  const showTable = useCallback(
+    (id: string | null, keepsFocus = false) => {
+      const grid = gridRef.current;
+      const host = hostRef.current;
+      if (!grid || !host || id === tableRef.current) {
+        return;
+      }
+      if (id === null) {
+        host.inert = false;
+        grid.resume();
+        zoomSignal.set(grid.zoom);
+      } else {
+        actionsRef.current.commitPending();
+        grid.pause();
+      }
+      tableRef.current = id;
+      setTable(id === null ? null : { id, focus: !keepsFocus });
+    },
+    [zoomSignal],
   );
   const dialogOpener = useOpener(dialog !== null);
   const renameOpener = useOpener(renamingSheet !== null);
@@ -947,7 +998,8 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
           return;
         }
         let effTsv = tsv;
-        let effHtml = html ?? undefined;
+        // Texts of data tables stay texts, whatever they look like.
+        let effHtml = html?.replace(/(<td[^>]* data-reticula-text[^>]*>)(?!<\/td)/g, "$1'");
         if (effTsv.length === 0 && !effHtml && lastCopiedRef.current) {
           effTsv = lastCopiedRef.current.tsv;
           effHtml = lastCopiedRef.current.html;
@@ -1082,6 +1134,7 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
               waitingForFileRef.current = false;
               safeModeRef.current = null;
               setDocId(message.docId);
+              setOpening(message.opening);
               setDocTitle(message.title);
               setLockOverlay(null);
               setCsvProgress(null);
@@ -1097,6 +1150,7 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
               waitingForFileRef.current = false;
               setDocId(message.docId);
               setDocTitle(message.title);
+              setCsvProgress(null);
               setLockOverlay({ kind: "blocked", docId: message.docId, title: message.title });
               break;
             }
@@ -1145,11 +1199,15 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
               break;
             }
             case "quotaExceeded": {
+              // The copies of tables, which can be had again, make room for what cannot.
+              void laterNow()
+                ?.dropCopies()
+                .catch(() => {});
               setQuotaBanner(message.message);
               break;
             }
             case "csvImportProgress": {
-              setCsvProgress({ rowsParsed: message.rowsParsed, percent: message.percent });
+              setCsvProgress(message);
               break;
             }
             case "fileExported": {
@@ -1587,29 +1645,32 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
       };
     }
 
-    const flushAndCloseDoc = (): Promise<void> => {
+    const flushAndCloseDoc = async (): Promise<void> => {
+      const tablesClosed = laterNow()?.closeTables();
       if (workerTerminatedRef.current || !clientRef.current) {
-        return Promise.resolve();
+        return tablesClosed;
       }
       clientRef.current.sendHost({ kind: "flushAndCloseForUpdate" });
-      return new Promise<void>((resolve) => {
+      await new Promise<void>((resolve) => {
         const cap = window.setTimeout(resolve, 1_500);
         closeWaiters.push(() => {
           window.clearTimeout(cap);
           resolve();
         });
       });
+      await tablesClosed;
     };
 
     let swStartTimer = 0;
     let swClient: Promise<SwClientHandle> | null = null;
     let disposed = false;
     const ensureSwClient = (): Promise<SwClientHandle> => {
-      swClient ??= import("./sw-client.ts").then(({ createSwClient }) => {
+      swClient ??= loadLater().then(({ createSwClient }) => {
         const handle = createSwClient({
           tabId: tabIdRef.current,
           onUpdateReady: (ready) => setSwUpdateReady(ready),
           onDrainForUpdate: flushAndCloseDoc,
+          onBusy: (onAgreed) => askTables({ kind: "giveUp", onAgreed }),
         });
         if (disposed) {
           handle.dispose();
@@ -1710,6 +1771,7 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
     };
   }, [
     arriveAt,
+    askTables,
     autoFillDown,
     clearEditState,
     ensureEditSession,
@@ -1904,6 +1966,7 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
     if (!editor || !client || workerTerminatedRef.current) {
       return;
     }
+    showTable(null);
     if (targetId === (askedSheetRef.current ?? activeSheetRef.current)) {
       if (!keepsFocus) {
         editor.focus();
@@ -1997,10 +2060,12 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
     style: matchingInspected?.style,
     formatCode: matchingInspected?.formatCode ?? "General",
     isCloud: collabTarget !== null,
+    table: table && { id: table.id, view: tableView },
   };
   const stateRef = useRef(state);
   stateRef.current = state;
   const actions = {
+    tables,
     commitPending,
     handleSwitchSheet,
     handleCreateNewWorkbook,
@@ -2017,7 +2082,13 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
       cellEditor: () => editorRef.current,
       mutate,
       send,
-      sendHost: (command, transfer) => clientRef.current?.sendHost(command, transfer),
+      sendHost(command, transfer) {
+        // Another workbook is to be opened: what is changed until then would be lost.
+        if (/^import/.test(command.kind)) {
+          setCsvProgress({ rowsParsed: 0, percent: 0 });
+        }
+        clientRef.current?.sendHost(command, transfer);
+      },
       openWith,
       openCollab,
       collab: () => collabTargetRef.current,
@@ -2053,6 +2124,12 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
       openMenu: setMenu,
       renameSheet: (tab) => setRenamingSheet(tab.id),
       editNameBox: () => setNameBoxEditing(true),
+      docId: () => activeDocIdRef.current,
+      tables: () => actionsRef.current.tables,
+      showTable,
+      askTables,
+      notify: setQuotaBanner,
+      reject,
     }),
   );
   // For tests and measurements, which ask for them in the page's address.
@@ -2097,7 +2174,14 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       const isEditing = editorRef.current?.editing != null;
-      const id = commandFor(event, focusScope(event.target, hostRef.current, isEditing));
+      const id = commandFor(
+        event,
+        focusScope(
+          event.target,
+          document.querySelector(".table-grid") ?? hostRef.current,
+          isEditing,
+        ),
+      );
       if (id !== null) {
         event.preventDefault();
         if (id === "contextMenu") {
@@ -2110,33 +2194,51 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [handle]);
 
-  const canDeleteRows = !effectiveReadOnly && selection !== null && selection.rowId !== null;
-  const canDeleteCols = !effectiveReadOnly && selection !== null && selection.colId !== null;
+  /** Takes files before an editor of text does. */
+  const onDrag = (event: DragEvent<HTMLElement>) => {
+    const { currentTarget, dataTransfer, type } = event;
+    if (dataTransfer.types.includes("Files")) {
+      event.preventDefault();
+      event.stopPropagation();
+      const files = [...dataTransfer.files];
+      void loadLater().then(({ dragFiles }) => dragFiles(handle, currentTarget, type, files));
+    }
+  };
 
-  const nameBox = (
-    <NameBox
-      handle={handle}
-      text={nameBoxText}
-      isEditing={nameBoxEditing && readySheet !== null}
-      inactive={readySheet === null}
-      onEdit={() => onCommand("goTo")}
-      onDone={(byKey) => {
-        setNameBoxEditing(false);
-        if (byKey) {
-          focusGrid();
-        }
-      }}
-    />
+  const canEdit = !effectiveReadOnly && !table;
+  const canDeleteRows = canEdit && selection !== null && selection.rowId !== null;
+  const canDeleteCols = canEdit && selection !== null && selection.colId !== null;
+
+  const nameBoxProps = {
+    handle,
+    isEditing: nameBoxEditing && readySheet !== null,
+    onEdit: () => onCommand("goTo"),
+    onDone: (byKey: boolean) => {
+      setNameBoxEditing(false);
+      if (byKey) {
+        focusGrid();
+      }
+    },
+  };
+  const nameBox = table ? null : (
+    <NameBox {...nameBoxProps} text={nameBoxText} inactive={readySheet === null} />
   );
 
   return (
-    <div className="app" data-touch={touchMode || undefined}>
+    <div
+      className="app"
+      data-touch={touchMode || undefined}
+      data-table={table ? "" : undefined}
+      onDragOverCapture={onDrag}
+      onDropCapture={onDrag}
+    >
       <TitleBar
         handle={handle}
         title={docTitle}
         sheet={readySheet}
+        isTable={table !== null}
         collabRole={collabTarget?.role ?? null}
-        readOnly={effectiveReadOnly}
+        readOnly={!canEdit}
         canDeleteRows={canDeleteRows}
         storageUsedMb={storageUsedMb}
         aiOpen={aiOpen}
@@ -2198,10 +2300,12 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
           readySheet?.recalcFrozen === true ||
           draftPreview ||
           historyPreviewSeq !== null ||
+          csvProgress !== null ||
           rejectedReason !== null) && (
           <Suspense fallback={null}>
             <LazyBanners
               sheet={readySheet}
+              importing={csvProgress}
               rejected={rejectedReason}
               onDismissRejected={() => leaveBanner(() => setRejectedReason(null))}
               storage={quotaBanner}
@@ -2230,7 +2334,7 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
         <FormulaBar
           ref={formulaBarRef}
           nameBox={nameBox}
-          inert={lockOverlay !== null}
+          inert={lockOverlay !== null || table !== null}
           value={formulaBarValue}
           placeholder={
             effectiveReadOnly
@@ -2281,7 +2385,34 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
       )}
 
       <main className="sheet">
-        <div ref={hostRef} className="grid" data-testid="grid" inert={lockOverlay !== null} />
+        <div
+          ref={hostRef}
+          className="grid"
+          data-testid="grid"
+          inert={lockOverlay !== null || table !== null}
+        />
+        {isLaterReady && (
+          <Suspense fallback={null}>
+            <LazyTableDock
+              key={`${docId} ${opening}`}
+              handle={handle}
+              docId={docId}
+              tabId={tabIdRef.current}
+              shown={table}
+              view={tableView}
+              ask={tableAsk}
+              isCloud={collabTarget !== null}
+              isOnline={collabConn === "online"}
+              isClosed={readySheet === null || historyPreviewSeq !== null || draftPreview}
+              readOnly={effectiveReadOnly}
+              nameBox={nameBoxProps}
+              zoom={zoomSignal}
+              onTables={setTables}
+              onView={setTableView}
+              onAsked={() => setTableAsk(null)}
+            />
+          </Suspense>
+        )}
         {lockOverlay && (
           <Suspense fallback={null}>
             <LazyLockOverlay
@@ -2307,7 +2438,7 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
             nameBox={nameBox}
             inspection={matchingInspected}
             text={selection?.text ?? ""}
-            inert={lockOverlay !== null}
+            inert={lockOverlay !== null || table !== null}
           />
         </Suspense>
       )}
@@ -2315,12 +2446,16 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
       {readySheet && (
         <SheetTabs
           sheet={readySheet}
+          tables={tables}
+          table={table?.id ?? null}
           readOnly={effectiveReadOnly}
           renaming={renamingSheet}
           onRename={handleRenameSheet}
           onSwitch={handleSwitchSheet}
           onMenu={(tab, clientX, clientY) => setMenu({ kind: "tab", clientX, clientY, tab })}
           onCommand={onCommand}
+          onTable={showTable}
+          onTables={askTables}
         />
       )}
 
@@ -2341,8 +2476,7 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
         zoom={{
           zoom: zoomSignal,
           handle,
-          onStep: (direction) =>
-            direction > 0 ? gridRef.current?.zoomIn() : gridRef.current?.zoomOut(),
+          onStep: (direction) => onCommand(direction > 0 ? "zoomIn" : "zoomOut"),
         }}
       />
 
@@ -2351,7 +2485,7 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
           <LazyAnnouncements
             host={hostRef}
             documentId={docId}
-            sheet={readySheet}
+            sheet={table ? null : readySheet}
             selection={selection}
             inspection={matchingInspected}
             activity={activity}
@@ -2387,7 +2521,6 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
             activeDocId={docId}
             docs={catalogDocs}
             storageUsedMb={storageUsedMb}
-            csvProgress={csvProgress}
             onClose={() => setModalMode(null)}
             onNotice={setQuotaBanner}
             onRejected={reject}

@@ -2,6 +2,7 @@ import {
   type CollabEvent,
   Engine,
   type EngineCommand,
+  type EngineInfo,
   encodePendingWalInit,
   encodeWalInit,
   HistoryPlayer,
@@ -32,6 +33,7 @@ import {
   readDocState,
   readSnapshotSlot,
   removeDocStorage,
+  renameCatalogEntry,
   type SnapshotStreamSink,
   type StorageBackendKind,
   upsertCatalogEntry,
@@ -81,7 +83,14 @@ interface ActiveSnapshotJob {
   postSnapFrames: Uint8Array[];
 }
 
+interface ImportedWorkbook {
+  readonly info: EngineInfo;
+  readonly sheet: SheetInfo;
+}
+
 let engine: Engine | null = null;
+/** How many workbooks have been opened. */
+let openings = 0;
 let backend: StorageBackendKind = "memory";
 let stopped = false;
 let activeDoc: ActiveDoc | null = null;
@@ -761,6 +770,18 @@ function sheetFromEvent(event: EngineMessage | undefined): SheetInfo | undefined
   }
 }
 
+function postOpened(doc: ActiveDoc, walRecords: number): void {
+  scope.postMessage({
+    kind: "docOpened",
+    docId: doc.docId,
+    title: doc.title,
+    storageBackend: backend,
+    walRecords,
+    activeSlot: doc.state.activeSlot,
+    opening: ++openings,
+  });
+}
+
 async function runEngineCommand(command: EngineCommand): Promise<void> {
   if (stopped || !engine) {
     return;
@@ -931,14 +952,7 @@ async function initializeFreshDoc(
 
   // Emit `ready` and push initial viewport pages BEFORE initial OPFS stub writes so
   // cold-start first-screen paint has zero storage latency on the critical path!
-  scope.postMessage({
-    kind: "docOpened",
-    docId,
-    title,
-    storageBackend: backend,
-    walRecords: 0,
-    activeSlot: "a",
-  });
+  postOpened(activeDoc, 0);
   scope.postMessage(event);
 
   // Default 1M sample writes a ~120B SeedOrigin stub (`14-m1b.md` 7.1).
@@ -1149,14 +1163,7 @@ async function finishOpeningWithLock(
       awaitingInitialSettle: true,
     };
 
-    scope.postMessage({
-      kind: "docOpened",
-      docId,
-      title,
-      storageBackend: backend,
-      walRecords: outcome.replayedTxns,
-      activeSlot: state.activeSlot,
-    });
+    postOpened(activeDoc, outcome.replayedTxns);
     scope.postMessage({ kind: "ready", info: outcome.info, sheet: outcome.sheet });
     await settleOpeningSentinelIfReady(engine);
 
@@ -1279,76 +1286,114 @@ async function handleSafeModeRecover(
     }
   }
 
-  scope.postMessage({
-    kind: "docOpened",
-    docId,
-    title: doc.title,
-    storageBackend: backend,
-    walRecords: outcome.replayedTxns,
-    activeSlot: doc.state.activeSlot,
-  });
+  postOpened(doc, outcome.replayedTxns);
   scope.postMessage({ kind: "ready", info: outcome.info, sheet: outcome.sheet });
   scheduleWorkSlice();
 }
 
-async function handleImportRtcl(docId: string, title: string, bytes: ArrayBuffer): Promise<void> {
-  if (!engine) {
+/**
+ * Has the engine load a workbook, and stores it as a new one. What is open stays
+ * so until that is loaded, and is opened again if it cannot be stored.
+ */
+async function importDoc(
+  docId: string,
+  title: string,
+  load: (live: Engine) => ImportedWorkbook | Promise<ImportedWorkbook>,
+  writeSnapshot: (live: Engine) => Promise<number>,
+): Promise<void> {
+  const live = engine;
+  if (!live) {
     return;
   }
-  await closeActiveDoc(true);
   const lockName = lockNameOf(docId);
-  const granted = await acquireExclusiveLock(lockName, { ifAvailable: true });
-  if (!granted) {
+  if (!(await acquireExclusiveLock(lockName, { ifAvailable: true }))) {
+    await closeActiveDoc(true);
     scope.postMessage({ kind: "docBlocked", docId, title });
     return;
   }
-  const wal = await openWalHandle(docId, backend, 500);
-  const snapView = new Uint8Array(bytes);
-  const walInit = encodeWalInit(0);
-  const outcome = engine.loadSnapshotAndWal(snapView, walInit, 0, 0, 0, true, false, false);
+  let before: ActiveDoc | null = null;
+  let wal: WalHandle | null = null;
+  try {
+    wal = await openWalHandle(docId, backend, 500);
+    const { info, sheet } = await load(live);
+    before = activeDoc;
+    await closeActiveDoc(true);
 
-  const now = Date.now();
-  const state: LocalDocState = {
-    activeSlot: "a",
-    snapshotSeq: 0,
-    lastFlushedSeq: 0,
-    openingCount: 0,
-  };
-  await writeSnapshotSlotFull(docId, "a", snapView, backend);
-  await wal.rewrite(walInit);
-  await writeDocState(docId, state, backend);
-  const docs = await upsertCatalogEntry(
-    {
-      id: docId,
+    const byteLen = await writeSnapshot(live);
+    const walInit = encodeWalInit(0);
+    await wal.rewrite(walInit);
+    const state: LocalDocState = {
+      activeSlot: "a",
+      snapshotSeq: 0,
+      lastFlushedSeq: 0,
+      openingCount: 0,
+    };
+    await writeDocState(docId, state, backend);
+    const now = Date.now();
+    const docs = await upsertCatalogEntry(
+      {
+        id: docId,
+        title,
+        createdAt: now,
+        updatedAt: now,
+        sizeBytes: byteLen + walInit.byteLength,
+      },
+      backend,
+    );
+    activeDoc = {
+      docId,
       title,
       createdAt: now,
-      updatedAt: now,
-      sizeBytes: snapView.byteLength + walInit.byteLength,
-    },
-    backend,
-  );
+      state,
+      wal,
+      currentSeq: 0,
+      txnsSinceSnapshot: 0,
+      awaitingInitialSettle: false,
+    };
+    scope.postMessage({ kind: "catalogListed", docs });
+    postOpened(activeDoc, 0);
+    scope.postMessage({ kind: "ready", info, sheet });
+    scheduleWorkSlice();
+  } catch (err) {
+    wal?.close();
+    await removeDocStorage(docId, backend).catch(() => {});
+    releaseLock(lockName);
+    // A trap leaves the engine in a state that nothing is to be done with.
+    if (stopped || err instanceof WebAssembly.RuntimeError) {
+      throw err;
+    }
+    if (before) {
+      await handleOpenDoc(before.docId, before.title, false);
+    }
+    scope.postMessage({
+      kind: "rejected",
+      reason: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
 
-  activeDoc = {
-    docId,
-    title,
-    createdAt: now,
-    state,
-    wal,
-    currentSeq: 0,
-    txnsSinceSnapshot: 0,
-    awaitingInitialSettle: false,
-  };
-  scope.postMessage({ kind: "catalogListed", docs });
-  scope.postMessage({
-    kind: "docOpened",
-    docId,
-    title,
-    storageBackend: backend,
-    walRecords: 0,
-    activeSlot: "a",
-  });
-  scope.postMessage({ kind: "ready", info: outcome.info, sheet: outcome.sheet });
-  scheduleWorkSlice();
+/** Writes the workbook as it is encoded, so that it is never in memory twice. */
+async function streamSnapshot(live: Engine, docId: string): Promise<number> {
+  const sink = await openSnapshotStreamSink(docId, "a", backend);
+  try {
+    live.startSnapshotStream();
+    for (;;) {
+      const step = live.stepSnapshotStream(8);
+      if (step.kind === "progress") {
+        continue;
+      }
+      const chunk = live.takeSnapshotChunk();
+      if (chunk && chunk.byteLength > 0) {
+        await sink.writeAt(chunk, step.kind === "chunk" ? step.offset : 0);
+      }
+      if (step.kind === "finished") {
+        await sink.finish(step.totalLen);
+        return step.totalLen;
+      }
+    }
+  } finally {
+    sink.abort();
+  }
 }
 
 async function handleImportCsv(
@@ -1357,9 +1402,6 @@ async function handleImportCsv(
   sheetName: string,
   bytes: ArrayBuffer,
 ): Promise<void> {
-  if (!engine) {
-    return;
-  }
   if (bytes.byteLength > MAX_CSV_RAW_BYTES) {
     scope.postMessage({
       kind: "rejected",
@@ -1367,101 +1409,27 @@ async function handleImportCsv(
     });
     return;
   }
-  await closeActiveDoc(true);
-  const lockName = lockNameOf(docId);
-  const granted = await acquireExclusiveLock(lockName, { ifAvailable: true });
-  if (!granted) {
-    scope.postMessage({ kind: "docBlocked", docId, title });
-    return;
-  }
-  const wal = await openWalHandle(docId, backend, 500);
-  try {
-    engine.startCsvImport(sheetName, new Uint8Array(bytes));
-  } catch (err) {
-    wal.close();
-    releaseLock(lockName);
-    scope.postMessage({
-      kind: "rejected",
-      reason: err instanceof Error ? err.message : String(err),
-    });
-    return;
-  }
-
-  for (;;) {
-    const step = engine.stepCsvImport(CSV_STEP_ROWS);
-    if (step.kind === "progress") {
-      scope.postMessage({
-        kind: "csvImportProgress",
-        rowsParsed: step.rowsParsed,
-        percent: step.percent,
-      });
-      // Yield macrotask so progress updates paint smoothly on 1M-row imports.
-      await new Promise<void>((r) => setTimeout(r, 0));
-    } else {
-      const walInit = encodeWalInit(0);
-      const now = Date.now();
-      const state: LocalDocState = {
-        activeSlot: "a",
-        snapshotSeq: 0,
-        lastFlushedSeq: 0,
-        openingCount: 0,
-      };
-      await wal.rewrite(walInit);
-      await writeDocState(docId, state, backend);
-      activeDoc = {
-        docId,
-        title,
-        createdAt: now,
-        state,
-        wal,
-        currentSeq: 0,
-        txnsSinceSnapshot: 0,
-        awaitingInitialSettle: false,
-      };
-      // Stream initial snapshot into slot "a" via CoW encoder so we never duplicate 1M-row memory!
-      const sink = await openSnapshotStreamSink(docId, "a", backend);
-      engine.startSnapshotStream();
+  await importDoc(
+    docId,
+    title,
+    async (live) => {
+      live.startCsvImport(sheetName, new Uint8Array(bytes));
       for (;;) {
-        const s = engine.stepSnapshotStream(8);
-        if (s.kind === "chunk") {
-          const c = engine.takeSnapshotChunk();
-          if (c && c.byteLength > 0) {
-            await sink.writeAt(c, s.offset);
-          }
-        } else if (s.kind === "finished") {
-          const c = engine.takeSnapshotChunk();
-          if (c && c.byteLength > 0) {
-            await sink.writeAt(c, 0);
-          }
-          await sink.finish(s.totalLen);
-          const docs = await upsertCatalogEntry(
-            {
-              id: docId,
-              title,
-              createdAt: now,
-              updatedAt: now,
-              sizeBytes: s.totalLen + walInit.byteLength,
-            },
-            backend,
-          );
-          scope.postMessage({ kind: "catalogListed", docs });
-          break;
+        const step = live.stepCsvImport(CSV_STEP_ROWS);
+        if (step.kind !== "progress") {
+          return step;
         }
+        scope.postMessage({
+          kind: "csvImportProgress",
+          rowsParsed: step.rowsParsed,
+          percent: step.percent,
+        });
+        // Yield macrotask so progress updates paint smoothly on 1M-row imports.
+        await new Promise<void>((r) => setTimeout(r, 0));
       }
-
-      scope.postMessage({
-        kind: "docOpened",
-        docId,
-        title,
-        storageBackend: backend,
-        walRecords: 0,
-        activeSlot: "a",
-      });
-      scope.postMessage({ kind: "ready", info: step.info, sheet: step.sheet });
-      scheduleWorkSlice();
-      return;
-    }
-  }
+    },
+    (live) => streamSnapshot(live, docId),
+  );
 }
 
 async function handleHostCommand(cmd: HostCommand): Promise<void> {
@@ -1577,26 +1545,32 @@ async function handleHostCommand(cmd: HostCommand): Promise<void> {
       break;
     }
     case "renameDoc": {
-      const catalog = await readCatalog(backend);
-      const found = catalog.find((c) => c.id === cmd.docId);
-      if (found) {
-        const docs = await upsertCatalogEntry(
-          { ...found, title: cmd.title, updatedAt: Date.now() },
-          backend,
-        );
-        if (activeDoc?.docId === cmd.docId) {
-          activeDoc.title = cmd.title;
-        }
-        scope.postMessage({ kind: "catalogListed", docs });
+      const docs = await renameCatalogEntry(cmd.docId, cmd.title, backend);
+      if (activeDoc?.docId === cmd.docId) {
+        activeDoc.title = cmd.title;
       }
+      scope.postMessage({ kind: "catalogListed", docs });
       break;
     }
     case "deleteDoc": {
       const deletingActive = activeDoc?.docId === cmd.docId;
+      const lockName = lockNameOf(cmd.docId);
+      const isFree =
+        deletingActive || (await acquireExclusiveLock(lockName, { ifAvailable: true }));
+      const { deleteTables } = await import("../tables/delete.ts");
+      // The data tables first: while they are in use, nothing is lost.
+      if (!isFree || !(await deleteTables(cmd.docId))) {
+        if (isFree && !deletingActive) {
+          releaseLock(lockName);
+        }
+        scope.postMessage({ kind: "rejected", reason: "The workbook is open in another tab." });
+        break;
+      }
       if (deletingActive) {
         await closeActiveDoc(false);
       }
       const docs = await removeDocStorage(cmd.docId, backend);
+      releaseLock(lockName);
       scope.postMessage({ kind: "catalogListed", docs });
       if (deletingActive) {
         const nextDoc = docs[0]?.id ?? SAMPLE_DOC_ID;
@@ -1640,14 +1614,17 @@ async function handleHostCommand(cmd: HostCommand): Promise<void> {
       break;
     }
     case "importRtcl": {
-      try {
-        await handleImportRtcl(cmd.docId, cmd.title, cmd.bytes);
-      } catch (err) {
-        scope.postMessage({
-          kind: "rejected",
-          reason: err instanceof Error ? err.message : String(err),
-        });
-      }
+      const { docId, title } = cmd;
+      const bytes = new Uint8Array(cmd.bytes);
+      await importDoc(
+        docId,
+        title,
+        (live) => live.loadSnapshotAndWal(bytes, encodeWalInit(0), 0, 0, 0, true, false, false),
+        async () => {
+          await writeSnapshotSlotFull(docId, "a", bytes, backend);
+          return bytes.byteLength;
+        },
+      );
       break;
     }
     case "exportCsv": {
@@ -1926,8 +1903,14 @@ function dispatchEnvelope(item: WorkerEnvelope | EngineCommand): void {
           return;
         }
         await handleHostCommand(item.command);
-      } else {
+      } else if (!item.opening || item.opening === openings || item.command.kind === "setEvalEnv") {
         await runEngineCommand(item.command);
+      } else if (!/^(?:subscribe|inspectCell)$/.test(item.command.kind)) {
+        // It was meant for the workbook that was open when it was sent.
+        scope.postMessage({
+          kind: "rejected",
+          reason: "Nothing was changed: another workbook has been opened meanwhile.",
+        });
       }
     } else {
       await runEngineCommand(item);

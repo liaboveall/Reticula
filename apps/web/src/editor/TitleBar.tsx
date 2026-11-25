@@ -15,6 +15,8 @@ export interface TitleBarProps {
   readonly title: string;
   /** The sheet in view, or `null` while there is none to work on. */
   readonly sheet: SheetInfo | null;
+  /** Whether a data table is in view in its place. */
+  readonly isTable: boolean;
   /** The user's role in the cloud workbook that is open, or `null` for a local one. */
   readonly collabRole: CollabWorkbookTarget["role"] | null;
   readonly readOnly: boolean;
@@ -37,6 +39,7 @@ export function TitleBar({
   handle,
   title,
   sheet,
+  isTable,
   collabRole,
   readOnly,
   canDeleteRows,
@@ -128,12 +131,14 @@ export function TitleBar({
       )}
       {sheet && (
         <span className="document" data-testid="document">
-          {t("{title} · {rows} rows × {cols} columns · {formulas} formulas", {
-            title,
-            rows: fmtInt(sheet.rows),
-            cols: sheet.cols,
-            formulas: fmtInt(sheet.formulaCount),
-          })}
+          {isTable
+            ? title
+            : t("{title} · {rows} rows × {cols} columns · {formulas} formulas", {
+                title,
+                rows: fmtInt(sheet.rows),
+                cols: sheet.cols,
+                formulas: fmtInt(sheet.formulaCount),
+              })}
         </span>
       )}
       <span className="titlebar-spacer" />

@@ -7,7 +7,7 @@ export function runCommand(handle: EditorHandle, id: string, sheet?: number): vo
     run(handle, id, sheet);
     const { activeElement, body } = document;
     if (activeElement === null || activeElement === body) {
-      handle.cellEditor()?.focus();
+      (handle.state().table?.view ?? handle.cellEditor())?.focus();
     }
   };
   const later = laterNow();

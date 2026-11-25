@@ -1,4 +1,4 @@
-import type { GpuResult, GpuRun } from "../generated/benchmarks.ts";
+import type { GpuResult, GpuRun, TableRun } from "../generated/benchmarks.ts";
 import { fmtInt, t } from "../i18n/index.ts";
 
 export function rendererName(renderer: GpuResult["renderer"]): string {
@@ -56,6 +56,31 @@ export function comparisons({ results }: GpuRun): readonly Comparison[] {
       ? [{ name: workloadName(canvas2d), canvas2d, webgpu }]
       : [];
   });
+}
+
+/** The latest run of data tables in Chrome. */
+export function latestTables(runs: readonly TableRun[]): TableRun | null {
+  return runs.findLast(({ browser }) => browser?.startsWith("Chrome ")) ?? null;
+}
+
+export interface TableQuestion {
+  readonly name: string;
+  readonly ms: number;
+}
+
+/** What was asked of a data table, and how long the answer took. What was not measured is left out. */
+export function tableQuestions(run: TableRun): readonly TableQuestion[] {
+  const all: readonly (readonly [string, number | null])[] = [
+    [t("Sort by a number"), run.sortNumberMs],
+    [t("Sort by a text"), run.sortTextMs],
+    [t("Sort by two columns"), run.sortTwoMs],
+    [t("Filter by a number"), run.filterNumberMs],
+    [t("Filter by a value"), run.filterValuesMs],
+    [t("Filter by a part of a text"), run.filterTextMs],
+    [t("List the values of a column"), run.listValuesMs],
+    [t("Summary of all columns"), run.summaryMs],
+  ];
+  return all.flatMap(([name, ms]) => (ms === null ? [] : [{ name, ms }]));
 }
 
 /** Where milliseconds are on a scale of four decades from 0.1 on, as a share of it. */

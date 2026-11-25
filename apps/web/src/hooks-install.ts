@@ -1,9 +1,15 @@
 import type { EditorHandle } from "./commands/handle.ts";
+import { loadLater } from "./editor/load-later.ts";
 import type { EngineMessage } from "./engine/client.ts";
 import type { CollabTransportHandle } from "./engine/collab-transport.ts";
-import type { CollabHookStatus, HookDocStatus, Hooks } from "./hooks.ts";
+import type { CollabHookStatus, HookDocStatus, Hooks, TableHooks } from "./hooks.ts";
 import { setRendererPreference } from "./renderer.ts";
 import type { SwClientHandle } from "./sw-client.ts";
+import { readCatalog } from "./tables/catalog.ts";
+import type { TableClient } from "./tables/client.ts";
+import { deleteTables, tablesLock } from "./tables/delete.ts";
+import { lastTables } from "./tables/shell.ts";
+import type { TableModel } from "./tables/ui/model.ts";
 
 /** A part of the editor's state that is not rendered. */
 interface Ref<T> {
@@ -50,6 +56,23 @@ function answer<T>(
     });
     ask();
   });
+}
+
+/** The data table in view. */
+function tableHooks(handle: EditorHandle): TableHooks | null {
+  // The only view of a table there is.
+  const model = handle.state().table?.view as TableModel | null | undefined;
+  const grid = model?.grid();
+  return model && grid
+    ? {
+        stats: () => grid.stats(),
+        scrollTo: (position) => grid.scrollTo(position),
+        textAt: (row, col) => grid.textAt(row, col),
+        ask: (query) => model.ask(query),
+        // The only tables that are opened.
+        client: () => lastTables() as TableClient | null,
+      }
+    : null;
 }
 
 export function installHooks(handle: EditorHandle, host: HookHost): () => void {
@@ -114,6 +137,18 @@ export function installHooks(handle: EditorHandle, host: HookHost): () => void {
       host.manualOffline.current = offline;
       host.transport.current?.setOffline(offline);
     },
+    tables: async () => ({
+      readCatalog,
+      deleteTables,
+      tablesLock,
+      ...(await (await loadLater()).loadTables()),
+    }),
+    tableStatus: () => lastTables()?.status() ?? null,
+    crashDataWorker: () => lastTables()?.crash(),
+    tableMemoryLimit: (bytes) => lastTables()?.setMemoryLimit(bytes) ?? Promise.resolve(),
+    tableEntries: () => handle.tables(),
+    showTable: (id) => handle.showTable(id),
+    table: () => tableHooks(handle),
     setRenderer: (preference) => setRendererPreference(grid, preference),
   };
   window.__reticula = hooks;

@@ -1,12 +1,20 @@
 import type { SheetInfo } from "@reticula/protocol";
 import { useEffect, useState } from "react";
-import { type Message, t } from "../i18n/index.ts";
+import { fmtInt, type Message, t } from "../i18n/index.ts";
 import { announce } from "../ui/announcer.ts";
 import { engineText } from "./load-later.ts";
 
 /** Has a banner read out that has just appeared: a live region that comes with its text is not. */
 function useAnnounced(text: string, politeness: "polite" | "assertive" = "polite"): void {
   useEffect(() => announce(text, { politeness }), [text, politeness]);
+}
+
+/** At which parts of an import its progress is read out. */
+const ANNOUNCED_PERCENT = 25;
+
+export interface ImportProgress {
+  readonly rowsParsed: number;
+  readonly percent: number;
 }
 
 export interface BannersProps {
@@ -20,10 +28,12 @@ export interface BannersProps {
   readonly onExportRtcl: () => void;
   readonly onOpenWorkbooks: () => void;
   readonly updateReady: boolean;
-  /** Reloads into the new version; rejects if that did not work out. */
-  readonly onUpdate: () => Promise<void> | undefined;
+  /** Reloads into the new version. Whether it does. */
+  readonly onUpdate: () => Promise<boolean> | undefined;
   readonly onDismissUpdate: () => void;
   readonly onResumeRecalc: () => void;
+  /** How far a file has been read that becomes a workbook, if one is. */
+  readonly importing: ImportProgress | null;
   readonly isDraft: boolean;
   readonly onExitDraft: () => void;
   /** The revision in view, or `null` outside the history. */
@@ -43,6 +53,7 @@ export default function Banners(props: BannersProps) {
           onDismiss={props.onDismissStorage}
         />
       )}
+      {props.importing && <ImportBanner {...props.importing} />}
       {props.updateReady && (
         <UpdateBanner onApply={props.onUpdate} onDismiss={props.onDismissUpdate} />
       )}
@@ -65,6 +76,45 @@ export default function Banners(props: BannersProps) {
         </div>
       )}
     </>
+  );
+}
+
+/** How far something has got: the whole of it is 100. */
+export function ProgressBox({
+  testId,
+  text,
+  label,
+  percent,
+}: {
+  readonly testId: string;
+  readonly text: string;
+  readonly label: string;
+  readonly percent: number | undefined;
+}) {
+  return (
+    <div className="csv-progress-box" data-testid={testId}>
+      <span>{text}</span>
+      <progress aria-label={label} max={100} value={percent} />
+    </div>
+  );
+}
+
+function ImportBanner({ rowsParsed, percent }: ImportProgress) {
+  // Other files than CSV are read at once.
+  const isStarted = rowsParsed > 0;
+  const part = Math.floor(percent / ANNOUNCED_PERCENT) * ANNOUNCED_PERCENT;
+  useAnnounced(isStarted ? t("Importing CSV: {percent}%", { percent: part }) : t("Importing…"));
+  return (
+    <ProgressBox
+      testId="csv-import-progress"
+      text={
+        isStarted
+          ? t("Importing CSV: {rows} rows ({percent}%)", { rows: fmtInt(rowsParsed), percent })
+          : t("Importing…")
+      }
+      label={t("CSV import")}
+      percent={isStarted ? percent : undefined}
+    />
   );
 }
 
@@ -108,7 +158,7 @@ function UpdateBanner({
   onApply,
   onDismiss,
 }: {
-  readonly onApply: () => Promise<void> | undefined;
+  readonly onApply: () => Promise<boolean> | undefined;
   readonly onDismiss: () => void;
 }) {
   const [updating, setUpdating] = useState(false);
@@ -126,8 +176,9 @@ function UpdateBanner({
           data-testid="sw-update-btn"
           disabled={updating}
           onClick={() => {
-            setUpdating(true);
-            void onApply()?.catch(() => setUpdating(false));
+            const applied = onApply();
+            setUpdating(applied !== undefined);
+            void applied?.catch(() => false).then(setUpdating);
           }}
         >
           {updating ? t("Updating…") : t("Update now")}

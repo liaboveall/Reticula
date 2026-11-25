@@ -233,8 +233,23 @@
   font-size: 12px;
 }
 
-.bench-renderers p {
+.bench-renderers p,
+.bench-tables p {
   margin: 0;
+}
+
+.bench-tables {
+  margin: 0;
+  font-size: 12px;
+}
+
+.bench-tables svg {
+  font-size: 11px;
+  fill: currentColor;
+}
+
+.bench-tables svg path {
+  fill: var(--shell-accent, #0f766e);
 }
 
 /* Both are told apart on either background, whatever colours one sees. */

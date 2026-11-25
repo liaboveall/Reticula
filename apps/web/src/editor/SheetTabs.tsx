@@ -1,14 +1,24 @@
 import type { SheetInfo, SheetTabInfo } from "@reticula/protocol";
 import { type KeyboardEvent, Suspense, useEffect, useLayoutEffect, useRef } from "react";
+import type { TableAsk } from "../commands/handle.ts";
 import { t } from "../i18n/index.ts";
 import { swallowContextMenu } from "../keymap.ts";
+import type { TableEntry } from "../tables/catalog.ts";
 import { ActionButton } from "../ui/ActionButton.tsx";
 import { lazyPart } from "./load-later.ts";
 
 const LazySheetRename = lazyPart(({ SheetRename }) => SheetRename);
 
+type Tab = SheetTabInfo | TableEntry;
+
+const isTable = (tab: Tab): tab is TableEntry => typeof tab.id === "string";
+
 export interface SheetTabsProps {
   readonly sheet: SheetInfo;
+  /** The data tables, which come after the worksheets. */
+  readonly tables: readonly TableEntry[];
+  /** The data table in view in place of the worksheet. */
+  readonly table: string | null;
   readonly readOnly: boolean;
   /** The sheet that is being renamed. */
   readonly renaming: number | null;
@@ -17,19 +27,26 @@ export interface SheetTabsProps {
   readonly onSwitch: (id: number, byKey: boolean) => void;
   readonly onMenu: (tab: SheetTabInfo, clientX: number, clientY: number) => void;
   readonly onCommand: (id: string, sheet: number) => void;
+  readonly onTable: (id: string, byKey: boolean) => void;
+  readonly onTables: (ask: TableAsk) => void;
 }
 
 export function SheetTabs({
   sheet,
+  tables,
+  table,
   readOnly,
   renaming,
   onRename,
   onSwitch,
   onMenu,
   onCommand,
+  onTable,
+  onTables,
 }: SheetTabsProps) {
   const listRef = useRef<HTMLDivElement>(null);
   const { sheets } = sheet;
+  const tabs: readonly Tab[] = [...sheets, ...tables];
   const renamed = sheets.find(({ id }) => id === renaming);
 
   // The focus does not go with the tab that had it. React says nothing of what
@@ -61,15 +78,22 @@ export function SheetTabs({
     }
   });
 
+  const show = (tab: Tab, byKey: boolean) =>
+    isTable(tab) ? onTable(tab.id, byKey) : onSwitch(tab.id, byKey);
+  const act = (tab: Tab, kind: "rename" | "delete") =>
+    isTable(tab) ? onTables({ kind, id: tab.id }) : onCommand(`${kind}Sheet`, tab.id);
+  const openMenu = (tab: Tab, x: number, y: number) =>
+    isTable(tab) ? onTables({ kind: "menu", id: tab.id, x, y }) : onMenu(tab, x, y);
+
   const focusTab = (index: number) => {
-    const tab = sheets[index];
+    const tab = tabs[index];
     if (tab) {
       listRef.current?.querySelectorAll<HTMLElement>('[role="tab"]')[index]?.focus();
-      onSwitch(tab.id, true);
+      show(tab, true);
     }
   };
 
-  const onKeyDown = (event: KeyboardEvent<HTMLElement>, tab: SheetTabInfo, index: number) => {
+  const onKeyDown = (event: KeyboardEvent<HTMLElement>, tab: Tab, index: number) => {
     const { key } = event;
     if (event.ctrlKey || event.metaKey || event.altKey) {
       return;
@@ -77,16 +101,16 @@ export function SheetTabs({
     if ((key === "F10" && event.shiftKey) || key === "ContextMenu") {
       swallowContextMenu();
       const { left, top } = event.currentTarget.getBoundingClientRect();
-      onMenu(tab, left, top);
+      openMenu(tab, left, top);
     } else if (key === "F2") {
-      onCommand("renameSheet", tab.id);
+      act(tab, "rename");
     } else if (key === "Delete") {
-      onCommand("deleteSheet", tab.id);
+      act(tab, "delete");
     } else if (key === "ArrowLeft" || key === "ArrowRight") {
-      const { length } = sheets;
+      const { length } = tabs;
       focusTab((index + (key === "ArrowLeft" ? -1 : 1) + length) % length);
     } else if (key === "Home" || key === "End") {
-      focusTab(key === "Home" ? 0 : sheets.length - 1);
+      focusTab(key === "Home" ? 0 : tabs.length - 1);
     } else {
       return;
     }
@@ -96,8 +120,8 @@ export function SheetTabs({
   return (
     <div className="sheetbar" data-testid="sheet-tabs">
       <div ref={listRef} className="sheet-list" role="tablist" aria-label={t("Worksheets")}>
-        {sheets.map((tab, index) => {
-          const isActive = tab.id === sheet.sheet;
+        {tabs.map((tab, index) => {
+          const isActive = tab.id === (table ?? sheet.sheet);
           return (
             <button
               key={tab.id}
@@ -105,13 +129,14 @@ export function SheetTabs({
               role="tab"
               aria-selected={isActive}
               tabIndex={isActive ? 0 : -1}
-              className={isActive ? "sheet-tab active" : "sheet-tab"}
-              data-testid={`sheet-tab-${tab.id}`}
-              onClick={() => onSwitch(tab.id, false)}
-              onDoubleClick={() => onCommand("renameSheet", tab.id)}
+              className={`sheet-tab${isActive ? " active" : ""}${isTable(tab) ? " table-tab" : ""}`}
+              title={isTable(tab) ? t("Data table") : undefined}
+              data-testid={`${isTable(tab) ? "table" : "sheet"}-tab-${tab.id}`}
+              onClick={() => show(tab, false)}
+              onDoubleClick={() => act(tab, "rename")}
               onContextMenu={(event) => {
                 event.preventDefault();
-                onMenu(tab, event.clientX, event.clientY);
+                openMenu(tab, event.clientX, event.clientY);
               }}
               onKeyDown={(event) => onKeyDown(event, tab, index)}
             >

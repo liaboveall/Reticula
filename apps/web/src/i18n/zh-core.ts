@@ -370,6 +370,7 @@ const zhCore: Readonly<Record<string, string>> = {
   "Import .rtcl / .csv / .xlsx": "导入 .rtcl / .csv / .xlsx",
   "Export .csv": "导出 .csv",
   "Export .xlsx": "导出 .xlsx",
+  "Importing…": "正在导入…",
   "Importing CSV: {rows} rows ({percent}%)": "正在导入 CSV：{rows} 行（{percent}%）",
   "Importing CSV: {percent}%": "正在导入 CSV：{percent}%",
   "CSV import": "CSV 导入",
@@ -388,6 +389,10 @@ const zhCore: Readonly<Record<string, string>> = {
   "{n} external/unknown formula(s) preserved with cached values":
     "{n} 个外部或未知公式已保留，显示缓存的值",
   "; |separator": "；",
+  "Data tables of this workbook are still being uploaded. Delete it again to give that up.":
+    "此工作簿的数据表还在上传。再删除一次即放弃上传。",
+  "Open a local workbook first: a file becomes a workbook in this browser.":
+    "请先打开一个本地工作簿：文件会成为此浏览器里的工作簿。",
   "CSV file ({size}) exceeds the 256 MiB local workbook limit.":
     "CSV 文件（{size}）超过本地工作簿 256 MiB 的上限。",
   "Safe Mode — {title}": "安全模式 — {title}",

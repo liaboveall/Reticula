@@ -4,7 +4,40 @@ import type { CollabWorkbookTarget } from "../collab/CollabShell.tsx";
 import type { SheetAction } from "../editor/activity.ts";
 import type { EditorDialog, EditorMenu } from "../editor/types.ts";
 import type { EngineMessage, HostCommand } from "../engine/client.ts";
+import type { Message } from "../i18n/index.ts";
 import type { M3aToolMode } from "../M3aToolsModal.tsx";
+import type { TableEntry } from "../tables/catalog.ts";
+
+/** What there is to do about data tables, besides showing one. */
+export type TableAsk =
+  /** Adds one from a file, which is asked for if there is none. */
+  | { readonly kind: "import"; readonly file?: File }
+  /** Adds the built-in one to a workbook. */
+  | { readonly kind: "sample"; readonly docId: string; readonly rows?: number }
+  | { readonly kind: "menu"; readonly id: string; readonly x: number; readonly y: number }
+  | { readonly kind: "rename" | "delete" | "export"; readonly id: string }
+  | { readonly kind: "move"; readonly id: string; readonly by: -1 | 1 }
+  /** Asks whether what is being imported may be given up. */
+  | { readonly kind: "giveUp"; readonly onAgreed: () => unknown };
+
+/** The data table in view, as far as commands are about it. */
+export interface TableView {
+  grid(): Grid | null;
+  focus(): void;
+  /** Whether a command does anything now. */
+  can(command: string): boolean;
+  /** Returns `false`, or a promise of it, if it came to nothing. */
+  run(command: string): unknown;
+  /** Selects what a text refers to. Returns what is wrong with it, if anything is. */
+  goTo(text: string): string | null;
+}
+
+/** A data table in view in place of a worksheet. */
+export interface ShownTable {
+  readonly id: string;
+  /** Whether it takes the focus once it is there. */
+  readonly focus: boolean;
+}
 
 /** What the commands that there are depend on. */
 export interface EditorState {
@@ -17,6 +50,8 @@ export interface EditorState {
   readonly formatCode: string;
   /** Whether the workbook is one on the server. */
   readonly isCloud: boolean;
+  /** The data table in view in place of the worksheet, with nothing to do with it while it is loaded. */
+  readonly table: { readonly id: string; readonly view: TableView | null } | null;
 }
 
 /** What has been copied last, for browsers that do not let the clipboard be read. */
@@ -87,4 +122,14 @@ export interface EditorHandle {
   openMenu(menu: EditorMenu): void;
   renameSheet(tab: SheetTabInfo): void;
   editNameBox(): void;
+  docId(): string;
+  /** The data tables of the workbook, in the order of their tabs. */
+  tables(): readonly TableEntry[];
+  /** Shows a data table, or the worksheet again. Unless it stays on the tab, what is shown has the focus then. */
+  showTable(id: string | null, keepsFocus?: boolean): void;
+  askTables(ask: TableAsk): void;
+  /** Says something at the top of the editor. */
+  notify(message: Message): void;
+  /** Says why something was not done. */
+  reject(reason: string | Message): void;
 }

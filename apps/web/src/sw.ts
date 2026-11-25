@@ -1,7 +1,8 @@
 /// Hand-written Service Worker offline shell (`14-m1b.md` 7.4 & D-019).
 ///
-/// Build-time manifest injection replaces `__RETICULA_BUILD_ID__` and
-/// `["__RETICULA_PRECACHE__"]` in `dist/sw.js` before `.br`/`.gz` precompression.
+/// Build-time manifest injection replaces `__RETICULA_BUILD_ID__`,
+/// `["__RETICULA_PRECACHE__"]` and `["__RETICULA_ON_USE__"]` in `dist/sw.js`
+/// before `.br`/`.gz` precompression.
 ///
 /// Update policy:
 /// - New versions install into their own `reticula-shell-<BUILD_ID>` cache and
@@ -9,6 +10,10 @@
 ///   tabs and posts `{ kind: "SKIP_WAITING" }`.
 /// - Hashed `/assets/*` are served cache-first; only a response of the kind the
 ///   name asks for is kept.
+/// - What not everybody needs is kept when it is first used, in a cache that
+///   outlives an update: a new version adds what it has of it before it takes
+///   over, and deletes what it has no use for. Pages that were loaded before
+///   there was a worker say what they have in use.
 /// - Navigation / HTML requests are served network-first with instant fallback
 ///   to the precached `/index.html` shell when offline.
 
@@ -53,6 +58,8 @@ const BUILD_ID = "__RETICULA_BUILD_ID__";
 const PRECACHE_URLS: readonly string[] = ["__RETICULA_PRECACHE__"];
 const CACHE_PREFIX = "reticula-shell-";
 const CACHE_NAME = `${CACHE_PREFIX}${BUILD_ID}`;
+const ON_USE_URLS: readonly string[] = ["__RETICULA_ON_USE__"];
+const ON_USE_CACHE = "reticula-optional";
 const NAV_TIMEOUT_MS = 3_000;
 
 function isUsable(pathname: string, response: Response): boolean {
@@ -62,15 +69,18 @@ function isUsable(pathname: string, response: Response): boolean {
   );
 }
 
-async function precacheShell(): Promise<void> {
-  const urls = PRECACHE_URLS.filter((u) => u.startsWith("/"));
-  if (urls.length === 0) {
-    return;
-  }
-  const cache = await caches.open(CACHE_NAME);
+async function precache(
+  name: string,
+  urls: readonly string[],
+  mode: RequestCache = "reload",
+): Promise<void> {
+  const cache = await caches.open(name);
   await Promise.all(
     urls.map(async (url) => {
-      const request = new Request(url, { cache: "reload" });
+      if (mode !== "reload" && (await cache.match(url))) {
+        return;
+      }
+      const request = new Request(url, { cache: mode });
       const response = await fetch(request);
       if (!response.ok || !isUsable(url, response)) {
         const type = response.headers.get("content-type");
@@ -81,6 +91,20 @@ async function precacheShell(): Promise<void> {
   );
 }
 
+async function install(): Promise<void> {
+  await precache(
+    CACHE_NAME,
+    PRECACHE_URLS.filter((url) => url.startsWith("/")),
+  );
+  // Who has used the rest will look for it without a connection as well.
+  if (await caches.has(ON_USE_CACHE)) {
+    const used = await (await caches.open(ON_USE_CACHE)).keys();
+    if (used.length > 0) {
+      await precache(ON_USE_CACHE, ON_USE_URLS, "default");
+    }
+  }
+}
+
 async function cleanupOldCaches(): Promise<void> {
   const keys = await caches.keys();
   await Promise.all(
@@ -88,12 +112,21 @@ async function cleanupOldCaches(): Promise<void> {
       .filter((key) => key.startsWith(CACHE_PREFIX) && key !== CACHE_NAME)
       .map((key) => caches.delete(key)),
   );
+  if (await caches.has(ON_USE_CACHE)) {
+    const cache = await caches.open(ON_USE_CACHE);
+    const requests = await cache.keys();
+    await Promise.all(
+      requests
+        .filter(({ url }) => !ON_USE_URLS.includes(new URL(url).pathname))
+        .map((request) => cache.delete(request)),
+    );
+  }
   await sw.clients.claim();
 }
 
 async function cacheFirstAsset(request: Request): Promise<Response> {
   const { pathname } = new URL(request.url);
-  const cache = await caches.open(CACHE_NAME);
+  const cache = await caches.open(ON_USE_URLS.includes(pathname) ? ON_USE_CACHE : CACHE_NAME);
   const hit = (await cache.match(request)) ?? (await caches.match(request));
   // An older version of this worker may have kept a response it should not have.
   if (hit && isUsable(pathname, hit)) {
@@ -136,7 +169,7 @@ async function networkFirstHtml(request: Request): Promise<Response> {
 sw.addEventListener("install", (event) => {
   // Never call `skipWaiting()` automatically here so active tabs can drain OPFS
   // handles cleanly when the user confirms the update (`14-m1b.md` 7.4).
-  event.waitUntil(precacheShell());
+  event.waitUntil(install());
 });
 
 sw.addEventListener("activate", (event) => {
@@ -144,12 +177,16 @@ sw.addEventListener("activate", (event) => {
 });
 
 sw.addEventListener("message", (event) => {
-  const data = event.data as { kind?: string } | null;
+  const data = event.data as { kind?: string; paths?: readonly string[] } | null;
   if (!data || typeof data !== "object") {
     return;
   }
   if (data.kind === "SKIP_WAITING") {
     event.waitUntil(sw.skipWaiting());
+  } else if (data.kind === "IN_USE") {
+    if (data.paths?.some((path) => ON_USE_URLS.includes(path))) {
+      event.waitUntil(precache(ON_USE_CACHE, ON_USE_URLS, "default").catch(() => {}));
+    }
   } else if (data.kind === "GET_VERSION") {
     const reply = { kind: "VERSION", buildId: BUILD_ID };
     const port = event.ports[0];

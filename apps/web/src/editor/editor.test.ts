@@ -10,6 +10,7 @@ import type { EngineStatus } from "./types.ts";
 // What is loaded later may arrive when the test is over.
 vi.mock("../i18n/zh-engine.ts", () => ({ default: {} }));
 vi.mock("../i18n/zh-functions.ts", () => ({ default: {} }));
+vi.mock("../i18n/zh-tables.ts", () => ({ default: {} }));
 
 const ACTIVITIES: readonly (readonly [Activity, string, string])[] = [
   [

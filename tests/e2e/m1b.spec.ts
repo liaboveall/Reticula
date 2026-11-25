@@ -625,3 +625,53 @@ test("mid-file WAL corruption enters Safe Mode (raw .zip export, salvage recover
   expect(await page.evaluate(() => window.__reticula?.textAt(1, 1))).toBe('Quoted, "Line"');
   expect(await page.evaluate(() => window.__reticula?.textAt(1, 2))).toBe("125.5");
 });
+
+test("a CSV file that is cut off leaves the workbook that is open as it was", async ({ page }) => {
+  await openWorkbook(page, "doc=csv-failure");
+  const backend = await page.evaluate(() => window.__reticula?.docStatus().storageBackend);
+  test.skip(backend === "memory", "Browser lacks persistent OPFS in this environment");
+  await editCellViaBar(page, 0, 0, "A1", "before", "before");
+
+  // So long that some of it has been read when its end turns out to be missing.
+  const rows = Array.from({ length: 70_000 }, (_, row) => `${row},x`).join("\n");
+  await page.getByTestId("workbooks-btn").click();
+  await page.getByTestId("import-file-input").setInputFiles({
+    name: "cut-off.csv",
+    mimeType: "text/csv",
+    buffer: Buffer.from(`${rows}\n"never closed`, "utf8"),
+  });
+  await expect(page.getByText(/unclosed double-quoted field/).first()).toBeAttached();
+  await page.keyboard.press("Escape");
+  await expect(page.getByTestId("workbooks-drawer")).toHaveCount(0);
+  await expect(page.getByTestId("engine-status")).toHaveText("ready");
+  expect(await page.evaluate(() => window.__reticula?.docStatus().docId)).toBe("csv-failure");
+
+  // It is still being stored, and nothing is left of the other one.
+  await editCellViaBar(page, 1, 0, "A2", "after", "after");
+  const stored = await page.evaluate(async () => {
+    const root = await navigator.storage.getDirectory();
+    const local = await (await root.getDirectoryHandle("reticula-v1")).getDirectoryHandle("local");
+    const names: string[] = [];
+    // The iterator is missing in the types of the DOM.
+    for await (const name of (local as unknown as { keys(): AsyncIterable<string> }).keys()) {
+      names.push(name);
+    }
+    return names;
+  });
+  expect(stored).toEqual(["csv-failure"]);
+  await openWorkbook(page, "doc=csv-failure");
+  expect(await page.evaluate(() => window.__reticula?.textAt(0, 0))).toBe("before");
+  expect(await page.evaluate(() => window.__reticula?.textAt(1, 0))).toBe("after");
+
+  // The next file is imported as ever.
+  await page.getByTestId("workbooks-btn").click();
+  await page.getByTestId("import-file-input").setInputFiles({
+    name: "whole.csv",
+    mimeType: "text/csv",
+    buffer: Buffer.from('a,"b"\n1,2\n', "utf8"),
+  });
+  await expect(page.getByTestId("workbooks-drawer")).toHaveCount(0);
+  await expect(page.getByTestId("document")).toContainText("whole");
+  await settled(page);
+  expect(await page.evaluate(() => window.__reticula?.textAt(1, 1))).toBe("2");
+});

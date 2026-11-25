@@ -1,4 +1,5 @@
-import { type Span, ZOOM_STEPS } from "@reticula/grid";
+import { type Grid, type Span, ZOOM_STEPS } from "@reticula/grid";
+import { autofitSelectedCols, moveSelectedCols, moveSelectedRows } from "@reticula/grid/arrange";
 import type {
   FillDirection,
   SheetTabInfo,
@@ -18,6 +19,7 @@ import { rendererPreference, setRendererPreference } from "../renderer.ts";
 import { announce } from "../ui/announcer.ts";
 import type { EditorHandle, EditorState } from "./handle.ts";
 import { cycleRegions } from "./regions.ts";
+import { tableUseOf } from "./table-use.ts";
 import { TITLES } from "./titles.ts";
 
 /** The headings the commands are listed under. */
@@ -28,6 +30,7 @@ export const GROUPS = {
   cells: () => t("Rows and columns"),
   data: () => t("Data"),
   sheets: () => t("Worksheets"),
+  table: () => t("Data table"),
   view: () => t("View"),
   file: () => t("File"),
   help: () => t("Help"),
@@ -444,6 +447,11 @@ function deleteCols(handle: EditorHandle): boolean {
   );
 }
 
+const arrange = (act: (grid: Grid) => boolean) => (handle: EditorHandle) => {
+  const grid = handle.grid();
+  return grid ? act(grid) : false;
+};
+
 /** The most rows and columns that can be frozen. */
 const MOST_FROZEN = 32;
 
@@ -530,10 +538,17 @@ const hasTab =
   (state, sheet) =>
     mayEdit(state) && tabAt(state, sheet, offset) !== undefined;
 
-/** From the one that has been asked for last, which may not be in view yet. */
+/** From the one that has been asked for last, which may not be in view yet. Data tables come after the worksheets. */
 const goToTab = (offset: number) => (handle: EditorHandle) => {
-  const tab = tabAt(handle.state(), handle.askedSheetId(), offset);
-  return tab !== undefined && handle.switchSheet(tab.id) === undefined;
+  const { sheet, table } = handle.state();
+  const sheets = sheet?.sheets ?? [];
+  const tabs = [...sheets, ...handle.tables()];
+  const at = tabs.findIndex(({ id }) => id === (table?.id ?? handle.askedSheetId()));
+  const tab = at < 0 ? undefined : tabs[at + offset];
+  if (tab === undefined) {
+    return false;
+  }
+  return typeof tab.id === "string" ? handle.showTable(tab.id, true) : handle.switchSheet(tab.id);
 };
 
 function moveSheet(direction: -1 | 1) {
@@ -578,6 +593,29 @@ async function deleteSheet(handle: EditorHandle, sheet?: number): Promise<void> 
 
 const ZOOM_WORDS = "scale size";
 
+/** The grid of the data table that is in view, or of the worksheet. */
+export function gridInView(handle: EditorHandle): Grid | null {
+  const { table } = handle.state();
+  return table ? (table.view?.grid() ?? null) : handle.grid();
+}
+
+/** Of a data table, which carries it out. */
+function ofTable(id: string, title: () => string, words: string): Command {
+  return {
+    id,
+    group: "table",
+    title,
+    words,
+    enabled: ({ table }) => table !== null,
+    run: () => false,
+  };
+}
+
+const mayImport: Test = ({ sheet, readOnly }) => sheet !== null && !readOnly;
+
+/** The workbook with the built-in data table. */
+const SAMPLE_DOC = "orders-10m";
+
 function zoomTo(zoom: number): Command {
   return {
     id: `zoom:${Math.round(zoom * 100)}`,
@@ -585,9 +623,9 @@ function zoomTo(zoom: number): Command {
     title: () => t("Zoom: {percent}", { percent: `${fmtInt(Math.round(zoom * 100))}%` }),
     words: ZOOM_WORDS,
     enabled: isOpen,
-    checked: (handle) => handle.grid()?.zoom === zoom,
+    checked: (handle) => gridInView(handle)?.zoom === zoom,
     whileEditing: true,
-    run: (handle) => handle.grid()?.setZoom(zoom),
+    run: (handle) => gridInView(handle)?.setZoom(zoom),
   };
 }
 
@@ -599,7 +637,10 @@ function renderer(id: string, preference: "auto" | "canvas2d", title: () => stri
     words: "webgpu canvas graphics drawing",
     checked: () => (rendererPreference() === "canvas2d") === (preference === "canvas2d"),
     whileEditing: true,
-    run: (handle) => setRendererPreference(handle.grid(), preference),
+    run: (handle) => {
+      setRendererPreference(handle.grid(), preference);
+      handle.state().table?.view?.grid()?.setRenderer(preference);
+    },
   };
 }
 
@@ -830,28 +871,28 @@ export const COMMANDS: readonly Command[] = [
     group: "cells",
     title: () => t("Move Rows Up"),
     enabled: hasRows,
-    run: (handle) => handle.grid()?.moveSelectedRows(-1),
+    run: arrange((grid) => moveSelectedRows(grid, -1)),
   },
   {
     id: "moveRowsDown",
     group: "cells",
     title: () => t("Move Rows Down"),
     enabled: hasRows,
-    run: (handle) => handle.grid()?.moveSelectedRows(1),
+    run: arrange((grid) => moveSelectedRows(grid, 1)),
   },
   {
     id: "moveColsLeft",
     group: "cells",
     title: () => t("Move Columns Left"),
     enabled: hasCols,
-    run: (handle) => handle.grid()?.moveSelectedCols(-1),
+    run: arrange((grid) => moveSelectedCols(grid, -1)),
   },
   {
     id: "moveColsRight",
     group: "cells",
     title: () => t("Move Columns Right"),
     enabled: hasCols,
-    run: (handle) => handle.grid()?.moveSelectedCols(1),
+    run: arrange((grid) => moveSelectedCols(grid, 1)),
   },
   {
     id: "rowHeight",
@@ -875,7 +916,7 @@ export const COMMANDS: readonly Command[] = [
     title: () => t("Fit Column Width to Text"),
     words: "auto size resize autofit",
     enabled: hasCols,
-    run: (handle) => handle.grid()?.autofitSelectedCols(),
+    run: arrange(autofitSelectedCols),
   },
   ...freezeCommands(),
   {
@@ -934,6 +975,7 @@ export const COMMANDS: readonly Command[] = [
     words: "insert new tab",
     enabled: mayEdit,
     run: (handle) => {
+      handle.showTable(null);
       handle.cellEditor()?.focus();
       return handle.mutate(
         { kind: "addSheet", afterSheet: handle.sheetId() },
@@ -994,6 +1036,20 @@ export const COMMANDS: readonly Command[] = [
     enabled: isOpen,
     run: goToTab(-1),
   },
+  ofTable("tableSortAscending", () => t("Sort Rows by This Column, Ascending"), "order"),
+  ofTable("tableSortDescending", () => t("Sort Rows by This Column, Descending"), "order"),
+  ofTable("tableSortAdd", () => t("Sort by This Column as Well"), "order key next secondary"),
+  ofTable("tableSortClear", () => t("Clear Sort"), "order original"),
+  ofTable("tableFilterValues", () => t("Filter This Column by Values…"), "choose show"),
+  ofTable("tableFilterCondition", () => t("Filter This Column by a Condition…"), "where show top"),
+  ofTable("tableFilterClear", () => t("Clear Filter of This Column"), "show all"),
+  ofTable("tablePanel", () => t("Show or Hide the Table Panel"), "summary statistics columns sum"),
+  ofTable("tableRename", () => t("Rename Data Table…"), "tab title"),
+  ofTable("tableMoveLeft", () => t("Move Data Table Left"), "tab order"),
+  ofTable("tableMoveRight", () => t("Move Data Table Right"), "tab order"),
+  ofTable("tableExport", () => t("Export Data Table (.rtbl)"), "save download backup file"),
+  ofTable("tableDelete", () => t("Delete Data Table…"), "tab remove"),
+  ofTable("tableCancel", () => t("Cancel What the Table Is Doing"), "stop sort filter job"),
   {
     id: "zoomIn",
     group: "view",
@@ -1001,7 +1057,7 @@ export const COMMANDS: readonly Command[] = [
     words: ZOOM_WORDS,
     enabled: isOpen,
     whileEditing: true,
-    run: (handle) => handle.grid()?.zoomIn(),
+    run: (handle) => gridInView(handle)?.zoomIn(),
   },
   {
     id: "zoomOut",
@@ -1010,7 +1066,7 @@ export const COMMANDS: readonly Command[] = [
     words: ZOOM_WORDS,
     enabled: isOpen,
     whileEditing: true,
-    run: (handle) => handle.grid()?.zoomOut(),
+    run: (handle) => gridInView(handle)?.zoomOut(),
   },
   ...ZOOM_STEPS.map(zoomTo),
   renderer("rendererAuto", "auto", () => t("Draw with the Graphics Card")),
@@ -1062,12 +1118,27 @@ export const COMMANDS: readonly Command[] = [
     run: (handle) => handle.openWorkbooks(true),
   },
   {
+    id: "importTable",
+    group: "file",
+    title: () => t("Import as Data Table…"),
+    words: "open upload file csv tsv parquet rtbl large",
+    enabled: mayImport,
+    run: (handle) => handle.askTables({ kind: "import" }),
+  },
+  {
+    id: "sampleTable",
+    group: "file",
+    title: () => t("Open 10 Million Rows"),
+    words: "sample data table orders demo large",
+    run: openSampleTable,
+  },
+  {
     id: "exportRtcl",
     group: "file",
     title: () => t("Export .rtcl"),
     words: "save download backup file",
     enabled: isOpen,
-    run: (handle) => handle.sendHost({ kind: "exportRtcl" }),
+    run: (handle) => exportWorkbook(handle, "exportRtcl"),
   },
   {
     id: "exportCsv",
@@ -1083,7 +1154,7 @@ export const COMMANDS: readonly Command[] = [
     title: () => t("Export .xlsx"),
     words: "save download file excel",
     enabled: isOpen,
-    run: (handle) => handle.sendHost({ kind: "exportXlsxSnapshot" }),
+    run: (handle) => exportWorkbook(handle, "exportXlsxSnapshot"),
   },
   {
     id: "cloud",
@@ -1125,6 +1196,27 @@ export const COMMANDS: readonly Command[] = [
   },
 ];
 
+/** Opens the built-in workbook, with its table if that is to be made first. */
+function openSampleTable(handle: EditorHandle): void {
+  if (handle.docId() !== SAMPLE_DOC) {
+    const command = { kind: "openDoc", docId: SAMPLE_DOC, title: t("10 million orders") } as const;
+    handle.openWith(SAMPLE_DOC, command, handle.collab() !== null);
+  }
+  handle.askTables({ kind: "sample", docId: SAMPLE_DOC });
+}
+
+function exportWorkbook(handle: EditorHandle, kind: "exportRtcl" | "exportXlsxSnapshot"): void {
+  handle.sendHost({ kind });
+  if (handle.tables().length > 0) {
+    handle.notify({
+      say: () =>
+        t(
+          "The file has no data tables in it. Export each of them as .rtbl, from the menu of its tab.",
+        ),
+    });
+  }
+}
+
 function numberFormatCommands(): Command[] {
   return numberFormats().map(({ value: code }) => ({
     id: `numberFormat:${code}`,
@@ -1140,6 +1232,15 @@ function numberFormatCommands(): Command[] {
   }));
 }
 
+function isFrozen(handle: EditorHandle, choice: FreezeChoice): boolean {
+  const { sheet, table } = handle.state();
+  if (!table) {
+    return freezeChoiceOf(sheet) === choice;
+  }
+  // What is so already is nothing to do.
+  return (choice === "none" || choice === "col1") && !table.view?.can(`freeze:${choice}`);
+}
+
 function freezeCommands(): Command[] {
   return freezeChoices().map(({ value: choice }) => ({
     id: `freeze:${choice}`,
@@ -1147,7 +1248,7 @@ function freezeCommands(): Command[] {
     title: () => freezeChoices().find(({ value }) => value === choice)?.text ?? "",
     words: "freeze panes lock",
     enabled: mayEdit,
-    checked: (handle) => freezeChoiceOf(handle.state().sheet) === choice,
+    checked: (handle) => isFrozen(handle, choice),
     run: freeze(choice),
   }));
 }
@@ -1159,6 +1260,10 @@ export function commandOf(id: string): Command | undefined {
 }
 
 export function isEnabled(command: Command, state: EditorState, sheet?: number): boolean {
+  const use = state.table && tableUseOf(command.id);
+  if (use && use !== "same") {
+    return use === "table" && state.table?.view?.can(command.id) === true;
+  }
   return command.enabled?.(state, sheet) !== false;
 }
 
@@ -1176,7 +1281,12 @@ export function run(handle: EditorHandle, id: string, sheet?: number): void {
       announce(t("Not possible here: {command}", { command: command.title() }));
     }
   };
-  const outcome = isEnabled(command, handle.state(), sheet) && command.run(handle, sheet);
+  const state = handle.state();
+  const act = () =>
+    state.table && tableUseOf(id) === "table"
+      ? state.table.view?.run(id)
+      : command.run(handle, sheet);
+  const outcome = isEnabled(command, state, sheet) && act();
   if (outcome instanceof Promise) {
     void outcome.then(say);
   } else {

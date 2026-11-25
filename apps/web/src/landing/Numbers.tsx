@@ -1,5 +1,5 @@
 import type { Measurement } from "../generated/benchmarks.ts";
-import { BENCHMARKS, PROVENANCE } from "../generated/benchmarks.ts";
+import { BENCHMARKS, PROVENANCE, TABLES, TABLES_PROVENANCE } from "../generated/benchmarks.ts";
 import { fmtInt, t } from "../i18n/index.ts";
 import { measured, mib, ms, seconds, us } from "./numbers.ts";
 import { Source } from "./Source.tsx";
@@ -10,15 +10,17 @@ interface Cell {
   readonly value: string;
   /** The conditions, and what else the same run measured. */
   readonly detail: string;
-  readonly from: Measurement;
+  readonly from: Measurement | "tables";
 }
+
+const int = (value: number | null) => measured(value, fmtInt);
+const size = (bytes: number | null) => measured(bytes, (value) => mib(value / 2 ** 20));
 
 // What a workload consists of (100,000 formulas, a million rows) is part of its
 // definition in the benchmarks; everything that was measured or chosen for a
 // run is read off its report.
 function cells(): readonly Cell[] {
   const b = BENCHMARKS;
-  const int = (value: number | null) => measured(value, fmtInt);
   return [
     {
       id: "startup",
@@ -98,6 +100,47 @@ function cells(): readonly Cell[] {
   ];
 }
 
+/** The same of data tables, once there is a report about them. */
+function tableCells(): readonly Cell[] {
+  if (!TABLES) {
+    return [];
+  }
+  const b = TABLES;
+  const rows = int(b.rows);
+  return [
+    {
+      id: "table-import",
+      label: t("Import {rows} rows of CSV", { rows }),
+      value: measured(b.importMs, seconds),
+      detail: t("{text} in {columns} columns, into a table of {file}", {
+        text: size(b.textBytes),
+        columns: int(b.columns),
+        file: size(b.fileBytes),
+      }),
+      from: "tables",
+    },
+    {
+      id: "table-sort",
+      label: t("Sort {rows} rows by a number", { rows }),
+      value: measured(b.sortNumberMs, ms),
+      detail: t("by a text {text}; filter by a number {filter}", {
+        text: measured(b.sortTextMs, ms),
+        filter: measured(b.filterNumberMs, ms),
+      }),
+      from: "tables",
+    },
+    {
+      id: "table-scroll",
+      label: t("Main thread per frame, {rows} rows", { rows }),
+      value: measured(b.scrollWorkP99Ms, ms),
+      detail: t("p99 of scrolling, the worst of both renderers; {n} frames with placeholders", {
+        n: int(b.scrollPlaceholderFrames),
+      }),
+      from: "tables",
+    },
+  ];
+}
+
 export function Numbers() {
   return (
     <section id="numbers" className="landing-section" aria-labelledby="numbers-heading">
@@ -108,12 +151,15 @@ export function Numbers() {
         )}
       </p>
       <ul className="landing-cells">
-        {cells().map(({ id, label, value, detail, from }) => (
+        {[...cells(), ...tableCells()].map(({ id, label, value, detail, from }) => (
           <li key={id} className="landing-cell" data-testid={`number-${id}`}>
             <h3>{label}</h3>
             <p className="landing-value">{value}</p>
             <p className="landing-detail">{detail}</p>
-            <Source of={PROVENANCE[from]} ran={from === "load" ? "natively" : "in a browser"} />
+            <Source
+              of={from === "tables" ? TABLES_PROVENANCE : PROVENANCE[from]}
+              ran={from === "load" ? "natively" : "in a browser"}
+            />
           </li>
         ))}
       </ul>

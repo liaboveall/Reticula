@@ -14,6 +14,7 @@ import {
 // What is loaded later may arrive when the test is over.
 vi.mock("../i18n/zh-engine.ts", () => ({ default: { "Edit {cell}": "编辑 {cell}" } }));
 vi.mock("../i18n/zh-functions.ts", () => ({ default: {} }));
+vi.mock("../i18n/zh-tables.ts", () => ({ default: {} }));
 
 async function inLanguage(search: string): Promise<void> {
   const { initLocale } = await import("../i18n/index.ts");
@@ -23,6 +24,8 @@ async function inLanguage(search: string): Promise<void> {
     navigator: { languages: [] },
   });
   await initLocale("app");
+  // What is loaded later arrives before the test is over.
+  await vi.dynamicImportSettled();
 }
 
 beforeEach(() => {

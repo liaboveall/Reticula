@@ -23,7 +23,9 @@ import {
   type WorkbookCatalogEntry,
 } from "../engine/storage.ts";
 import { fmtBytes } from "../i18n/formats.ts";
-import { type Message, t } from "../i18n/index.ts";
+import { type Message, t, tn } from "../i18n/index.ts";
+import { keepsUploads, type TableSize, tableSizes, uploadsReason } from "../local-tables.ts";
+import { deleteTables } from "../tables/delete.ts";
 import { ActionButton } from "../ui/ActionButton.tsx";
 import { announce } from "../ui/announcer.ts";
 import { isComposing, useKeptFocus } from "../ui/focus.ts";
@@ -38,6 +40,9 @@ export interface WorkbooksPageProps {
   readonly onNavigate: (path: string) => void;
 }
 
+/** The workbook with the built-in data table, which is made if it is not there yet. */
+const SAMPLE_TABLE_PATH = "/app?doc=orders-10m&sample=10000000";
+
 type TabKind = "owned" | "shared" | "local" | "samples";
 
 function failureOf(err: unknown, fallback: () => string): Message {
@@ -48,11 +53,23 @@ function localBackend(): StorageBackendKind {
   return typeof navigator.storage?.getDirectory === "function" ? "opfs-writable" : "memory";
 }
 
+/** Deletes a workbook with its data tables, and lists the others. `null` if it is open somewhere. */
+async function deleteLocal(id: string): Promise<readonly WorkbookCatalogEntry[] | null> {
+  const remove = async () =>
+    (await deleteTables(id)) ? removeDocStorage(id, localBackend()) : null;
+  return navigator.locks?.request
+    ? navigator.locks.request(`reticula:local:${id}`, { ifAvailable: true }, (lock) =>
+        lock ? remove() : null,
+      )
+    : remove();
+}
+
 export default function WorkbooksPage({ onNavigate }: WorkbooksPageProps) {
   const [tab, setTab] = useState<TabKind>("owned");
   const [user, setUser] = useState<User | null>(null);
   const [cloudLists, setCloudLists] = useState<WorkbookLists | null>(null);
   const [localDocs, setLocalDocs] = useState<readonly WorkbookCatalogEntry[]>([]);
+  const [tables, setTables] = useState<ReadonlyMap<string, TableSize>>(new Map());
   const [newTitle, setNewTitle] = useState("Untitled Cloud Workbook");
   const [renameId, setRenameId] = useState<string | null>(null);
   const [renameTitle, setRenameTitle] = useState("");
@@ -68,6 +85,14 @@ export default function WorkbooksPage({ onNavigate }: WorkbooksPageProps) {
       announce(statusMsg.say());
     }
   }, [statusMsg]);
+
+  useEffect(() => {
+    let isOver = false;
+    void tableSizes(localDocs).then((sizes) => isOver || setTables(sizes));
+    return () => {
+      isOver = true;
+    };
+  }, [localDocs]);
 
   const loadData = useCallback(async () => {
     const seq = ++loadSeqRef.current;
@@ -205,13 +230,35 @@ export default function WorkbooksPage({ onNavigate }: WorkbooksPageProps) {
   const handleDeleteLocal = async (entry: WorkbookCatalogEntry) => {
     setBusy(true);
     try {
-      const next = await removeDocStorage(entry.id, localBackend());
-      setLocalDocs(next);
+      if (await keepsUploads(entry.id)) {
+        setError({ say: uploadsReason });
+        return;
+      }
+      const next = await deleteLocal(entry.id);
+      if (next) {
+        setLocalDocs(next);
+      } else {
+        setError({
+          say: () => t("The workbook is open in another tab. Close it there to delete it."),
+        });
+      }
     } catch (err) {
       setError(failureOf(err, () => t("Could not remove local workbook")));
     } finally {
       setBusy(false);
     }
+  };
+
+  const tablesText = (id: string) => {
+    const { count, bytes } = tables.get(id) ?? { count: 0, bytes: 0 };
+    return bytes === 0
+      ? null
+      : tn(
+          count,
+          "{n} data table · {size} · stays in this browser",
+          "{n} data tables · {size} · stay in this browser",
+          { size: fmtBytes(bytes) },
+        );
   };
 
   const renderCloudRow = (item: WorkbookListItem, owned: boolean) => (
@@ -434,6 +481,11 @@ export default function WorkbooksPage({ onNavigate }: WorkbooksPageProps) {
                             size: fmtBytes(entry.sizeBytes),
                           })}
                         </span>
+                        {tablesText(entry.id) && (
+                          <span className="page-muted" data-testid={`local-tables-${entry.id}`}>
+                            {tablesText(entry.id)}
+                          </span>
+                        )}
                       </div>
                       <div className="collab-row">
                         <button
@@ -485,6 +537,22 @@ export default function WorkbooksPage({ onNavigate }: WorkbooksPageProps) {
                     onClick={() => onNavigate("/app")}
                   >
                     {t("Open Sample")}
+                  </button>
+                </div>
+                <div className="page-item">
+                  <div className="page-item-meta">
+                    <strong>{t("10,000,000-Row Data Table")}</strong>
+                    <span className="page-muted">
+                      {t("15 columns · made in this browser, about 190 MB of its storage")}
+                    </span>
+                  </div>
+                  <button
+                    type="button"
+                    className="toolbar-btn primary-btn"
+                    data-testid="open-sample-table"
+                    onClick={() => onNavigate(SAMPLE_TABLE_PATH)}
+                  >
+                    {t("Open Data Table")}
                   </button>
                 </div>
                 <div className="page-item">

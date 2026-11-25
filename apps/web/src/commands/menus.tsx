@@ -17,7 +17,7 @@ function keyShortcuts(id: string): string | undefined {
 }
 
 /** An entry of a menu: a command, and how tests find it. A line is between two groups. */
-type Entry = readonly [id: string, testId?: string, title?: string] | "line";
+export type Entry = readonly [id: string, testId?: string, title?: string] | "line";
 
 interface CommandMenuProps {
   readonly handle: EditorHandle;
@@ -32,7 +32,7 @@ interface CommandMenuProps {
   readonly testId: string;
 }
 
-function CommandMenu({
+export function CommandMenu({
   handle,
   label,
   entries,
@@ -75,7 +75,7 @@ function CommandMenu({
             key={id}
             type="button"
             tabIndex={-1}
-            className={id === "deleteSheet" ? "ctx-item danger" : "ctx-item"}
+            className={/^(?:deleteSheet|tableDelete)$/.test(id) ? "ctx-item danger" : "ctx-item"}
             data-testid={testId ?? `menu-${id}`}
             onClick={() => {
               if (!inactive) {

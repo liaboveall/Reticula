@@ -115,6 +115,31 @@ const zhLabs: Readonly<Record<string, string>> = {
   "{date} · a frame every {interval} (p99 {tail}) at {hz} Hz · {late} over 16.7 ms":
     "{date} · {hz} Hz 下每 {interval} 一帧（p99 {tail}）· {late} 超过 16.7 毫秒",
   "{n} frames with placeholders": "{n} 帧有占位符",
+  "B14 {rows} rows: import (types guessed right / wrong early on / wrong in the last row)":
+    "B14 {rows} 行：导入（类型猜对 / 开头之后猜错 / 最后一行才发现猜错）",
+  "B14 {rows} rows: sort by a number / a text / two columns":
+    "B14 {rows} 行：按数字 / 文本 / 两列排序",
+  "B14 {rows} rows: filter by a number / a value / a part of a text":
+    "B14 {rows} 行：按数字 / 值 / 文本片段筛选",
+  "B14 {rows} rows: values of a column / summary of all columns":
+    "B14 {rows} 行：一列的取值 / 各列汇总",
+  "B14 {rows} rows: frame work p99 / jump p95 / page while sorting p95":
+    "B14 {rows} 行：每帧工作耗时 p99 / 跳转 p95 / 排序期间取页 p95",
+  "B14 {rows} rows: peak memory / longest step of the worker":
+    "B14 {rows} 行：内存峰值 / Worker 最长的一步",
+  "Questions to a Data Table of {rows} Rows (ms)": "对 {rows} 行数据表的查询（毫秒）",
+  "{date} · {commit} · {browser} · {cpu}. All numbers are in the table below.":
+    "{date} · {commit} · {browser} · {cpu}。全部数字见下表。",
+  "Compared with {reference}: {questions} questions, {different} answered differently, {known} differences that are known ({date} · {commit}).":
+    "与 {reference} 对比：{questions} 个查询，{different} 个结果不同，{known} 个已知差异（{date} · {commit}）。",
+  "Sort by a number": "按数字排序",
+  "Sort by a text": "按文本排序",
+  "Sort by two columns": "按两列排序",
+  "Filter by a number": "按数字筛选",
+  "Filter by a value": "按值筛选",
+  "Filter by a part of a text": "按文本片段筛选",
+  "List the values of a column": "列出一列的取值",
+  "Summary of all columns": "各列汇总",
 
   // Formula correctness
   "Formula Correctness & Differential Pipeline": "公式正确性与差分流水线",

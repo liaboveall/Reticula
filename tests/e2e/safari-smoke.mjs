@@ -6,7 +6,8 @@
 //   2. CoW `RTCLSNAP` v1 compaction + `RTCLWAL1` persistence across a full reload;
 //   3. Dual-tab single-instance Web Lock (`blocked`) and graceful takeover (`yielded` -> `ready`);
 //   4. Hung-worker takeover exercising the 500 ms watchdog & Safari `InvalidStateError` recovery;
-//   5. Determinism digest match against `tests/determinism/expected.txt`;
+//   5. Determinism digest match against `tests/determinism/expected.txt`, and of
+//      data tables against `tests/determinism/table-app.txt`;
 //   6. The renderer the grid gets, and how far what WebGPU draws is from a 2D canvas.
 //
 // Usage:
@@ -17,6 +18,7 @@ import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { dirname, extname, join, resolve } from "node:path";
+import { tableDigest } from "./table-digest.ts";
 
 const options = {
   dist: "apps/web/dist",
@@ -41,7 +43,8 @@ for (let i = 0; i < argv.length; i++) {
 }
 
 const distDir = resolve(options.dist);
-const expectedDigest = readFileSync(resolve("tests/determinism/expected.txt"), "utf8").trim();
+const recorded = (name) => readFileSync(resolve("tests/determinism", name), "utf8");
+const expectedDigest = recorded("expected.txt").trim();
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -508,6 +511,24 @@ try {
     `determinism digest mismatch: got ${digestRes.digest}, expected ${expectedDigest}`,
   );
 
+  const tables = await execAsync(
+    tab1,
+    `
+    const done = arguments[arguments.length - 1];
+    (${tableDigest})(arguments[0]).then(
+      (lines) => done({ ok: true, lines }),
+      (err) => done({ ok: false, err: String(err) }),
+    );
+    `,
+    [recorded("table.csv")],
+  );
+  assert(tables.ok, `the digest of tables failed: ${tables.err}`);
+  assert(
+    tables.lines === recorded("table-app.txt"),
+    `determinism mismatch of tables: got ${tables.lines}`,
+  );
+  console.log("[safari-smoke] step 5 ok: both digests match");
+
   // 6. The renderer: by itself, and when WebGPU is asked for.
   const automatic = await execSync(tab1, `return window.__reticula.stats().renderer;`);
   assert(
@@ -567,6 +588,7 @@ try {
       dualTabLockAndGracefulTakeover: true,
       hungWorkerTakeover: true,
       determinismDigestMatch: true,
+      tableDigestMatch: true,
     },
     renderer: {
       automatic: { kind: automatic.kind, reason: automatic.reason },

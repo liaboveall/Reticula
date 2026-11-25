@@ -72,11 +72,24 @@ export function cellText(inspection: CellInspection): string {
 const rowsOf = (span: Span) => span.endRow - span.firstRow;
 const colsOf = (span: Span) => span.endCol - span.firstCol;
 
-function rangeText(span: Span, scope: SelectionScope, rowNumber: RowNumber): string {
+/** What a column is called, if not by letters. */
+export type ColumnName = (col: number) => string;
+
+/** A cell by its column and the number of its row. A name of a column's own may end with a digit. */
+function cellName(col: number, row: number, columnOf: ColumnName | undefined): string {
+  return columnOf ? `${columnOf(col)} ${row}` : `${columnName(col)}${row}`;
+}
+
+function rangeText(
+  span: Span,
+  scope: SelectionScope,
+  rowNumber: RowNumber,
+  columnOf?: ColumnName,
+): string {
   const firstRow = rowNumber(span.firstRow);
   const lastRow = rowNumber(span.endRow - 1);
-  const firstCol = columnName(span.firstCol);
-  const lastCol = columnName(span.endCol - 1);
+  const firstCol = (columnOf ?? columnName)(span.firstCol);
+  const lastCol = (columnOf ?? columnName)(span.endCol - 1);
   switch (scope) {
     case "all":
       return t("All cells selected");
@@ -98,12 +111,12 @@ function rangeText(span: Span, scope: SelectionScope, rowNumber: RowNumber): str
           });
     case "cells": {
       const cells = rowsOf(span) * colsOf(span);
-      const first = `${firstCol}${firstRow}`;
+      const first = cellName(span.firstCol, firstRow, columnOf);
       return cells === 1
         ? t("{cell} selected", { cell: first })
         : t("{first} to {last} selected, {n} cells", {
             first,
-            last: `${lastCol}${lastRow}`,
+            last: cellName(span.endCol - 1, lastRow, columnOf),
             n: fmtInt(cells),
           });
     }
@@ -131,12 +144,12 @@ export function selectionText(
 }
 
 /** The same where there is no engine to ask: the cell as the grid shows it. */
-export function plainSelectionText(selection: Selection): string {
-  const cell = `${columnName(selection.col)}${selection.row + 1}`;
+export function plainSelectionText(selection: Selection, columnOf?: ColumnName): string {
+  const cell = cellName(selection.col, selection.row + 1, columnOf);
   const value = selection.text ? shortened(selection.text) : t("blank|cell");
   return isSingleCell(selection)
     ? t("{cell}, {value}", { cell, value })
-    : rangeText(selection.range, selection.scope, (row) => row + 1);
+    : rangeText(selection.range, selection.scope, (row) => row + 1, columnOf);
 }
 
 type SheetState = Pick<

@@ -1,6 +1,10 @@
 import type { GridStats, RemotePresenceOverlay } from "@reticula/grid";
+import type { TableQuery } from "@reticula/protocol/table";
 import type { SafeModeInfo } from "./engine/client.ts";
 import type { StorageBackendKind } from "./engine/storage.ts";
+import type { TableEntry } from "./tables/catalog.ts";
+import type { TableClient } from "./tables/client.ts";
+import type { TableStatus } from "./tables/shell.ts";
 
 export interface SwStatus {
   readonly supported: boolean;
@@ -45,6 +49,20 @@ export interface CollabHookStatus {
   readonly remotePresences: readonly RemotePresenceOverlay[];
 }
 
+/** The data table in view. */
+export interface TableHooks {
+  /** What its grid is doing right now. */
+  stats(): GridStats;
+  /** Scrolls it to a position in CSS pixels. */
+  scrollTo(position: { top?: number; left?: number }): void;
+  /** The text of a cell of the view, or `null` while the grid does not hold it. */
+  textAt(row: number, col: number): string | null;
+  /** Shows other rows, or in another order, as the menus do. Whether that came to be. */
+  ask(query: TableQuery): Promise<boolean>;
+  /** What answers questions about it, in its worker. */
+  client(): TableClient | null;
+}
+
 /**
  * A window onto the running app for end-to-end tests and measurements, which
  * assert on what the grid and the engine report instead of comparing pixels.
@@ -83,6 +101,24 @@ export interface Hooks {
   collabStatus(): CollabHookStatus;
   /** Forces the collaborative WebSocket transport offline or back online (for tests). */
   setCollabOffline(offline: boolean): void;
+  /** Loads what a table needs, as opening one does. */
+  tables(): Promise<
+    typeof import("./tables/client.ts") &
+      Pick<typeof import("./tables/catalog.ts"), "readCatalog"> &
+      Pick<typeof import("./tables/delete.ts"), "deleteTables" | "tablesLock">
+  >;
+  /** What became of the tables that were opened. Null while none were. */
+  tableStatus(): TableStatus | null;
+  /** Has the worker behind the open tables fail as a defect would. */
+  crashDataWorker(): void;
+  /** How much memory the worker takes for a question about a table, at most. Null for no limit. */
+  tableMemoryLimit(bytes: number | null): Promise<void>;
+  /** The data tables of the workbook. */
+  tableEntries(): readonly TableEntry[];
+  /** Shows a data table, or the worksheet again. */
+  showTable(id: string | null): void;
+  /** The data table in view. Null while there is none, or it is being loaded. */
+  table(): TableHooks | null;
   /** Chooses what draws the grid, as the menu does. */
   setRenderer(preference: "auto" | "canvas2d"): void;
 }

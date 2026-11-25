@@ -1,6 +1,13 @@
 import { describe, expect, it } from "vitest";
-import type { GpuResult, GpuRun } from "../generated/benchmarks.ts";
-import { comparisons, latestComparison, logPosition, workloadName } from "./benchmarks.ts";
+import type { GpuResult, GpuRun, TableRun } from "../generated/benchmarks.ts";
+import {
+  comparisons,
+  latestComparison,
+  latestTables,
+  logPosition,
+  tableQuestions,
+  workloadName,
+} from "./benchmarks.ts";
 
 const RESULT: GpuResult = {
   part: "renderer",
@@ -46,6 +53,34 @@ describe("workloads", () => {
     expect(workloadName({ ...RESULT, part: "app", size: null, cells: 16_650 })).toBe(
       "App: 16,650 cells, scrolling",
     );
+  });
+});
+
+describe("the questions to a data table", () => {
+  const run = { browser: "Chrome 1.2", sortNumberMs: 250, summaryMs: 0 } as TableRun;
+  const empty = Object.fromEntries(
+    [
+      "sortTextMs",
+      "sortTwoMs",
+      "filterNumberMs",
+      "filterValuesMs",
+      "filterTextMs",
+      "listValuesMs",
+    ].map((key) => [key, null]),
+  );
+
+  it("are those of the latest run in Chrome", () => {
+    const firefox = { ...run, browser: "Firefox 160.0" };
+    expect(latestTables([{ ...run, commit: "abc1234" }, run, firefox])).toBe(run);
+    expect(latestTables([firefox, { ...run, browser: null }])).toBeNull();
+    expect(latestTables([])).toBeNull();
+  });
+
+  it("are left out where they were not measured", () => {
+    expect(tableQuestions({ ...run, ...empty })).toEqual([
+      { name: "Sort by a number", ms: 250 },
+      { name: "Summary of all columns", ms: 0 },
+    ]);
   });
 });
 

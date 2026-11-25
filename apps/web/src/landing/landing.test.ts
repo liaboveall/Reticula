@@ -3,7 +3,7 @@ import { fileURLToPath } from "node:url";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { Provenance, RendererComparison } from "../generated/benchmarks.ts";
+import type { Provenance, RendererComparison, TableRun } from "../generated/benchmarks.ts";
 import { BENCHMARKS, PROVENANCE } from "../generated/benchmarks.ts";
 import { pageTitle } from "../ui/page.ts";
 import { Architecture } from "./Architecture.tsx";
@@ -78,6 +78,8 @@ describe("numbers", () => {
     vi.doMock("../generated/benchmarks.ts", () => ({
       BENCHMARKS: Object.fromEntries(Object.keys(BENCHMARKS).map((key) => [key, null])),
       PROVENANCE: Object.fromEntries(Object.keys(PROVENANCE).map((key) => [key, null])),
+      TABLES: null,
+      TABLES_PROVENANCE: null,
     }));
     const { Numbers: Empty } = await import("./Numbers.tsx");
     const markup = renderToStaticMarkup(createElement(Empty));
@@ -85,6 +87,65 @@ describe("numbers", () => {
     expect(values.length).toBeGreaterThan(6);
     expect(new Set(values)).toEqual(new Set(["not available"]));
     expect(markup).not.toMatch(/NaN|null|undefined|\b0(?:\.0+)? ms/);
+  });
+
+  it("are of data tables as well, once there is a report about them", async () => {
+    const run: TableRun = {
+      report: FROM.report,
+      date: FROM.date,
+      commit: FROM.commit,
+      suite: "some-tables",
+      cpu: FROM.cpu,
+      browser: FROM.browser,
+      headless: false,
+      affinity: null,
+      rows: 10_000_000,
+      columns: 13,
+      textBytes: 988_455_324,
+      fileBytes: 209_715_200,
+      importMs: 8_120,
+      importTwiceMs: 14_000,
+      importLastMs: 15_000,
+      importHardMs: 40_000,
+      importFrameGapMs: 21,
+      sortNumberMs: 251,
+      sortTextMs: 900,
+      sortTwoMs: 500,
+      filterNumberMs: 40.2,
+      filterValuesMs: 41,
+      filterTextMs: 200,
+      listValuesMs: 250,
+      summaryMs: 300,
+      scrollWorkP99Ms: 3.4,
+      scrollPlaceholderFrames: 0,
+      jumpP95Ms: 61,
+      pageWhileSortingP95Ms: 19,
+      peakMemoryMiB: 300,
+      longestStepMs: null,
+    };
+    const render = async (tables: TableRun | null) => {
+      vi.resetModules();
+      vi.doMock("../generated/benchmarks.ts", () => ({
+        BENCHMARKS,
+        PROVENANCE,
+        TABLES: tables,
+        TABLES_PROVENANCE: tables && FROM,
+      }));
+      const { Numbers: Both } = await import("./Numbers.tsx");
+      return renderToStaticMarkup(createElement(Both));
+    };
+    expect(await render(null)).not.toContain("number-table");
+    const markup = await render(run);
+    expect(count(markup, /data-testid="number-table/g)).toBe(3);
+    const text = textOf(markup);
+    expect(text).toContain("Import 10,000,000 rows of CSV 8.12 s 943 MiB in 13 columns");
+    expect(text).toContain("into a table of 200 MiB abc1234 2026-11-25");
+    expect(text).toContain("251 ms by a text 900 ms; filter by a number 40.2 ms");
+    expect(text).toContain("3.40 ms p99 of scrolling");
+    expect(text).toContain("; 0 frames with placeholders");
+    expect(textOf(await render({ ...run, importMs: null, fileBytes: null }))).toContain(
+      "rows of CSV not available 943 MiB in 13 columns, into a table of not available",
+    );
   });
 });
 

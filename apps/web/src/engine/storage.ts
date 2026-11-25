@@ -286,25 +286,48 @@ export async function writeCatalog(
   await writeOpfsFileAtomic(root, CATALOG_FILE, bytes, backend);
 }
 
-export async function upsertCatalogEntry(
+/**
+ * Changes the catalog. Tabs take turns, or what one of them adds would be lost
+ * on another that had read the catalog before.
+ */
+function updateCatalog(
+  backend: StorageBackendKind,
+  change: (entries: readonly WorkbookCatalogEntry[]) => WorkbookCatalogEntry[],
+): Promise<WorkbookCatalogEntry[]> {
+  const update = async () => {
+    const next = change(await readCatalog(backend));
+    await writeCatalog(next, backend);
+    return next;
+  };
+  return navigator.locks?.request ? navigator.locks.request("reticula:catalog", update) : update();
+}
+
+const newestFirst = (a: WorkbookCatalogEntry, b: WorkbookCatalogEntry): number =>
+  b.updatedAt - a.updatedAt;
+
+export function upsertCatalogEntry(
   entry: WorkbookCatalogEntry,
   backend: StorageBackendKind,
 ): Promise<WorkbookCatalogEntry[]> {
-  const list = await readCatalog(backend);
-  const idx = list.findIndex((item) => item.id === entry.id);
-  const next = [...list];
-  if (idx >= 0) {
-    const existing = next[idx];
-    next[idx] = {
-      ...entry,
-      createdAt: existing ? existing.createdAt : entry.createdAt,
-    };
-  } else {
-    next.push(entry);
-  }
-  next.sort((a, b) => b.updatedAt - a.updatedAt);
-  await writeCatalog(next, backend);
-  return next;
+  return updateCatalog(backend, (entries) => {
+    const existing = entries.find(({ id }) => id === entry.id);
+    const { createdAt } = existing ?? entry;
+    return [...entries.filter((other) => other !== existing), { ...entry, createdAt }].sort(
+      newestFirst,
+    );
+  });
+}
+
+export function renameCatalogEntry(
+  id: string,
+  title: string,
+  backend: StorageBackendKind,
+): Promise<WorkbookCatalogEntry[]> {
+  return updateCatalog(backend, (entries) =>
+    entries
+      .map((entry) => (entry.id === id ? { ...entry, title, updatedAt: Date.now() } : entry))
+      .sort(newestFirst),
+  );
 }
 
 export async function removeDocStorage(
@@ -328,9 +351,7 @@ export async function removeDocStorage(
       }
     }
   }
-  const list = (await readCatalog(backend)).filter((e) => e.id !== docId);
-  await writeCatalog(list, backend);
-  return list;
+  return updateCatalog(backend, (entries) => entries.filter(({ id }) => id !== docId));
 }
 
 export async function readDocState(

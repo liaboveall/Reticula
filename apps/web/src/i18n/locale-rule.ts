@@ -12,7 +12,8 @@ export type CatalogueName =
   | "zh-landing"
   | "zh-labs"
   | "zh-engine"
-  | "zh-functions";
+  | "zh-functions"
+  | "zh-tables";
 
 /**
  * The texts each page waits for before it is rendered in Chinese. The build
@@ -30,7 +31,7 @@ export const CATALOGUES: Readonly<Record<AppRoute, readonly CatalogueName[]>> = 
 
 /** The texts a page can do without at first. They are loaded after the others. */
 export const LATER_CATALOGUES: Readonly<Partial<Record<AppRoute, readonly CatalogueName[]>>> = {
-  app: ["zh-engine", "zh-functions"],
+  app: ["zh-engine", "zh-functions", "zh-tables"],
   workbooks: ["zh-engine"],
   sim: ["zh-engine"],
 };

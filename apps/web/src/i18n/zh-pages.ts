@@ -45,6 +45,13 @@ const zhPages: Readonly<Record<string, string>> = {
   "22 columns · 100,000 bound formulas · runs locally in Web Worker + OPFS":
     "22 列 · 100,000 个绑定公式 · 通过 Web Worker + OPFS 在本地运行",
   "Open Sample": "打开示例",
+  "The workbook is open in another tab. Close it there to delete it.":
+    "工作簿正在另一个标签页中打开，请先在那里关闭再删除。",
+  "{n} data tables · {size} · stay in this browser": "{n} 个数据表 · {size} · 只在此浏览器里",
+  "10,000,000-Row Data Table": "10,000,000 行数据表",
+  "15 columns · made in this browser, about 190 MB of its storage":
+    "15 列 · 在此浏览器里生成，约占 190 MB 存储",
+  "Open Data Table": "打开数据表",
   "Deterministic Sync Simulation Lab": "确定性同步仿真实验室",
   "Interactive 2–3 replica offline merge & 5-replica fault injector without sign-in":
     "动手体验 2–3 个副本的离线合并，或对 5 个副本注入故障，无需登录",
@@ -58,6 +65,7 @@ const zhPages: Readonly<Record<string, string>> = {
   "Owned workbooks: {owned} · Shared workbooks: {shared}":
     "拥有的工作簿：{owned} · 与我共享的工作簿：{shared}",
   "Cloud Storage Usage": "云端存储用量",
+  "Data Tables": "数据表",
   "{used} used of {quota} ({percent}%)": "已用 {used}，共 {quota}（{percent}%）",
   "Server disk volume is full; creating or importing new cloud workbooks is paused.":
     "服务器磁盘已满，暂停新建和导入云端工作簿。",

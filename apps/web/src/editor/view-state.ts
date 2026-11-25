@@ -18,10 +18,10 @@ const SCOPES: readonly SelectionScope[] = ["cells", "rows", "cols", "all"];
 
 type Cell = { readonly row: number; readonly col: number };
 
-const isRecord = (value: unknown): value is Readonly<Record<string, unknown>> =>
+export const isRecord = (value: unknown): value is Readonly<Record<string, unknown>> =>
   typeof value === "object" && value !== null;
 
-const isPosition = (value: unknown): value is number =>
+export const isPosition = (value: unknown): value is number =>
   typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 
 const isFraction = (value: unknown): value is number =>
@@ -55,18 +55,70 @@ export function parseView(value: unknown): GridView | null {
     : null;
 }
 
-/** The documents' views in a browser's storage, which may be full, forbidden or tampered with. */
-export class ViewStore {
+/** What is known of documents, in a browser's storage, which may be full, forbidden or tampered with. */
+export class StoredDocuments<T extends { readonly id: string }> {
+  #key: string;
+  #parse: (entry: Readonly<Record<string, unknown>>) => Omit<T, "id"> | null;
   #storage: () => Storage;
 
-  constructor(storage: () => Storage = () => window.localStorage) {
+  constructor(
+    key: string,
+    parse: (entry: Readonly<Record<string, unknown>>) => Omit<T, "id"> | null,
+    storage: () => Storage = () => window.localStorage,
+  ) {
+    this.#key = key;
+    this.#parse = parse;
     this.#storage = storage;
+  }
+
+  find(id: string): T | undefined {
+    return this.#all().find((one) => one.id === id);
+  }
+
+  /** Writes down one, as the one that was left last. */
+  write(own: T): void {
+    const others = this.#all().filter(({ id }) => id !== own.id);
+    // Without room for all of them, for this one at least.
+    for (const kept of [others.slice(1 - MOST_DOCUMENTS), []]) {
+      try {
+        this.#storage().setItem(this.#key, JSON.stringify({ documents: [...kept, own] }));
+        return;
+      } catch {
+        // The next visit starts afresh then.
+      }
+    }
+  }
+
+  #all(): T[] {
+    let stored: unknown;
+    try {
+      stored = JSON.parse(this.#storage().getItem(this.#key) ?? "null");
+    } catch {
+      return [];
+    }
+    const documents = isRecord(stored) && Array.isArray(stored.documents) ? stored.documents : [];
+    return documents.flatMap((entry: unknown) => {
+      const known = isRecord(entry) && typeof entry.id === "string" && this.#parse(entry);
+      return known ? [{ ...known, id: entry.id } as T] : [];
+    });
+  }
+}
+
+/** The documents' views. */
+export class ViewStore {
+  #documents: StoredDocuments<StoredDocument>;
+
+  constructor(storage?: () => Storage) {
+    this.#documents = new StoredDocuments(
+      STORAGE_KEY,
+      ({ sheets }) => (isRecord(sheets) ? { sheets } : null),
+      storage,
+    );
   }
 
   read(documentId: string): Map<number, GridView> {
     const views = new Map<number, GridView>();
-    const stored = this.#documents().find(({ id }) => id === documentId);
-    for (const [sheet, value] of Object.entries(stored?.sheets ?? {})) {
+    for (const [sheet, value] of Object.entries(this.#documents.find(documentId)?.sheets ?? {})) {
       const view = parseView(value);
       if (view && isPosition(Number(sheet))) {
         views.set(Number(sheet), view);
@@ -76,37 +128,9 @@ export class ViewStore {
   }
 
   /** Remembers a sheet's view. Those of other sheets may have changed in another tab. */
-  write(documentId: string, sheet: number, view: GridView): void {
-    const documents = this.#documents();
-    const stored = documents.find(({ id }) => id === documentId);
-    const others = documents.filter(({ id }) => id !== documentId).slice(1 - MOST_DOCUMENTS);
-    const own = { id: documentId, sheets: { ...stored?.sheets, [sheet]: view } };
-    // Without room for all of them, for this one at least.
-    for (const kept of [others, []]) {
-      try {
-        this.#storage().setItem(STORAGE_KEY, JSON.stringify({ documents: [...kept, own] }));
-        return;
-      } catch {
-        // The next visit starts at the top then.
-      }
-    }
-  }
-
-  #documents(): StoredDocument[] {
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(this.#storage().getItem(STORAGE_KEY) ?? "null");
-    } catch {
-      return [];
-    }
-    if (!isRecord(parsed) || !Array.isArray(parsed.documents)) {
-      return [];
-    }
-    return parsed.documents.flatMap((entry: unknown) =>
-      isRecord(entry) && typeof entry.id === "string" && isRecord(entry.sheets)
-        ? [{ id: entry.id, sheets: entry.sheets }]
-        : [],
-    );
+  write(id: string, sheet: number, view: GridView): void {
+    const { sheets } = this.#documents.find(id) ?? {};
+    this.#documents.write({ id, sheets: { ...sheets, [sheet]: view } });
   }
 }
 

@@ -21,6 +21,7 @@ import zhFunctions from "./zh-functions.ts";
 import zhLabs from "./zh-labs.ts";
 import zhLanding from "./zh-landing.ts";
 import zhPages from "./zh-pages.ts";
+import zhTables from "./zh-tables.ts";
 
 // Every text of the interface is translated, every translation is used, and
 // nothing is shown in English past them. The modules are read, not run.
@@ -35,6 +36,7 @@ const TRANSLATIONS: Readonly<Record<CatalogueName, Catalogue>> = {
   "zh-labs": zhLabs,
   "zh-engine": zhEngine,
   "zh-functions": zhFunctions,
+  "zh-tables": zhTables,
 };
 
 const ROUTES = Object.keys(CATALOGUES) as AppRoute[];

@@ -39,6 +39,8 @@ import { t } from "../i18n/index.ts";
 import { tx } from "../i18n/react.ts";
 import { apiErrorMessage } from "../pages/helpers.ts";
 import { roleName } from "../pages/labels.ts";
+import { deleteCopies, dropCopiesOf } from "../tables/delete.ts";
+import { closeTables } from "../tables/shell.ts";
 import { ActionButton } from "../ui/ActionButton.tsx";
 import { announce } from "../ui/announcer.ts";
 import { Dialog } from "../ui/Dialog.tsx";
@@ -329,6 +331,7 @@ export default function CollabShell(props: CollabShellProps) {
             }
           }
           if (err instanceof ApiError && (err.status === 403 || err.status === 404)) {
+            void dropCopiesOf(initialCollabId).catch(() => {});
             setAccessError(t("You do not have permission to open this collaborative workbook."));
             onRequestOpenModal();
           } else if (err instanceof ApiError && err.status === 401) {
@@ -496,6 +499,11 @@ export default function CollabShell(props: CollabShellProps) {
     } catch {
       // Clear local user view even if already expired.
     }
+    // Nothing is kept of the data tables of somebody who is gone.
+    if (activeTarget) {
+      await closeTables();
+    }
+    await deleteCopies().catch(() => {});
     setUser(null);
     setShareUrl(null);
     const cache = readCache();

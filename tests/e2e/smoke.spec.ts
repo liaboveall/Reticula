@@ -1,12 +1,14 @@
 import { readFileSync } from "node:fs";
 import { expect, type Page, test } from "@playwright/test";
+import { tableDigest } from "./table-digest.ts";
+import { canKeepTables, importTable, openWorkbook, ordersCsv } from "./tables-helpers.ts";
+
+const recorded = (name: string) =>
+  readFileSync(new URL(`../determinism/${name}`, import.meta.url), "utf8");
 
 // The same value the native and Node runs are checked against. Each browser
 // has its own WebAssembly implementation; all of them must agree with it.
-const expectedDigest = readFileSync(
-  new URL("../determinism/expected.txt", import.meta.url),
-  "utf8",
-).trim();
+const expectedDigest = recorded("expected.txt").trim();
 
 const ROWS = 1_000_000;
 const COLS = 22;
@@ -80,6 +82,78 @@ test("the engine passes the determinism self-check in this browser", async ({ pa
   await open(page);
   const digest = await page.evaluate(() => window.__reticula?.selfCheck());
   expect(digest).toBe(expectedDigest);
+});
+
+test("tables come out the same in this browser", async ({ page }) => {
+  await openWorkbook(page);
+  test.skip(!(await canKeepTables(page)), "the browser cannot keep tables");
+  expect(await page.evaluate(tableDigest, recorded("table.csv"))).toBe(recorded("table-app.txt"));
+});
+
+test("the hooks tell of a data table, and show it in another order", async ({ page }) => {
+  await openWorkbook(page);
+  test.skip(!(await canKeepTables(page)), "the browser cannot keep tables");
+  expect(await page.evaluate(() => window.__reticula?.table())).toBeNull();
+  await importTable(page, "orders", ordersCsv(5_000));
+  const whole = () =>
+    page.waitForFunction(() => {
+      const stats = window.__reticula?.table()?.stats();
+      return stats !== undefined && stats.cellsDrawn > 0 && stats.missingCells === 0;
+    });
+  await whole();
+  const told = await page.evaluate(() => {
+    const hooks = window.__reticula;
+    const table = hooks?.table();
+    return {
+      names: hooks?.tableEntries().map(({ name, rows, cols }) => [name, rows, cols]),
+      sheet: table?.stats().sheet,
+      first: table?.textAt(0, 0),
+    };
+  });
+  expect(told).toEqual({
+    names: [["orders", 5_000, 5]],
+    sheet: { rows: 5_000, cols: 5 },
+    first: "1",
+  });
+
+  const shown = await page.evaluate(() =>
+    window.__reticula?.table()?.ask({
+      filters: [{ column: 0, condition: { kind: "number", op: "atMost", a: "4000" } }],
+      order: [{ column: 0, descending: true }],
+    }),
+  );
+  expect(shown).toBe(true);
+  await whole();
+  expect(
+    await page.evaluate(() => {
+      const table = window.__reticula?.table();
+      return [table?.stats().sheet.rows, table?.textAt(0, 0)];
+    }),
+  ).toEqual([4_000, "4000"]);
+  await page.evaluate(() => window.__reticula?.table()?.scrollTo({ top: 1_000_000 }));
+  await expect
+    .poll(() => page.evaluate(() => window.__reticula?.table()?.textAt(3_999, 0)))
+    .toBe("1");
+  expect(
+    await page.evaluate(() =>
+      window.__reticula
+        ?.table()
+        ?.client()
+        ?.memory()
+        .then(({ total }) => total > 0),
+    ),
+  ).toBe(true);
+
+  const id = await page.evaluate(() => {
+    const [entry] = window.__reticula?.tableEntries() ?? [];
+    window.__reticula?.showTable(null);
+    return entry?.id ?? "";
+  });
+  await page.waitForFunction(() => window.__reticula?.table() === null);
+  await page.evaluate((table) => window.__reticula?.showTable(table), id);
+  await whole();
+  // The way it was left.
+  expect(await page.evaluate(() => window.__reticula?.table()?.stats().sheet.rows)).toBe(4_000);
 });
 
 test("scrolling to the end shows the last row and column", async ({ page }) => {

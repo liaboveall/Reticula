@@ -12,6 +12,7 @@ import { useCallback, useEffect, useState } from "react";
 import { fmtBytes } from "../i18n/formats.ts";
 import { fmtInt, t } from "../i18n/index.ts";
 import { tx } from "../i18n/react.ts";
+import { deleteCopies } from "../tables/delete.ts";
 import { ActionButton } from "../ui/ActionButton.tsx";
 import { useKeptFocus } from "../ui/focus.ts";
 import { apiErrorMessage } from "./helpers.ts";
@@ -28,6 +29,33 @@ export interface AccountPageProps {
 interface Failure {
   readonly cause: unknown;
   readonly what: "load" | "signIn" | "delete";
+}
+
+/** How much of something there may be is taken. */
+function Usage({
+  used,
+  quota,
+  testId,
+}: {
+  readonly used: number;
+  readonly quota: number;
+  readonly testId: string;
+}) {
+  const percent = quota > 0 ? Math.min(100, Math.round((used / quota) * 100)) : 0;
+  return (
+    <>
+      <div className="page-quota-bar" aria-hidden="true">
+        <div className="page-quota-fill" style={{ width: `${percent}%` }} />
+      </div>
+      <span className="page-muted" data-testid={testId}>
+        {t("{used} used of {quota} ({percent}%)", {
+          used: fmtBytes(used),
+          quota: fmtBytes(quota),
+          percent,
+        })}
+      </span>
+    </>
+  );
 }
 
 function failureText({ cause, what }: Failure): string {
@@ -94,6 +122,7 @@ export default function AccountPage({ onNavigate }: AccountPageProps) {
     } catch {
       // Ignore storage access errors.
     }
+    await deleteCopies().catch(() => {});
     setSummary(null);
     setBusy(false);
   };
@@ -111,6 +140,7 @@ export default function AccountPage({ onNavigate }: AccountPageProps) {
       } catch {
         // Ignore storage access errors.
       }
+      await deleteCopies().catch(() => {});
       onNavigate("/");
     } catch (err) {
       setError({ cause: err, what: "delete" });
@@ -118,11 +148,6 @@ export default function AccountPage({ onNavigate }: AccountPageProps) {
       setBusy(false);
     }
   };
-
-  const pct =
-    summary && summary.quotaBytes > 0
-      ? Math.min(100, Math.round((summary.storageBytes / summary.quotaBytes) * 100))
-      : 0;
 
   return (
     <div className="page-shell" data-testid="account-page">
@@ -190,16 +215,17 @@ export default function AccountPage({ onNavigate }: AccountPageProps) {
 
               <div className="collab-section">
                 <h2 className="collab-section-title">{t("Cloud Storage Usage")}</h2>
-                <div className="page-quota-bar" aria-hidden="true">
-                  <div className="page-quota-fill" style={{ width: `${pct}%` }} />
-                </div>
-                <span className="page-muted" data-testid="account-storage-usage">
-                  {t("{used} used of {quota} ({percent}%)", {
-                    used: fmtBytes(summary.storageBytes),
-                    quota: fmtBytes(summary.quotaBytes),
-                    percent: pct,
-                  })}
-                </span>
+                <Usage
+                  used={summary.storageBytes}
+                  quota={summary.quotaBytes}
+                  testId="account-storage-usage"
+                />
+                <h3 className="collab-section-title">{t("Data Tables")}</h3>
+                <Usage
+                  used={summary.tableBytes}
+                  quota={summary.tableQuotaBytes}
+                  testId="account-table-usage"
+                />
                 {summary.diskOverHardLimit && (
                   <div className="collab-error" role="alert">
                     {t(

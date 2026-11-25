@@ -1,4 +1,5 @@
-import { type KeyboardEvent, type RefObject, useId, useRef, useState } from "react";
+import { resizeSelectedCols, resizeSelectedRows, sizeOfSelection } from "@reticula/grid/arrange";
+import { type KeyboardEvent, type ReactNode, type RefObject, useId, useRef, useState } from "react";
 import { flushSync } from "react-dom";
 import type { EditorDialog } from "../editor/types.ts";
 import { t, tn } from "../i18n/index.ts";
@@ -9,7 +10,7 @@ import { isComposing } from "../ui/focus.ts";
 import { rovingTarget } from "../ui/roving.ts";
 import type { EditorHandle } from "./handle.ts";
 import { keysOf } from "./key-names.ts";
-import { COMMANDS, GROUPS, isEnabled, run } from "./registry.ts";
+import { COMMANDS, GROUPS, gridInView, isEnabled, run } from "./registry.ts";
 import { findCommands } from "./search.ts";
 
 export interface EditorDialogsProps {
@@ -34,7 +35,7 @@ export default function EditorDialogs(props: EditorDialogsProps) {
   }
 }
 
-function Header({
+export function DialogHeader({
   id,
   text,
   onClose,
@@ -182,7 +183,7 @@ function KeyboardHelp({ opener, onFocusGrid, onClose }: EditorDialogsProps) {
       onClose={onClose}
       testId="keyboard-help"
     >
-      <Header id={id} text={t("Keyboard Shortcuts")} onClose={onClose} />
+      <DialogHeader id={id} text={t("Keyboard Shortcuts")} onClose={onClose} />
       <table className="keys-table">
         <tbody>
           {[...commands, ...gridKeys()].map(([keys, text]) => (
@@ -209,7 +210,8 @@ function SizeDialog({
   const id = useId();
   const inputRef = useRef<HTMLInputElement>(null);
   const [current] = useState(() => {
-    const { rowPx = null, colPx = null } = handle.grid()?.sizeOfSelection() ?? {};
+    const grid = gridInView(handle);
+    const { rowPx = null, colPx = null } = grid ? sizeOfSelection(grid) : {};
     return axis === "row" ? rowPx : colPx;
   });
   const [text, setText] = useState(current === null ? "" : String(current));
@@ -217,13 +219,13 @@ function SizeDialog({
   const isValid = text.trim() !== "" && Number.isFinite(size) && size > 0;
 
   const apply = (px: number | null) => {
-    const grid = handle.grid();
+    const grid = gridInView(handle);
     flushSync(onClose);
     // It may have become read-only since this was opened; the grid would show another size.
-    const done =
-      !handle.state().readOnly &&
-      (axis === "row" ? grid?.resizeSelectedRows(px) : grid?.resizeSelectedCols(px));
-    if (done === false) {
+    const resize = axis === "row" ? resizeSelectedRows : resizeSelectedCols;
+    // Columns of a data table are as wide as whoever looks at it wants.
+    const { readOnly, table } = handle.state();
+    if (grid && ((readOnly && !table) || !resize(grid, px))) {
       announce(t("The size could not be changed."), { politeness: "assertive" });
     }
   };
@@ -238,7 +240,7 @@ function SizeDialog({
       className="small-dialog"
       testId="size-dialog"
     >
-      <Header
+      <DialogHeader
         id={id}
         text={axis === "row" ? t("Row Height") : t("Column Width")}
         onClose={onClose}
@@ -289,14 +291,23 @@ function SizeDialog({
   );
 }
 
-function DeleteSheetDialog({
-  handle,
-  id: sheet,
-  name,
+/** Asks before something is done that others may miss, or that cannot be taken back. */
+export function Confirm({
   opener,
   onFocusGrid,
   onClose,
-}: EditorDialogsProps & { readonly id: number; readonly name: string }) {
+  heading,
+  action,
+  testId,
+  onConfirm,
+  children,
+}: Omit<EditorDialogsProps, "handle" | "dialog"> & {
+  readonly heading: string;
+  readonly action: string;
+  readonly testId: string;
+  readonly onConfirm: () => void;
+  readonly children: ReactNode;
+}) {
   const id = useId();
   const cancelRef = useRef<HTMLButtonElement>(null);
   return (
@@ -308,16 +319,10 @@ function DeleteSheetDialog({
       fallbackFocus={onFocusGrid}
       onClose={onClose}
       className="small-dialog"
-      testId="delete-sheet-dialog"
+      testId={testId}
     >
-      <Header id={id} text={t("Delete Sheet")} onClose={onClose} />
-      <p id={`${id}-text`}>
-        {tx(
-          "Delete <0>{name}</0> and everything on it? This can be undone.",
-          { 0: <strong /> },
-          { name },
-        )}
-      </p>
+      <DialogHeader id={id} text={heading} onClose={onClose} />
+      <p id={`${id}-text`}>{children}</p>
       <div className="dialog-footer">
         <button ref={cancelRef} type="button" className="toolbar-btn" onClick={onClose}>
           {t("Cancel")}
@@ -325,15 +330,38 @@ function DeleteSheetDialog({
         <button
           type="button"
           className="toolbar-btn primary-btn"
-          data-testid="delete-sheet-confirm"
+          data-testid={`${testId.replace("-dialog", "")}-confirm`}
           onClick={() => {
             flushSync(onClose);
-            handle.mutate({ kind: "deleteSheet", sheet }, { action: "deletedSheet" });
+            onConfirm();
           }}
         >
-          {t("Delete")}
+          {action}
         </button>
       </div>
     </Dialog>
+  );
+}
+
+function DeleteSheetDialog({
+  handle,
+  id: sheet,
+  name,
+  ...props
+}: EditorDialogsProps & { readonly id: number; readonly name: string }) {
+  return (
+    <Confirm
+      {...props}
+      heading={t("Delete Sheet")}
+      action={t("Delete")}
+      testId="delete-sheet-dialog"
+      onConfirm={() => handle.mutate({ kind: "deleteSheet", sheet }, { action: "deletedSheet" })}
+    >
+      {tx(
+        "Delete <0>{name}</0> and everything on it? This can be undone.",
+        { 0: <strong /> },
+        { name },
+      )}
+    </Confirm>
   );
 }
