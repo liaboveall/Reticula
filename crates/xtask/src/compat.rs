@@ -45,6 +45,8 @@ use reticula_wire::wal::{
 
 use crate::util::{self, Flags, Result};
 
+mod table_v1;
+
 const HASHES_FILE: &str = "tests/compat/hashes.txt";
 
 const FROZEN_V1_FILES: [&str; 4] = [
@@ -76,9 +78,16 @@ pub fn run(flags: &Flags) -> Result {
             "v1" => freeze_v1(),
             "v2" => freeze_v2(),
             "v3" => freeze_v3(),
+            "table-v1" => table_v1::freeze(),
             other => Err(format!(
-                "unknown wire version `{other}` (supported: `v1`, `v2`, `v3`)"
+                "unknown version `{other}` (supported: `v1`, `v2`, `v3`, `table-v1`)"
             )),
+        };
+    }
+    if let Some(version) = flags.get("samples") {
+        return match version {
+            "table-v1" => table_v1::preview(),
+            other => Err(format!("no samples of `{other}` (supported: `table-v1`)")),
         };
     }
     check()
@@ -123,6 +132,17 @@ pub fn check() -> Result {
         }
     }
 
+    let tables = table_v1::is_frozen(&entries);
+    if tables {
+        for required in table_v1::FROZEN_TABLE_V1_FILES {
+            if !entries.iter().any(|(_, path)| path == required) {
+                return Err(format!(
+                    "{HASHES_FILE} is missing required frozen file `{required}`"
+                ));
+            }
+        }
+    }
+
     for (expected_hex, rel_path) in &entries {
         let full_path = root.join(rel_path);
         let actual_hex = hash_repo_file(&full_path)?;
@@ -133,6 +153,9 @@ pub fn check() -> Result {
         }
     }
 
+    if tables {
+        table_v1::check()?;
+    }
     println!("{} frozen wire file(s) verified", entries.len());
     Ok(())
 }

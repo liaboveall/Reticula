@@ -10,6 +10,8 @@
 //!    M1b operation sequences + `WireOpV1` round-trip;
 //! 5. `fuzz_one_eval`: arbitrary `BoundExpr` syntax trees + arbitrary cell
 //!    contents evaluated in `FormulaEngine`.
+//!
+//! Those of tables are in [`crate::fuzz_tables`].
 
 use arbitrary::Unstructured;
 use reticula_core::csv::import_csv_sheet;

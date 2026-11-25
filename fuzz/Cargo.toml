@@ -56,3 +56,24 @@ path = "fuzz_targets/fuzz_sync.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "fuzz_table"
+path = "fuzz_targets/fuzz_table.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_parquet"
+path = "fuzz_targets/fuzz_parquet.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_csv"
+path = "fuzz_targets/fuzz_csv.rs"
+test = false
+doc = false
+bench = false

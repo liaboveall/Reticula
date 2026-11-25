@@ -16,6 +16,7 @@ reticula-agent = { workspace = true }
 reticula-core = { workspace = true }
 reticula-formula = { workspace = true }
 reticula-server = { path = "../server" }
+reticula-table = { workspace = true }
 reticula-wire = { workspace = true }
 serde_json = "1.0"
 tokio = { version = "1", features = ["rt-multi-thread"] }

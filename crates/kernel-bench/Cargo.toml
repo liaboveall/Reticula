@@ -12,7 +12,7 @@ publish.workspace = true
 workspace = true
 
 [features]
-default = ["diff"]
+default = ["diff", "table-diff"]
 diff = [
   "dep:formualizer-common",
   "dep:formualizer-eval",
@@ -21,11 +21,17 @@ diff = [
   "dep:reticula-xlsx",
   "dep:serde_json",
 ]
+table-diff = ["dep:serde_json"]
 
 [[bin]]
 name = "runner"
 path = "src/bin/runner.rs"
 required-features = ["diff"]
+
+[[bin]]
+name = "table_diff"
+path = "src/bin/table_diff.rs"
+required-features = ["table-diff"]
 
 [[test]]
 name = "diff_regression"
@@ -50,11 +56,13 @@ postcard = { workspace = true }
 reticula-core = { workspace = true }
 reticula-formula = { workspace = true }
 reticula-sync = { workspace = true }
+reticula-table = { workspace = true }
 reticula-wasm = { path = "../wasm", features = ["bench"] }
 reticula-wire = { workspace = true }
 reticula-xlsx = { workspace = true, optional = true }
 serde = { workspace = true, features = ["std"] }
 serde_json = { version = "1.0", optional = true }
+sha2 = { version = "0.11.1", default-features = false }
 
 [dev-dependencies]
 criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }

@@ -1,9 +1,11 @@
 //! Multi-threaded mutation & `arbitrary` fuzz runner (`14-m1b.md` 8.1).
 //!
-//! Runs all six shared harnesses (`fuzz_one_parser`, `fuzz_one_snapshot`,
-//! `fuzz_one_wal`, `fuzz_one_ops`, `fuzz_one_eval`, `fuzz_one_sync`) across
-//! `threads` worker threads until cumulative CPU time exceeds `target_cpu_seconds`.
+//! Runs all nine shared harnesses (`fuzz_one_parser`, `fuzz_one_snapshot`,
+//! `fuzz_one_wal`, `fuzz_one_ops`, `fuzz_one_eval`, `fuzz_one_sync`,
+//! `fuzz_one_table`, `fuzz_one_parquet`, `fuzz_one_csv`) across `threads`
+//! worker threads until cumulative CPU time exceeds `target_cpu_seconds`.
 
+use std::panic::{catch_unwind, resume_unwind};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -26,6 +28,9 @@ use serde::Serialize;
 
 use crate::fuzz_harnesses::{
     fuzz_one_eval, fuzz_one_ops, fuzz_one_parser, fuzz_one_snapshot, fuzz_one_sync, fuzz_one_wal,
+};
+use crate::fuzz_tables::{
+    csv_seeds, fuzz_one_csv, fuzz_one_parquet, fuzz_one_table, parquet_templates, table_templates,
 };
 
 /// Summary of a completed fuzzing campaign.
@@ -51,11 +56,17 @@ pub struct FuzzReport {
     pub eval_execs: u64,
     /// Total collaborative sync frame & state-machine executions.
     pub sync_execs: u64,
+    /// Total executions of files opened and queried as tables.
+    pub table_execs: u64,
+    /// Total Parquet import executions.
+    pub parquet_execs: u64,
+    /// Total executions of delimited text imported as a table.
+    pub csv_execs: u64,
     /// Number of seed corpus entries constructed.
     pub seed_corpus_count: usize,
 }
 
-const DICT_TOKENS: [&[u8]; 22] = [
+const DICT_TOKENS: [&[u8]; 30] = [
     b"=SUM(A1:B10)",
     b"=ROUND(J2*K2*(1-L2-$V$1),2)",
     b"='Sheet 1'!$A$1:$XFD$1048576",
@@ -78,6 +89,14 @@ const DICT_TOKENS: [&[u8]; 22] = [
     b"((((((((((((((((1))))))))))))))))",
     b"=CONCAT(TRIM(\"  a  b \"),MID(\"hello\",2,3))",
     b"a,\"b\"\"c\nline2\",=not_formula\r\n1,2,3\r\n",
+    b"\n9223372036854775807,-9223372036854775808\n",
+    b"2024-02-29T23:59:59.999999Z",
+    b",00123,+1,-0,-0.0,1e308,5e-324,0.30000000000000004,",
+    b"\r\n\"\",\"a\"b\"\n",
+    b"RTBL\x01\x00\x00\x00",
+    b"RTBLEND1",
+    b"PAR1",
+    b"\x15\x04\x15\x80\x01\x15\x80\x01\x2c\x15\x10\x15\x00\x15\x06\x15\x06\x00\x00",
 ];
 
 /// Builds initial seed corpus buffers (including real `RTCLSNAP` v0/v1
@@ -195,9 +214,24 @@ pub fn build_seed_corpus() -> Vec<Vec<u8>> {
 }
 
 /// The names `--target` accepts, in the order the campaign cycles through them.
-pub const FUZZ_TARGETS: [&str; 6] = ["parser", "snapshot", "wal", "ops", "eval", "sync"];
+pub const FUZZ_TARGETS: [&str; 9] = [
+    "parser", "snapshot", "wal", "ops", "eval", "sync", "table", "parquet", "csv",
+];
 
-/// Runs the six fuzz targets in parallel across `threads` threads until
+/// The harnesses, in the same order.
+const HARNESSES: [fn(&[u8]); 9] = [
+    fuzz_one_parser,
+    fuzz_one_snapshot,
+    fuzz_one_wal,
+    fuzz_one_ops,
+    fuzz_one_eval,
+    fuzz_one_sync,
+    fuzz_one_table,
+    fuzz_one_parquet,
+    fuzz_one_csv,
+];
+
+/// Runs the nine fuzz targets in parallel across `threads` threads until
 /// `threads * wall_elapsed >= target_cpu_seconds`, cycling through all of
 /// them, or running only `FUZZ_TARGETS[only]` so that the whole budget goes
 /// to one target.
@@ -210,84 +244,56 @@ pub fn run_fuzz_campaign(
     let wall_budget =
         Duration::from_secs_f64(target_cpu_seconds as f64 / worker_count as f64 + 1.0);
     let seeds = build_seed_corpus();
-    let seed_corpus_count = seeds.len();
+    // Those of tables begin with what is like them.
+    let of_tables = [
+        table_templates().to_vec(),
+        parquet_templates().to_vec(),
+        csv_seeds(),
+    ];
+    let seed_corpus_count = seeds.len() + of_tables.iter().map(Vec::len).sum::<usize>();
+    let seeds_of = |target: usize| match target.checked_sub(6).and_then(|at| of_tables.get(at)) {
+        Some(seeds) if !seeds.is_empty() => seeds.as_slice(),
+        _ => seeds.as_slice(),
+    };
 
-    let parser_execs = AtomicU64::new(0);
-    let snapshot_execs = AtomicU64::new(0);
-    let wal_execs = AtomicU64::new(0);
-    let ops_execs = AtomicU64::new(0);
-    let eval_execs = AtomicU64::new(0);
-    let sync_execs = AtomicU64::new(0);
+    let execs: [AtomicU64; 9] = std::array::from_fn(|_| AtomicU64::new(0));
 
     let started = Instant::now();
     std::thread::scope(|scope| {
         for tid in 0..worker_count {
-            let seeds_ref = &seeds;
-            let p_cnt = &parser_execs;
-            let s_cnt = &snapshot_execs;
-            let w_cnt = &wal_execs;
-            let o_cnt = &ops_execs;
-            let e_cnt = &eval_execs;
-            let y_cnt = &sync_execs;
-
+            let (execs, seeds_of) = (&execs, &seeds_of);
             scope.spawn(move || {
                 let mut rng =
                     Rng::from_seed(0xF022_2026_u64 ^ (tid as u64).wrapping_mul(0x9E37_79B9));
                 let mut buf = Vec::with_capacity(512);
-                let mut local_p = 0_u64;
-                let mut local_s = 0_u64;
-                let mut local_w = 0_u64;
-                let mut local_o = 0_u64;
-                let mut local_e = 0_u64;
-                let mut local_y = 0_u64;
+                let mut local = [0_u64; 9];
                 let mut iter = 0_u64;
 
                 while started.elapsed() < wall_budget {
-                    mutate_input(&mut rng, seeds_ref, &mut buf);
-                    match only.unwrap_or((iter % 6) as usize) {
-                        0 => {
-                            fuzz_one_parser(&buf);
-                            local_p += 1;
-                        }
-                        1 => {
-                            fuzz_one_snapshot(&buf);
-                            local_s += 1;
-                        }
-                        2 => {
-                            fuzz_one_wal(&buf);
-                            local_w += 1;
-                        }
-                        3 => {
-                            fuzz_one_ops(&buf);
-                            local_o += 1;
-                        }
-                        4 => {
-                            fuzz_one_eval(&buf);
-                            local_e += 1;
-                        }
-                        _ => {
-                            fuzz_one_sync(&buf);
-                            local_y += 1;
-                        }
+                    let target = only.unwrap_or((iter % 9) as usize);
+                    if target >= 6 && rng.next_below(2) == 0 {
+                        random_input(&mut rng, 2_500, &mut buf);
+                    } else {
+                        mutate_input(&mut rng, seeds_of(target), &mut buf);
                     }
+                    if let Err(panic) = catch_unwind(|| HARNESSES[target](&buf)) {
+                        keep(FUZZ_TARGETS[target], &buf);
+                        resume_unwind(panic);
+                    }
+                    local[target] += 1;
                     iter += 1;
-                    // Periodically flush counters and check wall clock every 64 iterations.
-                    if iter & 63 == 0 && started.elapsed() >= wall_budget {
-                        break;
-                    }
                 }
 
-                p_cnt.fetch_add(local_p, Ordering::Relaxed);
-                s_cnt.fetch_add(local_s, Ordering::Relaxed);
-                w_cnt.fetch_add(local_w, Ordering::Relaxed);
-                o_cnt.fetch_add(local_o, Ordering::Relaxed);
-                e_cnt.fetch_add(local_e, Ordering::Relaxed);
-                y_cnt.fetch_add(local_y, Ordering::Relaxed);
+                for (count, local) in execs.iter().zip(local) {
+                    count.fetch_add(local, Ordering::Relaxed);
+                }
             });
         }
     });
 
     let wall_seconds = started.elapsed().as_secs_f64();
+    let [parser, snapshot, wal, ops, eval, sync, table, parquet, csv] =
+        execs.map(AtomicU64::into_inner);
     FuzzReport {
         target: only
             .and_then(|i| FUZZ_TARGETS.get(i).copied())
@@ -295,30 +301,47 @@ pub fn run_fuzz_campaign(
         threads: worker_count,
         wall_seconds,
         cpu_seconds: wall_seconds * (worker_count as f64),
-        parser_execs: parser_execs.load(Ordering::Relaxed),
-        snapshot_execs: snapshot_execs.load(Ordering::Relaxed),
-        wal_execs: wal_execs.load(Ordering::Relaxed),
-        ops_execs: ops_execs.load(Ordering::Relaxed),
-        eval_execs: eval_execs.load(Ordering::Relaxed),
-        sync_execs: sync_execs.load(Ordering::Relaxed),
+        parser_execs: parser,
+        snapshot_execs: snapshot,
+        wal_execs: wal,
+        ops_execs: ops,
+        eval_execs: eval,
+        sync_execs: sync,
+        table_execs: table,
+        parquet_execs: parquet,
+        csv_execs: csv,
         seed_corpus_count,
     }
 }
 
-fn mutate_input(rng: &mut Rng, seeds: &[Vec<u8>], out: &mut Vec<u8>) {
+/// Writes down an input that made a harness panic.
+fn keep(target: &str, input: &[u8]) {
+    let path = format!("target/qa/fuzz-{target}-{}.bin", std::process::id());
+    let written = std::fs::create_dir_all("target/qa").and_then(|()| std::fs::write(&path, input));
+    match written {
+        Ok(()) => eprintln!("the input is in {path}"),
+        Err(error) => eprintln!("the input cannot be written to {path}: {error}"),
+    }
+}
+
+/// Pseudo-random bytes, at most so many.
+fn random_input(rng: &mut Rng, most: u64, out: &mut Vec<u8>) {
     out.clear();
+    let len = rng.next_below(most + 1) as usize;
+    while out.len() < len {
+        let word = rng.next_u64().to_le_bytes();
+        let take = (len - out.len()).min(8);
+        out.extend_from_slice(&word[..take]);
+    }
+}
+
+fn mutate_input(rng: &mut Rng, seeds: &[Vec<u8>], out: &mut Vec<u8>) {
     if rng.next_below(5) == 0 {
         // Fresh pseudo-random byte slice (`0..=256` bytes).
-        let len = rng.next_below(257) as usize;
-        let mut i = 0;
-        while i < len {
-            let word = rng.next_u64().to_le_bytes();
-            let take = (len - i).min(8);
-            out.extend_from_slice(&word[..take]);
-            i += take;
-        }
+        random_input(rng, 256, out);
         return;
     }
+    out.clear();
 
     let base = &seeds[rng.next_below(seeds.len() as u64) as usize];
     out.extend_from_slice(base);

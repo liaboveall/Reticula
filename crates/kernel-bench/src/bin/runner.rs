@@ -344,19 +344,26 @@ fn run_fuzz_cmd(args: &[String]) {
         report.cpu_seconds / 3600.0
     );
     println!(
-        "  executions: parser={}, snapshot={}, wal={}, ops={}, eval={}, sync={} (total={})",
+        "  executions: parser={}, snapshot={}, wal={}, ops={}, eval={}, sync={}, table={}, \
+         parquet={}, csv={} (total={})",
         report.parser_execs,
         report.snapshot_execs,
         report.wal_execs,
         report.ops_execs,
         report.eval_execs,
         report.sync_execs,
+        report.table_execs,
+        report.parquet_execs,
+        report.csv_execs,
         report.parser_execs
             + report.snapshot_execs
             + report.wal_execs
             + report.ops_execs
             + report.eval_execs
             + report.sync_execs
+            + report.table_execs
+            + report.parquet_execs
+            + report.csv_execs
     );
 
     if let Some(path) = out {

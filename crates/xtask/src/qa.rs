@@ -12,6 +12,9 @@ use crate::web;
 const WASM_TARGET: &str = "wasm32-unknown-unknown";
 
 pub fn diff(flags: &Flags) -> Result {
+    if flags.has("tables") {
+        return diff_tables(flags);
+    }
     let engine = flags.get("engine").unwrap_or("rust");
     let count = flags.get("count").unwrap_or("10000");
     let quota_per_fn = flags.get("quota-per-fn").unwrap_or("250");
@@ -103,6 +106,139 @@ pub fn diff(flags: &Flags) -> Result {
     Ok(())
 }
 
+/// Compares tables with DuckDB. The native half makes files up, imports them and
+/// answers questions about them; `bench/table-diff/run.mjs` asks DuckDB the same.
+fn diff_tables(flags: &Flags) -> Result {
+    let known = ["tables", "count", "seed", "archive", "out", "date"];
+    if let Some(name) = flags.other_than(&known) {
+        return Err(format!("`diff --tables` takes no `--{name}`"));
+    }
+    let count: u64 = flags
+        .get("count")
+        .unwrap_or("3200")
+        .parse()
+        .map_err(|error| format!("--count: {error}"))?;
+    let seed = flags.get("seed").unwrap_or("2026");
+    // Not after minutes.
+    if flags.has("archive") && has_changes() {
+        return Err(
+            "a report is not archived while the working tree has uncommitted changes".to_owned(),
+        );
+    }
+    let root = util::root();
+    let dir = root.join("target/qa/tables");
+    if dir.exists() {
+        fs::remove_dir_all(&dir).map_err(|e| format!("cannot remove {}: {e}", dir.display()))?;
+    }
+    fs::create_dir_all(&dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
+
+    install_duckdb()?;
+    let native = |args: &[&str]| {
+        cargo()
+            .args(["run", "--locked", "--release", "--package"])
+            .args(["reticula-kernel-bench", "--no-default-features"])
+            .args(["--features", "table-diff", "--bin", "table_diff", "--"])
+            .args(args)
+            .args(["--seed", seed, "--dir"])
+            .arg(&dir)
+            .run()
+    };
+    // It reads the repository and writes to the one directory. It may not start
+    // the worker that would download an extension, and its home is its own.
+    let reference = |stage: &str| {
+        let home = root.join(".tools").join("duckdb-home");
+        let mut read = std::ffi::OsString::from("--allow-fs-read=");
+        read.push(&root);
+        let mut write = std::ffi::OsString::from("--allow-fs-write=");
+        write.push(&dir);
+        node()
+            .args(["--permission", "--max-old-space-size=8192"])
+            .args([read, write])
+            .arg("bench/table-diff/run.mjs")
+            .arg(stage)
+            .arg(&dir)
+            .env("HOME", &home)
+            .env("USERPROFILE", &home)
+            .run()
+    };
+    util::step(&format!("tables, asked {count} times (seed {seed})"));
+    native(&["generate"])?;
+    let asked = (count - count / 4).to_string();
+    native(&["answer", "--from", "csv", "--count", &asked])?;
+    reference("parquet")?;
+    let asked = (count / 4).to_string();
+    native(&["answer", "--from", "parquet", "--count", &asked])?;
+    util::step("the same of DuckDB");
+    reference("compare")?;
+
+    let commit = git_output(&["rev-parse", "--short", "HEAD"]);
+    let dirty = has_changes();
+    let date = flags
+        .get("date")
+        .map_or_else(current_utc_date, str::to_owned);
+    let path = dir.join("report.json");
+    let text = fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let mut report: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| format!("parse {}: {e}", path.display()))?;
+    // A gigabyte, which is of use only where something differs.
+    fs::remove_dir_all(&dir).map_err(|e| format!("cannot remove {}: {e}", dir.display()))?;
+    report["suite"] = "m5-tablediff".into();
+    report["date"] = date.as_str().into();
+    report["commit"] = commit.as_str().into();
+    report["uncommittedChanges"] = dirty.into();
+    let text = format!("{}\n", serde_json::to_string_pretty(&report).unwrap());
+    let out = root.join(
+        flags
+            .get("out")
+            .unwrap_or("target/qa/tablediff-report.json"),
+    );
+    fs::write(&out, &text).map_err(|e| format!("write {}: {e}", out.display()))?;
+    println!("wrote {}", out.display());
+    if flags.has("archive") {
+        if dirty {
+            return Err("the report is not archived: the working tree has changed".to_owned());
+        }
+        let archive = root
+            .join("bench/results")
+            .join(format!("{date}-{commit}-tablediff.json"));
+        fs::write(&archive, &text).map_err(|e| format!("write {}: {e}", archive.display()))?;
+        println!("archived in {}", archive.display());
+    }
+    Ok(())
+}
+
+/// Puts the pinned DuckDB and its Parquet extension into `.tools`.
+fn install_duckdb() -> Result {
+    let source = util::root().join("bench/table-diff");
+    let tools = util::root().join(".tools");
+    let target = tools.join("duckdb");
+    let read = |path: &std::path::Path| fs::read(path).ok();
+    let lock = read(&source.join("package-lock.json"));
+    // npm writes the last one when everything is there.
+    let installed = target.join("node_modules/.package-lock.json").is_file()
+        && read(&target.join("package-lock.json")) == lock;
+    if !installed {
+        util::step("DuckDB");
+        fs::create_dir_all(&target).map_err(|e| format!("mkdir {}: {e}", target.display()))?;
+        for name in ["package.json", "package-lock.json"] {
+            fs::copy(source.join(name), target.join(name))
+                .map_err(|e| format!("copy {name} to {}: {e}", target.display()))?;
+        }
+        let npm = if cfg!(windows) {
+            Cmd::new("cmd").args(["/C", "npm"])
+        } else {
+            Cmd::new("npm")
+        };
+        npm.args(["ci", "--ignore-scripts", "--no-audit", "--no-fund"])
+            .arg("--prefix")
+            .arg(&target)
+            .arg("--cache")
+            .arg(tools.join("npm-cache"))
+            .run()?;
+    }
+    node().arg("bench/table-diff/setup.mjs").run()
+}
+
 pub fn fuzz(flags: &Flags) -> Result {
     let cpu_seconds = flags.get("cpu-seconds").unwrap_or("3600");
     let threads = flags.get("threads").unwrap_or("16");
@@ -186,16 +322,18 @@ pub fn sim(flags: &Flags) -> Result {
 }
 
 /// The switches and the options of `bench`.
-pub const BENCH_SWITCHES: [&str; 7] = [
+pub const BENCH_SWITCHES: [&str; 9] = [
     "quick",
     "headless",
     "headed",
     "software",
+    "stress",
+    "duckdb",
     "no-archive",
     "skip-build",
     "skip-firefox",
 ];
-pub const BENCH_OPTIONS: [&str; 14] = [
+pub const BENCH_OPTIONS: [&str; 15] = [
     "affinity",
     "browser",
     "date",
@@ -203,6 +341,7 @@ pub const BENCH_OPTIONS: [&str; 14] = [
     "suite",
     "slowdown",
     "dpr",
+    "rows",
     "rounds",
     "seconds",
     "product-seconds",
@@ -223,6 +362,15 @@ const RENDER_OPTIONS: [&str; 8] = [
     "only",
     "results",
 ];
+const TABLE_SWITCHES: [&str; 6] = [
+    "quick",
+    "headless",
+    "software",
+    "stress",
+    "duckdb",
+    "no-archive",
+];
+const TABLE_OPTIONS: [&str; 6] = ["browser", "rows", "rounds", "seconds", "only", "results"];
 const GRID_SWITCHES: [&str; 3] = ["quick", "no-archive", "skip-firefox"];
 const GRID_OPTIONS: [&str; 1] = ["results"];
 const AB_SWITCHES: [&str; 3] = ["quick", "no-archive", "headed"];
@@ -234,12 +382,13 @@ fn check_flags(flags: &Flags, suite: &str) -> Result {
     let known: Vec<&str> = match suite {
         "engine" | "b9" => vec!["quick", "browser", "date", "out"],
         "render" => [&["skip-build"], &RENDER_SWITCHES[..], &RENDER_OPTIONS].concat(),
+        "table" => [&["skip-build"], &TABLE_SWITCHES[..], &TABLE_OPTIONS].concat(),
         "grid" => [&["skip-build"], &GRID_SWITCHES[..], &GRID_OPTIONS].concat(),
         "ab" => [&["skip-build"], &AB_SWITCHES[..], &AB_OPTIONS].concat(),
         "startup" => vec!["skip-build", "quick", "no-archive", "results"],
         other => {
             return Err(format!(
-                "unknown benchmark suite `{other}` (engine, b9, render, grid, startup or ab)"
+                "unknown benchmark suite `{other}` (engine, b9, render, table, grid, startup or ab)"
             ));
         }
     };
@@ -265,6 +414,18 @@ pub fn bench(flags: &Flags) -> Result {
             &RENDER_SWITCHES,
             &RENDER_OPTIONS,
         ),
+        // B14: data tables.
+        "table" => {
+            if flags.has("duckdb") {
+                install_duckdb()?;
+            }
+            script_bench(
+                flags,
+                "bench/run-table-bench.mjs",
+                &TABLE_SWITCHES,
+                &TABLE_OPTIONS,
+            )
+        }
         // S1 and S2: viewport pages, and drawing a thousand cells.
         "grid" => script_bench(
             flags,
@@ -486,16 +647,7 @@ fn kernel_bench(
     .map_err(|e| format!("parse wasm.json: {e}"))?;
 
     let commit = git_output(&["rev-parse", "--short", "HEAD"]);
-    // Results do not count: nothing is built from them, and the first one that is
-    // archived of a commit must not stand in the way of the others.
-    let dirty = !git_output(&[
-        "status",
-        "--porcelain",
-        "--",
-        ".",
-        ":(exclude)bench/results",
-    ])
-    .is_empty();
+    let dirty = has_changes();
     let today = flags
         .get("date")
         .map_or_else(current_utc_date, str::to_owned);
@@ -526,6 +678,20 @@ fn kernel_bench(
     .map_err(|e| format!("write {}: {e}", archive_path.display()))?;
     println!("archived benchmark report to {}", archive_path.display());
     Ok(())
+}
+
+/// Whether the working tree differs from the commit. Results do not count: nothing
+/// is built from them, and the first one that is archived of a commit must not
+/// stand in the way of the others.
+fn has_changes() -> bool {
+    !git_output(&[
+        "status",
+        "--porcelain",
+        "--",
+        ".",
+        ":(exclude)bench/results",
+    ])
+    .is_empty()
 }
 
 pub(crate) fn git_output(args: &[&str]) -> String {
@@ -575,7 +741,13 @@ mod tests {
             Ok(())
         );
         assert_eq!(check("ab", &["--visits", "5", "--affinity", "FF"]), Ok(()));
+        assert_eq!(
+            check("table", &["--rows", "1000", "--stress", "--duckdb"]),
+            Ok(())
+        );
         for (suite, flag) in [
+            ("render", "--stress"),
+            ("table", "--headed"),
             ("engine", "--headless"),
             ("grid", "--headless"),
             ("ab", "--software"),
