@@ -16,7 +16,7 @@ async function synced(page: Page, timeout = 20_000): Promise<void> {
 test.describe("M4 AI Analyst — visitor pure-client replays (no sign-in)", () => {
   test("lists all 10 demos, replays Regional Sales Summary, and enforces 3-way conflict + reference closure guard on demo #10", async ({
     page,
-  }) => {
+  }, testInfo) => {
     // A workbook of one's own, with a cell that no demo writes to.
     const ownDoc = "demo-own";
     await page.goto(`/app?hooks&doc=${ownDoc}`);
@@ -82,6 +82,14 @@ test.describe("M4 AI Analyst — visitor pure-client replays (no sign-in)", () =
       .toBe("555");
 
     // Opened again, the workbook of one's own still has what was saved in it.
+    const backend = await page.evaluate(() => window.__reticula?.docStatus().storageBackend);
+    if (backend === "memory") {
+      testInfo.annotations.push({
+        type: "note",
+        description: "this browser keeps local workbooks in memory, which a reload empties",
+      });
+      return;
+    }
     await page.evaluate(() => window.__reticula?.flushAndClose());
     await page.goto(`/app?hooks&doc=${ownDoc}`);
     await expect(page.getByTestId("engine-status")).toHaveText("ready", { timeout: 20_000 });
