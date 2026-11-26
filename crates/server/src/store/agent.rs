@@ -13,7 +13,9 @@ use serde_json::Value as JsonValue;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
-use super::{MAIN_BRANCH, SnapshotFile, Store, StoreError, decode_log, integer, snapshot};
+use super::{
+    MAIN_BRANCH, MergedDraft, SnapshotFile, Store, StoreError, decode_log, integer, snapshot,
+};
 
 /// Branch metadata row exposed via `GET /api/workbooks/{id}/branches`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -422,32 +424,22 @@ impl Store {
         Ok(())
     }
 
+    /// Marks a draft merged when the merge carried nothing to `main`.
     pub async fn mark_branch_merged(
         &self,
         doc: Uuid,
         branch_id: Uuid,
         merge_seq: u64,
     ) -> Result<(), StoreError> {
-        let merge_seq_i64 = integer::<_, i64>(merge_seq, "merge_seq")?;
         let mut db = self.pool.begin().await?;
-        sqlx::query(
-            "UPDATE branches
-             SET status = 'merged', merge_seq = $3, merged_at = now(), updated_at = now()
-             WHERE workbook_id = $1 AND id = $2",
+        mark_draft_merged(
+            &mut db,
+            doc,
+            MergedDraft {
+                branch_id,
+                merge_seq,
+            },
         )
-        .bind(doc)
-        .bind(branch_id)
-        .bind(merge_seq_i64)
-        .execute(&mut *db)
-        .await?;
-        sqlx::query(
-            "UPDATE agent_runs
-             SET status = 'merged', updated_at = now(), finished_at = COALESCE(finished_at, now())
-             WHERE workbook_id = $1 AND branch_id = $2 AND status IN ('waiting_review', 'running')",
-        )
-        .bind(doc)
-        .bind(branch_id)
-        .execute(&mut *db)
         .await?;
         db.commit().await?;
         Ok(())
@@ -942,4 +934,39 @@ impl Store {
         self.refresh_disk_used().await?;
         Ok(count)
     }
+}
+
+/// Marks an active draft merged, and the run that made it. A draft that is no
+/// longer active is a conflict, so that the transaction it is part of rolls back.
+pub(super) async fn mark_draft_merged(
+    db: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    doc: Uuid,
+    draft: MergedDraft,
+) -> Result<(), StoreError> {
+    let merge_seq = integer::<_, i64>(draft.merge_seq, "merge_seq")?;
+    let marked = sqlx::query(
+        "UPDATE branches
+         SET status = 'merged', merge_seq = $3, merged_at = now(), updated_at = now()
+         WHERE workbook_id = $1 AND id = $2 AND status = 'active'",
+    )
+    .bind(doc)
+    .bind(draft.branch_id)
+    .bind(merge_seq)
+    .execute(&mut **db)
+    .await?;
+    if marked.rows_affected() != 1 {
+        return Err(StoreError::Conflict(
+            "branch is no longer active".to_owned(),
+        ));
+    }
+    sqlx::query(
+        "UPDATE agent_runs
+         SET status = 'merged', updated_at = now(), finished_at = COALESCE(finished_at, now())
+         WHERE workbook_id = $1 AND branch_id = $2 AND status IN ('waiting_review', 'running')",
+    )
+    .bind(doc)
+    .bind(draft.branch_id)
+    .execute(&mut **db)
+    .await?;
+    Ok(())
 }

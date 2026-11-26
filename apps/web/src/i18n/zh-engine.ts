@@ -420,6 +420,7 @@ const zhEngine: Readonly<Record<string, string>> = {
   "merge conflict": "合并冲突",
   "merge rejected: {reason}": "合并被拒绝：{reason}",
   "branch is already {status}": "分支已处于“{status}”状态",
+  "branch is no longer active": "分支已不再处于活动状态",
   active: "进行中",
   merged: "已合并",
   abandoned: "已放弃",

@@ -123,6 +123,13 @@ pub struct BatchEntry<'a> {
     pub base_seq: u64,
 }
 
+/// A draft whose changes a batch on `main` carries, and the revision it ends at.
+#[derive(Clone, Copy, Debug)]
+pub struct MergedDraft {
+    pub branch_id: Uuid,
+    pub merge_seq: u64,
+}
+
 #[derive(Clone)]
 pub struct Store {
     pool: PgPool,
@@ -543,7 +550,7 @@ impl Store {
         entries: &[BatchEntry<'_>],
         est_bytes: usize,
     ) -> Result<(), StoreError> {
-        self.commit_batch_branch(doc, MAIN_BRANCH, epoch, entries, est_bytes)
+        self.commit_batch_branch(doc, MAIN_BRANCH, epoch, entries, est_bytes, None)
             .await
     }
 
@@ -552,6 +559,10 @@ impl Store {
     /// Preserves `workbooks.est_bytes` isolation: non-main branches update
     /// `branches.est_bytes` while continuing to account log bytes against
     /// `workbooks.log_bytes` and `users.storage_bytes`.
+    ///
+    /// With `merged`, the draft that the batch comes from is marked merged in the
+    /// same transaction: either both are durable or neither is, and a draft that is
+    /// no longer active makes the whole batch fail, so one merge lands at most once.
     pub async fn commit_batch_branch(
         &self,
         doc: Uuid,
@@ -559,6 +570,7 @@ impl Store {
         epoch: u8,
         entries: &[BatchEntry<'_>],
         est_bytes: usize,
+        merged: Option<MergedDraft>,
     ) -> Result<(), StoreError> {
         let Some(first) = entries.first() else {
             return Ok(());
@@ -698,6 +710,9 @@ impl Store {
             .bind(log_bytes)
             .execute(&mut *db)
             .await?;
+        if let Some(draft) = merged {
+            agent::mark_draft_merged(&mut db, doc, draft).await?;
+        }
         db.commit().await?;
         self.disk_used_bytes.fetch_add(
             u64::try_from(log_bytes.max(0)).unwrap_or(0),

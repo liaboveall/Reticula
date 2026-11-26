@@ -337,6 +337,7 @@ pub(super) async fn merge_branch(
         .rooms
         .apply_merge(
             id,
+            bid,
             user.id,
             access.role,
             base,
@@ -354,7 +355,7 @@ pub(super) async fn merge_branch(
             committed_txns,
             committed_ops,
         } => {
-            state.store.mark_branch_merged(id, bid, merge_seq).await?;
+            // The draft was marked merged together with the changes it put on `main`.
             state.rooms.shutdown_branch_room(id, bid).await;
             if branch.kind == "ai_draft" {
                 state.metrics.record_agent_run_status("merged");

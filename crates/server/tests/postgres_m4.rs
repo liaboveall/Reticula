@@ -1536,3 +1536,140 @@ async fn sse_last_event_id_concurrent_start_active_merge_guard_and_owner_delete(
     drop(server);
     db.cleanup().await;
 }
+
+async fn main_txn_count(pool: &PgPool, doc: Uuid) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM txns WHERE workbook_id = $1 AND branch_id = $2")
+        .bind(doc)
+        .bind(MAIN_BRANCH)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+#[ignore = "requires an isolated PostgreSQL database in RETICULA_TEST_DATABASE_URL"]
+async fn a_merge_that_fails_leaves_main_as_it_was_and_lands_once_when_retried() {
+    let db = IsolatedDb::create().await;
+    let server = TestServer::start(
+        &db,
+        StorageLimits::default(),
+        GovernanceConfig::default(),
+        AgentRuntimeConfig::mock_for_tests(),
+    )
+    .await;
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&db.url)
+        .await
+        .unwrap();
+
+    let (cookie, _) = server.dev_login("alice").await;
+    let doc = server.create_workbook(&cookie, "Merge Once").await;
+    let run: Value = server
+        .req(
+            Method::POST,
+            &format!("/api/workbooks/{doc}/agent/runs"),
+            Some(&cookie),
+            None,
+            Some(json!({ "prompt": "[conflict] Update A2 and add an uplift in B2" })),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+    let run_id = Uuid::parse_str(run["id"].as_str().unwrap()).unwrap();
+    let branch_id = Uuid::parse_str(run["branchId"].as_str().unwrap()).unwrap();
+    let _ = wait_run_status(&server, &cookie, doc, run_id, "waiting_review").await;
+
+    let diff: Value = server
+        .req(
+            Method::GET,
+            &format!("/api/workbooks/{doc}/branches/{branch_id}/diff"),
+            Some(&cookie),
+            None,
+            None,
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+    let hunks: Vec<String> = diff["hunks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|h| h["id"].as_str().unwrap().to_owned())
+        .collect();
+    assert!(!hunks.is_empty());
+    let merge_path = format!("/api/workbooks/{doc}/branches/{branch_id}/merge");
+    let merge = || {
+        server.req(
+            Method::POST,
+            &merge_path,
+            Some(&cookie),
+            None,
+            Some(json!({ "acceptedHunks": hunks, "conflictChoices": {}, "allowRefErrors": false })),
+        )
+    };
+
+    // The draft's status cannot be written: the changes must not land on `main` either.
+    sqlx::raw_sql(
+        "CREATE FUNCTION refuse_merged() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN
+             IF NEW.status = 'merged' THEN RAISE EXCEPTION 'simulated failure'; END IF;
+             RETURN NEW;
+         END $$;
+         CREATE TRIGGER refuse_merged BEFORE UPDATE ON branches
+             FOR EACH ROW EXECUTE FUNCTION refuse_merged();",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let failed = merge().await;
+    assert_eq!(failed.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(main_txn_count(&pool, doc).await, 0);
+    let branch = server
+        .store
+        .get_branch(doc, branch_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(branch.status, "active");
+    let run_after: Value = server
+        .req(
+            Method::GET,
+            &format!("/api/workbooks/{doc}/agent/runs/{run_id}"),
+            Some(&cookie),
+            None,
+            None,
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(run_after["run"]["status"], "waiting_review");
+
+    // Once the database accepts it, the retry lands, and only once.
+    sqlx::raw_sql("DROP TRIGGER refuse_merged ON branches; DROP FUNCTION refuse_merged();")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let merged = merge().await;
+    assert_eq!(merged.status(), StatusCode::OK);
+    let body: Value = merged.json().await.unwrap();
+    let committed = i64::from(u32::try_from(body["committedTxns"].as_u64().unwrap()).unwrap());
+    assert!(committed >= 1);
+    assert_eq!(main_txn_count(&pool, doc).await, committed);
+    let branch = server
+        .store
+        .get_branch(doc, branch_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(branch.status, "merged");
+    assert_eq!(merge().await.status(), StatusCode::CONFLICT);
+    assert_eq!(main_txn_count(&pool, doc).await, committed);
+
+    pool.close().await;
+    drop(server);
+    db.cleanup().await;
+}

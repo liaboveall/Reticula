@@ -33,7 +33,9 @@ use tokio::time::{Instant, sleep_until};
 use uuid::Uuid;
 
 use crate::ops::{Metrics, WsConnGuard, WsConnKind};
-use crate::store::{BatchEntry, DEFAULT_SNAPSHOT_KEEP_RECENT, MAIN_BRANCH, Store, StoreError};
+use crate::store::{
+    BatchEntry, DEFAULT_SNAPSHOT_KEEP_RECENT, MAIN_BRANCH, MergedDraft, Store, StoreError,
+};
 
 const BATCH_WINDOW: Duration = Duration::from_millis(5);
 const BATCH_COUNT: usize = 32;
@@ -458,11 +460,12 @@ impl DocRooms {
     /// `DocActor`, guaranteeing zero TOCTOU race with concurrent editors on `main`.
     #[expect(
         clippy::too_many_arguments,
-        reason = "three-way merge needs workbook, user, role, base, draft, fork_seq, draft_txns, selection, and label"
+        reason = "three-way merge needs workbook, draft branch, user, role, base, draft, fork_seq, draft_txns, selection, and label"
     )]
     pub async fn apply_merge(
         &self,
         doc: Uuid,
+        draft_branch: Uuid,
         user: Uuid,
         role: MemberRole,
         base: Workbook<BoundFormula>,
@@ -477,6 +480,7 @@ impl DocRooms {
         lease
             .sender
             .send(Command::ApplyMerge(Box::new(ApplyMergeCmd {
+                draft_branch,
                 user,
                 role,
                 base,
@@ -945,6 +949,7 @@ enum Command {
 }
 
 struct ApplyMergeCmd {
+    draft_branch: Uuid,
     user: Uuid,
     role: MemberRole,
     base: Workbook<BoundFormula>,
@@ -1110,6 +1115,7 @@ impl DocActor {
                     }
                     Some(Command::ApplyMerge(cmd)) => {
                         let ApplyMergeCmd {
+                            draft_branch,
                             user,
                             role,
                             base,
@@ -1121,7 +1127,17 @@ impl DocActor {
                             reply,
                         } = *cmd;
                         let outcome = room
-                            .apply_merge(user, role, base, draft, fork_seq, draft_txns, selection, label)
+                            .apply_merge(
+                                draft_branch,
+                                user,
+                                role,
+                                base,
+                                draft,
+                                fork_seq,
+                                draft_txns,
+                                selection,
+                                label,
+                            )
                             .await;
                         let _ = reply.send(outcome);
                     }
@@ -1429,6 +1445,7 @@ impl DocActor {
     )]
     async fn apply_merge(
         &mut self,
+        draft_branch: Uuid,
         user: Uuid,
         role: MemberRole,
         base: Workbook<BoundFormula>,
@@ -1572,8 +1589,16 @@ impl DocActor {
             Err(MergePlanError::RemapFailed(msg)) => return MergeCommitOutcome::RemapFailed(msg),
         };
         if shards.is_empty() {
+            let merge_seq = self.machine.head_seq();
+            if let Err(err) = self
+                .store
+                .mark_branch_merged(self.doc, draft_branch, merge_seq)
+                .await
+            {
+                return MergeCommitOutcome::Storage(err);
+            }
             return MergeCommitOutcome::Merged {
-                merge_seq: self.machine.head_seq(),
+                merge_seq,
                 committed_txns: 0,
                 committed_ops: 0,
             };
@@ -1630,7 +1655,13 @@ impl DocActor {
             }
         }
 
-        if let Err(err) = self.flush().await {
+        // The changes and the draft's new status are one transaction: a merge that
+        // fails leaves `main` as it was, and one that is retried lands only once.
+        let merged = MergedDraft {
+            branch_id: draft_branch,
+            merge_seq: self.machine.head_seq(),
+        };
+        if let Err(err) = self.flush_merging(Some(merged)).await {
             self.rollback_pending_batch();
             return MergeCommitOutcome::Storage(err);
         }
@@ -1856,6 +1887,10 @@ impl DocActor {
     }
 
     async fn flush(&mut self) -> Result<(), StoreError> {
+        self.flush_merging(None).await
+    }
+
+    async fn flush_merging(&mut self, merged: Option<MergedDraft>) -> Result<(), StoreError> {
         if self.batch.is_empty() {
             return Ok(());
         }
@@ -1879,6 +1914,7 @@ impl DocActor {
                 self.machine.epoch(),
                 &batch,
                 est_bytes,
+                merged,
             )
             .await?;
         let elapsed = started.elapsed();

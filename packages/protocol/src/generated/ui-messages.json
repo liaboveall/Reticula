@@ -1855,7 +1855,8 @@
       "owner storage quota exceeded",
       "cannot abandon the main branch",
       "daily AI run limit reached ({used_runs}/{max_runs})",
-      "daily AI token limit reached ({used_tokens}/{max_tokens})"
+      "daily AI token limit reached ({used_tokens}/{max_tokens})",
+      "branch is no longer active"
     ],
     "crates/server/src/store/collaboration.rs": [
       "cannot assign deleted user",
