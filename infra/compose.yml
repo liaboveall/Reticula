@@ -9,7 +9,8 @@
 #   RETICULA_PUBLIC_ORIGIN          origin browsers use, e.g. https://example.com
 #   RETICULA_GITHUB_CLIENT_ID       GitHub OAuth application
 #   RETICULA_GITHUB_CLIENT_SECRET
-#   RETICULA_IMAGE                  optional, defaults to the published image
+#   RETICULA_IMAGE                  the image, by its digest: ghcr.io/liaboveall/reticula@sha256:...
+#                                   (the "Container Image" workflow prints it); a tag can be moved
 #   PORT                            optional loopback port, defaults to 3200
 #   METRICS_PORT                    optional loopback metrics port, defaults to 3201
 #   RETICULA_LLM_*                  optional AI analyst provider settings (see .env.example)
@@ -54,7 +55,7 @@ services:
         max-file: "3"
 
   server:
-    image: ${RETICULA_IMAGE:-ghcr.io/liaboveall/reticula:latest}
+    image: ${RETICULA_IMAGE:?set RETICULA_IMAGE in the env file to the image by its digest}
     restart: unless-stopped
     depends_on:
       postgres:

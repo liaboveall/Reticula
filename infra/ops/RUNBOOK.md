@@ -1,5 +1,16 @@
 # Reticula Operations Runbook
 
+## Which Image Runs
+
+`infra/compose.yml` takes the server image from `RETICULA_IMAGE` in the env file and does not start without it. Name it by its digest, `ghcr.io/liaboveall/reticula@sha256:...`, never by a tag: `latest` and the short-commit tags are moved by each run of the `Container Image` workflow, which ends by printing the digest it pushed (in its summary). Build the image from the commit that was tested, then check what is running:
+
+```bash
+docker compose --project-name reticula --file infra/compose.yml --env-file /etc/reticula/reticula.env images server
+docker inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$(docker compose --project-name reticula --file infra/compose.yml --env-file /etc/reticula/reticula.env ps --quiet server)"
+```
+
+The first shows the digest, the second the commit the image was built from.
+
 ## Architecture on the Host
 
 `infra/compose.yml` runs two containers with explicit resource ceilings:
