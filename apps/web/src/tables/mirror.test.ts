@@ -51,9 +51,9 @@ describe("room for copies", () => {
   });
 
   it("is made where the ones used longest ago are", async () => {
-    await makeRoom(dir(), "new", 300, 1_200);
+    expect(await makeRoom(dir(), "new", 300, 1_200)).toBe(true);
     expect(names()).toEqual(["b", "c", "doc.json"]);
-    await makeRoom(dir(), "new", 900, 1_000);
+    expect(await makeRoom(dir(), "new", 900, 1_000)).toBe(true);
     expect(names()).toEqual(["doc.json"]);
   });
 
@@ -64,8 +64,16 @@ describe("room for copies", () => {
 
   it("is not made where a table is open", async () => {
     await (await copies().getFileHandle("a")).createSyncAccessHandle();
-    await makeRoom(dir(), "new", 300, 1_000);
+    expect(await makeRoom(dir(), "new", 300, 1_000)).toBe(true);
     expect(names()).toEqual(["a", "doc.json"]);
+  });
+
+  it("is not there when the copies in use take it", async () => {
+    for (const name of ["a", "b"]) {
+      await (await copies().getFileHandle(name)).createSyncAccessHandle();
+    }
+    expect(await makeRoom(dir(), "new", 300, 1_000)).toBe(false);
+    expect(names()).toEqual(["a", "b", "doc.json"]);
   });
 
   it("goes by when a copy was opened last, not only by what came", async () => {

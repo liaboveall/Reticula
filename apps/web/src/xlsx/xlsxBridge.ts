@@ -11,9 +11,22 @@ import xlsxWasmUrl from "@reticula/protocol/xlsx-wasm?url";
 
 let ready: Promise<void> | null = null;
 
-async function ensureXlsxReady(): Promise<void> {
+/**
+ * Loads the module once. A load that failed, as it does without a network, is
+ * forgotten, so that the next import or export loads it again.
+ */
+export async function ensureXlsxReady(): Promise<void> {
   if (!ready) {
-    ready = initXlsx({ module_or_path: xlsxWasmUrl }).then(() => undefined);
+    const loading = initXlsx({ module_or_path: xlsxWasmUrl }).then(
+      () => undefined,
+      (err: unknown) => {
+        if (ready === loading) {
+          ready = null;
+        }
+        throw err;
+      },
+    );
+    ready = loading;
   }
   await ready;
 }

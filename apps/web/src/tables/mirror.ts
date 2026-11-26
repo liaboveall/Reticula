@@ -11,13 +11,16 @@ export interface Mirror {
   remove(): Promise<unknown>;
 }
 
-/** Deletes the copies that were used longest ago, until there is room for another one. */
+/**
+ * Deletes the copies that were used longest ago, until there is room for another
+ * one. Whether there is: copies that are in use stay, and may leave too little.
+ */
 export async function makeRoom(
   dir: FileSystemDirectoryHandle,
   name: string,
   bytes: number,
   most: number = MOST_COPIED,
-): Promise<void> {
+): Promise<boolean> {
   const files: File[] = [];
   for (const other of await namesIn(dir)) {
     if (other !== name && !other.endsWith(".json")) {
@@ -31,6 +34,7 @@ export async function makeRoom(
       total -= file.size;
     }
   }
+  return total <= most;
 }
 
 /** The copy of a table. Null when there cannot be one, or another tab has it. */
@@ -41,7 +45,10 @@ export async function openMirror(
 ): Promise<Mirror | null> {
   try {
     const dir = await copiesDir(userId, true);
-    await makeRoom(dir, sha256, bytes);
+    // Without room, the table is had in memory, as it is in another tab.
+    if (!(await makeRoom(dir, sha256, bytes))) {
+      return null;
+    }
     const file = await openStored(dir, sha256, true, 0);
     file.touch();
     return {
