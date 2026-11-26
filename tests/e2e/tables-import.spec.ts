@@ -299,6 +299,7 @@ test.describe("the list of workbooks", () => {
     expect((await tableFiles(page)).length).toBeGreaterThan(0);
     await page.getByTestId("workbooks-btn").click();
     await page.getByTestId("delete-doc-tables-doc").click();
+    await page.getByTestId("confirm-delete-btn").click();
     await expect(page.getByTestId("workbook-row-tables-doc")).toBeHidden();
     expect(await tableFiles(page)).toEqual([]);
   });
@@ -310,10 +311,12 @@ test.describe("the list of workbooks", () => {
     await other.getByTestId("workbooks-tab-local").click();
     await expect(other.getByTestId("local-tables-tables-doc")).toContainText("1 data table");
     await other.getByRole("button", { name: /^Delete Local: tables-doc/ }).click();
+    await other.getByTestId("confirm-delete-btn").click();
     await expect(other.getByTestId("workbooks-error")).toContainText("open in another tab");
     expect((await tableFiles(page)).length).toBeGreaterThan(0);
     await page.close();
     await other.getByRole("button", { name: /^Delete Local: tables-doc/ }).click();
+    await other.getByTestId("confirm-delete-btn").click();
     await expect(other.getByTestId("local-wb-tables-doc")).toBeHidden();
     expect(await tableFiles(other)).toEqual([]);
   });
@@ -368,9 +371,11 @@ test("a workbook whose tables are still to be uploaded is deleted when that is a
   await page.getByTestId("workbooks-tab-local").click();
   const row = page.getByTestId("local-wb-tables-doc");
   await row.getByRole("button", { name: /^Delete Local/ }).click();
+  await page.getByTestId("confirm-delete-btn").click();
   await expect(page.getByTestId("workbooks-error")).toContainText("still being uploaded");
   await expect(row).toBeVisible();
   await row.getByRole("button", { name: /^Delete Local/ }).click();
+  await page.getByTestId("confirm-delete-btn").click();
   await expect(row).toBeHidden();
   expect(await tableFiles(page)).toEqual([]);
   const queued = await page.evaluate(async () => {
@@ -400,8 +405,10 @@ test("the workbook that takes the place of a deleted one has no tables", async (
   const docId = await page.evaluate(() => window.__reticula?.docStatus().docId);
   await page.getByTestId("workbooks-btn").click();
   await page.getByTestId("delete-doc-tables-doc").click();
+  await page.getByTestId("confirm-delete-btn").click();
   await expect(page.getByTestId("workbook-row-tables-doc")).toBeHidden();
   await page.getByTestId(`delete-doc-${docId}`).click();
+  await page.getByTestId("confirm-delete-btn").click();
   await expect.poll(() => tableFiles(page, docId)).toEqual([]);
   // It has the same name as the one before: the sample that there is when nothing else is.
   await expect(page.getByTestId("engine-status")).toHaveAttribute("data-status", "ready");

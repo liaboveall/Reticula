@@ -13,6 +13,7 @@ import { fileKind, hasManyRows, importWorkbook } from "./import-workbook.ts";
 import { keepsUploads, type TableSize, tableSizes, uploadsReason } from "./local-tables.ts";
 import { closeTables } from "./tables/shell.ts";
 import { announce } from "./ui/announcer.ts";
+import { ConfirmDelete } from "./ui/ConfirmDelete.tsx";
 import { Dialog } from "./ui/Dialog.tsx";
 import { isComposing } from "./ui/focus.ts";
 
@@ -185,6 +186,8 @@ function WorkbookDialogs({
   const importRef = useRef<HTMLButtonElement>(null);
   const isImporting = mode.kind === "workbooks" && mode.importing === true;
   const deletingRef = useRef<WorkbookCatalogEntry | null>(null);
+  /** The workbook that is asked about before it is deleted. */
+  const [confirming, setConfirming] = useState<WorkbookCatalogEntry | null>(null);
   const [editingDoc, setEditingDoc] = useState<{ id: string; draft: string } | null>(null);
   const [skipCountOverride, setSkipCountOverride] = useState<number | null>(null);
   /** How many raw files were downloaded, or `null` while nobody has asked for them. */
@@ -580,10 +583,7 @@ function WorkbookDialogs({
                   data-testid={`delete-doc-${doc.id}`}
                   title={t("Delete local workbook")}
                   aria-label={t("Delete {title}", { title: doc.title })}
-                  onClick={() => {
-                    deletingRef.current = doc;
-                    onDeleteDoc(doc.id);
-                  }}
+                  onClick={() => setConfirming(doc)}
                 >
                   {t("Delete")}
                 </button>
@@ -592,6 +592,20 @@ function WorkbookDialogs({
           })
         )}
       </div>
+      {confirming && (
+        <ConfirmDelete
+          title={confirming.title}
+          consequence={t(
+            "It is deleted from this browser, with its data tables. There is no copy on a server, so this cannot be undone.",
+          )}
+          onCancel={() => setConfirming(null)}
+          onConfirm={() => {
+            deletingRef.current = confirming;
+            setConfirming(null);
+            onDeleteDoc(confirming.id);
+          }}
+        />
+      )}
     </Dialog>
   );
 }

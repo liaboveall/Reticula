@@ -776,6 +776,22 @@ input.name-box {
   font-weight: 600;
 }
 
+.danger-btn {
+  border-color: var(--shell-danger);
+  background: var(--shell-danger);
+  color: #fff;
+  font-weight: 600;
+}
+
+.confirm-delete {
+  width: min(440px, calc(100vw - 40px));
+}
+
+.confirm-delete-text {
+  margin: 0;
+  line-height: 1.5;
+}
+
 .lock-overlay {
   position: fixed;
   inset: 0;

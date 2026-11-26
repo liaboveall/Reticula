@@ -384,6 +384,9 @@ const zhCore: Readonly<Record<string, string>> = {
   Delete: "删除",
   "Delete {title}": "删除 {title}",
   'Deleted "{title}".': "已删除“{title}”。",
+  'Delete "{title}"?': "删除“{title}”？",
+  "It is deleted from this browser, with its data tables. There is no copy on a server, so this cannot be undone.":
+    "它会连同数据表从此浏览器中删除。服务器上没有副本，此操作无法撤销。",
   Close: "关闭",
   "Imported with Excel compatibility notes: {notes}": "已导入，Excel 兼容性说明：{notes}",
   "{n} external/unknown formula(s) preserved with cached values":

@@ -598,7 +598,13 @@ test.describe("the editor's dialogs and drawers", () => {
     await expect(row).toContainText("Renamed by keys");
     await expect(rename).toBeFocused();
 
+    // It is asked first, with keeping it where the focus is.
     await activate(page, dialog.getByRole("button", { name: "Delete Renamed by keys" }));
+    const confirm = page.getByTestId("confirm-delete");
+    await expect(confirm).toContainText('Delete "Renamed by keys"?');
+    await expect(confirm.getByRole("button", { name: "Cancel" })).toBeFocused();
+    await activate(page, confirm.getByTestId("confirm-delete-btn"));
+    await expect(confirm).toHaveCount(0);
     await expect(row).toHaveCount(0);
     await expect.poll(() => announced(page)).toBe('Deleted "Renamed by keys".');
     await expectFocusInside(dialog);
@@ -1093,7 +1099,23 @@ test.describe("with a server", () => {
     await expect(row).toContainText(`${title} B`);
     await expect(row.getByRole("button", { name: `Rename ${title} B` })).toBeFocused();
 
-    await activate(page, row.getByRole("button", { name: `Delete ${title} B` }));
+    // It is asked first, and keeping it is what Enter does then.
+    const del = row.getByRole("button", { name: `Delete ${title} B` });
+    await activate(page, del);
+    const confirm = page.getByTestId("confirm-delete");
+    await expect(confirm).toContainText(`Delete "${title} B"?`);
+    await expect(confirm.getByRole("button", { name: "Cancel" })).toBeFocused();
+    await page.keyboard.press("Escape");
+    await expect(confirm).toHaveCount(0);
+    await expect(row).toBeVisible();
+    await expect(del).toBeFocused();
+    await page.keyboard.press("Enter");
+    await page.keyboard.press("Enter");
+    await expect(confirm).toHaveCount(0);
+    await expect(row).toBeVisible();
+
+    await page.keyboard.press("Enter");
+    await activate(page, confirm.getByTestId("confirm-delete-btn"));
     await expect(row).toHaveCount(0, { timeout: 10_000 });
     await expect.poll(() => announced(page)).toBe(`Deleted "${title} B".`);
     await expectFocusInside(page.getByRole("main"));

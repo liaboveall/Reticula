@@ -28,6 +28,7 @@ import { keepsUploads, type TableSize, tableSizes, uploadsReason } from "../loca
 import { deleteTables } from "../tables/delete.ts";
 import { ActionButton } from "../ui/ActionButton.tsx";
 import { announce } from "../ui/announcer.ts";
+import { ConfirmDelete } from "../ui/ConfirmDelete.tsx";
 import { isComposing, useKeptFocus } from "../ui/focus.ts";
 import { Tabs } from "../ui/Tabs.tsx";
 import { apiErrorMessage } from "./helpers.ts";
@@ -76,6 +77,12 @@ export default function WorkbooksPage({ onNavigate }: WorkbooksPageProps) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<Message | null>(null);
   const [statusMsg, setStatusMsg] = useState<Message | null>(null);
+  /** What is about to be deleted, once it has been confirmed. */
+  const [deleting, setDeleting] = useState<
+    | { readonly kind: "cloud"; readonly item: WorkbookListItem }
+    | { readonly kind: "local"; readonly entry: WorkbookCatalogEntry }
+    | null
+  >(null);
   const loadSeqRef = useRef(0);
   const mainRef = useKeptFocus();
   const importRef = useRef<HTMLInputElement>(null);
@@ -336,7 +343,7 @@ export default function WorkbooksPage({ onNavigate }: WorkbooksPageProps) {
               className="toolbar-btn"
               aria-label={t("Delete {title}", { title: item.title })}
               inactive={busy}
-              onClick={() => void handleDeleteCloud(item)}
+              onClick={() => setDeleting({ kind: "cloud", item })}
             >
               {t("Delete")}
             </ActionButton>
@@ -510,7 +517,7 @@ export default function WorkbooksPage({ onNavigate }: WorkbooksPageProps) {
                             className="toolbar-btn"
                             aria-label={`${t("Delete Local")}: ${entry.title}`}
                             inactive={busy}
-                            onClick={() => void handleDeleteLocal(entry)}
+                            onClick={() => setDeleting({ kind: "local", entry })}
                           >
                             {t("Delete Local")}
                           </ActionButton>
@@ -573,6 +580,29 @@ export default function WorkbooksPage({ onNavigate }: WorkbooksPageProps) {
           </Tabs>
         </div>
       </main>
+      {deleting && (
+        <ConfirmDelete
+          title={deleting.kind === "cloud" ? deleting.item.title : deleting.entry.title}
+          consequence={
+            deleting.kind === "cloud"
+              ? t(
+                  "It is deleted from the server, with its history, for everyone it is shared with. This cannot be undone.",
+                )
+              : t(
+                  "It is deleted from this browser, with its data tables. There is no copy on a server, so this cannot be undone.",
+                )
+          }
+          onCancel={() => setDeleting(null)}
+          onConfirm={() => {
+            const what = deleting;
+            setDeleting(null);
+            void (what.kind === "cloud"
+              ? handleDeleteCloud(what.item)
+              : handleDeleteLocal(what.entry));
+          }}
+          fallbackFocus={() => mainRef.current?.focus()}
+        />
+      )}
     </div>
   );
 }

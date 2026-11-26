@@ -80,6 +80,11 @@ test.describe("M2b governance, workbooks, history, and account lifecycle", () =>
       await expect(createdRow).toContainText(renamedTitle, { timeout: 10_000 });
 
       await createdRow.getByRole("button", { name: "Delete" }).click();
+      await page.getByTestId("confirm-delete").getByRole("button", { name: "Cancel" }).click();
+      await expect(page.getByTestId("confirm-delete")).toHaveCount(0);
+      await expect(createdRow).toBeVisible();
+      await createdRow.getByRole("button", { name: "Delete" }).click();
+      await page.getByTestId("confirm-delete-btn").click();
       await expect(page.getByTestId(`cloud-wb-${createdId}`)).toHaveCount(0, { timeout: 10_000 });
 
       if (backend === "memory") {

@@ -38,6 +38,8 @@ const zhPages: Readonly<Record<string, string>> = {
   "Could not create cloud workbook": "无法创建云端工作簿",
   "Could not rename workbook": "无法重命名工作簿",
   "Could not delete workbook": "无法删除工作簿",
+  "It is deleted from the server, with its history, for everyone it is shared with. This cannot be undone.":
+    "它会连同历史记录从服务器上删除，所有共享对象都将无法再打开。此操作无法撤销。",
   "Could not import snapshot": "无法导入快照",
   "Could not convert local workbook to cloud": "无法将本地工作簿转为云端工作簿",
   "Could not remove local workbook": "无法删除本地工作簿",
