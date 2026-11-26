@@ -27,6 +27,7 @@ import { announce } from "../ui/announcer.ts";
 import { useDrawer } from "../ui/drawer.ts";
 import { focusIsLost } from "../ui/focus.ts";
 import { type TabItem, Tabs } from "../ui/Tabs.tsx";
+import { hasSeenAiDataNotice, noteAiDataNotice } from "./data-notice.ts";
 import "./ai.css";
 import { DiffReviewDrawer } from "./DiffReviewDrawer.tsx";
 import { runStatusText, runSummaryText, stepKindText, stepText } from "./labels.ts";
@@ -375,11 +376,15 @@ export default function AiPanel({
     ],
   );
 
-  const canRun = !cloudBusy && prompt.trim() !== "" && activeRun?.status !== "running";
+  /** Whether it has been read what a run sends out of the server, before the first one. */
+  const [knowsWhatIsSent, setKnowsWhatIsSent] = useState(hasSeenAiDataNotice);
+  const canRun =
+    knowsWhatIsSent && !cloudBusy && prompt.trim() !== "" && activeRun?.status !== "running";
 
   const handleStartRun = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!collabDocId || !canRun) return;
+    noteAiDataNotice();
     setCloudBusy(true);
     setCloudError(null);
     try {
@@ -683,6 +688,27 @@ export default function AiPanel({
                 onChange={(e) => setPrompt(e.target.value)}
                 maxLength={4000}
               />
+              <div className="ai-card ai-data-notice" data-testid="ai-data-notice">
+                <p>
+                  {t(
+                    "A run sends your prompt, and the cells, formulas and sheet names that the analyst reads, to the language model service that this server's operator has set up. The run and its steps are kept with the workbook.",
+                  )}{" "}
+                  <a href="/privacy" target="_blank" rel="noopener">
+                    {t("Privacy")}
+                  </a>
+                </p>
+                {!hasSeenAiDataNotice() && (
+                  <label className="ai-row">
+                    <input
+                      type="checkbox"
+                      data-testid="ai-data-notice-ok"
+                      checked={knowsWhatIsSent}
+                      onChange={(e) => setKnowsWhatIsSent(e.target.checked)}
+                    />
+                    {t("I understand what is sent")}
+                  </label>
+                )}
+              </div>
               <div className="ai-row">
                 <ActionButton
                   type="submit"

@@ -672,6 +672,9 @@ const zhCore: Readonly<Record<string, string>> = {
   'Merged selected changes from "{title}" into a new workbook. The workbook you had open is unchanged.':
     "已将“{title}”中选中的更改合并到一个新工作簿，原来打开的工作簿没有改动。",
   "{title} (AI demo)": "{title}（AI 演示）",
+  "A run sends your prompt, and the cells, formulas and sheet names that the analyst reads, to the language model service that this server's operator has set up. The run and its steps are kept with the workbook.":
+    "运行会把你的提示，以及分析师读取的单元格、公式和工作表名称，发送给本服务器运营者配置的语言模型服务。运行及其步骤与工作簿一起保存。",
+  "I understand what is sent": "我了解会发送哪些内容",
   "Could not load AI demos ({status})": "无法加载 AI 演示 ({status})",
   'Could not load demo "{id}" ({status})': "无法加载演示“{id}”({status})",
 

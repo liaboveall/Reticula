@@ -95,6 +95,8 @@ const zhPages: Readonly<Record<string, string>> = {
     "<0>本地模式（/app，不使用云端）：</0>所有表格都只保存在浏览器的源私有文件系统（OPFS）或内存中，绝不会离开本机设备。",
   "<0>Cloud collaboration (opt-in sign-in):</0> When you sign in via GitHub, the server stores your GitHub numeric user ID, public login/display name, avatar URL, and the cloud workbooks, revision logs, and snapshots you create or share.":
     "<0>云端协作（自愿登录）：</0>通过 GitHub 登录后，服务器会存储登录者的 GitHub 数字用户 ID、公开的登录名/显示名称、头像网址，以及登录者创建或共享的云端工作簿、修订日志和快照。",
+  "<0>Cloud AI Analyst (only when you start a run):</0> A run on a cloud workbook sends your prompt, and the cell values, formulas, sheet names and layout that the analyst reads with its tools, to the large language model service that the operator of this server has configured. That service is not run by Reticula, and its own terms apply to what it receives. The run, its steps and the draft it makes are stored with the workbook and deleted with it. The recorded demos run inside your browser and send nothing.":
+    "<0>云端 AI 分析师（仅在你发起运行时）：</0>在云端工作簿上运行时，你的提示，以及分析师用工具读取的单元格值、公式、工作表名称和结构，会发送给本服务器运营者配置的大语言模型服务。该服务不由 Reticula 运营，它对收到的内容适用其自身条款。运行、各个步骤及生成的草稿与工作簿一起保存，并随工作簿一起删除。录制的演示只在你的浏览器里运行，不发送任何内容。",
   "Cookies & Tracking": "Cookie 与跟踪",
   "No third-party analytics, ads, or tracking scripts are used. Cloud sign-in uses only strictly necessary first-party <0>HttpOnly</0> session cookies.":
     "不使用任何第三方统计分析、广告或跟踪脚本。云端登录只使用严格必要的第一方 <0>HttpOnly</0> 会话 Cookie。",

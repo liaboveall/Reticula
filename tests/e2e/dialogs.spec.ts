@@ -1056,6 +1056,7 @@ test.describe("with a server", () => {
     await page.keyboard.press("Enter");
     await expect(page.getByTestId("ai-prompt-input")).toBeFocused();
     await page.keyboard.type("Sum up");
+    await activate(page, page.getByTestId("ai-data-notice-ok"), " ");
     await activate(page, page.getByTestId("ai-run-btn"));
     await page.getByTestId("cloud-menu-btn").focus();
     await page.keyboard.press("Enter");

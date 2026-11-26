@@ -41,6 +41,12 @@ export default function PrivacyPage({ onNavigate }: PrivacyPageProps) {
                 { 0: <strong /> },
               )}
             </li>
+            <li>
+              {tx(
+                "<0>Cloud AI Analyst (only when you start a run):</0> A run on a cloud workbook sends your prompt, and the cell values, formulas, sheet names and layout that the analyst reads with its tools, to the large language model service that the operator of this server has configured. That service is not run by Reticula, and its own terms apply to what it receives. The run, its steps and the draft it makes are stored with the workbook and deleted with it. The recorded demos run inside your browser and send nothing.",
+                { 0: <strong /> },
+              )}
+            </li>
           </ul>
           <h2>{t("Cookies & Tracking")}</h2>
           <p>

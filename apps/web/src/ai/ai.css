@@ -152,6 +152,16 @@
   background: var(--shell-background);
 }
 
+.ai-data-notice {
+  font-size: 11px;
+  color: var(--shell-muted);
+}
+
+.ai-data-notice p {
+  margin: 0 0 4px;
+  line-height: 1.45;
+}
+
 .ai-card.conflict {
   border-color: var(--shell-warning);
   background: var(--shell-warning-soft);

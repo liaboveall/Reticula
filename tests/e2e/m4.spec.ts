@@ -141,6 +141,10 @@ test.describe("M4 AI Analyst — collaborative cloud draft, conflict/closure rev
       const asked = "[closure] Insert row 2 with A2=25 and set B1 = =A2*2";
       await prompt.fill(asked);
       await expect(prompt).toHaveValue(asked);
+      // What a run sends, and to whom, is said before the first one.
+      await expect(alice.getByTestId("ai-data-notice")).toContainText("language model service");
+      await expect(alice.getByTestId("ai-run-btn")).toHaveAttribute("aria-disabled", "true");
+      await alice.getByTestId("ai-data-notice-ok").check();
       await alice.getByTestId("ai-run-btn").click();
       await expect(alice.getByTestId("ai-draft-banner")).toContainText("Viewing AI Draft", {
         timeout: 15_000,
