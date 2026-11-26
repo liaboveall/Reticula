@@ -148,7 +148,10 @@ export type HostCommand =
   | { readonly kind: "draftOpenReplay"; readonly baseSnapshot: ArrayBuffer }
   | { readonly kind: "draftApplyTxn"; readonly txn: ArrayBuffer }
   | {
+      /** Stores what a recorded demo makes as a new local workbook. */
       readonly kind: "draftCommitLocalMerge";
+      readonly docId: string;
+      readonly title: string;
       readonly baseSnapshot: ArrayBuffer;
       readonly txns: readonly ArrayBuffer[];
     }

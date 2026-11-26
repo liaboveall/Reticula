@@ -669,8 +669,9 @@ const zhCore: Readonly<Record<string, string>> = {
     "已预览“{title}”的合并选择，并返回云端工作簿，未覆盖其内容。",
   'Previewed "{title}". Nothing was merged: the workbook is read-only here.':
     "已预览“{title}”。此处的工作簿只读，没有合并任何更改。",
-  'Merged selected changes from "{title}" into your sheet.':
-    "已将“{title}”中选中的更改合并到表格。",
+  'Merged selected changes from "{title}" into a new workbook. The workbook you had open is unchanged.':
+    "已将“{title}”中选中的更改合并到一个新工作簿，原来打开的工作簿没有改动。",
+  "{title} (AI demo)": "{title}（AI 演示）",
   "Could not load AI demos ({status})": "无法加载 AI 演示 ({status})",
   'Could not load demo "{id}" ({status})': "无法加载演示“{id}”({status})",
 

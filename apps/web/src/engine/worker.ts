@@ -1790,23 +1790,33 @@ async function handleHostCommand(cmd: HostCommand): Promise<void> {
       draftPreview?.close();
       draftPreview = null;
       if (!collaborative) {
-        const loaded = engine.loadSnapshotAndWal(
-          new Uint8Array(cmd.baseSnapshot),
-          encodeWalInit(0),
-          0,
-          0,
-          0,
-          true,
-          false,
-          false,
+        // A demo is of a workbook of its own: what it makes becomes a new one,
+        // and the workbook that was open stays as it was saved.
+        const { docId, title, txns } = cmd;
+        const base = new Uint8Array(cmd.baseSnapshot);
+        await importDoc(
+          docId,
+          title,
+          (live) => {
+            const loaded = live.loadSnapshotAndWal(
+              base,
+              encodeWalInit(0),
+              0,
+              0,
+              0,
+              true,
+              false,
+              false,
+            );
+            let sheet: SheetInfo = loaded.sheet;
+            for (const txn of txns) {
+              sheet = live.applyWireTxnV3(new Uint8Array(txn));
+            }
+            activeSheetId = sheet.sheet;
+            return { info: loaded.info, sheet };
+          },
+          (live) => streamSnapshot(live, docId),
         );
-        let sheet: SheetInfo = loaded.sheet;
-        for (const txn of cmd.txns) {
-          sheet = engine.applyWireTxnV3(new Uint8Array(txn));
-        }
-        activeSheetId = sheet.sheet;
-        scope.postMessage({ kind: "draftExited", sheet });
-        flushDuePages(engine);
         break;
       }
       // Fall back to cleanly exiting draft preview on collaborative workbooks.

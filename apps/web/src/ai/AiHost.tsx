@@ -36,12 +36,19 @@ export default function AiHost({ handle, ...props }: AiHostProps) {
         handle.sendHost({ kind: "draftOpenReplay", baseSnapshot }, [baseSnapshot])
       }
       onApplyReplayTxn={(txn) => handle.sendHost({ kind: "draftApplyTxn", txn }, [txn])}
-      onCommitLocalMerge={(baseSnapshot, txns) =>
-        handle.sendHost({ kind: "draftCommitLocalMerge", baseSnapshot, txns }, [
-          baseSnapshot,
-          ...txns,
-        ])
-      }
+      onCommitLocalMerge={(title, baseSnapshot, txns) => {
+        handle.noteChange();
+        handle.sendHost(
+          {
+            kind: "draftCommitLocalMerge",
+            docId: handle.freshDocId(),
+            title,
+            baseSnapshot,
+            txns,
+          },
+          [baseSnapshot, ...txns],
+        );
+      }}
       onExitDraft={() => handle.sendHost({ kind: "draftExit" })}
       onSetAiPresence={(presence) =>
         handle

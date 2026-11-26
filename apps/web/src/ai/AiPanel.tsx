@@ -58,7 +58,12 @@ export interface AiPanelProps {
   readonly onOpenCloudDraft: (docId: string, branchId: string) => void;
   readonly onOpenReplayDraft: (baseSnapshot: ArrayBuffer) => void;
   readonly onApplyReplayTxn: (txn: ArrayBuffer) => void;
-  readonly onCommitLocalMerge: (baseSnapshot: ArrayBuffer, txns: ArrayBuffer[]) => void;
+  /** Stores the merged demo as a new local workbook called `title`. */
+  readonly onCommitLocalMerge: (
+    title: string,
+    baseSnapshot: ArrayBuffer,
+    txns: ArrayBuffer[],
+  ) => void;
   readonly onExitDraft: () => void;
   readonly onSetAiPresence: (presence: RemotePresenceOverlay | null) => void;
   readonly onSetDiffHighlights: (map: DiffHighlightMap | null) => void;
@@ -587,10 +592,18 @@ export default function AiPanel({
       sel.conflictChoices ?? {},
       Boolean(sel.allowRefErrors),
     );
-    onCommitLocalMerge(decodeBase64(bundle.baseSnapshotB64), txns);
+    onCommitLocalMerge(
+      t("{title} (AI demo)", { title }),
+      decodeBase64(bundle.baseSnapshotB64),
+      txns,
+    );
     setReplayReview(false);
     setReplayMsg({
-      say: () => t('Merged selected changes from "{title}" into your sheet.', { title }),
+      say: () =>
+        t(
+          'Merged selected changes from "{title}" into a new workbook. The workbook you had open is unchanged.',
+          { title },
+        ),
     });
   };
 

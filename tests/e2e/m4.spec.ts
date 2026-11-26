@@ -17,8 +17,13 @@ test.describe("M4 AI Analyst — visitor pure-client replays (no sign-in)", () =
   test("lists all 10 demos, replays Regional Sales Summary, and enforces 3-way conflict + reference closure guard on demo #10", async ({
     page,
   }) => {
-    await page.goto("/app?hooks");
+    // A workbook of one's own, with a cell that no demo writes to.
+    const ownDoc = "demo-own";
+    await page.goto(`/app?hooks&doc=${ownDoc}`);
     await expect(page.getByTestId("engine-status")).toHaveText("ready", { timeout: 20_000 });
+    await editCell(page, 0, 7, "H1", "Mine");
+    await editCell(page, 0, 4, "E1", "Kept");
+    expect(await page.evaluate(() => window.__reticula?.docStatus().docId)).toBe(ownDoc);
 
     await page.getByTestId("ai-panel-btn").click();
     await expect(page.getByTestId("ai-panel")).toBeVisible();
@@ -41,6 +46,11 @@ test.describe("M4 AI Analyst — visitor pure-client replays (no sign-in)", () =
     await expect
       .poll(() => page.evaluate(() => window.__reticula?.textAt(1, 4)), { timeout: 10_000 })
       .toBe("South");
+    // The demo became a workbook of its own; the one that was open is as it was.
+    const demoDoc = await page.evaluate(() => window.__reticula?.docStatus().docId);
+    expect(demoDoc).toBeTruthy();
+    expect(demoDoc).not.toBe(ownDoc);
+    await expect(page.getByTestId("document")).toContainText("AI demo");
 
     // 2. Demo #10: Conflict & Reference Closure Lab. The merged one is put away.
     await expect(page.getByTestId("ai-replay-play")).toHaveCount(0);
@@ -70,6 +80,16 @@ test.describe("M4 AI Analyst — visitor pure-client replays (no sign-in)", () =
     await expect
       .poll(() => page.evaluate(() => window.__reticula?.textAt(0, 2)), { timeout: 10_000 })
       .toBe("555");
+
+    // Opened again, the workbook of one's own still has what was saved in it.
+    await page.evaluate(() => window.__reticula?.flushAndClose());
+    await page.goto(`/app?hooks&doc=${ownDoc}`);
+    await expect(page.getByTestId("engine-status")).toHaveText("ready", { timeout: 20_000 });
+    await expect.poll(() => page.evaluate(() => window.__reticula?.docStatus().docId)).toBe(ownDoc);
+    await expect
+      .poll(() => page.evaluate(() => window.__reticula?.textAt(0, 7)), { timeout: 10_000 })
+      .toBe("Mine");
+    expect(await page.evaluate(() => window.__reticula?.textAt(0, 4))).toBe("Kept");
   });
 });
 
