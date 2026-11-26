@@ -23,6 +23,8 @@ export interface SwClientOptions {
   readonly tabId: string;
   readonly onUpdateReady: (ready: boolean) => void;
   readonly onDrainForUpdate: () => Promise<void>;
+  /** Called synchronously right before reloading on `controllerchange`. */
+  readonly onBeforeReload?: () => void;
   /** Something is being imported, here or in another tab. `update`: to be called if it may be given up. */
   readonly onBusy: (update: () => void) => void;
 }
@@ -161,6 +163,11 @@ export function createSwClient(options: SwClientOptions): SwClientHandle {
       return;
     }
     reloaded = true;
+    try {
+      options.onBeforeReload?.();
+    } catch {
+      // Reload even if the hook throws.
+    }
     window.location.reload();
   };
   swContainer.addEventListener("controllerchange", onControllerChange);
@@ -290,32 +297,40 @@ export function createSwClient(options: SwClientOptions): SwClientHandle {
       await new Promise<void>((r) => window.setTimeout(r, DISCOVER_WINDOW_MS));
     }
 
-    // Drain all sibling tabs AND this tab concurrently so every OPFS handle and
-    // Web Lock closes cleanly before the new Service Worker takes control.
-    const peersWait =
-      channel && discoveredPeers.size > 0
-        ? new Promise<void>((resolve) => {
-            const finish = () => {
-              window.clearTimeout(cap);
-              onPeerDrained = null;
-              resolve();
-            };
-            const cap = window.setTimeout(finish, DRAIN_TIMEOUT_MS);
-            onPeerDrained = () => {
-              for (const id of discoveredPeers) {
-                if (!drainedPeers.has(id)) {
-                  return;
-                }
+    // Always broadcast `drainForUpdate` so a throttled sibling tab that missed
+    // the discovery window still gets a chance to flush before `SKIP_WAITING`.
+    let peersWait: Promise<void> = Promise.resolve();
+    if (channel) {
+      if (discoveredPeers.size > 0) {
+        peersWait = new Promise<void>((resolve) => {
+          const finish = () => {
+            window.clearTimeout(cap);
+            onPeerDrained = null;
+            resolve();
+          };
+          const cap = window.setTimeout(finish, DRAIN_TIMEOUT_MS);
+          onPeerDrained = () => {
+            for (const id of discoveredPeers) {
+              if (!drainedPeers.has(id)) {
+                return;
               }
-              finish();
-            };
-            channel.postMessage({
-              kind: "drainForUpdate",
-              updateId,
-              fromTabId: options.tabId,
-            } satisfies SwChannelMessage);
-          })
-        : Promise.resolve();
+            }
+            finish();
+          };
+          channel.postMessage({
+            kind: "drainForUpdate",
+            updateId,
+            fromTabId: options.tabId,
+          } satisfies SwChannelMessage);
+        });
+      } else {
+        channel.postMessage({
+          kind: "drainForUpdate",
+          updateId,
+          fromTabId: options.tabId,
+        } satisfies SwChannelMessage);
+      }
+    }
 
     await Promise.all([options.onDrainForUpdate().catch(() => {}), peersWait]);
 

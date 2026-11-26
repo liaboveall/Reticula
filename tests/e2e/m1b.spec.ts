@@ -675,3 +675,60 @@ test("a CSV file that is cut off leaves the workbook that is open as it was", as
   await settled(page);
   expect(await page.evaluate(() => window.__reticula?.textAt(1, 1))).toBe("2");
 });
+
+test("a damaged local catalog recovers from its spare and rebuilds from workbook directories", async ({
+  page,
+}) => {
+  await openWorkbook(page, "doc=cat-a");
+  const backend = await page.evaluate(() => window.__reticula?.docStatus().storageBackend);
+  test.skip(backend === "memory", "Browser lacks persistent OPFS in this environment");
+  await editCellViaBar(page, 0, 0, "A1", "AlphaData", "AlphaData");
+
+  await openWorkbook(page, "doc=cat-b");
+  await editCellViaBar(page, 0, 0, "A1", "BetaData", "BetaData");
+
+  const truncateCatalogFiles = async (names: readonly string[]) => {
+    await page.evaluate(async (targets) => {
+      const root = await navigator.storage.getDirectory();
+      const v1 = await root.getDirectoryHandle("reticula-v1");
+      for (const name of targets) {
+        const fh = await v1.getFileHandle(name, { create: true });
+        const writable = await fh.createWritable({ keepExistingData: false });
+        await writable.write('[{"id":');
+        await writable.close();
+      }
+    }, names);
+  };
+
+  // 1. Truncate only catalog.json -> falls back to catalog.spare.json with titles intact.
+  await page.evaluate(() => window.__reticula?.flushAndClose());
+  await truncateCatalogFiles(["catalog.json"]);
+  await openWorkbook(page, "doc=cat-c");
+  await page.getByTestId("workbooks-btn").click();
+  await expect(page.getByTestId("workbooks-drawer")).toBeVisible();
+  await expect(page.getByTestId("workbook-row-cat-a")).toBeVisible();
+  await expect(page.getByTestId("workbook-row-cat-b")).toBeVisible();
+  await expect(page.getByTestId("workbook-row-cat-c")).toBeVisible();
+  await page.keyboard.press("Escape");
+
+  // 2. Truncate BOTH catalog.json and catalog.spare.json -> rebuilds from local/<id> directories,
+  //    creating another workbook keeps the recovered ones, and both old workbooks still open cleanly.
+  await page.evaluate(() => window.__reticula?.flushAndClose());
+  await truncateCatalogFiles(["catalog.json", "catalog.spare.json"]);
+  await openWorkbook(page, "doc=cat-d");
+  await page.getByTestId("workbooks-btn").click();
+  await expect(page.getByTestId("workbooks-drawer")).toBeVisible();
+  await expect(page.getByTestId("workbook-row-cat-a")).toBeVisible();
+  await expect(page.getByTestId("workbook-row-cat-b")).toBeVisible();
+  await expect(page.getByTestId("workbook-row-cat-d")).toBeVisible();
+  await page.getByTestId("workbook-row-cat-a").getByRole("button").first().click();
+  await expect(page.getByTestId("workbooks-drawer")).toHaveCount(0);
+  await settled(page);
+  await expect.poll(() => page.evaluate(() => window.__reticula?.textAt(0, 0))).toBe("AlphaData");
+
+  await page.getByTestId("workbooks-btn").click();
+  await page.getByTestId("workbook-row-cat-b").getByRole("button").first().click();
+  await expect(page.getByTestId("workbooks-drawer")).toHaveCount(0);
+  await settled(page);
+  await expect.poll(() => page.evaluate(() => window.__reticula?.textAt(0, 0))).toBe("BetaData");
+});

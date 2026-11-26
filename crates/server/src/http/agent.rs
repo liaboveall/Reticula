@@ -664,7 +664,7 @@ fn build_sse_stream(
         if let Some(mut rx_live) = live_rx {
             loop {
                 let received = tokio::select! {
-                    received = rx_live.recv() => received,
+                    biased;
                     () = watch.changed() => {
                         if watch.still_allowed().await {
                             continue;
@@ -672,6 +672,7 @@ fn build_sse_stream(
                         // Ending it is enough: reconnecting is refused.
                         return;
                     }
+                    received = rx_live.recv() => received,
                 };
                 match received {
                     Ok(msg) => {

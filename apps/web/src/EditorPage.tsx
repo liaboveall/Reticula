@@ -112,6 +112,7 @@ interface ActiveEditSession {
   address: string;
   source: string;
   cursorUtf16: number;
+  inFormulaBar: boolean;
   canInsertRef: boolean;
   activeRefSpan: [number, number] | null;
   pointPickedSpan: [number, number] | null;
@@ -675,6 +676,7 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
         address: sel.name,
         source: initialSource,
         cursorUtf16,
+        inFormulaBar: false,
         canInsertRef: initialSource === "=",
         activeRefSpan: null,
         pointPickedSpan: null,
@@ -948,6 +950,7 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
           }
           session.source = text;
           session.cursorUtf16 = cursorUtf16;
+          session.inFormulaBar = false;
           session.canInsertRef = text === "=";
         }
         setEditingText(text);
@@ -1692,27 +1695,32 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
     let swStartTimer = 0;
     let swClient: Promise<SwClientHandle> | null = null;
     let disposed = false;
+    const saveEditForReload = () => {
+      // An update reloads the tab: what is being typed comes back afterwards.
+      const session = editSessionRef.current;
+      if (session) {
+        laterNow()?.keepEdit({
+          doc: editDocKey(),
+          sheet: session.hostSheet,
+          row: session.row,
+          col: session.col,
+          source: session.source,
+          cursorUtf16: session.cursorUtf16,
+          inFormulaBar: session.inFormulaBar,
+        });
+      }
+    };
+
     const ensureSwClient = (): Promise<SwClientHandle> => {
       swClient ??= loadLater().then(({ createSwClient }) => {
         const handle = createSwClient({
           tabId: tabIdRef.current,
           onUpdateReady: (ready) => setSwUpdateReady(ready),
           onDrainForUpdate: () => {
-            // An update reloads the tab: what is being typed comes back afterwards.
-            const session = editSessionRef.current;
-            if (session) {
-              laterNow()?.keepEdit({
-                doc: editDocKey(),
-                sheet: session.hostSheet,
-                row: session.row,
-                col: session.col,
-                source: session.source,
-                cursorUtf16: session.cursorUtf16,
-                inFormulaBar: document.activeElement?.closest(".formulabar") != null,
-              });
-            }
+            saveEditForReload();
             return flushAndCloseDoc();
           },
+          onBeforeReload: saveEditForReload,
           onBusy: (onAgreed) => askTables({ kind: "giveUp", onAgreed }),
         });
         if (disposed) {
@@ -1916,6 +1924,7 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
     if (activeSheetRef.current === session.hostSheet) {
       editor.setTextExternal(next, cursorUtf16);
     }
+    session.inFormulaBar = true;
     requestAnalyze(client, grid, editor);
   };
 
@@ -1994,6 +2003,9 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
     formulaBarRef.current?.applyTextAndSelection(nextSource, nextCursor, nextCursor);
     if (!session || activeSheetRef.current === session.hostSheet) {
       editor.applyTextAndSelection(nextSource, nextCursor, nextCursor);
+    }
+    if (session) {
+      session.inFormulaBar = fromFormulaBar;
     }
     if (fromFormulaBar) {
       formulaBarRef.current?.focus();
@@ -2120,7 +2132,7 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
   const restoreEdit = (kept: KeptEdit) =>
     onSheet(kept.sheet, (grid) => {
       keptEditRef.current = kept;
-      grid.select({ row: kept.row, col: kept.col });
+      grid.jumpTo(kept.row, kept.col, false);
     });
 
   /** Types it again, if its cell is the one selected and is there. */
@@ -2456,6 +2468,11 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
           analysisSource={formulaAnalysis?.source ?? null}
           getEditSource={getEditSource}
           onChange={handleFormulaBarChange}
+          onFocus={() => {
+            if (editSessionRef.current) {
+              editSessionRef.current.inFormulaBar = true;
+            }
+          }}
           onCommit={handleFormulaBarCommit}
           onCancel={handleFormulaBarCancel}
           onToggleDollar={(text, cursorUtf16) => {

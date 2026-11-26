@@ -143,7 +143,20 @@ test.describe("a file", () => {
   test("is imported in the background when the dialog is closed, and can be cancelled", async ({
     page,
   }) => {
-    await choose(page, "large.csv", ordersCsv(600_000));
+    // Build a 2,000,000-row virtual CSV directly in the browser from a repeated
+    // 1,000-row chunk so it allocates ~40 KB yet takes long enough to cancel on fast CI runners.
+    const block = ordersCsv(1_000).replace(/^[^\n]*\n/, "");
+    await page.getByTestId("table-import-input").evaluate((el, chunk) => {
+      const input = el as HTMLInputElement;
+      const parts: string[] = ["id,region,amount,day,note\n"];
+      for (let i = 0; i < 2_000; i += 1) {
+        parts.push(chunk);
+      }
+      const dt = new DataTransfer();
+      dt.items.add(new File(parts, "large.csv", { type: "text/csv" }));
+      input.files = dt.files;
+      input.dispatchEvent(new Event("change", { bubbles: true }));
+    }, block);
     await expect(page.getByTestId("table-import-preview")).toBeVisible();
     await page.getByTestId("table-import-start").click();
     await expect(page.getByTestId("table-import-progress")).toBeVisible();

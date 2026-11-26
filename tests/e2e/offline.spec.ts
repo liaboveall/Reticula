@@ -287,6 +287,50 @@ test("two open tabs coordinate OPFS drain and upgrade together from SW v1 to v2 
     await expect.poll(() => tab2.evaluate(() => window.__reticula?.textAt(0, 1))).toBe("");
     await expect(bar2).toHaveText("");
 
+    // Now trigger a v3 update from the tab that is editing in the formula bar, while the
+    // other tab is editing in a cell — both drafts must still survive and return to their place.
+    const V3_BUILD_ID = "e2ev3build000003";
+    await tab1.bringToFront();
+    await tab1.evaluate(() => window.__reticula?.select(0, 2));
+    await expect(tab1.getByTestId("name-box")).toHaveText("C1");
+    await tab1.keyboard.type("Cell v3");
+    await expect(cell1).toHaveText("Cell v3");
+
+    await tab2.bringToFront();
+    await tab2.evaluate(() => window.__reticula?.select(0, 2));
+    await expect(tab2.getByTestId("name-box")).toHaveText("C1");
+    await bar2.click();
+    await bar2.fill('=A1&" bar v3"');
+    await expect(bar2).toHaveText('=A1&" bar v3"');
+
+    srv.setSwOverride(V3_BUILD_ID);
+    await tab2.evaluate(() => window.__reticula?.checkSwUpdate());
+    await expect(tab2.getByTestId("sw-update-banner")).toBeVisible({ timeout: 10_000 });
+    await expect(tab1.getByTestId("sw-update-banner")).toBeVisible({ timeout: 10_000 });
+
+    const tab1Nav3 = tab1.waitForEvent("load", { timeout: 15_000 });
+    const tab2Nav3 = tab2.waitForEvent("load", { timeout: 15_000 });
+    await tab2.getByTestId("sw-update-btn").click();
+    await Promise.all([tab1Nav3, tab2Nav3]);
+
+    await tab2.bringToFront();
+    await expect(tab2.getByTestId("engine-status")).toHaveText("ready", { timeout: 15_000 });
+    await settled(tab2);
+    await expect
+      .poll(async () => (await tab2.evaluate(() => window.__reticula?.swStatus()))?.buildId, {
+        timeout: 10_000,
+      })
+      .toBe(V3_BUILD_ID);
+    await expect(bar2).toHaveText('=A1&" bar v3"', { timeout: 10_000 });
+    await expect(tab2.locator(".formula-cm-wrap.focused")).toBeVisible();
+    await expect(tab2.getByTestId("name-box")).toHaveText("C1");
+
+    await tab1.bringToFront();
+    await expect(tab1.getByTestId("engine-status")).toHaveText("ready", { timeout: 15_000 });
+    await settled(tab1);
+    await expect(cell1).toHaveText("Cell v3", { timeout: 10_000 });
+    await expect(tab1.getByTestId("name-box")).toHaveText("C1");
+
     await tab1.close();
     await tab2.close();
   } finally {

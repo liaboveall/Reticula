@@ -80,9 +80,18 @@ test.describe("M2b governance, workbooks, history, and account lifecycle", () =>
       await expect(createdRow).toContainText(renamedTitle, { timeout: 10_000 });
 
       await createdRow.getByRole("button", { name: "Delete" }).click();
+      await expect(page.getByTestId("confirm-delete")).toContainText(renamedTitle);
       await page.getByTestId("confirm-delete").getByRole("button", { name: "Cancel" }).click();
       await expect(page.getByTestId("confirm-delete")).toHaveCount(0);
       await expect(createdRow).toBeVisible();
+      // Cancelling keeps the cloud workbook openable.
+      await createdRow.getByRole("button", { name: `Open ${renamedTitle}` }).click();
+      await expect(page).toHaveURL(new RegExp(`\\?collab=${createdId}`), { timeout: 10_000 });
+      await expect(page.getByTestId("collab-status-pill")).toHaveText("Synced", {
+        timeout: 15_000,
+      });
+      await page.goto(`${server.baseUrl}/workbooks`);
+      await expect(createdRow).toBeVisible({ timeout: 10_000 });
       await createdRow.getByRole("button", { name: "Delete" }).click();
       await page.getByTestId("confirm-delete-btn").click();
       await expect(page.getByTestId(`cloud-wb-${createdId}`)).toHaveCount(0, { timeout: 10_000 });
@@ -96,6 +105,23 @@ test.describe("M2b governance, workbooks, history, and account lifecycle", () =>
       } else {
         await page.getByTestId("workbooks-tab-local").click();
         const localRow = page.getByTestId(`local-wb-${localDocId}`);
+        await expect(localRow).toBeVisible({ timeout: 10_000 });
+        // Cancelling local delete keeps the workbook and its saved data openable.
+        await localRow.getByRole("button", { name: /^Delete Local/ }).click();
+        await expect(page.getByTestId("confirm-delete")).toContainText(localDocId);
+        await page.getByTestId("confirm-delete").getByRole("button", { name: "Cancel" }).click();
+        await expect(page.getByTestId("confirm-delete")).toHaveCount(0);
+        await expect(localRow).toBeVisible();
+        await localRow.getByRole("button", { name: "Open Local" }).click();
+        await expect(page.getByTestId("engine-status")).toHaveText("ready", { timeout: 15_000 });
+        await page.goto(`${server.baseUrl}/app?hooks&doc=${encodeURIComponent(localDocId)}`);
+        await expect(page.getByTestId("engine-status")).toHaveText("ready", { timeout: 15_000 });
+        await expect
+          .poll(() => page.evaluate(() => window.__reticula?.textAt(0, 0)), { timeout: 5_000 })
+          .toBe("LocalSeed");
+        await page.evaluate(() => window.__reticula?.flushAndClose());
+        await page.goto(`${server.baseUrl}/workbooks`);
+        await page.getByTestId("workbooks-tab-local").click();
         await expect(localRow).toBeVisible({ timeout: 10_000 });
         await page.getByTestId(`convert-cloud-${localDocId}`).click();
         await expect(page).toHaveURL(/\?collab=/, { timeout: 15_000 });

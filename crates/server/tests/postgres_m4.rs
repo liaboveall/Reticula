@@ -78,7 +78,7 @@ impl IsolatedDb {
 }
 
 struct TestServer {
-    _root: TempDir,
+    _root: Option<TempDir>,
     store: Store,
     api: ApiState,
     base: String,
@@ -99,7 +99,16 @@ impl TestServer {
         gov: GovernanceConfig,
         agent_cfg: AgentRuntimeConfig,
     ) -> Self {
-        let root = tempfile::tempdir().unwrap();
+        Self::start_with_root(db, tempfile::tempdir().unwrap(), limits, gov, agent_cfg).await
+    }
+
+    async fn start_with_root(
+        db: &IsolatedDb,
+        root: TempDir,
+        limits: StorageLimits,
+        gov: GovernanceConfig,
+        agent_cfg: AgentRuntimeConfig,
+    ) -> Self {
         let store = Store::connect_with_limits(&db.url, root.path().to_path_buf(), limits)
             .await
             .unwrap();
@@ -124,13 +133,18 @@ impl TestServer {
             .build()
             .unwrap();
         Self {
-            _root: root,
+            _root: Some(root),
             store,
             api,
             base: format!("http://{addr}"),
             client,
             handle,
         }
+    }
+
+    fn stop_keeping_root(mut self) -> TempDir {
+        self.handle.abort();
+        self._root.take().expect("root dir")
     }
 
     async fn dev_login(&self, account: &str) -> (String, Uuid) {
@@ -1601,15 +1615,8 @@ async fn a_merge_that_fails_leaves_main_as_it_was_and_lands_once_when_retried() 
         .collect();
     assert!(!hunks.is_empty());
     let merge_path = format!("/api/workbooks/{doc}/branches/{branch_id}/merge");
-    let merge = || {
-        server.req(
-            Method::POST,
-            &merge_path,
-            Some(&cookie),
-            None,
-            Some(json!({ "acceptedHunks": hunks, "conflictChoices": {}, "allowRefErrors": false })),
-        )
-    };
+    let merge_body =
+        json!({ "acceptedHunks": hunks, "conflictChoices": {}, "allowRefErrors": false });
 
     // The draft's status cannot be written: the changes must not land on `main` either.
     sqlx::raw_sql(
@@ -1624,7 +1631,15 @@ async fn a_merge_that_fails_leaves_main_as_it_was_and_lands_once_when_retried() 
     .execute(&pool)
     .await
     .unwrap();
-    let failed = merge().await;
+    let failed = server
+        .req(
+            Method::POST,
+            &merge_path,
+            Some(&cookie),
+            None,
+            Some(merge_body.clone()),
+        )
+        .await;
     assert_eq!(failed.status(), StatusCode::INTERNAL_SERVER_ERROR);
     assert_eq!(main_txn_count(&pool, doc).await, 0);
     let branch = server
@@ -1648,12 +1663,31 @@ async fn a_merge_that_fails_leaves_main_as_it_was_and_lands_once_when_retried() 
         .unwrap();
     assert_eq!(run_after["run"]["status"], "waiting_review");
 
-    // Once the database accepts it, the retry lands, and only once.
+    // Restart the server against the same DB and data directory, then clear the fault and retry:
+    // main must still be clean before retry, and the retry must land once and only once.
+    let root = server.stop_keeping_root();
     sqlx::raw_sql("DROP TRIGGER refuse_merged ON branches; DROP FUNCTION refuse_merged();")
         .execute(&pool)
         .await
         .unwrap();
-    let merged = merge().await;
+    let server = TestServer::start_with_root(
+        &db,
+        root,
+        StorageLimits::default(),
+        GovernanceConfig::default(),
+        AgentRuntimeConfig::mock_for_tests(),
+    )
+    .await;
+    assert_eq!(main_txn_count(&pool, doc).await, 0);
+    let merged = server
+        .req(
+            Method::POST,
+            &merge_path,
+            Some(&cookie),
+            None,
+            Some(merge_body.clone()),
+        )
+        .await;
     assert_eq!(merged.status(), StatusCode::OK);
     let body: Value = merged.json().await.unwrap();
     let committed = i64::from(u32::try_from(body["committedTxns"].as_u64().unwrap()).unwrap());
@@ -1666,7 +1700,18 @@ async fn a_merge_that_fails_leaves_main_as_it_was_and_lands_once_when_retried() 
         .unwrap()
         .unwrap();
     assert_eq!(branch.status, "merged");
-    assert_eq!(merge().await.status(), StatusCode::CONFLICT);
+    let main_after = server.store.load_machine(doc).await.unwrap();
+    assert_eq!(main_after.head_seq(), u64::try_from(committed).unwrap());
+    let retried = server
+        .req(
+            Method::POST,
+            &merge_path,
+            Some(&cookie),
+            None,
+            Some(merge_body),
+        )
+        .await;
+    assert_eq!(retried.status(), StatusCode::CONFLICT);
     assert_eq!(main_txn_count(&pool, doc).await, committed);
 
     pool.close().await;

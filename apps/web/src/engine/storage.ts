@@ -278,13 +278,9 @@ function parseCatalog(bytes: Uint8Array | null | undefined): WorkbookCatalogEntr
   );
 }
 
-/**
- * Reads the list of local workbooks. When it is damaged its spare is read; when
- * both are, the list is made again from the workbooks that have files, so that
- * none is lost to a write that stopped halfway. Their titles are not in their
- * files, so they are found again as {@link RECOVERED_TITLE}.
- */
-export async function readCatalog(backend: StorageBackendKind): Promise<WorkbookCatalogEntry[]> {
+async function readCatalogState(
+  backend: StorageBackendKind,
+): Promise<{ readonly entries: WorkbookCatalogEntry[]; readonly mainIntact: boolean }> {
   let main: Uint8Array | null;
   let spare: () => Promise<Uint8Array | null>;
   if (backend === "memory") {
@@ -297,25 +293,36 @@ export async function readCatalog(backend: StorageBackendKind): Promise<Workbook
   }
   const listed = parseCatalog(main);
   if (listed) {
-    return listed;
+    return { entries: listed, mainIntact: true };
   }
   const spareBytes = await spare();
   const kept = parseCatalog(spareBytes);
   if (kept) {
-    return kept;
+    return { entries: kept, mainIntact: false };
   }
   if (main === null && spareBytes === null) {
     // Never written: a workbook being made has its files before its entry.
-    return [];
+    return { entries: [], mainIntact: true };
   }
   // Rarely needed, and so not loaded until it is.
   const { findDocs } = await import("./catalog-recovery.ts");
-  return (await findDocs(backend)).sort(newestFirst);
+  return { entries: (await findDocs(backend)).sort(newestFirst), mainIntact: false };
+}
+
+/**
+ * Reads the list of local workbooks. When it is damaged its spare is read; when
+ * both are, the list is made again from the workbooks that have files, so that
+ * none is lost to a write that stopped halfway. Their titles are not in their
+ * files, so they are found again as {@link RECOVERED_TITLE}.
+ */
+export async function readCatalog(backend: StorageBackendKind): Promise<WorkbookCatalogEntry[]> {
+  return (await readCatalogState(backend)).entries;
 }
 
 export async function writeCatalog(
   entries: readonly WorkbookCatalogEntry[],
   backend: StorageBackendKind,
+  repairMainFirst = false,
 ): Promise<void> {
   const bytes = encoder.encode(JSON.stringify(entries));
   if (backend === "memory") {
@@ -324,10 +331,13 @@ export async function writeCatalog(
     return;
   }
   const root = await getRootDir(true);
-  // The spare first: while the list is written, the spare is whole, and the
-  // other way round.
-  await writeOpfsFileAtomic(root, CATALOG_SPARE, bytes, backend);
-  await writeOpfsFileAtomic(root, CATALOG_FILE, bytes, backend);
+  // Write the damaged copy first when repairing, otherwise the spare first, so
+  // an intact copy always stays on disk across any interruption.
+  for (const name of repairMainFirst
+    ? [CATALOG_FILE, CATALOG_SPARE]
+    : [CATALOG_SPARE, CATALOG_FILE]) {
+    await writeOpfsFileAtomic(root, name, bytes, backend);
+  }
 }
 
 /**
@@ -339,8 +349,9 @@ function updateCatalog(
   change: (entries: readonly WorkbookCatalogEntry[]) => WorkbookCatalogEntry[],
 ): Promise<WorkbookCatalogEntry[]> {
   const update = async () => {
-    const next = change(await readCatalog(backend));
-    await writeCatalog(next, backend);
+    const { entries, mainIntact } = await readCatalogState(backend);
+    const next = change(entries);
+    await writeCatalog(next, backend, !mainIntact);
     return next;
   };
   return navigator.locks?.request ? navigator.locks.request("reticula:catalog", update) : update();

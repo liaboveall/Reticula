@@ -336,7 +336,7 @@ pub fn eval_rate(
         let Some(f0) = eval_f(r) else {
             break;
         };
-        if f0.abs() < 1e-13 * scale {
+        if f0.abs() <= 1e-13 * scale {
             return fin_result(r);
         }
         let h = (r.abs() * 1e-6).max(1e-7);
@@ -352,7 +352,7 @@ pub fn eval_rate(
         r = next;
         if delta < 1e-14
             && let Some(chk) = eval_f(r)
-            && chk.abs() < 1e-9 * scale
+            && chk.abs() <= 1e-9 * scale
         {
             return fin_result(r);
         }
@@ -541,7 +541,7 @@ pub fn eval_irr(
         let Some((f0, df)) = irr_val(r) else {
             break;
         };
-        if f0.abs() < 1e-13 * scale {
+        if f0.abs() <= 1e-13 * scale {
             return fin_result(r);
         }
         if df.abs() < 1e-18 * scale {
@@ -552,7 +552,7 @@ pub fn eval_irr(
         r = next;
         if delta < 1e-14
             && let Some((chk, _)) = irr_val(r)
-            && chk.abs() < 1e-9 * scale
+            && chk.abs() <= 1e-9 * scale
         {
             return fin_result(r);
         }

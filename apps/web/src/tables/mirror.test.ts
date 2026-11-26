@@ -76,6 +76,23 @@ describe("room for copies", () => {
     expect(names()).toEqual(["a", "b", "doc.json"]);
   });
 
+  it("evicts nothing when the new copy alone exceeds the budget", async () => {
+    expect(await makeRoom(dir(), "huge", 1_500, 1_000)).toBe(false);
+    expect(names()).toEqual(["a", "b", "c", "doc.json"]);
+  });
+
+  it("refuses to create a new mirror file on disk when locked copies leave no room", async () => {
+    copies().putBytes("x", new Uint8Array(450));
+    copies().putBytes("y", new Uint8Array(450));
+    for (const name of ["x", "y"]) {
+      await (await copies().getFileHandle(name)).createSyncAccessHandle();
+    }
+    expect(await openMirror("user", "z", 300, 1_000)).toBeNull();
+    expect(names()).not.toContain("z");
+    expect(await openMirror("user", "huge", (1 << 30) + 1)).toBeNull();
+    expect(names()).not.toContain("huge");
+  });
+
   it("goes by when a copy was opened last, not only by what came", async () => {
     (await openMirror("user", "a", 400))?.file.close();
     await makeRoom(dir(), "new", 300, 800);

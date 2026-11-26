@@ -163,11 +163,32 @@ describe("a list of workbooks that a write left damaged", () => {
   };
   const state = { activeSlot: "a", snapshotSeq: 0, lastFlushedSeq: 0, openingCount: 0 } as const;
 
-  test("is read from its spare", async () => {
-    await upsertCatalogEntry(entry("a", 1), "opfs-writable");
-    await upsertCatalogEntry(entry("b", 2), "opfs-writable");
+  test("is read from its spare, and repairs the main copy before touching the spare", async () => {
+    await upsertCatalogEntry(entry("a", 1, "Alpha"), "opfs-writable");
+    await upsertCatalogEntry(entry("b", 2, "Beta"), "opfs-writable");
     await damage("catalog.json");
     expect(await ids()).toEqual(["b", "a"]);
+
+    const dir = await top();
+    const order: string[] = [];
+    const origGetFileHandle = dir.getFileHandle.bind(dir);
+    dir.getFileHandle = async (name: string, options?: { create?: boolean }) => {
+      const handle = await origGetFileHandle(name, options);
+      return {
+        ...handle,
+        createWritable: async () => {
+          order.push(name);
+          return handle.createWritable();
+        },
+      };
+    };
+    await upsertCatalogEntry(entry("c", 3, "Gamma"), "opfs-writable");
+    expect(order).toEqual(["catalog.json", "catalog.spare.json"]);
+    expect((await readCatalog("opfs-writable")).map(({ title }) => title)).toEqual([
+      "Gamma",
+      "Beta",
+      "Alpha",
+    ]);
   });
 
   test("is made again from the workbooks that are there", async () => {

@@ -61,7 +61,12 @@ jobs:
           ENTRYPOINT ["/usr/local/bin/reticula-server"]
           EOF
           SHORT_SHA="${GITHUB_SHA::7}"
-          docker build             --label "org.opencontainers.image.revision=${GITHUB_SHA}"             --label "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}"             --tag "${IMAGE_NAME}:${SHORT_SHA}" --tag "${IMAGE_NAME}:latest" "${STAGE}"
+          docker build \
+            --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            --label "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
+            --tag "${IMAGE_NAME}:${SHORT_SHA}" \
+            --tag "${IMAGE_NAME}:latest" \
+            "${STAGE}"
           if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
             TAG_NAME="${GITHUB_REF#refs/tags/}"
             docker tag "${IMAGE_NAME}:${SHORT_SHA}" "${IMAGE_NAME}:${TAG_NAME}"

@@ -21,10 +21,19 @@ export async function makeRoom(
   bytes: number,
   most: number = MOST_COPIED,
 ): Promise<boolean> {
+  if (bytes > most) {
+    return false;
+  }
   const files: File[] = [];
   for (const other of await namesIn(dir)) {
     if (other !== name && !other.endsWith(".json")) {
-      files.push(await (await dir.getFileHandle(other)).getFile());
+      try {
+        files.push(await (await dir.getFileHandle(other)).getFile());
+      } catch (err) {
+        if ((err as { name?: string })?.name !== "NotFoundError") {
+          throw err;
+        }
+      }
     }
   }
   let total = files.reduce((sum, { size }) => sum + size, bytes);
@@ -42,11 +51,12 @@ export async function openMirror(
   userId: string,
   sha256: string,
   bytes: number,
+  most: number = MOST_COPIED,
 ): Promise<Mirror | null> {
   try {
     const dir = await copiesDir(userId, true);
     // Without room, the table is had in memory, as it is in another tab.
-    if (!(await makeRoom(dir, sha256, bytes))) {
+    if (!(await makeRoom(dir, sha256, bytes, most))) {
       return null;
     }
     const file = await openStored(dir, sha256, true, 0);

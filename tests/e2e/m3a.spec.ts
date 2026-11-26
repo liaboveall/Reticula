@@ -1,5 +1,5 @@
 import { readFile } from "node:fs/promises";
-import { expect, type Page, test } from "@playwright/test";
+import { expect, type Page, type Route, test } from "@playwright/test";
 import {
   type CollabServerHandle,
   createAndShareSheet,
@@ -597,6 +597,72 @@ test("XLSX import/export preserves dynamic & opaque formulas and unauthenticated
   expect(await page.locator('[data-testid="bench-table"] tbody tr').count()).toBeGreaterThan(0);
 
   expect(pageErrors).toEqual([]);
+});
+
+test("XLSX import and export both retry cleanly on the same page after a failed module load", async ({
+  browser,
+}) => {
+  const opaqueInput = buildMinimalXlsxWithOpaqueFormula();
+  const blockXlsxWasm = (route: Route) => route.abort("failed");
+  // Block Service Worker registration so Playwright intercepts the direct WASM fetch in all browsers.
+  const context = await browser.newContext({ serviceWorkers: "block" });
+  try {
+    // 1. Import fails when the XLSX WASM module cannot be fetched, then succeeds on retry in place.
+    const importPage = await context.newPage();
+    await openWorkbook(importPage, "doc=m3a-xlsx-retry-in");
+    await importPage.route(/xlsx.*\.wasm/i, blockXlsxWasm);
+    await importPage.getByTestId("workbooks-btn").click();
+    await expect(importPage.getByTestId("workbooks-drawer")).toBeVisible();
+    await importPage.getByTestId("import-file-input").setInputFiles({
+      name: "retry-import.xlsx",
+      mimeType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      buffer: opaqueInput,
+    });
+    await expect(importPage.getByTestId("rejected-banner")).toBeVisible({ timeout: 10_000 });
+    await importPage.unroute(/xlsx.*\.wasm/i, blockXlsxWasm);
+    await importPage.getByTestId("workbooks-btn").click();
+    await expect(importPage.getByTestId("workbooks-drawer")).toBeVisible();
+    await importPage.getByTestId("import-file-input").setInputFiles({
+      name: "retry-import.xlsx",
+      mimeType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      buffer: opaqueInput,
+    });
+    await expect(importPage.getByTestId("workbooks-drawer")).toHaveCount(0);
+    await expect(importPage.getByTestId("document")).toContainText("retry-import");
+    await settled(importPage);
+    await expect
+      .poll(() => importPage.evaluate(() => window.__reticula?.textAt(0, 1)))
+      .toBe("250.5");
+    await importPage.close();
+
+    // 2. Export fails when the XLSX WASM module cannot be fetched, then succeeds on retry in place.
+    const exportPage = await context.newPage();
+    await openWorkbook(exportPage, "doc=m3a-xlsx-retry-out");
+    await editCellViaBar(exportPage, 0, 0, "A1", "ExportRetry", "ExportRetry");
+    await exportPage.route(/xlsx.*\.wasm/i, blockXlsxWasm);
+    await exportPage.getByTestId("workbooks-btn").click();
+    await expect(exportPage.getByTestId("workbooks-drawer")).toBeVisible();
+    await exportPage.getByTestId("drawer-export-xlsx").click();
+    await expect(exportPage.getByTestId("rejected-banner")).toBeAttached({ timeout: 10_000 });
+    await exportPage.unroute(/xlsx.*\.wasm/i, blockXlsxWasm);
+    if ((await exportPage.getByTestId("workbooks-drawer").count()) === 0) {
+      await exportPage.getByTestId("workbooks-btn").click();
+      await expect(exportPage.getByTestId("workbooks-drawer")).toBeVisible();
+    }
+    const dlPromise = exportPage.waitForEvent("download");
+    await exportPage.getByTestId("drawer-export-xlsx").click();
+    const dl = await dlPromise;
+    const dlPath = await dl.path();
+    expect(dlPath).toBeTruthy();
+    if (!dlPath) {
+      throw new Error("missing retried xlsx download path");
+    }
+    const bytes = await readFile(dlPath);
+    expect(bytes.subarray(0, 4).toString("binary")).toBe("PK\x03\x04");
+    await exportPage.close();
+  } finally {
+    await context.close();
+  }
 });
 
 test.describe("M3a collaborative concurrent sort convergence (E16)", () => {
