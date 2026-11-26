@@ -76,7 +76,9 @@ pub fn wildcard_search_substring(
     start_char_idx: usize,
 ) -> Option<usize> {
     let within_chars: Vec<char> = within.chars().collect();
-    if start_char_idx > within_chars.len() {
+    // Unlike `FIND`, `SEARCH` starts at a character of `within` or not at all:
+    // Excel answers `SEARCH("", "abc", 4)` and `SEARCH("*", "abc", 4)` with `#VALUE!`.
+    if start_char_idx >= within_chars.len() {
         return None;
     }
     if pattern.is_empty() {

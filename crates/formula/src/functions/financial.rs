@@ -326,6 +326,9 @@ pub fn eval_rate(
     }
 
     let eval_f = |r: f64| annuity_eval(r, nper, pmt, pv, fv, ptype);
+    // What is near enough to zero is as large as the amounts are: the rate of
+    // amounts that are all 1e-14 of others is that of the others.
+    let scale = amount_scale(&[pmt, pv, fv]);
 
     // 1. Deterministic Newton-Raphson from `guess`.
     let mut r = guess;
@@ -333,7 +336,7 @@ pub fn eval_rate(
         let Some(f0) = eval_f(r) else {
             break;
         };
-        if f0.abs() < 1e-13 {
+        if f0.abs() < 1e-13 * scale {
             return fin_result(r);
         }
         let h = (r.abs() * 1e-6).max(1e-7);
@@ -341,7 +344,7 @@ pub fn eval_rate(
             break;
         };
         let deriv = (f_hi - f_lo) / (2.0 * h);
-        if !deriv.is_finite() || deriv.abs() < 1e-18 {
+        if !deriv.is_finite() || deriv.abs() < 1e-18 * scale {
             break;
         }
         let next = (r - f0 / deriv).clamp(-0.999_999, 1e6);
@@ -349,7 +352,7 @@ pub fn eval_rate(
         r = next;
         if delta < 1e-14
             && let Some(chk) = eval_f(r)
-            && chk.abs() < 1e-9
+            && chk.abs() < 1e-9 * scale
         {
             return fin_result(r);
         }
@@ -528,16 +531,20 @@ pub fn eval_irr(
         (f.is_finite() && df.is_finite()).then_some((f, df))
     };
 
+    // What is near enough to zero is as large as the flows are: IRR of flows that
+    // are all 1e-14 of others is that of the others, as it is in Excel.
+    let scale = amount_scale(&flows);
+
     // 1. Deterministic Newton-Raphson from `guess`.
     let mut r = guess;
     for _ in 0..100 {
         let Some((f0, df)) = irr_val(r) else {
             break;
         };
-        if f0.abs() < 1e-13 {
+        if f0.abs() < 1e-13 * scale {
             return fin_result(r);
         }
-        if df.abs() < 1e-18 {
+        if df.abs() < 1e-18 * scale {
             break;
         }
         let next = (r - f0 / df).clamp(-0.999_999, 1e6);
@@ -545,7 +552,7 @@ pub fn eval_irr(
         r = next;
         if delta < 1e-14
             && let Some((chk, _)) = irr_val(r)
-            && chk.abs() < 1e-9
+            && chk.abs() < 1e-9 * scale
         {
             return fin_result(r);
         }
@@ -589,6 +596,19 @@ pub fn eval_irr(
     }
 
     EvalValue::Scalar(EvalScalar::Error(CalcError::Num))
+}
+
+/// The largest of some amounts, by which the tolerances of a solver are scaled;
+/// 1 when they are all zero, so that zero is then near enough to zero.
+fn amount_scale(amounts: &[f64]) -> f64 {
+    let largest = amounts
+        .iter()
+        .fold(0.0_f64, |largest, amount| largest.max(amount.abs()));
+    if largest > 0.0 && largest.is_finite() {
+        largest
+    } else {
+        1.0
+    }
 }
 
 /// Evaluates `SLN(cost, salvage, life)`.
