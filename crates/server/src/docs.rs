@@ -27,7 +27,7 @@ use reticula_wire::v3::{
     SYNC_PROTOCOL_VERSION_V2, WireCatchupV2, WireCommittedTxnV3, WirePendingTxnV3, WireSyncFrameV2,
 };
 use thiserror::Error;
-use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep_until};
 use uuid::Uuid;
@@ -158,10 +158,20 @@ impl Drop for BudgetLease {
     }
 }
 
+/// Somebody's access to a workbook changed, or ended (`role: None`).
+#[derive(Clone, Copy, Debug)]
+pub struct AccessChange {
+    pub doc: Uuid,
+    pub user: Uuid,
+    pub role: Option<MemberRole>,
+}
+
 #[derive(Clone)]
 pub struct DocRooms {
     store: Store,
     rooms: Arc<Registry>,
+    /// For what is connected outside the rooms, such as the events of AI runs.
+    access: broadcast::Sender<AccessChange>,
     extra_budget_bytes: Arc<AtomicU64>,
     max_loaded_bytes: u64,
     metrics: Arc<Metrics>,
@@ -177,6 +187,7 @@ impl DocRooms {
         Self {
             store,
             rooms: Arc::default(),
+            access: broadcast::channel(128).0,
             extra_budget_bytes: Arc::new(AtomicU64::new(0)),
             max_loaded_bytes,
             metrics,
@@ -186,6 +197,11 @@ impl DocRooms {
 
     pub fn max_loaded_bytes(&self) -> u64 {
         self.max_loaded_bytes
+    }
+
+    /// Hears of every change of access, to any workbook, from now on.
+    pub fn subscribe_access(&self) -> broadcast::Receiver<AccessChange> {
+        self.access.subscribe()
     }
 
     /// `user` and `role` are supplied by the authenticated transport.
@@ -497,6 +513,7 @@ impl DocRooms {
     }
 
     pub async fn update_member_role(&self, doc: Uuid, user: Uuid, role: Option<MemberRole>) {
+        let _ = self.access.send(AccessChange { doc, user, role });
         for sender in self.senders_for_doc(doc).await {
             let _ = sender.send(Command::UpdateRole { user, role }).await;
         }

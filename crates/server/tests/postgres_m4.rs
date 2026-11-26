@@ -1673,3 +1673,115 @@ async fn a_merge_that_fails_leaves_main_as_it_was_and_lands_once_when_retried() 
     drop(server);
     db.cleanup().await;
 }
+
+/// Reads a stream of events until it ends; `false` when it is still going after `within`.
+async fn ends_within(resp: &mut Response, within: Duration) -> bool {
+    timeout(within, async {
+        while let Ok(Some(_)) = resp.chunk().await {}
+    })
+    .await
+    .is_ok()
+}
+
+#[tokio::test]
+#[ignore = "requires an isolated PostgreSQL database in RETICULA_TEST_DATABASE_URL"]
+async fn the_events_of_a_run_stop_for_whoever_may_no_longer_read_them() {
+    let db = IsolatedDb::create().await;
+    let server = TestServer::start(
+        &db,
+        StorageLimits::default(),
+        GovernanceConfig::default(),
+        AgentRuntimeConfig::mock_for_tests(),
+    )
+    .await;
+    let (alice_cookie, _) = server.dev_login("alice").await;
+    let (bob_cookie, bob_id) = server.dev_login("bob").await;
+    let doc = server.create_workbook(&alice_cookie, "Who reads").await;
+    let link: Value = server
+        .req(
+            Method::POST,
+            &format!("/api/workbooks/{doc}/share-links"),
+            Some(&alice_cookie),
+            None,
+            Some(json!({ "role": "editor", "label": "b" })),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+    let tok = link["url"].as_str().unwrap().trim_start_matches("/join/");
+    let joined = server
+        .req(
+            Method::POST,
+            &format!("/api/join/{tok}"),
+            Some(&bob_cookie),
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(joined.status(), StatusCode::OK);
+
+    let run: Value = server
+        .req(
+            Method::POST,
+            &format!("/api/workbooks/{doc}/agent/runs"),
+            Some(&alice_cookie),
+            None,
+            Some(json!({ "prompt": "[slow] A run that takes its time" })),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+    let run_id = run["id"].as_str().unwrap().to_owned();
+    let events = format!("/api/workbooks/{doc}/agent/runs/{run_id}/events");
+
+    // Bob follows it, and is then removed: his stream ends long before the run.
+    let mut bobs = server
+        .req(Method::GET, &events, Some(&bob_cookie), None, None)
+        .await;
+    assert_eq!(bobs.status(), StatusCode::OK);
+    assert!(!ends_within(&mut bobs, Duration::from_millis(300)).await);
+    let removed = server
+        .req(
+            Method::DELETE,
+            &format!("/api/workbooks/{doc}/members/{bob_id}"),
+            Some(&alice_cookie),
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(removed.status(), StatusCode::NO_CONTENT);
+    assert!(
+        ends_within(&mut bobs, Duration::from_secs(3)).await,
+        "a removed member's stream goes on"
+    );
+    let again = server
+        .req(Method::GET, &events, Some(&bob_cookie), None, None)
+        .await;
+    assert_eq!(again.status(), StatusCode::FORBIDDEN);
+
+    // Alice follows it, and signs out: hers ends as well.
+    let mut alices = server
+        .req(Method::GET, &events, Some(&alice_cookie), None, None)
+        .await;
+    assert_eq!(alices.status(), StatusCode::OK);
+    assert!(!ends_within(&mut alices, Duration::from_millis(300)).await);
+    let out = server
+        .req(
+            Method::POST,
+            "/api/auth/logout",
+            Some(&alice_cookie),
+            None,
+            None,
+        )
+        .await;
+    assert!(out.status().is_success());
+    assert!(
+        ends_within(&mut alices, Duration::from_secs(3)).await,
+        "a stream of a session that was signed out goes on"
+    );
+
+    drop(server);
+    db.cleanup().await;
+}

@@ -23,7 +23,7 @@ use uuid::Uuid;
 
 use super::{ApiError, ApiState, auth, check_write_rate};
 use crate::agent::AgentStartError;
-use crate::docs::MergeCommitOutcome;
+use crate::docs::{AccessChange, MergeCommitOutcome};
 use crate::store::{
     AgentRunDetail, AgentRunRecord, BranchRecord, MAIN_BRANCH, User, WorkbookAccess,
 };
@@ -522,7 +522,20 @@ pub(super) async fn agent_run_events(
     headers: HeaderMap,
     Path((id, rid)): Path<(Uuid, Uuid)>,
 ) -> Result<Response, ApiError> {
-    let _ = member_only(&state, &jar, &headers, id).await?;
+    // Heard of before access is checked, so that no change in between is missed.
+    let revocations = state.revocations.subscribe();
+    let access_changes = state.rooms.subscribe_access();
+    let (user, _) = member_only(&state, &jar, &headers, id).await?;
+    let session = auth::session_hash(&state.auth, &jar).ok_or(ApiError::Unauthorized)?;
+    let watch = AccessWatch {
+        state: state.clone(),
+        doc: id,
+        user: user.id,
+        session,
+        revocations,
+        access_changes,
+        next_check: tokio::time::Instant::now() + ACCESS_RECHECK,
+    };
     let last_event_id: u64 = headers
         .get("last-event-id")
         .and_then(|v| v.to_str().ok())
@@ -538,7 +551,7 @@ pub(super) async fn agent_run_events(
         .ok_or(ApiError::NotFound)?;
     let history = state.store.list_agent_steps(rid).await?;
 
-    let stream = build_sse_stream(run, history, last_event_id, live_rx);
+    let stream = build_sse_stream(run, history, last_event_id, live_rx, watch);
     let sse = Sse::new(stream).keep_alive(
         KeepAlive::new()
             .interval(Duration::from_secs(15))
@@ -550,11 +563,68 @@ pub(super) async fn agent_run_events(
     Ok(resp)
 }
 
+/// How often a stream looks again at whether its reader may still read it.
+const ACCESS_RECHECK: Duration = Duration::from_secs(15);
+
+/// What a stream of a run's events goes by: it is for a session of a member,
+/// and ends as soon as either is no longer so.
+struct AccessWatch {
+    state: ApiState,
+    doc: Uuid,
+    user: Uuid,
+    session: [u8; 32],
+    revocations: tokio::sync::broadcast::Receiver<[u8; 32]>,
+    access_changes: tokio::sync::broadcast::Receiver<AccessChange>,
+    /// When to look again, whatever is heard meanwhile.
+    next_check: tokio::time::Instant,
+}
+
+impl AccessWatch {
+    /// Whether the session is still signed in and its user still a member.
+    async fn still_allowed(&self) -> bool {
+        let Ok(Some(user)) = self.state.store.session_user(&self.session).await else {
+            return false;
+        };
+        user.id == self.user
+            && self
+                .state
+                .store
+                .workbook_access(self.doc, self.user)
+                .await
+                .is_ok_and(|access| access.is_some())
+    }
+
+    /// Waits until access may have ended: the session was revoked, or the user's
+    /// access to the workbook changed, or it is time to look again anyway.
+    async fn changed(&mut self) {
+        let recheck = tokio::time::sleep_until(self.next_check);
+        tokio::pin!(recheck);
+        loop {
+            tokio::select! {
+                revoked = self.revocations.recv() => match revoked {
+                    Ok(hash) if hash != self.session => {}
+                    // Lagged or closed: what was missed may have been this session.
+                    _ => return,
+                },
+                change = self.access_changes.recv() => match change {
+                    Ok(change) if change.doc != self.doc || change.user != self.user => {}
+                    _ => return,
+                },
+                () = &mut recheck => {
+                    self.next_check = tokio::time::Instant::now() + ACCESS_RECHECK;
+                    return;
+                }
+            }
+        }
+    }
+}
+
 fn build_sse_stream(
     run: AgentRunRecord,
     history: Vec<reticula_agent::runner::PersistedStep>,
     last_event_id: u64,
     live_rx: Option<tokio::sync::broadcast::Receiver<crate::agent::SseMessage>>,
+    mut watch: AccessWatch,
 ) -> impl Stream<Item = Result<Event, Infallible>> + Send + 'static {
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(64);
     tokio::spawn(async move {
@@ -593,7 +663,17 @@ fn build_sse_stream(
 
         if let Some(mut rx_live) = live_rx {
             loop {
-                match rx_live.recv().await {
+                let received = tokio::select! {
+                    received = rx_live.recv() => received,
+                    () = watch.changed() => {
+                        if watch.still_allowed().await {
+                            continue;
+                        }
+                        // Ending it is enough: reconnecting is refused.
+                        return;
+                    }
+                };
+                match received {
                     Ok(msg) => {
                         if let Some(step_id) = msg.id {
                             if msg.event == "step" && step_id <= max_step_id {
