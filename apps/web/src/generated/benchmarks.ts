@@ -300,10 +300,54 @@ export interface TableComparison {
   readonly allowed: number;
 }
 
-export const TABLES_PROVENANCE: Provenance | null = null;
+export const TABLES_PROVENANCE: Provenance | null = {
+    report: "bench/results/2026-11-26-e8dccbb-tables.json",
+    commit: "e8dccbb",
+    date: "2026-11-26",
+    uncommittedChanges: false,
+    cpu: "Intel Core i9-13980HX",
+    logicalProcessors: 32,
+    memoryGb: 32,
+    os: "Windows_NT 10.0.26300",
+    browser: "Chrome 158.0.8127.37",
+    headless: false,
+    affinity: "FFFF",
+  };
 
 /** The latest run in Chrome. */
-export const TABLES: TableRun | null = null;
+export const TABLES: TableRun | null = {
+  "affinity": "FFFF",
+  "browser": "Chrome 158.0.8127.37",
+  "columns": 13,
+  "commit": "e8dccbb",
+  "cpu": "Intel Core i9-13980HX",
+  "date": "2026-11-26",
+  "fileBytes": 200032691,
+  "filterNumberMs": 37.95,
+  "filterTextMs": 63.88,
+  "filterValuesMs": 26.63,
+  "headless": false,
+  "importFrameGapMs": 8.38,
+  "importHardMs": 6485.18,
+  "importLastMs": 9692.54,
+  "importMs": 4883.58,
+  "importTwiceMs": 7987.86,
+  "jumpP95Ms": 20.87,
+  "listValuesMs": 24.15,
+  "longestStepMs": 25.67,
+  "pageWhileSortingP95Ms": 9.28,
+  "peakMemoryMiB": 155.88,
+  "report": "bench/results/2026-11-26-e8dccbb-tables.json",
+  "rows": 10000000,
+  "scrollPlaceholderFrames": 0,
+  "scrollWorkP99Ms": 0.76,
+  "sortNumberMs": 157.32,
+  "sortTextMs": 221.55,
+  "sortTwoMs": 266.49,
+  "suite": "m5-tables",
+  "summaryMs": 166.83,
+  "textBytes": 988455324
+};
 
 export const TABLE_COMPARISON: TableComparison | null = {
   provenance: {

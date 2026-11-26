@@ -30,7 +30,7 @@ Reticula splits rendering, calculation, wire persistence, `.xlsx` interop, and l
 
 ## Measured Performance
 
-Measured on an Intel Core i9-13980HX (pinned to P-cores `0xFFFF`, 32 GB RAM, GeForce RTX 4080 Laptop, Windows 11, Google Chrome `158.0.8127.37`). Raw reports, with machine, browser and commit, are archived under [`bench/results/`](bench/results/): engine and sync at `d4ee458`, grid, renderers and startup at `9c2544c` (2026-11-25).
+Measured on an Intel Core i9-13980HX (pinned to P-cores `0xFFFF`, 32 GB RAM, GeForce RTX 4080 Laptop, Windows 11, Google Chrome `158.0.8127.37`). Raw reports, with machine, browser and commit, are archived under [`bench/results/`](bench/results/): engine and sync at `d4ee458`, grid and renderers at `9c2544c`, startup at `7953455` (2026-11-25), data tables at `e8dccbb` (2026-11-26).
 
 | Workload | Chrome WASM | Native (`x86_64`) | Target |
 |---|---:|---:|---:|
@@ -45,7 +45,7 @@ Measured on an Intel Core i9-13980HX (pinned to P-cores `0xFFFF`, 32 GB RAM, GeF
 | **B6** — `100k` exact `VLOOKUP` over `100k` rows | `3.65 ms` | `1.7 ms` | `≤ 50 ms` |
 | **B7a** — Top-row insert, structural formulas / cross-range formulas (1M rows) | `0.56 ms` / `2.04 ms` | `0.45 ms` / `1.59 ms` | `≤ 20 ms` |
 | **B8** — WASM memory: 10M numbers / 1M repeated / 1M unique strings / 1M formulas | `81.6` / `9.3` / `110.6` / `25.4 MB` | — | — |
-| **B10** — Cold first visit (`20 Mbit/s`, `50 ms` RTT, 2-RTT TLS), shell / first screen | `408 ms` / `1,028 ms` | — | `≤ 1.5 s` / `≤ 2.0 s` |
+| **B10** — Cold first visit (`20 Mbit/s`, `50 ms` RTT, 2-RTT TLS), shell / first screen | `445 ms` / `1,067 ms` | — | `≤ 1.5 s` / `≤ 2.0 s` |
 | **Bundles** (brotli-11) — core / sim / XLSX / tables `.wasm` | `966.5 KB` / `706.2 KB` / `763.1 KB` / `173.1 KB` | — | `≤ 1.2 MB` / `≤ 800 KB` / `≤ 900 KB` / `≤ 185 KB` |
 | **JS** (brotli-11) — editor / landing first screen / WebGPU / Chinese / tables / total | `179.3` / `71.0` / `11.8` / `29.8` / `29.8` / `340.2 KB` | — | `≤ 180` / `80` / `16` / `40` / `40` / `400 KB` |
 
@@ -65,6 +65,30 @@ Benchmark B13 draws the same sheets with both renderers in one browser, in turns
 | Chrome, main thread slowed 4×, **WebGPU** | `2.08` / `5.43 ms` | `4.17 ms` | 0 of 1,892 |
 
 With a thousand cells, Canvas 2D takes the main thread 0.69 to 1.01 times as long as before the renderers shared a scene (`*-ab.json`, alternating runs against `5b46fff`). During a zoom gesture, WebGPU shows stretched stand-ins for texts that are not ready yet: in 69 of 72 frames when all texts differ, with up to 11,725 cells in view. Chrome reported a discrete GPU (`nvidia lovelace`); Firefox does not name its adapter. Integrated and mobile GPUs were not measured.
+
+### Data tables
+
+Benchmark B14 imports a CSV file of ten million made-up orders (13 columns, 988 MB) by way of the app's dialog, asks it questions, and scrolls it, in a window on a 240 Hz screen; medians of three runs (`e8dccbb`, raw report [`bench/results/2026-11-26-e8dccbb-tables.json`](bench/results/2026-11-26-e8dccbb-tables.json)).
+
+| 10,000,000 rows × 13 columns | Chrome 158 | Firefox 159 | Target |
+|---|---:|---:|---:|
+| Import: types decided by every row, checksums, written to OPFS | `4.88 s` | `5.68 s` | `≤ 10 s` / `≤ 11.5 s` |
+| Import when a column's type turns out otherwise after 2 MiB (two passes) | `7.99 s` | `8.57 s` | `≤ 1.8×` one pass |
+| The same, when that happens in the last row | `9.69 s`¹ | `11.18 s`¹ | `≤ 1.8×` one pass |
+| File | `200.0 MB` | `200.0 MB` | `≤ 215 MB` |
+| Sort by a number / a text of 1.2M different values / two columns | `157` / `222` / `266 ms` | `192` / `273` / `338 ms` | `≤ 300` / `1,000` / `600 ms` |
+| Filter by a number / a value / a part of a text | `37.9` / `26.6` / `63.9 ms` | `48.9` / `34.5` / `69.6 ms` | `≤ 60` / `60` / `250 ms` |
+| Values of a column / of one with 1.2M different ones | `24.1` / `121 ms` | `34.8` / `144 ms` | `≤ 300 ms` |
+| Sums, extremes and counts of all 13 columns | `167 ms` | `210 ms` | `≤ 400 ms` |
+| Scrolling five screens a second for 8 s, as is, filtered and sorted, with both renderers: frames with placeholders / main thread `p99` | **0 of 11,513** / `≤ 0.76 ms` | **0 of 11,514** / `≤ 1.20 ms` | `0` / `≤ 8 ms` |
+| A jump anywhere, filled in (`p95`) | `≤ 20.9 ms` | `≤ 54.1 ms` | `≤ 100 ms` |
+| Longest call into the module | `25.7 ms` | `34.8 ms`² | `≤ 30 ms` |
+| Peak WASM memory | `163 MB` | `203 MB` | `≤ 400 MB` |
+| **50,000,000 rows**: import / file / sort by a number | `24.9 s` / `948.7 MB` / `833 ms` | `28.4 s` / `948.7 MB` / `996 ms` | done, and scrolled without placeholders |
+
+¹ Over the target: the whole file is read twice. ² Over the target: 5 of about 278,000 calls took more than 30 ms in Firefox, 4 of them while scrolling.
+
+Ten million rows that do not compress (distinct 36-byte texts and floats with all their digits, 568 MB) are imported in 6.5 s (Chrome) and 7.1 s (Firefox) and sorted by any column in at most 1.47 s and 1.51 s.
 
 ## Measured Collaboration, Formula & End-to-End Verification
 
