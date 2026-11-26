@@ -47,8 +47,11 @@ if ! restic cat config >/dev/null 2>&1; then
 fi
 
 restic backup --tag reticula "${paths[@]}"
+# Every backup has a path of its own, and restic keeps the last of each path:
+# what is kept is decided over all of them on this host.
 restic forget \
   --tag reticula \
+  --group-by host,tags \
   --keep-daily "${RESTIC_KEEP_DAILY:-7}" \
   --keep-weekly "${RESTIC_KEEP_WEEKLY:-4}" \
   --keep-monthly "${RESTIC_KEEP_MONTHLY:-6}" \

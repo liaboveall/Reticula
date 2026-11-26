@@ -41,6 +41,8 @@ export RESTIC_PASSWORD_FILE=/etc/reticula/restic.pass
 ENV_FILE=/etc/reticula/reticula.env ./infra/ops/backup-restic.sh
 ```
 
+Snapshots are kept by `RESTIC_KEEP_DAILY`, `RESTIC_KEEP_WEEKLY` and `RESTIC_KEEP_MONTHLY` (7, 4 and 6) over all snapshots of the host with the tag `reticula`, whatever their paths; the others are deleted when the script runs.
+
 Suggested cron schedule (daily at `03:15` UTC, monitor every 5 minutes):
 
 ```cron

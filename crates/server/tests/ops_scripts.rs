@@ -403,6 +403,7 @@ printf 'a\tb\tc\t1\tready\n' > bk/20260101T000000Z/tables.tsv
 (cd bk && bash "$OPS/backup-restic.sh" 20260101T000000Z > "$WORK/out.log" 2>&1)
 check "a backup is uploaded" $? 0
 has "with the copies of its tables" "backup --tag reticula $WORK/bk/20260101T000000Z $WORK/bk-tables" restic.log
+has "and older ones go, whatever their paths" "forget --tag reticula --group-by host,tags --keep-daily 7 --keep-weekly 4 --keep-monthly 6 --prune" restic.log
 rm -rf bk-tables restic.log
 bash "$OPS/backup-restic.sh" "$WORK/bk/20260101T000000Z" > out.log 2>&1
 check "not without those it lists" "$? $([[ -e restic.log ]] && echo uploaded)" "1 "
