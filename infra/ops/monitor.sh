@@ -78,7 +78,11 @@ elif (( disk_pct >= DISK_WARN_PCT )); then
   alert "filesystem usage on ${DATA_MOUNT} is ${disk_pct}% (>= ${DISK_WARN_PCT}%)"
 fi
 
-if [[ -d "$BACKUP_ROOT" ]]; then
+latest_backup=""
+if [[ ! -d "$BACKUP_ROOT" ]]; then
+  # No directory is no backup, not one that is fine.
+  alert "the backup directory ${BACKUP_ROOT} does not exist"
+else
   latest_backup="$(find "$BACKUP_ROOT" -mindepth 1 -maxdepth 1 -type d ! -name "*.tmp" | LC_ALL=C sort | tail -n 1 || true)"
   if [[ -z "$latest_backup" ]]; then
     alert "no completed backups found under ${BACKUP_ROOT}"
@@ -102,7 +106,11 @@ if [[ -d "$BACKUP_ROOT" ]]; then
   fi
 fi
 
-if [[ -d "$TABLE_BACKUP_ROOT" ]]; then
+if [[ ! -d "$TABLE_BACKUP_ROOT" ]]; then
+  if [[ -n "$latest_backup" && -s "${latest_backup}/tables.tsv" ]]; then
+    alert "the table backup directory ${TABLE_BACKUP_ROOT} does not exist, and ${latest_backup} has tables"
+  fi
+else
   # A file may go while it is looked at.
   table_bytes="$({ find "$TABLE_BACKUP_ROOT" -type f -printf '%s\n' 2>/dev/null || true; } | awk '{ sum += $1 } END { printf "%.0f", sum }')"
   if (( table_bytes * 100 >= TABLE_BACKUP_MAX_BYTES * TABLE_BACKUP_WARN_PCT )); then

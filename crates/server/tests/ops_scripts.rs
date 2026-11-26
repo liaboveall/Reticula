@@ -198,6 +198,14 @@ check "and in no volume" "$("$DOCKER" volume ls -q | grep -cx bk-tables)" 0
 check "the archive has no tables" "$(tar -tzf "$BACKUP/workbooks.tar.gz" | grep -c tables)" 0
 BACKUP_ROOT="$WORK/bk"
 
+# A copy as long as the table, but not its bytes, is not taken for one.
+sum1="$(sha256sum < file1 | cut -d' ' -f1)"
+copy1="bk-tables/${sum1:0:2}/$sum1.rtbl"
+head -c 100000 /dev/zero > "$copy1"
+sleep 1.1; backup
+check "a damaged copy is made again" "$? $(sha256sum < "$copy1" | cut -d' ' -f1)" "0 $sum1"
+check "and the backup misses nothing" "$(wc -c < "$BACKUP/tables-missed.tsv")" 0
+
 # On a fresh host, by the name of the directory alone.
 volume "rm -rf /data/tables"
 (cd bk && restore "$(basename "$BACKUP")")
@@ -225,6 +233,14 @@ check "the list did" "$([[ "$(sql 'SELECT tables_version FROM workbooks')" -gt "
 before="$(sql 'SELECT tables_version FROM workbooks')"
 restore --tables-only "$BACKUP"
 check "again is nothing" "$? $(sql 'SELECT tables_version FROM workbooks')" "0 $before"
+
+# A damaged copy of a table that is no longer on the volume is no backup of it.
+volume "rm /data/tables/$BOOK/*2.rtbl"
+sql "UPDATE tables SET status = 'missing' WHERE position = 2"
+sum2="$(sha256sum < file2 | cut -d' ' -f1)"
+head -c 200000 /dev/zero > "bk-tables/${sum2:0:2}/$sum2.rtbl"
+sleep 1.1; backup
+has "a damaged copy of a lost table is reported" "the copy was damaged" "$BACKUP/tables-missed.tsv"
 "##,
     ]);
 }
@@ -372,6 +388,19 @@ printf 'a\nb\n' > bk/20260101T000000Z/tables-missed.tsv
 monitor
 check "tables without a backup" $? 1
 has "are reported" "without 2 table" hook.log
+
+# Where there is no backup at all.
+BACKUP_ROOT="$WORK/gone" monitor
+check "no backup directory" $? 1
+has "is reported" "the backup directory $WORK/gone does not exist" hook.log
+printf 'row
+' > bk/20260101T000000Z/tables.tsv
+TABLE_BACKUP_ROOT="$WORK/gone-tables" monitor
+check "no directory for the copies of tables" $? 1
+has "is reported" "gone-tables does not exist" hook.log
+rm bk/20260101T000000Z/tables.tsv
+TABLE_BACKUP_ROOT="$WORK/gone-tables" monitor
+check "which a backup without tables has no need of" "$? $(grep -c gone-tables hook.log)" "1 0"
 
 # Files that go while they are looked at, as they do during a backup.
 real="$(command -v find)"

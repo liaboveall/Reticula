@@ -152,14 +152,27 @@ docker run --rm -i \
       [ -n "$sha" ] || continue
       dir="/store/$(printf "%.2s" "$sha")"
       file="$dir/$sha.rtbl"
-      if [ -f "$file" ] && [ "$(stat -c %s "$file")" = "$bytes" ]; then
-        continue
+      damaged=""
+      if [ -f "$file" ]; then
+        if [ "$(stat -c %s "$file")" = "$bytes" ] &&
+          [ "$(sha256sum < "$file" | cut -d" " -f1)" = "$sha" ]; then
+          continue
+        fi
+        # A copy that is not the bytes it is named by is no copy: it goes, and
+        # is made again from the volume if it can be.
+        used="$((used - $(stat -c %s "$file")))"
+        rm -f "$file"
+        damaged=1
       fi
       source="/data/tables/$workbook/$id.rtbl"
       reason=""
       if [ ! -f "$source" ]; then
-        [ "$status" != missing ] || continue
-        reason="not on the volume"
+        if [ -n "$damaged" ]; then
+          reason="the copy was damaged, and the table is not on the volume"
+        else
+          [ "$status" != missing ] || continue
+          reason="not on the volume"
+        fi
       elif [ "$((used + bytes))" -gt "$LIMIT" ]; then
         reason="over the limit of the table backups"
       else
