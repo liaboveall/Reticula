@@ -36,6 +36,7 @@ import { DemoTip } from "./editor/DemoTip.tsx";
 import { FormatToolbar } from "./editor/FormatToolbar.tsx";
 import { useGridStrings } from "./editor/grid-strings.ts";
 import { type CellIds, HeldCommits } from "./editor/held-commits.ts";
+import type { KeptEdit } from "./editor/kept-edit.ts";
 import {
   engineText,
   laterNow,
@@ -171,6 +172,15 @@ function readInitialUrlDoc(): {
   };
 }
 
+/** Whether something typed before an update waits to be had back (`editor/kept-edit.ts`). */
+function hasKeptEdit(): boolean {
+  try {
+    return sessionStorage.getItem("reticula:kept-edit") !== null;
+  } catch {
+    return false;
+  }
+}
+
 function syncUrlForDoc(docId: string): void {
   const url = new URL(window.location.href);
   url.searchParams.delete("safe");
@@ -241,6 +251,14 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
   const swClientRef = useRef<SwClientHandle | null>(null);
   const collabTransportRef = useRef<CollabTransportHandle | null>(null);
   const collabTargetRef = useRef<CollabWorkbookTarget | null>(null);
+  /** The workbook that is open, as what was typed in it is kept by. */
+  const editDocKey = useCallback(
+    () =>
+      collabTargetRef.current
+        ? `cloud:${collabTargetRef.current.docId}`
+        : `local:${activeDocIdRef.current}`,
+    [],
+  );
   const collabConnRef = useRef<CollabHookStatus["connection"]>("offline");
   const collabReplicaRef = useRef<number | null>(null);
   const collabPendingRef = useRef<number>(0);
@@ -1289,6 +1307,16 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
               setDraftPreview(false);
               openSheet(message.sheet);
               setEngine({ status: "ready", info: message.info, sheet: message.sheet });
+              // What was being typed before an update, which is rarely anything.
+              if (hasKeptEdit()) {
+                void loadLater().then(({ takeKeptEdit }) => {
+                  const kept = takeKeptEdit(editDocKey());
+                  if (kept) {
+                    // Once it can be typed into again.
+                    window.setTimeout(() => actionsRef.current.restoreEdit(kept), 0);
+                  }
+                });
+              }
               break;
             case "sheetChanged": {
               const switched = message.sheet.sheet !== activeSheetRef.current;
@@ -1669,7 +1697,22 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
         const handle = createSwClient({
           tabId: tabIdRef.current,
           onUpdateReady: (ready) => setSwUpdateReady(ready),
-          onDrainForUpdate: flushAndCloseDoc,
+          onDrainForUpdate: () => {
+            // An update reloads the tab: what is being typed comes back afterwards.
+            const session = editSessionRef.current;
+            if (session) {
+              laterNow()?.keepEdit({
+                doc: editDocKey(),
+                sheet: session.hostSheet,
+                row: session.row,
+                col: session.col,
+                source: session.source,
+                cursorUtf16: session.cursorUtf16,
+                inFormulaBar: document.activeElement?.closest(".formulabar") != null,
+              });
+            }
+            return flushAndCloseDoc();
+          },
           onBusy: (onAgreed) => askTables({ kind: "giveUp", onAgreed }),
         });
         if (disposed) {
@@ -1787,6 +1830,7 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
     sendPresenceNow,
     syncGridFormulaRefs,
     zoomSignal,
+    editDocKey,
   ]);
 
   useGridStrings(gridRef);
@@ -2064,8 +2108,65 @@ function DesktopSpreadsheet({ onNavigate }: EditorPageProps) {
   };
   const stateRef = useRef(state);
   stateRef.current = state;
+  /**
+   * What was being typed before an update, until its cell is known: a tab that
+   * was reloaded behind another one has no pages yet, and nothing can be typed
+   * into a cell that is not there.
+   */
+  const keptEditRef = useRef<KeptEdit | null>(null);
+  /** And once it has been typed again into the formula bar, which then has the focus. */
+  const keptForBarRef = useRef<KeptEdit | null>(null);
+
+  const restoreEdit = (kept: KeptEdit) =>
+    onSheet(kept.sheet, (grid) => {
+      keptEditRef.current = kept;
+      grid.select({ row: kept.row, col: kept.col });
+    });
+
+  /** Types it again, if its cell is the one selected and is there. */
+  const typeKeptEdit = (selected: Selection | null) => {
+    const kept = keptEditRef.current;
+    const editor = editorRef.current;
+    if (!kept || !editor || selected === null) {
+      return;
+    }
+    const isThere =
+      selected.row === kept.row &&
+      selected.col === kept.col &&
+      activeSheetRef.current === kept.sheet;
+    if (isThere && selected.rowId === null) {
+      return; // Until its page has come.
+    }
+    keptEditRef.current = null;
+    // Another cell has been gone to meanwhile: it is for that one now.
+    if (!isThere) {
+      return;
+    }
+    if (effectiveReadOnlyRef.current || editSessionRef.current) {
+      return;
+    }
+    if (kept.inFormulaBar) {
+      keptForBarRef.current = kept;
+      handleFormulaBarChange(kept.source, kept.cursorUtf16);
+    } else {
+      editor.startEdit("F2", kept.source);
+      editor.applyTextAndSelection(kept.source, kept.cursorUtf16);
+    }
+  };
+  useEffect(() => actionsRef.current.typeKeptEdit(selection), [selection]);
+  useEffect(() => {
+    const kept = keptForBarRef.current;
+    if (kept && editingText === kept.source) {
+      keptForBarRef.current = null;
+      formulaBarRef.current?.applyTextAndSelection(kept.source, kept.cursorUtf16);
+      formulaBarRef.current?.focus();
+    }
+  }, [editingText]);
+
   const actions = {
     tables,
+    restoreEdit,
+    typeKeptEdit,
     commitPending,
     handleSwitchSheet,
     handleCreateNewWorkbook,

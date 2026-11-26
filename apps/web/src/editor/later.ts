@@ -17,6 +17,7 @@ export { announceCleared, announceCommit, CellAnnouncements } from "./cell-annou
 export { default as FormulaAssist } from "./FormulaAssist.tsx";
 export { freezeChoices, numberFormats } from "./formats.ts";
 export { HINTS } from "./hints.ts";
+export { keepEdit, takeKeptEdit } from "./kept-edit.ts";
 export { default as LockOverlay } from "./LockOverlay.tsx";
 export { default as NameBoxInput } from "./NameBoxInput.tsx";
 export { default as SheetRename } from "./SheetRename.tsx";

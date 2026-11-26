@@ -217,6 +217,21 @@ test("two open tabs coordinate OPFS drain and upgrade together from SW v1 to v2 
     await editCellViaBar(tab2, 0, 0, "A1", "TabTwoV1Data", "TabTwoV1Data");
     await tab2.waitForTimeout(80);
 
+    // Something is being typed in each tab, and not entered yet: in the formula
+    // bar of one, and in a cell of the other.
+    await tab2.evaluate(() => window.__reticula?.select(0, 1));
+    await expect(tab2.getByTestId("name-box")).toHaveText("B1");
+    const bar2 = tab2.getByTestId("formula-input");
+    await bar2.click();
+    await bar2.fill('=A1&" half"');
+    await expect(bar2).toHaveText('=A1&" half"');
+    await tab1.bringToFront();
+    await tab1.evaluate(() => window.__reticula?.select(0, 1));
+    await expect(tab1.getByTestId("name-box")).toHaveText("B1");
+    await tab1.keyboard.type("In cell");
+    const cell1 = tab1.locator(".reticula-editor .cm-content");
+    await expect(cell1).toHaveText("In cell");
+
     // Publish v2 Service Worker while both tabs remain open and editing.
     srv.setSwOverride(V2_BUILD_ID);
     await tab1.bringToFront();
@@ -245,6 +260,12 @@ test("two open tabs coordinate OPFS drain and upgrade together from SW v1 to v2 
     await expect
       .poll(() => tab1.evaluate(() => window.__reticula?.textAt(0, 0)))
       .toBe("TabOneV1Data");
+    // What was being typed is there again, in the cell, and not entered.
+    await expect(cell1).toHaveText("In cell", { timeout: 10_000 });
+    await expect(tab1.getByTestId("name-box")).toHaveText("B1");
+    expect(await tab1.evaluate(() => window.__reticula?.textAt(0, 1))).toBe("");
+    await tab1.keyboard.press("Enter");
+    await expect.poll(() => tab1.evaluate(() => window.__reticula?.textAt(0, 1))).toBe("In cell");
 
     await tab2.bringToFront();
     await expect(tab2.getByTestId("engine-status")).toHaveText("ready", { timeout: 15_000 });
@@ -257,6 +278,14 @@ test("two open tabs coordinate OPFS drain and upgrade together from SW v1 to v2 
     await expect
       .poll(() => tab2.evaluate(() => window.__reticula?.textAt(0, 0)))
       .toBe("TabTwoV1Data");
+    // And in the formula bar of the other, with the focus.
+    await expect(bar2).toHaveText('=A1&" half"', { timeout: 10_000 });
+    await expect(tab2.locator(".formula-cm-wrap.focused")).toBeVisible();
+    await expect(tab2.getByTestId("name-box")).toHaveText("B1");
+    expect(await tab2.evaluate(() => window.__reticula?.textAt(0, 1))).toBe("");
+    await tab2.keyboard.press("Escape");
+    await expect.poll(() => tab2.evaluate(() => window.__reticula?.textAt(0, 1))).toBe("");
+    await expect(bar2).toHaveText("");
 
     await tab1.close();
     await tab2.close();
