@@ -44,6 +44,7 @@ const WRITERS = [
 /** What reads like English in them and is no message. */
 const NO_MESSAGES = new Set([
   // Titles, which are stored with the workbooks.
+  "Recovered workbook",
   "Sample sales data",
   "Unsynced changes - {title}",
   "Untitled",

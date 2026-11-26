@@ -1,9 +1,11 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import {
+  RECOVERED_TITLE,
   readCatalog,
   removeDocStorage,
   upsertCatalogEntry,
   type WorkbookCatalogEntry,
+  writeDocState,
 } from "./storage.ts";
 
 // Storage that takes its time, as that of a browser does: whoever reads and then
@@ -40,7 +42,12 @@ class FakeDirectory {
     return {
       getFile: async () => {
         await pause();
-        return { arrayBuffer: async () => (files.get(name) ?? new Uint8Array()).slice().buffer };
+        const bytes = files.get(name) ?? new Uint8Array();
+        return {
+          size: bytes.byteLength,
+          lastModified: 1_000,
+          arrayBuffer: async () => bytes.slice().buffer,
+        };
       },
       createWritable: async () => {
         let written = new Uint8Array();
@@ -55,6 +62,10 @@ class FakeDirectory {
         };
       },
     };
+  }
+
+  async *keys(): AsyncIterable<string> {
+    yield* [...this.files.keys(), ...this.directories.keys()];
   }
 
   async removeEntry(name: string): Promise<void> {
@@ -140,5 +151,62 @@ describe("the list of workbooks", () => {
     await upsertCatalogEntry(entry("a", 1), "opfs-writable");
     await removeDocStorage("a", "opfs-writable");
     expect(await ids()).toEqual([]);
+  });
+});
+
+describe("a list of workbooks that a write left damaged", () => {
+  const top = async () => root.getDirectoryHandle("reticula-v1");
+  const damage = async (name: string) => {
+    const bytes = (await top()).files.get(name);
+    expect(bytes).toBeDefined();
+    (await top()).files.set(name, bytes?.slice(0, 7) ?? new Uint8Array());
+  };
+  const state = { activeSlot: "a", snapshotSeq: 0, lastFlushedSeq: 0, openingCount: 0 } as const;
+
+  test("is read from its spare", async () => {
+    await upsertCatalogEntry(entry("a", 1), "opfs-writable");
+    await upsertCatalogEntry(entry("b", 2), "opfs-writable");
+    await damage("catalog.json");
+    expect(await ids()).toEqual(["b", "a"]);
+  });
+
+  test("is made again from the workbooks that are there", async () => {
+    for (const [id, at] of [
+      ["a", 1],
+      ["b", 2],
+    ] as const) {
+      await upsertCatalogEntry(entry(id, at), "opfs-writable");
+      await writeDocState(id, state, "opfs-writable");
+    }
+    await damage("catalog.json");
+    await damage("catalog.spare.json");
+    const list = await readCatalog("opfs-writable");
+    expect(list.map(({ id }) => id).sort()).toEqual(["a", "b"]);
+    expect(list.every(({ title }) => title === RECOVERED_TITLE)).toBe(true);
+    // What is made next does not take the place of what was there.
+    await writeDocState("c", state, "opfs-writable");
+    await upsertCatalogEntry(entry("c", 5_000, "New"), "opfs-writable");
+    expect((await ids()).sort()).toEqual(["a", "b", "c"]);
+    const made = (await readCatalog("opfs-writable")).find(({ id }) => id === "c");
+    expect(made).toMatchObject({ title: "New", updatedAt: 5_000 });
+  });
+
+  test("is not made again while it is whole", async () => {
+    // A workbook that is being made has its files before it is on the list.
+    await writeDocState("a", state, "opfs-writable");
+    await upsertCatalogEntry(entry("a", 1, "Mine"), "opfs-writable");
+    await writeDocState("b", state, "opfs-writable");
+    expect(await readCatalog("opfs-writable")).toEqual([entry("a", 1, "Mine")]);
+    await damage("catalog.json");
+    expect(await readCatalog("opfs-writable")).toEqual([entry("a", 1, "Mine")]);
+  });
+
+  test("is no list of workbooks where there are none", async () => {
+    expect(await readCatalog("opfs-writable")).toEqual([]);
+    await (await root.getDirectoryHandle("reticula-v1", { create: true })).getFileHandle(
+      "catalog.json",
+      { create: true },
+    );
+    expect(await readCatalog("opfs-writable")).toEqual([]);
   });
 });

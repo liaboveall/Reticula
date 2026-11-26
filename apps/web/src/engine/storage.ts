@@ -34,7 +34,11 @@ interface WorkerFileHandle extends FileSystemFileHandle {
 
 export const OPFS_ROOT_DIR = "reticula-v1";
 const CATALOG_FILE = "catalog.json";
-const LOCAL_DIR = "local";
+/** The same list, written first: one of the two is whole whenever a write stops. */
+const CATALOG_SPARE = "catalog.spare.json";
+/** What a workbook that the list had lost is called when it is found again. */
+export const RECOVERED_TITLE = "Recovered workbook";
+export const LOCAL_DIR = "local";
 
 /**
  * Error names thrown when `createSyncAccessHandle()` finds a file already open
@@ -248,29 +252,65 @@ export async function writeOpfsFileAtomic(
 
 // --- Catalog & Doc State ----------------------------------------------------
 
-export async function readCatalog(backend: StorageBackendKind): Promise<WorkbookCatalogEntry[]> {
-  if (backend === "memory") {
-    const raw = memoryFiles.get(CATALOG_FILE);
-    if (!raw) {
-      return [];
-    }
-    try {
-      return JSON.parse(decoder.decode(raw)) as WorkbookCatalogEntry[];
-    } catch {
-      return [];
-    }
-  }
-  const root = await getRootDir(true);
-  const bytes = await readOpfsFileBytes(root, CATALOG_FILE);
+/** The entries of a list as it was written, or `null` when it is not one. */
+function parseCatalog(bytes: Uint8Array | null | undefined): WorkbookCatalogEntry[] | null {
   if (!bytes) {
-    return [];
+    return null;
   }
+  let parsed: unknown;
   try {
-    const parsed = JSON.parse(decoder.decode(bytes));
-    return Array.isArray(parsed) ? (parsed as WorkbookCatalogEntry[]) : [];
+    parsed = JSON.parse(decoder.decode(bytes));
   } catch {
+    return null;
+  }
+  if (!Array.isArray(parsed)) {
+    return null;
+  }
+  return parsed.filter(
+    (entry): entry is WorkbookCatalogEntry =>
+      typeof entry === "object" &&
+      entry !== null &&
+      typeof entry.id === "string" &&
+      typeof entry.title === "string" &&
+      typeof entry.createdAt === "number" &&
+      typeof entry.updatedAt === "number" &&
+      typeof entry.sizeBytes === "number",
+  );
+}
+
+/**
+ * Reads the list of local workbooks. When it is damaged its spare is read; when
+ * both are, the list is made again from the workbooks that have files, so that
+ * none is lost to a write that stopped halfway. Their titles are not in their
+ * files, so they are found again as {@link RECOVERED_TITLE}.
+ */
+export async function readCatalog(backend: StorageBackendKind): Promise<WorkbookCatalogEntry[]> {
+  let main: Uint8Array | null;
+  let spare: () => Promise<Uint8Array | null>;
+  if (backend === "memory") {
+    main = memoryFiles.get(CATALOG_FILE) ?? null;
+    spare = async () => memoryFiles.get(CATALOG_SPARE) ?? null;
+  } else {
+    const root = await getRootDir(true);
+    main = await readOpfsFileBytes(root, CATALOG_FILE);
+    spare = () => readOpfsFileBytes(root, CATALOG_SPARE);
+  }
+  const listed = parseCatalog(main);
+  if (listed) {
+    return listed;
+  }
+  const spareBytes = await spare();
+  const kept = parseCatalog(spareBytes);
+  if (kept) {
+    return kept;
+  }
+  if (main === null && spareBytes === null) {
+    // Never written: a workbook being made has its files before its entry.
     return [];
   }
+  // Rarely needed, and so not loaded until it is.
+  const { findDocs } = await import("./catalog-recovery.ts");
+  return (await findDocs(backend)).sort(newestFirst);
 }
 
 export async function writeCatalog(
@@ -279,10 +319,14 @@ export async function writeCatalog(
 ): Promise<void> {
   const bytes = encoder.encode(JSON.stringify(entries));
   if (backend === "memory") {
+    memoryFiles.set(CATALOG_SPARE, bytes);
     memoryFiles.set(CATALOG_FILE, bytes);
     return;
   }
   const root = await getRootDir(true);
+  // The spare first: while the list is written, the spare is whole, and the
+  // other way round.
+  await writeOpfsFileAtomic(root, CATALOG_SPARE, bytes, backend);
   await writeOpfsFileAtomic(root, CATALOG_FILE, bytes, backend);
 }
 
